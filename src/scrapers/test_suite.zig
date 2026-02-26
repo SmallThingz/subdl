@@ -22,25 +22,21 @@ pub fn runSuite(allocator: Allocator, probes: []const ProviderProbe) !void {
         try selected.append(allocator, probe);
     }
     if (selected.items.len == 0) return;
+    std.debug.print("[live][suite] starting threaded probe batch count={d}\n", .{selected.items.len});
 
-    const worker_count = @max(@as(usize, 1), @min(selected.items.len, @as(usize, 4)));
     const states = try allocator.alloc(ProbeState, selected.items.len);
     defer allocator.free(states);
     for (selected.items, 0..) |probe, idx| {
         states[idx] = .{ .probe = probe };
     }
 
-    var ctx: RunContext = .{
-        .next_index = std.atomic.Value(usize).init(0),
-        .states = states,
-    };
-
-    const threads = try allocator.alloc(std.Thread, worker_count);
+    const threads = try allocator.alloc(std.Thread, selected.items.len);
     defer allocator.free(threads);
-    for (threads) |*thread| {
-        thread.* = try std.Thread.spawn(.{}, runWorker, .{&ctx});
+    for (threads, states) |*thread, *state| {
+        thread.* = try std.Thread.spawn(.{}, runProbeWorker, .{state});
     }
     for (threads) |thread| thread.join();
+    std.debug.print("[live][suite] threaded probe batch complete count={d}\n", .{selected.items.len});
 
     var first_err: ?anyerror = null;
     for (states) |state| {
@@ -62,12 +58,29 @@ const ProbeState = struct {
     err: ?anyerror = null,
 };
 
-const RunContext = struct {
-    next_index: std.atomic.Value(usize),
-    states: []ProbeState,
-};
+fn runProbeWorker(state: *ProbeState) void {
+    const start_ms = std.time.milliTimestamp();
+    std.debug.print("[live][suite][{s}] worker_start state=0x{x}\n", .{
+        state.probe.name,
+        @intFromPtr(state),
+    });
+    defer {
+        const elapsed_ms = std.time.milliTimestamp() - start_ms;
+        if (state.err) |err| {
+            std.debug.print("[live][suite][{s}] worker_end status=err err={s} elapsed_ms={d}\n", .{
+                state.probe.name,
+                @errorName(err),
+                elapsed_ms,
+            });
+        } else {
+            std.debug.print("[live][suite][{s}] worker_end status=ok attempts={d} elapsed_ms={d}\n", .{
+                state.probe.name,
+                state.attempts + 1,
+                elapsed_ms,
+            });
+        }
+    }
 
-fn runWorker(ctx: *RunContext) void {
     var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
@@ -75,25 +88,20 @@ fn runWorker(ctx: *RunContext) void {
     var client: std.http.Client = .{ .allocator = allocator };
     defer client.deinit();
 
-    while (true) {
-        const idx = ctx.next_index.fetchAdd(1, .acq_rel);
-        if (idx >= ctx.states.len) break;
-
-        var attempt: usize = 0;
-        while (true) : (attempt += 1) {
-            ctx.states[idx].probe.run(allocator, &client) catch |err| {
-                if (attempt < 2 and isRetryable(err)) {
-                    const base_ms: u64 = if (err == error.RateLimited) 5000 else 300;
-                    std.Thread.sleep((@as(u64, 1) << @intCast(@min(attempt, 6))) * base_ms * std.time.ns_per_ms);
-                    continue;
-                }
-                ctx.states[idx].attempts = attempt;
-                ctx.states[idx].err = err;
-                break;
-            };
-            ctx.states[idx].attempts = attempt;
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        state.probe.run(allocator, &client) catch |err| {
+            if (attempt < 2 and isRetryable(err)) {
+                const base_ms: u64 = if (err == error.RateLimited) 5000 else 300;
+                std.Thread.sleep((@as(u64, 1) << @intCast(@min(attempt, 6))) * base_ms * std.time.ns_per_ms);
+                continue;
+            }
+            state.attempts = attempt;
+            state.err = err;
             break;
-        }
+        };
+        state.attempts = attempt;
+        break;
     }
 }
 

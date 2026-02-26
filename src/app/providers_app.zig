@@ -1429,15 +1429,198 @@ test "opensubtitles remote token helpers" {
     try std.testing.expect(parseOpenSubtitlesRemoteToken("https://example.com/file.zip") == null);
 }
 
+const ProviderSmokeState = struct {
+    provider: Provider,
+    err: ?anyerror = null,
+};
+
+fn runProviderSmokeWorker(state: *ProviderSmokeState) void {
+    const start_ms = std.time.milliTimestamp();
+    std.debug.print("[live][providers_app][{s}] worker_start state=0x{x}\n", .{
+        providerName(state.provider),
+        @intFromPtr(state),
+    });
+    defer {
+        const elapsed_ms = std.time.milliTimestamp() - start_ms;
+        if (state.err) |err| {
+            std.debug.print("[live][providers_app][{s}] worker_end status=err err={s} elapsed_ms={d}\n", .{
+                providerName(state.provider),
+                @errorName(err),
+                elapsed_ms,
+            });
+        } else {
+            std.debug.print("[live][providers_app][{s}] worker_end status=ok elapsed_ms={d}\n", .{
+                providerName(state.provider),
+                elapsed_ms,
+            });
+        }
+    }
+
+    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    runProviderTuiSmoke(allocator, &client, state.provider) catch |err| {
+        state.err = err;
+    };
+}
+
+fn runProviderTuiSmoke(allocator: std.mem.Allocator, client: *std.http.Client, provider: Provider) !void {
+    const query = liveQueryForProvider(provider);
+    std.debug.print("[live][providers_app][{s}] query={s}\n", .{ providerName(provider), query });
+
+    var search_response = try search(allocator, client, provider, query);
+    defer search_response.deinit();
+
+    if (search_response.items.len == 0) return error.TestUnexpectedResult;
+    std.debug.print("[live][providers_app][{s}] search_items={d}\n", .{ providerName(provider), search_response.items.len });
+
+    for (search_response.items, 0..) |item, idx| {
+        std.debug.print("[live][providers_app][{s}][search][{d}]\n", .{ providerName(provider), idx });
+        try validateUtfNoReplacement(item.title);
+        try validateUtfNoReplacement(item.label);
+        try common.livePrintField(allocator, "title", item.title);
+        try common.livePrintField(allocator, "label", item.label);
+        try common.livePrintField(allocator, "url", searchRefLogUrl(item.ref));
+    }
+
+    var chosen_idx: ?usize = null;
+    for (search_response.items, 0..) |item, idx| {
+        var subtitles_preview = fetchSubtitles(allocator, client, item.ref) catch continue;
+        defer subtitles_preview.deinit();
+
+        if (subtitles_preview.items.len > 0 and firstDownloadCandidate(subtitles_preview.items) != null) {
+            chosen_idx = idx;
+            break;
+        }
+    }
+    if (chosen_idx == null) return error.TestUnexpectedResult;
+
+    const picked_search = search_response.items[chosen_idx.?];
+    std.debug.print("[live][providers_app][{s}] chosen_search={d}\n", .{ providerName(provider), chosen_idx.? });
+    try common.livePrintField(allocator, "chosen_search_title", picked_search.title);
+    try common.livePrintField(allocator, "chosen_search_url", searchRefLogUrl(picked_search.ref));
+
+    var subtitles = try fetchSubtitles(allocator, client, picked_search.ref);
+    defer subtitles.deinit();
+
+    if (subtitles.items.len == 0) return error.TestUnexpectedResult;
+    try validateUtfNoReplacement(subtitles.title);
+    try common.livePrintField(allocator, "subtitles_title", subtitles.title);
+    std.debug.print("[live][providers_app][{s}] subtitles_items={d}\n", .{ providerName(provider), subtitles.items.len });
+
+    for (subtitles.items, 0..) |sub, idx| {
+        std.debug.print("[live][providers_app][{s}][subtitle][{d}]\n", .{ providerName(provider), idx });
+        try validateUtfNoReplacement(sub.label);
+        try common.livePrintField(allocator, "label", sub.label);
+        try common.livePrintOptionalField(allocator, "language", sub.language);
+        try common.livePrintOptionalField(allocator, "filename", sub.filename);
+        try common.livePrintOptionalField(allocator, "download_url", sub.download_url);
+        if (sub.language) |v| try validateUtfNoReplacement(v);
+        if (sub.filename) |v| try validateUtfNoReplacement(v);
+        if (sub.download_url) |v| try validateUtfNoReplacement(v);
+    }
+
+    if (firstDownloadCandidate(subtitles.items) == null) return error.TestUnexpectedResult;
+
+    var extraction_ok = false;
+    var extraction_files: usize = 0;
+    var chosen_download_idx: ?usize = null;
+    var archive_phase_cursor: usize = 0;
+    var non_archive_phase_cursor: usize = 0;
+
+    while (true) {
+        const download_idx = iterDownloadCandidates(subtitles.items, true, archive_phase_cursor) orelse break;
+        archive_phase_cursor += 1;
+        const subtitle = subtitles.items[download_idx];
+
+        const unique = std.time.nanoTimestamp();
+        const out_dir = try std.fmt.allocPrint(allocator, ".zig-cache/live-downloads/{s}-{d}-{d}", .{ providerName(provider), chosen_idx.?, unique });
+        defer allocator.free(out_dir);
+        try prepareDownloadOutDir(out_dir);
+        defer cleanupDownloadOutDir(out_dir);
+
+        std.debug.print("[live][providers_app][{s}] download_attempt idx={d} mode=archive-first\n", .{ providerName(provider), download_idx });
+        var download = downloadSubtitle(allocator, client, subtitle, out_dir) catch |err| {
+            std.debug.print("[live][providers_app][{s}] download_attempt_error idx={d} err={s}\n", .{
+                providerName(provider),
+                download_idx,
+                @errorName(err),
+            });
+            continue;
+        };
+        defer download.deinit(allocator);
+
+        std.debug.print("[live][providers_app][{s}] download_ok idx={d} bytes={d}\n", .{ providerName(provider), download_idx, download.bytes_written });
+        try common.livePrintField(allocator, "download_file_path", download.file_path);
+        if (download.archive_path) |p| try common.livePrintField(allocator, "download_archive_path", p);
+        for (download.extracted_files) |path| {
+            try common.livePrintField(allocator, "extracted_file", path);
+            try std.fs.cwd().access(path, .{});
+        }
+
+        if (download.bytes_written > 0 and download.extracted_files.len > 0) {
+            extraction_ok = true;
+            extraction_files = download.extracted_files.len;
+            chosen_download_idx = download_idx;
+            break;
+        }
+    }
+
+    while (!extraction_ok) {
+        const download_idx = iterDownloadCandidates(subtitles.items, false, non_archive_phase_cursor) orelse break;
+        non_archive_phase_cursor += 1;
+        const subtitle = subtitles.items[download_idx];
+
+        const unique = std.time.nanoTimestamp();
+        const out_dir = try std.fmt.allocPrint(allocator, ".zig-cache/live-downloads/{s}-{d}-{d}", .{ providerName(provider), chosen_idx.?, unique });
+        defer allocator.free(out_dir);
+        try prepareDownloadOutDir(out_dir);
+        defer cleanupDownloadOutDir(out_dir);
+
+        std.debug.print("[live][providers_app][{s}] download_attempt idx={d} mode=any\n", .{ providerName(provider), download_idx });
+        var download = downloadSubtitle(allocator, client, subtitle, out_dir) catch |err| {
+            std.debug.print("[live][providers_app][{s}] download_attempt_error idx={d} err={s}\n", .{
+                providerName(provider),
+                download_idx,
+                @errorName(err),
+            });
+            continue;
+        };
+        defer download.deinit(allocator);
+
+        std.debug.print("[live][providers_app][{s}] download_ok idx={d} bytes={d}\n", .{ providerName(provider), download_idx, download.bytes_written });
+        try common.livePrintField(allocator, "download_file_path", download.file_path);
+        if (download.archive_path) |p| try common.livePrintField(allocator, "download_archive_path", p);
+        for (download.extracted_files) |path| {
+            try common.livePrintField(allocator, "extracted_file", path);
+            try std.fs.cwd().access(path, .{});
+        }
+
+        if (download.bytes_written > 0 and download.extracted_files.len > 0) {
+            extraction_ok = true;
+            extraction_files = download.extracted_files.len;
+            chosen_download_idx = download_idx;
+            break;
+        }
+    }
+
+    if (!extraction_ok) return error.TestUnexpectedResult;
+    std.debug.print("[live][providers_app][{s}] extraction_ok idx={d} files={d}\n", .{
+        providerName(provider),
+        chosen_download_idx.?,
+        extraction_files,
+    });
+}
+
 test "live providers_app tui-path smoke: non-captcha providers" {
     if (!shouldRunTuiLiveSmoke(std.testing.allocator)) return error.SkipZigTest;
     std.debug.print("[live][providers_app] tui-path smoke enabled\n", .{});
 
     const filter = common.liveProviderFilter();
-
-    var client: std.http.Client = .{ .allocator = std.testing.allocator };
-    defer client.deinit();
-
     const smoke_providers = [_]Provider{
         .subdl_com,
         .isubtitles_org,
@@ -1450,153 +1633,38 @@ test "live providers_app tui-path smoke: non-captcha providers" {
         .tvsubtitles_net,
     };
 
+    var selected: std.ArrayListUnmanaged(Provider) = .empty;
+    defer selected.deinit(std.testing.allocator);
     for (smoke_providers) |provider| {
         if (!common.providerMatchesLiveFilter(filter, providerName(provider))) continue;
-
-        const query = liveQueryForProvider(provider);
-        std.debug.print("[live][providers_app][{s}] query={s}\n", .{ providerName(provider), query });
-
-        var search_response = try search(std.testing.allocator, &client, provider, query);
-        defer search_response.deinit();
-
-        try std.testing.expect(search_response.items.len > 0);
-        std.debug.print("[live][providers_app][{s}] search_items={d}\n", .{ providerName(provider), search_response.items.len });
-
-        for (search_response.items, 0..) |item, idx| {
-            std.debug.print("[live][providers_app][{s}][search][{d}]\n", .{ providerName(provider), idx });
-            try validateUtfNoReplacement(item.title);
-            try validateUtfNoReplacement(item.label);
-            try common.livePrintField(std.testing.allocator, "title", item.title);
-            try common.livePrintField(std.testing.allocator, "label", item.label);
-            try common.livePrintField(std.testing.allocator, "url", searchRefLogUrl(item.ref));
-        }
-
-        var chosen_idx: ?usize = null;
-        for (search_response.items, 0..) |item, idx| {
-            var subtitles = fetchSubtitles(std.testing.allocator, &client, item.ref) catch continue;
-            defer subtitles.deinit();
-
-            if (subtitles.items.len > 0 and firstDownloadCandidate(subtitles.items) != null) {
-                chosen_idx = idx;
-                break;
-            }
-        }
-        try std.testing.expect(chosen_idx != null);
-
-        const picked_search = search_response.items[chosen_idx.?];
-        std.debug.print("[live][providers_app][{s}] chosen_search={d}\n", .{ providerName(provider), chosen_idx.? });
-        try common.livePrintField(std.testing.allocator, "chosen_search_title", picked_search.title);
-        try common.livePrintField(std.testing.allocator, "chosen_search_url", searchRefLogUrl(picked_search.ref));
-
-        var subtitles = try fetchSubtitles(std.testing.allocator, &client, picked_search.ref);
-        defer subtitles.deinit();
-
-        try std.testing.expect(subtitles.items.len > 0);
-        try validateUtfNoReplacement(subtitles.title);
-        try common.livePrintField(std.testing.allocator, "subtitles_title", subtitles.title);
-        std.debug.print("[live][providers_app][{s}] subtitles_items={d}\n", .{ providerName(provider), subtitles.items.len });
-
-        for (subtitles.items, 0..) |sub, idx| {
-            std.debug.print("[live][providers_app][{s}][subtitle][{d}]\n", .{ providerName(provider), idx });
-            try validateUtfNoReplacement(sub.label);
-            try common.livePrintField(std.testing.allocator, "label", sub.label);
-            try common.livePrintOptionalField(std.testing.allocator, "language", sub.language);
-            try common.livePrintOptionalField(std.testing.allocator, "filename", sub.filename);
-            try common.livePrintOptionalField(std.testing.allocator, "download_url", sub.download_url);
-            if (sub.language) |v| try validateUtfNoReplacement(v);
-            if (sub.filename) |v| try validateUtfNoReplacement(v);
-            if (sub.download_url) |v| try validateUtfNoReplacement(v);
-        }
-
-        if (firstDownloadCandidate(subtitles.items) == null) return error.TestUnexpectedResult;
-
-        var extraction_ok = false;
-        var extraction_files: usize = 0;
-        var chosen_download_idx: ?usize = null;
-        var archive_phase_cursor: usize = 0;
-        var non_archive_phase_cursor: usize = 0;
-
-        while (true) {
-            const download_idx = iterDownloadCandidates(subtitles.items, true, archive_phase_cursor) orelse break;
-            archive_phase_cursor += 1;
-            const subtitle = subtitles.items[download_idx];
-
-            const unique = std.time.nanoTimestamp();
-            const out_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/live-downloads/{s}-{d}-{d}", .{ providerName(provider), chosen_idx.?, unique });
-            defer std.testing.allocator.free(out_dir);
-            try prepareDownloadOutDir(out_dir);
-            defer cleanupDownloadOutDir(out_dir);
-
-            std.debug.print("[live][providers_app][{s}] download_attempt idx={d} mode=archive-first\n", .{ providerName(provider), download_idx });
-            var download = downloadSubtitle(std.testing.allocator, &client, subtitle, out_dir) catch |err| {
-                std.debug.print("[live][providers_app][{s}] download_attempt_error idx={d} err={s}\n", .{
-                    providerName(provider),
-                    download_idx,
-                    @errorName(err),
-                });
-                continue;
-            };
-            defer download.deinit(std.testing.allocator);
-
-            std.debug.print("[live][providers_app][{s}] download_ok idx={d} bytes={d}\n", .{ providerName(provider), download_idx, download.bytes_written });
-            try common.livePrintField(std.testing.allocator, "download_file_path", download.file_path);
-            if (download.archive_path) |p| try common.livePrintField(std.testing.allocator, "download_archive_path", p);
-            for (download.extracted_files) |path| {
-                try common.livePrintField(std.testing.allocator, "extracted_file", path);
-                try std.fs.cwd().access(path, .{});
-            }
-
-            if (download.bytes_written > 0 and download.extracted_files.len > 0) {
-                extraction_ok = true;
-                extraction_files = download.extracted_files.len;
-                chosen_download_idx = download_idx;
-                break;
-            }
-        }
-
-        while (!extraction_ok) {
-            const download_idx = iterDownloadCandidates(subtitles.items, false, non_archive_phase_cursor) orelse break;
-            non_archive_phase_cursor += 1;
-            const subtitle = subtitles.items[download_idx];
-
-            const unique = std.time.nanoTimestamp();
-            const out_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/live-downloads/{s}-{d}-{d}", .{ providerName(provider), chosen_idx.?, unique });
-            defer std.testing.allocator.free(out_dir);
-            try prepareDownloadOutDir(out_dir);
-            defer cleanupDownloadOutDir(out_dir);
-
-            std.debug.print("[live][providers_app][{s}] download_attempt idx={d} mode=any\n", .{ providerName(provider), download_idx });
-            var download = downloadSubtitle(std.testing.allocator, &client, subtitle, out_dir) catch |err| {
-                std.debug.print("[live][providers_app][{s}] download_attempt_error idx={d} err={s}\n", .{
-                    providerName(provider),
-                    download_idx,
-                    @errorName(err),
-                });
-                continue;
-            };
-            defer download.deinit(std.testing.allocator);
-
-            std.debug.print("[live][providers_app][{s}] download_ok idx={d} bytes={d}\n", .{ providerName(provider), download_idx, download.bytes_written });
-            try common.livePrintField(std.testing.allocator, "download_file_path", download.file_path);
-            if (download.archive_path) |p| try common.livePrintField(std.testing.allocator, "download_archive_path", p);
-            for (download.extracted_files) |path| {
-                try common.livePrintField(std.testing.allocator, "extracted_file", path);
-                try std.fs.cwd().access(path, .{});
-            }
-
-            if (download.bytes_written > 0 and download.extracted_files.len > 0) {
-                extraction_ok = true;
-                extraction_files = download.extracted_files.len;
-                chosen_download_idx = download_idx;
-                break;
-            }
-        }
-
-        try std.testing.expect(extraction_ok);
-        std.debug.print("[live][providers_app][{s}] extraction_ok idx={d} files={d}\n", .{
-            providerName(provider),
-            chosen_download_idx.?,
-            extraction_files,
-        });
+        try selected.append(std.testing.allocator, provider);
     }
+    if (selected.items.len == 0) return error.SkipZigTest;
+    std.debug.print("[live][providers_app] starting threaded smoke batch count={d}\n", .{selected.items.len});
+
+    const states = try std.testing.allocator.alloc(ProviderSmokeState, selected.items.len);
+    defer std.testing.allocator.free(states);
+    for (selected.items, 0..) |provider, idx| {
+        states[idx] = .{ .provider = provider };
+    }
+
+    const threads = try std.testing.allocator.alloc(std.Thread, selected.items.len);
+    defer std.testing.allocator.free(threads);
+    for (threads, states) |*thread, *state| {
+        thread.* = try std.Thread.spawn(.{}, runProviderSmokeWorker, .{state});
+    }
+    for (threads) |thread| thread.join();
+    std.debug.print("[live][providers_app] threaded smoke batch complete count={d}\n", .{selected.items.len});
+
+    var first_err: ?anyerror = null;
+    for (states) |state| {
+        if (state.err) |err| {
+            std.log.err("providers_app live smoke failed for {s}: {s}", .{
+                providerName(state.provider),
+                @errorName(err),
+            });
+            if (first_err == null) first_err = err;
+        }
+    }
+    if (first_err) |err| return err;
 }
