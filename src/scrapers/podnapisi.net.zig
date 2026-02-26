@@ -1,6 +1,7 @@
 const std = @import("std");
 const common = @import("common.zig");
 const html = @import("htmlparser");
+const suite = @import("test_suite.zig");
 
 const Allocator = std.mem.Allocator;
 const site = "https://www.podnapisi.net";
@@ -67,30 +68,46 @@ pub const Scraper = struct {
             .accept = "application/json",
             .extra_headers = &headers,
             .max_attempts = 3,
+            .retry_initial_backoff_ms = 1500,
             .retry_on_429 = true,
             .allow_non_ok = true,
         }) catch {
+            arena.deinit();
             return self.searchFallbackHtml(query);
         };
 
         if (response.status == .too_many_requests or response.status == .service_unavailable) {
+            arena.deinit();
             return self.searchFallbackHtml(query);
         }
 
         if (response.status != .ok) {
+            arena.deinit();
             return self.searchFallbackHtml(query);
         }
 
-        const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
+        const root = std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{}) catch {
+            arena.deinit();
+            return self.searchFallbackHtml(query);
+        };
         const obj = switch (root) {
             .object => |o| o,
-            else => return self.searchFallbackHtml(query),
+            else => {
+                arena.deinit();
+                return self.searchFallbackHtml(query);
+            },
         };
 
-        const data = obj.get("data") orelse return self.searchFallbackHtml(query);
+        const data = obj.get("data") orelse {
+            arena.deinit();
+            return self.searchFallbackHtml(query);
+        };
         const arr = switch (data) {
             .array => |arr| arr,
-            else => return self.searchFallbackHtml(query),
+            else => {
+                arena.deinit();
+                return self.searchFallbackHtml(query);
+            },
         };
 
         var items: std.ArrayListUnmanaged(SearchItem) = .empty;
@@ -121,6 +138,11 @@ pub const Scraper = struct {
             });
         }
 
+        if (items.items.len == 0) {
+            arena.deinit();
+            return self.searchFallbackHtml(query);
+        }
+
         return .{ .arena = arena, .items = try items.toOwnedSlice(a) };
     }
 
@@ -134,6 +156,7 @@ pub const Scraper = struct {
         const response = try common.fetchBytes(self.client, a, url, .{
             .accept = "text/html",
             .max_attempts = 3,
+            .retry_initial_backoff_ms = 1500,
             .allow_non_ok = true,
             .retry_on_429 = true,
         });
@@ -146,9 +169,12 @@ pub const Scraper = struct {
         while (anchors.next()) |anchor| {
             const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
             if (std.mem.endsWith(u8, href, "/subtitles/search/")) continue;
-            const title = common.trimAscii(try anchor.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
+            if (std.mem.indexOf(u8, href, "/advanced") != null) continue;
+            const title = try common.innerTextTrimmedOwned(a, anchor);
             const absolute = try common.resolveUrl(a, site, href);
             const id = parseIdFromSubtitlesSearchUrl(absolute) orelse continue;
+            if (std.ascii.eqlIgnoreCase(id, "advanced")) continue;
+            if (std.ascii.eqlIgnoreCase(title, "search") or std.ascii.eqlIgnoreCase(title, "advanced search")) continue;
 
             try items.append(a, .{
                 .id = id,
@@ -173,6 +199,7 @@ pub const Scraper = struct {
         const response = try common.fetchBytes(self.client, a, subtitles_page_url, .{
             .accept = "text/html",
             .max_attempts = 3,
+            .retry_initial_backoff_ms = 1500,
             .allow_non_ok = true,
             .retry_on_429 = true,
         });
@@ -201,12 +228,12 @@ pub const Scraper = struct {
             const download_url = try common.resolveUrl(a, site, href);
 
             const language = if (findDescendantByTag(row, "abbr")) |node|
-                common.trimAscii(try node.innerTextWithOptions(a, .{ .normalize_whitespace = true }))
+                try common.innerTextTrimmedOwned(a, node)
             else
                 null;
 
             const release = if (findDescendantSpanWithClass(row, "release")) |node|
-                common.trimAscii(try node.innerTextWithOptions(a, .{ .normalize_whitespace = true }))
+                try common.innerTextTrimmedOwned(a, node)
             else
                 null;
 
@@ -245,7 +272,8 @@ pub const Scraper = struct {
 fn parseIdFromSubtitlesSearchUrl(url: []const u8) ?[]const u8 {
     const marker = "/subtitles/search/";
     const start = std.mem.indexOf(u8, url, marker) orelse return null;
-    const remainder = url[start + marker.len ..];
+    const remainder_raw = url[start + marker.len ..];
+    const remainder = std.mem.trimLeft(u8, remainder_raw, "/");
     const end = std.mem.indexOfAny(u8, remainder, "?#/") orelse remainder.len;
     if (end == 0) return null;
     return remainder[0..end];
@@ -295,6 +323,8 @@ test "parse podnapisi id" {
 
 test "live podnapisi search and subtitles" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
+    if (!common.shouldRunNamedLiveTest(std.testing.allocator, "PODNAPISI")) return error.SkipZigTest;
+    if (suite.shouldRunExtensiveLiveSuite(std.testing.allocator)) return error.SkipZigTest;
 
     var client: std.http.Client = .{ .allocator = std.testing.allocator };
     defer client.deinit();

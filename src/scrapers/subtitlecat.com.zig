@@ -1,6 +1,7 @@
 const std = @import("std");
 const common = @import("common.zig");
 const html = @import("htmlparser");
+const suite = @import("test_suite.zig");
 
 const Allocator = std.mem.Allocator;
 const site = "https://www.subtitlecat.com";
@@ -71,10 +72,10 @@ pub const Scraper = struct {
         var anchors = parsed.doc.queryAll("table.sub-table tbody tr td:first-child a");
         while (anchors.next()) |anchor| {
             const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
-            const title = common.trimAscii(try anchor.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
+            const title = try common.innerTextTrimmedOwned(a, anchor);
             const details_url = try common.resolveUrl(a, site, href);
             const first_cell = anchor.parentNode() orelse continue;
-            const raw = common.trimAscii(try first_cell.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
+            const raw = try common.innerTextTrimmedOwned(a, first_cell);
             const source_language = parseTranslatedFrom(raw);
 
             try items.append(a, .{ .title = title, .details_url = details_url, .source_language = source_language });
@@ -107,11 +108,12 @@ pub const Scraper = struct {
             const language_code = blk: {
                 const first_span = spans[0] orelse break :blk null;
                 const img = findDescendantByTag(first_span, "img") orelse break :blk null;
-                break :blk common.getAttributeValueSafe(img, "alt");
+                const raw = common.getAttributeValueSafe(img, "alt") orelse break :blk null;
+                break :blk try a.dupe(u8, raw);
             };
 
             const language_label = if (spans[1]) |s2|
-                common.trimAscii(try s2.innerTextWithOptions(a, .{ .normalize_whitespace = true }))
+                try common.innerTextTrimmedOwned(a, s2)
             else
                 null;
 
@@ -136,7 +138,12 @@ pub const Scraper = struct {
                     const onclick = common.getAttributeValueSafe(button, "onclick") orelse continue;
                     const spec = parseTranslateSpec(a, onclick) catch null;
                     const source = if (spec) |s| s.source_url else null;
-                    const code = if (language_code) |c| c else common.getAttributeValueSafe(button, "id");
+                    const code = if (language_code) |c|
+                        c
+                    else if (common.getAttributeValueSafe(button, "id")) |id|
+                        try a.dupe(u8, id)
+                    else
+                        null;
                     const filename = inferTranslatedFilename(a, source, code) catch "translated.srt";
                     try subtitles.append(a, .{
                         .language_code = code,
@@ -274,6 +281,8 @@ test "subtitlecat translate spec parser" {
 
 test "live subtitlecat search and subtitles" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
+    if (!common.shouldRunNamedLiveTest(std.testing.allocator, "SUBTITLECAT")) return error.SkipZigTest;
+    if (suite.shouldRunExtensiveLiveSuite(std.testing.allocator)) return error.SkipZigTest;
 
     var client: std.http.Client = .{ .allocator = std.testing.allocator };
     defer client.deinit();

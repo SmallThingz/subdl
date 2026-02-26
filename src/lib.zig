@@ -1,3 +1,5 @@
+const std = @import("std");
+
 pub const subdl = @import("scrapers/subdl.zig");
 pub const providers_app = @import("app/providers_app.zig");
 
@@ -20,3 +22,7 @@ pub const provider_union = subdl.provider_union;
 
 pub const Scraper = subdl.Scraper;
 pub const Error = subdl.Error;
+
+test {
+    std.testing.refAllDecls(@This());
+}

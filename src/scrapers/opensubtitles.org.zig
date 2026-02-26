@@ -83,7 +83,7 @@ pub const Scraper = struct {
         var anchors = parsed.doc.queryAll("table#search_results td[id^='main'] strong a.bnone[href*='/search/'][href*='idmovie-']");
         while (anchors.next()) |anchor| {
             const href = anchor.getAttributeValue("href") orelse continue;
-            const title = common.trimAscii(try anchor.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
+            const title = try common.innerTextTrimmedOwned(a, anchor);
             const page_url = try common.resolveUrl(a, site, href);
             try items.append(a, .{ .title = title, .page_url = page_url });
         }
@@ -92,8 +92,8 @@ pub const Scraper = struct {
             const has_subtitle_rows = parsed.doc.queryOne("table#search_results a[href*='/subtitleserve/sub/']") != null;
             if (has_subtitle_rows) {
                 const inferred_title = blk: {
-                    if (parsed.doc.queryOne("h1")) |n| break :blk common.trimAscii(try n.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
-                    break :blk query;
+                    if (parsed.doc.queryOne("h1")) |n| break :blk try common.innerTextTrimmedOwned(a, n);
+                    break :blk try a.dupe(u8, query);
                 };
                 try items.append(a, .{ .title = inferred_title, .page_url = try a.dupe(u8, url) });
             }
@@ -112,8 +112,8 @@ pub const Scraper = struct {
         defer parsed.deinit();
 
         const title = blk: {
-            if (parsed.doc.queryOne("h1")) |n| break :blk common.trimAscii(try n.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
-            if (parsed.doc.queryOne("title")) |n| break :blk common.trimAscii(try n.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
+            if (parsed.doc.queryOne("h1")) |n| break :blk try common.innerTextTrimmedOwned(a, n);
+            if (parsed.doc.queryOne("title")) |n| break :blk try common.innerTextTrimmedOwned(a, n);
             break :blk "";
         };
 
@@ -147,7 +147,7 @@ pub const Scraper = struct {
             const downloads = extractSubCellText(row, a, 7) catch null;
             const uploaded_at = extractSubCellText(row, a, 6) catch null;
 
-            const row_text = common.trimAscii(try row.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
+            const row_text = try common.innerTextTrimmedOwned(a, row);
             const lower_row = try lowerDup(a, row_text);
 
             try out.append(a, .{
@@ -503,9 +503,8 @@ fn extractFlagLanguage(row: @import("htmlparser").Node, allocator: Allocator) !?
     var it = std.mem.tokenizeScalar(u8, class, ' ');
     while (it.next()) |part| {
         if (std.mem.eql(u8, part, "flag")) continue;
-        return part;
+        return try allocator.dupe(u8, part);
     }
-    _ = allocator;
     return null;
 }
 
@@ -513,11 +512,11 @@ fn extractFilename(row: @import("htmlparser").Node, allocator: Allocator) !?[]co
     const main = row.queryOne("td[id^='main']") orelse return null;
     if (main.queryOne("span[title]")) |n| {
         if (n.getAttributeValue("title")) |title| {
-            if (title.len > 0) return title;
+            if (title.len > 0) return try allocator.dupe(u8, title);
         }
     }
     if (main.queryOne("strong a.bnone")) |n| {
-        const text = common.trimAscii(try n.innerTextWithOptions(allocator, .{ .normalize_whitespace = true }));
+        const text = try common.innerTextTrimmedOwned(allocator, n);
         if (text.len > 0) return text;
     }
     return null;
@@ -528,7 +527,7 @@ fn extractSubCellText(row: @import("htmlparser").Node, allocator: Allocator, cel
     var idx: usize = 1;
     while (cells.next()) |cell| : (idx += 1) {
         if (idx != cell_idx_one_based) continue;
-        const text = common.trimAscii(try cell.innerTextWithOptions(allocator, .{ .normalize_whitespace = true }));
+        const text = try common.innerTextTrimmedOwned(allocator, cell);
         if (text.len == 0) return null;
         return text;
     }

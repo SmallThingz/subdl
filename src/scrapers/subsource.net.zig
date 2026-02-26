@@ -13,7 +13,7 @@ pub const SearchOptions = struct {
     limit_per_page: usize = 500,
     cf_clearance: ?[]const u8 = null,
     user_agent: ?[]const u8 = null,
-    auto_cloudflare_session: bool = true,
+    auto_cloudflare_session: bool = false,
 };
 
 pub const SubtitlesOptions = struct {
@@ -23,7 +23,7 @@ pub const SubtitlesOptions = struct {
     resolve_download_tokens: bool = false,
     cf_clearance: ?[]const u8 = null,
     user_agent: ?[]const u8 = null,
-    auto_cloudflare_session: bool = true,
+    auto_cloudflare_session: bool = false,
 };
 
 pub const SeasonItem = struct {
@@ -389,7 +389,7 @@ fn resolveAuth(allocator: Allocator, cf_clearance_opt: ?[]const u8, user_agent_o
 
     var user_agent = user_agent_opt orelse std.posix.getenv("SUBSOURCE_USER_AGENT") orelse common.default_user_agent;
 
-    if (cf_clearance == null and auto_cloudflare_session) {
+    if (cf_clearance == null and auto_cloudflare_session and force_refresh) {
         const session = try cf_shared.ensureDomainSession(allocator, .{
             .domain = "subsource.net",
             .challenge_url = site,

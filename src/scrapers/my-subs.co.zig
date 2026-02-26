@@ -103,11 +103,11 @@ pub const Scraper = struct {
                 const title = blk: {
                     if (common.getAttributeValueSafe(anchor, "title")) |title_attr| {
                         const clean = common.trimAscii(title_attr);
-                        if (clean.len > 0) break :blk clean;
+                        if (clean.len > 0) break :blk try a.dupe(u8, clean);
                     }
-                    const txt = common.trimAscii(try anchor.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
+                    const txt = try common.innerTextTrimmedOwned(a, anchor);
                     if (txt.len > 0) break :blk txt;
-                    break :blk query;
+                    break :blk try a.dupe(u8, query);
                 };
 
                 try out.append(a, .{
@@ -175,7 +175,7 @@ pub const Scraper = struct {
                 defer parsed.deinit();
 
                 const page_title = if (parsed.doc.queryOne("h1")) |h1|
-                    common.trimAscii(try h1.innerTextWithOptions(a, .{ .normalize_whitespace = true }))
+                    try common.innerTextTrimmedOwned(a, h1)
                 else
                     "";
 
@@ -191,9 +191,12 @@ pub const Scraper = struct {
 
                     var filename = if (release_version) |rv| rv else page_title;
                     if (filename.len == 0) {
-                        filename = common.trimAscii(try anchor.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
+                        filename = try common.innerTextTrimmedOwned(a, anchor);
                     }
                     if (filename.len == 0) filename = "subtitle.srt";
+
+                    const language_raw = if (lang_meta.raw) |raw| try a.dupe(u8, raw) else null;
+                    const language_code = if (lang_meta.code) |code| try a.dupe(u8, code) else null;
 
                     var resolved_download_url: ?[]const u8 = null;
                     var is_archive: ?bool = null;
@@ -206,8 +209,8 @@ pub const Scraper = struct {
                     }
 
                     try subtitles.append(a, .{
-                        .language_raw = lang_meta.raw,
-                        .language_code = lang_meta.code,
+                        .language_raw = language_raw,
+                        .language_code = language_code,
                         .filename = filename,
                         .release_version = release_version,
                         .details_url = page_url,
@@ -263,7 +266,7 @@ fn extractNextPageUrl(allocator: Allocator, doc: *const html.Document, current_u
         const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
         if (std.mem.indexOf(u8, href, "page=") == null) continue;
 
-        const text = common.trimAscii(try anchor.innerTextWithOptions(allocator, .{ .normalize_whitespace = true }));
+        const text = try common.innerTextTrimmedOwned(allocator, anchor);
         if (!isLikelyNextText(text)) continue;
 
         const resolved = try common.resolveUrl(allocator, site, href);
@@ -328,14 +331,14 @@ fn languageFromFlag(flag_code: ?[]const u8, raw: ?[]const u8) ?[]const u8 {
 
 fn extractReleaseVersion(anchor: html.Node, allocator: Allocator) !?[]const u8 {
     if (anchor.queryOne("strong")) |strong| {
-        const text = common.trimAscii(try strong.innerTextWithOptions(allocator, .{ .normalize_whitespace = true }));
+        const text = try common.innerTextTrimmedOwned(allocator, strong);
         if (text.len > 0) return text;
     }
 
     if (anchor.parentNode()) |p1| {
         if (p1.parentNode()) |p2| {
             if (p2.queryOne("small")) |small| {
-                const text = common.trimAscii(try small.innerTextWithOptions(allocator, .{ .normalize_whitespace = true }));
+                const text = try common.innerTextTrimmedOwned(allocator, small);
                 if (text.len > 0) return text;
             }
         }

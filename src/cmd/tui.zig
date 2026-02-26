@@ -1557,7 +1557,7 @@ fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
 }
 
 fn printFitted(
-    _: *Ui,
+    ui: *Ui,
     win: anytype,
     row: u16,
     col: u16,
@@ -1567,25 +1567,91 @@ fn printFitted(
 ) !void {
     if (max_width == 0) return;
 
-    if (win.gwidth(text) <= max_width) {
-        const segs = [_]vaxis.Segment{.{ .text = text, .style = style }};
+    var display_text = text;
+    var owned_sanitized: ?[]u8 = null;
+    defer if (owned_sanitized) |buf| ui.allocator.free(buf);
+
+    if (needsUtfSanitizeForDisplay(text)) {
+        const sanitized = try sanitizeUtf8ForDisplay(ui.allocator, text);
+        owned_sanitized = sanitized;
+        display_text = sanitized;
+    }
+
+    if (win.gwidth(display_text) <= max_width) {
+        const segs = [_]vaxis.Segment{.{ .text = display_text, .style = style }};
         _ = win.print(&segs, .{ .row_offset = row, .col_offset = col, .wrap = .none });
         return;
     }
 
     if (max_width <= 3) {
-        const prefix = utf8PrefixForDisplayWidth(win, text, max_width);
+        const prefix = utf8PrefixForDisplayWidth(win, display_text, max_width);
         const segs = [_]vaxis.Segment{.{ .text = prefix, .style = style }};
         _ = win.print(&segs, .{ .row_offset = row, .col_offset = col, .wrap = .none });
         return;
     }
 
-    const prefix = utf8PrefixForDisplayWidth(win, text, max_width - 3);
+    const prefix = utf8PrefixForDisplayWidth(win, display_text, max_width - 3);
     const segs = [_]vaxis.Segment{
         .{ .text = prefix, .style = style },
         .{ .text = "...", .style = style },
     };
     _ = win.print(&segs, .{ .row_offset = row, .col_offset = col, .wrap = .none });
+}
+
+fn needsUtfSanitizeForDisplay(text: []const u8) bool {
+    if (!std.unicode.utf8ValidateSlice(text)) return true;
+    for (text) |b| {
+        if ((b < 0x20 and b != '\n' and b != '\r' and b != '\t') or b == 0x7F) return true;
+    }
+    return false;
+}
+
+fn sanitizeUtf8ForDisplay(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < input.len) {
+        const first = input[i];
+        const seq_len = std.unicode.utf8ByteSequenceLength(first) catch {
+            try appendHexEscape(allocator, &out, first);
+            i += 1;
+            continue;
+        };
+        if (i + seq_len > input.len) {
+            try appendHexEscape(allocator, &out, first);
+            i += 1;
+            continue;
+        }
+
+        const segment = input[i .. i + seq_len];
+        _ = std.unicode.utf8Decode(segment) catch {
+            try appendHexEscape(allocator, &out, first);
+            i += 1;
+            continue;
+        };
+
+        if (seq_len == 1 and (first < 0x20 or first == 0x7F)) {
+            switch (first) {
+                '\n' => try out.appendSlice(allocator, "\\n"),
+                '\r' => try out.appendSlice(allocator, "\\r"),
+                '\t' => try out.appendSlice(allocator, "\\t"),
+                else => try appendHexEscape(allocator, &out, first),
+            }
+            i += 1;
+            continue;
+        }
+
+        try out.appendSlice(allocator, segment);
+        i += seq_len;
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn appendHexEscape(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: u8) !void {
+    const hex = "0123456789ABCDEF";
+    try out.appendSlice(allocator, &.{ '\\', 'x', hex[value >> 4], hex[value & 0x0F] });
 }
 
 fn utf8PrefixForDisplayWidth(win: anytype, text: []const u8, max_width: usize) []const u8 {
@@ -1627,6 +1693,16 @@ test "utf8PrefixForDisplayWidth does not split utf8 sequences" {
 
     const full = utf8PrefixForDisplayWidth(win, text, 64);
     try std.testing.expectEqualStrings(text, full);
+}
+
+test "sanitizeUtf8ForDisplay escapes invalid bytes" {
+    const allocator = std.testing.allocator;
+    const raw = [_]u8{ 'A', 0xAA, 'B', 0xFF };
+    const safe = try sanitizeUtf8ForDisplay(allocator, &raw);
+    defer allocator.free(safe);
+
+    try std.testing.expectEqualStrings("A\\xAAB\\xFF", safe);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(safe));
 }
 
 fn subtitleSortName(mode: SubtitleSort) []const u8 {

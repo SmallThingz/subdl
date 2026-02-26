@@ -1,6 +1,7 @@
 const std = @import("std");
 const common = @import("common.zig");
 const html = @import("htmlparser");
+const suite = @import("test_suite.zig");
 
 const Allocator = std.mem.Allocator;
 const site = "https://www.moviesubtitles.org";
@@ -83,7 +84,7 @@ pub const Scraper = struct {
             raw_anchor_count += 1;
             const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
             if (std.mem.indexOf(u8, href, "/movie-") == null or !std.mem.endsWith(u8, href, ".html")) continue;
-            const text = common.trimAscii(try anchor.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
+            const text = try common.innerTextTrimmedOwned(a, anchor);
             if (text.len == 0) continue;
             const link = try common.resolveUrl(a, site, href);
             if (seen.contains(link)) continue;
@@ -125,8 +126,8 @@ pub const Scraper = struct {
         defer parsed.deinit();
 
         const title = blk: {
-            if (parsed.doc.queryOne("h1")) |h1| break :blk common.trimAscii(try h1.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
-            if (parsed.doc.queryOne("title")) |t| break :blk common.trimAscii(try t.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
+            if (parsed.doc.queryOne("h1")) |h1| break :blk try common.innerTextTrimmedOwned(a, h1);
+            if (parsed.doc.queryOne("title")) |t| break :blk try common.innerTextTrimmedOwned(a, t);
             break :blk "";
         };
 
@@ -145,10 +146,10 @@ pub const Scraper = struct {
             const block = findAncestorWithStyleFragment(detail_anchor, "margin-bottom") orelse detail_anchor.parentNode() orelse continue;
             const filename = blk_file: {
                 if (block.queryOne("b")) |b_node| {
-                    const text = common.trimAscii(try b_node.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
+                    const text = try common.innerTextTrimmedOwned(a, b_node);
                     if (text.len > 0) break :blk_file text;
                 }
-                const text = common.trimAscii(try block.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
+                const text = try common.innerTextTrimmedOwned(a, block);
                 break :blk_file text;
             };
 
@@ -158,12 +159,12 @@ pub const Scraper = struct {
                 const slash = std.mem.lastIndexOfScalar(u8, src, '/') orelse break :blk_lang null;
                 const dot = std.mem.lastIndexOfScalar(u8, src, '.') orelse break :blk_lang null;
                 if (dot <= slash + 1) break :blk_lang null;
-                break :blk_lang src[slash + 1 .. dot];
+                break :blk_lang try a.dupe(u8, src[slash + 1 .. dot]);
             };
 
             const rating_bad = blk_bad: {
                 if (block.queryOne("span[style*='color:red']")) |node| {
-                    const value = common.trimAscii(try node.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
+                    const value = try common.innerTextTrimmedOwned(a, node);
                     if (value.len > 0) break :blk_bad value;
                 }
                 break :blk_bad null;
@@ -171,7 +172,7 @@ pub const Scraper = struct {
 
             const rating_good = blk_good: {
                 if (block.queryOne("span[style*='color:green']")) |node| {
-                    const value = common.trimAscii(try node.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
+                    const value = try common.innerTextTrimmedOwned(a, node);
                     if (value.len > 0) break :blk_good value;
                 }
                 break :blk_good null;
@@ -271,6 +272,8 @@ test "moviesubtitles.org detail url rewrite" {
 
 test "live moviesubtitles.org search and subtitles" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
+    if (!common.shouldRunNamedLiveTest(std.testing.allocator, "MOVIESUBTITLES_ORG")) return error.SkipZigTest;
+    if (suite.shouldRunExtensiveLiveSuite(std.testing.allocator)) return error.SkipZigTest;
 
     var client: std.http.Client = .{ .allocator = std.testing.allocator };
     defer client.deinit();

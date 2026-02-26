@@ -3,6 +3,34 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const live_mode = b.option([]const u8, "live", "Live test mode: off | extensive | tui | all") orelse "off";
+    const live_providers = b.option([]const u8, "live-providers", "Comma-separated provider filter for live tests, or '*' for all") orelse "*";
+    const live_include_captcha = b.option(bool, "live-include-captcha", "Include captcha/cloudflare providers in live test runs") orelse false;
+
+    const valid_mode = std.mem.eql(u8, live_mode, "off") or
+        std.mem.eql(u8, live_mode, "extensive") or
+        std.mem.eql(u8, live_mode, "tui") or
+        std.mem.eql(u8, live_mode, "all");
+    if (!valid_mode) {
+        @panic("invalid -Dlive value, expected one of: off, extensive, tui, all");
+    }
+
+    const live_tests_enabled = !std.mem.eql(u8, live_mode, "off");
+    const live_extensive_suite = live_tests_enabled and
+        (std.mem.eql(u8, live_mode, "extensive") or std.mem.eql(u8, live_mode, "all"));
+    const live_tui_suite = live_tests_enabled and
+        (std.mem.eql(u8, live_mode, "tui") or std.mem.eql(u8, live_mode, "all"));
+    const live_named_tests_enabled = live_tests_enabled and !std.mem.eql(u8, live_mode, "tui");
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "live_tests_enabled", live_tests_enabled);
+    build_options.addOption(bool, "live_extensive_suite", live_extensive_suite);
+    build_options.addOption(bool, "live_tui_suite", live_tui_suite);
+    build_options.addOption(bool, "live_named_tests_enabled", live_named_tests_enabled);
+    build_options.addOption(bool, "live_include_captcha", live_include_captcha);
+    build_options.addOption([]const u8, "live_provider_filter", if (live_tests_enabled) live_providers else "");
+    const build_options_mod = build_options.createModule();
+
     const libvaxis_dep = b.dependency("libvaxis", .{
         .target = target,
         .optimize = optimize,
@@ -28,6 +56,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "htmlparser", .module = htmlparser_compat_mod },
             .{ .name = "alldriver", .module = alldriver_dep.module("alldriver") },
+            .{ .name = "build_options", .module = build_options_mod },
         },
     });
     const scrapers_mod = b.addModule("scrapers", .{
@@ -36,6 +65,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "htmlparser", .module = htmlparser_compat_mod },
             .{ .name = "alldriver", .module = alldriver_dep.module("alldriver") },
+            .{ .name = "build_options", .module = build_options_mod },
         },
     });
 
@@ -103,4 +133,19 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_scrapers_mod_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_tui_tests.step);
+
+    const test_live_step = b.step("test-live", "Run live tests using -Dlive, -Dlive-providers, -Dlive-include-captcha");
+    test_live_step.dependOn(&run_scrapers_mod_tests.step);
+
+    const test_live_all_step = b.step("test-live-all", "Run all providers live (including captcha providers)");
+    const live_all_cmd = b.addSystemCommand(&.{
+        "zig",
+        "build",
+        "test-live",
+        "-Dlive=all",
+        "-Dlive-providers=*",
+        "-Dlive-include-captcha=true",
+    });
+    live_all_cmd.setCwd(b.path("."));
+    test_live_all_step.dependOn(&live_all_cmd.step);
 }

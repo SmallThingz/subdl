@@ -433,7 +433,10 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
         .subsource_net => {
             var scraper = subdl.subsource_net.Scraper.init(a, client);
             defer scraper.deinit();
-            var response = try scraper.searchWithOptions(query, .{ .max_pages = 3 });
+            var response = try scraper.searchWithOptions(query, .{
+                .max_pages = 3,
+                .auto_cloudflare_session = false,
+            });
             defer response.deinit();
 
             for (response.items) |item| {
@@ -738,6 +741,7 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 .include_seasons = true,
                 .max_pages = 2,
                 .resolve_download_tokens = true,
+                .auto_cloudflare_session = false,
             });
             defer subtitles.deinit();
             if (subtitles.title.len > 0) title = try a.dupe(u8, subtitles.title);
@@ -1286,6 +1290,89 @@ fn asciiEndsWithIgnoreCase(input: []const u8, suffix: []const u8) bool {
     return true;
 }
 
+fn shouldRunTuiLiveSmoke(allocator: Allocator) bool {
+    return common.shouldRunLiveTests(allocator) and common.liveTuiSuiteEnabled();
+}
+
+fn validateUtfNoReplacement(value: []const u8) !void {
+    if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8Data;
+    var i: usize = 0;
+    while (i < value.len) {
+        const seq_len_raw = std.unicode.utf8ByteSequenceLength(value[i]) catch return error.InvalidUtf8Data;
+        const seq_len: usize = @intCast(seq_len_raw);
+        if (i + seq_len > value.len) return error.InvalidUtf8Data;
+        const cp = std.unicode.utf8Decode(value[i .. i + seq_len]) catch return error.InvalidUtf8Data;
+        if (cp == 0xFFFD) return error.InvalidUtf8Data;
+        i += seq_len;
+    }
+}
+
+fn liveQueryForProvider(provider: Provider) []const u8 {
+    return switch (provider) {
+        .tvsubtitles_net => "Chernobyl",
+        .subtitlecat_com => "The Matrix Revolutions 2003",
+        else => "The Matrix",
+    };
+}
+
+fn searchRefLogUrl(ref: SearchRef) []const u8 {
+    return switch (ref) {
+        .subdl_com => |item| item.link,
+        .opensubtitles_com => |item| item.subtitles_list_url,
+        .opensubtitles_org => |item| item.page_url,
+        .moviesubtitles_org => |item| item.link,
+        .moviesubtitlesrt_com => |item| item.page_url,
+        .podnapisi_net => |item| item.subtitles_page_url,
+        .yifysubtitles_ch => |item| item.movie_page_url,
+        .subtitlecat_com => |item| item.details_url,
+        .isubtitles_org => |item| item.details_url,
+        .my_subs_co => |item| item.details_url,
+        .subsource_net => |item| item.link,
+        .tvsubtitles_net => |item| item.show_url,
+    };
+}
+
+fn firstDownloadCandidate(subtitles: []const SubtitleChoice) ?usize {
+    for (subtitles, 0..) |sub, idx| {
+        const url = sub.download_url orelse continue;
+        if (likelyArchiveSource(url, sub.filename)) return idx;
+    }
+    for (subtitles, 0..) |sub, idx| {
+        if (sub.download_url != null) return idx;
+    }
+    return null;
+}
+
+fn iterDownloadCandidates(subtitles: []const SubtitleChoice, prefer_archive: bool, cursor: usize) ?usize {
+    var seen: usize = 0;
+    for (subtitles, 0..) |sub, idx| {
+        const url = sub.download_url orelse continue;
+        const is_archive_hint = likelyArchiveSource(url, sub.filename);
+        if (prefer_archive and !is_archive_hint) continue;
+        if (!prefer_archive and is_archive_hint) continue;
+        if (seen == cursor) return idx;
+        seen += 1;
+    }
+    return null;
+}
+
+fn likelyArchiveSource(url: []const u8, filename: ?[]const u8) bool {
+    if (asciiEndsWithIgnoreCase(url, ".zip") or asciiEndsWithIgnoreCase(url, ".rar") or asciiEndsWithIgnoreCase(url, ".7z")) return true;
+    if (std.mem.indexOf(u8, url, ".zip?") != null or std.mem.indexOf(u8, url, ".rar?") != null or std.mem.indexOf(u8, url, ".7z?") != null) return true;
+    if (filename) |name| {
+        if (asciiEndsWithIgnoreCase(name, ".zip") or asciiEndsWithIgnoreCase(name, ".rar") or asciiEndsWithIgnoreCase(name, ".7z")) return true;
+    }
+    return false;
+}
+
+fn prepareDownloadOutDir(path: []const u8) !void {
+    try std.fs.cwd().makePath(path);
+}
+
+fn cleanupDownloadOutDir(path: []const u8) void {
+    std.fs.cwd().deleteTree(path) catch {};
+}
+
 test "provider registry covers all subdl_js providers" {
     const expected = [_][]const u8{
         "subdl_com",
@@ -1340,4 +1427,176 @@ test "opensubtitles remote token helpers" {
     const parsed = parseOpenSubtitlesRemoteToken(token) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("/en/subtitleserve/file/abc", parsed);
     try std.testing.expect(parseOpenSubtitlesRemoteToken("https://example.com/file.zip") == null);
+}
+
+test "live providers_app tui-path smoke: non-captcha providers" {
+    if (!shouldRunTuiLiveSmoke(std.testing.allocator)) return error.SkipZigTest;
+    std.debug.print("[live][providers_app] tui-path smoke enabled\n", .{});
+
+    const filter = common.liveProviderFilter();
+
+    var client: std.http.Client = .{ .allocator = std.testing.allocator };
+    defer client.deinit();
+
+    const smoke_providers = [_]Provider{
+        .subdl_com,
+        .isubtitles_org,
+        .moviesubtitles_org,
+        .moviesubtitlesrt_com,
+        .my_subs_co,
+        .podnapisi_net,
+        .subtitlecat_com,
+        .subsource_net,
+        .tvsubtitles_net,
+    };
+
+    for (smoke_providers) |provider| {
+        if (!common.providerMatchesLiveFilter(filter, providerName(provider))) continue;
+
+        const query = liveQueryForProvider(provider);
+        std.debug.print("[live][providers_app][{s}] query={s}\n", .{ providerName(provider), query });
+
+        var search_response = try search(std.testing.allocator, &client, provider, query);
+        defer search_response.deinit();
+
+        try std.testing.expect(search_response.items.len > 0);
+        std.debug.print("[live][providers_app][{s}] search_items={d}\n", .{ providerName(provider), search_response.items.len });
+
+        for (search_response.items, 0..) |item, idx| {
+            std.debug.print("[live][providers_app][{s}][search][{d}]\n", .{ providerName(provider), idx });
+            try validateUtfNoReplacement(item.title);
+            try validateUtfNoReplacement(item.label);
+            try common.livePrintField(std.testing.allocator, "title", item.title);
+            try common.livePrintField(std.testing.allocator, "label", item.label);
+            try common.livePrintField(std.testing.allocator, "url", searchRefLogUrl(item.ref));
+        }
+
+        var chosen_idx: ?usize = null;
+        for (search_response.items, 0..) |item, idx| {
+            var subtitles = fetchSubtitles(std.testing.allocator, &client, item.ref) catch continue;
+            defer subtitles.deinit();
+
+            if (subtitles.items.len > 0 and firstDownloadCandidate(subtitles.items) != null) {
+                chosen_idx = idx;
+                break;
+            }
+        }
+        try std.testing.expect(chosen_idx != null);
+
+        const picked_search = search_response.items[chosen_idx.?];
+        std.debug.print("[live][providers_app][{s}] chosen_search={d}\n", .{ providerName(provider), chosen_idx.? });
+        try common.livePrintField(std.testing.allocator, "chosen_search_title", picked_search.title);
+        try common.livePrintField(std.testing.allocator, "chosen_search_url", searchRefLogUrl(picked_search.ref));
+
+        var subtitles = try fetchSubtitles(std.testing.allocator, &client, picked_search.ref);
+        defer subtitles.deinit();
+
+        try std.testing.expect(subtitles.items.len > 0);
+        try validateUtfNoReplacement(subtitles.title);
+        try common.livePrintField(std.testing.allocator, "subtitles_title", subtitles.title);
+        std.debug.print("[live][providers_app][{s}] subtitles_items={d}\n", .{ providerName(provider), subtitles.items.len });
+
+        for (subtitles.items, 0..) |sub, idx| {
+            std.debug.print("[live][providers_app][{s}][subtitle][{d}]\n", .{ providerName(provider), idx });
+            try validateUtfNoReplacement(sub.label);
+            try common.livePrintField(std.testing.allocator, "label", sub.label);
+            try common.livePrintOptionalField(std.testing.allocator, "language", sub.language);
+            try common.livePrintOptionalField(std.testing.allocator, "filename", sub.filename);
+            try common.livePrintOptionalField(std.testing.allocator, "download_url", sub.download_url);
+            if (sub.language) |v| try validateUtfNoReplacement(v);
+            if (sub.filename) |v| try validateUtfNoReplacement(v);
+            if (sub.download_url) |v| try validateUtfNoReplacement(v);
+        }
+
+        if (firstDownloadCandidate(subtitles.items) == null) return error.TestUnexpectedResult;
+
+        var extraction_ok = false;
+        var extraction_files: usize = 0;
+        var chosen_download_idx: ?usize = null;
+        var archive_phase_cursor: usize = 0;
+        var non_archive_phase_cursor: usize = 0;
+
+        while (true) {
+            const download_idx = iterDownloadCandidates(subtitles.items, true, archive_phase_cursor) orelse break;
+            archive_phase_cursor += 1;
+            const subtitle = subtitles.items[download_idx];
+
+            const unique = std.time.nanoTimestamp();
+            const out_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/live-downloads/{s}-{d}-{d}", .{ providerName(provider), chosen_idx.?, unique });
+            defer std.testing.allocator.free(out_dir);
+            try prepareDownloadOutDir(out_dir);
+            defer cleanupDownloadOutDir(out_dir);
+
+            std.debug.print("[live][providers_app][{s}] download_attempt idx={d} mode=archive-first\n", .{ providerName(provider), download_idx });
+            var download = downloadSubtitle(std.testing.allocator, &client, subtitle, out_dir) catch |err| {
+                std.debug.print("[live][providers_app][{s}] download_attempt_error idx={d} err={s}\n", .{
+                    providerName(provider),
+                    download_idx,
+                    @errorName(err),
+                });
+                continue;
+            };
+            defer download.deinit(std.testing.allocator);
+
+            std.debug.print("[live][providers_app][{s}] download_ok idx={d} bytes={d}\n", .{ providerName(provider), download_idx, download.bytes_written });
+            try common.livePrintField(std.testing.allocator, "download_file_path", download.file_path);
+            if (download.archive_path) |p| try common.livePrintField(std.testing.allocator, "download_archive_path", p);
+            for (download.extracted_files) |path| {
+                try common.livePrintField(std.testing.allocator, "extracted_file", path);
+                try std.fs.cwd().access(path, .{});
+            }
+
+            if (download.bytes_written > 0 and download.extracted_files.len > 0) {
+                extraction_ok = true;
+                extraction_files = download.extracted_files.len;
+                chosen_download_idx = download_idx;
+                break;
+            }
+        }
+
+        while (!extraction_ok) {
+            const download_idx = iterDownloadCandidates(subtitles.items, false, non_archive_phase_cursor) orelse break;
+            non_archive_phase_cursor += 1;
+            const subtitle = subtitles.items[download_idx];
+
+            const unique = std.time.nanoTimestamp();
+            const out_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/live-downloads/{s}-{d}-{d}", .{ providerName(provider), chosen_idx.?, unique });
+            defer std.testing.allocator.free(out_dir);
+            try prepareDownloadOutDir(out_dir);
+            defer cleanupDownloadOutDir(out_dir);
+
+            std.debug.print("[live][providers_app][{s}] download_attempt idx={d} mode=any\n", .{ providerName(provider), download_idx });
+            var download = downloadSubtitle(std.testing.allocator, &client, subtitle, out_dir) catch |err| {
+                std.debug.print("[live][providers_app][{s}] download_attempt_error idx={d} err={s}\n", .{
+                    providerName(provider),
+                    download_idx,
+                    @errorName(err),
+                });
+                continue;
+            };
+            defer download.deinit(std.testing.allocator);
+
+            std.debug.print("[live][providers_app][{s}] download_ok idx={d} bytes={d}\n", .{ providerName(provider), download_idx, download.bytes_written });
+            try common.livePrintField(std.testing.allocator, "download_file_path", download.file_path);
+            if (download.archive_path) |p| try common.livePrintField(std.testing.allocator, "download_archive_path", p);
+            for (download.extracted_files) |path| {
+                try common.livePrintField(std.testing.allocator, "extracted_file", path);
+                try std.fs.cwd().access(path, .{});
+            }
+
+            if (download.bytes_written > 0 and download.extracted_files.len > 0) {
+                extraction_ok = true;
+                extraction_files = download.extracted_files.len;
+                chosen_download_idx = download_idx;
+                break;
+            }
+        }
+
+        try std.testing.expect(extraction_ok);
+        std.debug.print("[live][providers_app][{s}] extraction_ok idx={d} files={d}\n", .{
+            providerName(provider),
+            chosen_download_idx.?,
+            extraction_files,
+        });
+    }
 }

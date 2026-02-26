@@ -1,6 +1,7 @@
 const std = @import("std");
 const common = @import("common.zig");
 const html = @import("htmlparser");
+const suite = @import("test_suite.zig");
 
 const Allocator = std.mem.Allocator;
 const site = "https://moviesubtitlesrt.com";
@@ -67,18 +68,18 @@ pub const Scraper = struct {
         var links = parsed.doc.queryAll("div.inside-article header h2 a");
         while (links.next()) |link| {
             const href = common.getAttributeValueSafe(link, "href") orelse continue;
-            const text = try link.innerTextWithOptions(a, .{ .normalize_whitespace = true });
+            const text = try common.innerTextTrimmedOwned(a, link);
             const page_url = try common.resolveUrl(a, site, href);
-            try items.append(a, .{ .title = common.trimAscii(text), .page_url = page_url });
+            try items.append(a, .{ .title = text, .page_url = page_url });
         }
 
         if (items.items.len == 0) {
             var fallback = parsed.doc.queryAll("article h2 a");
             while (fallback.next()) |link| {
                 const href = common.getAttributeValueSafe(link, "href") orelse continue;
-                const text = try link.innerTextWithOptions(a, .{ .normalize_whitespace = true });
+                const text = try common.innerTextTrimmedOwned(a, link);
                 const page_url = try common.resolveUrl(a, site, href);
-                try items.append(a, .{ .title = common.trimAscii(text), .page_url = page_url });
+                try items.append(a, .{ .title = text, .page_url = page_url });
             }
         }
 
@@ -95,7 +96,7 @@ pub const Scraper = struct {
         defer parsed.deinit();
 
         const title_node = parsed.doc.queryOne("h1") orelse parsed.doc.queryOne("title") orelse return error.MissingField;
-        const title = common.trimAscii(try title_node.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
+        const title = try common.innerTextTrimmedOwned(a, title_node);
 
         var language_raw: ?[]const u8 = null;
         var release_date: ?[]const u8 = null;
@@ -109,9 +110,9 @@ pub const Scraper = struct {
             const pair = firstAndLastTd(row) orelse continue;
             const label_node = pair.first;
             const value_node = pair.last;
-            const label_raw = common.trimAscii(try label_node.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
+            const label_raw = try common.innerTextTrimmedOwned(a, label_node);
             const label = try asciiLowerDup(a, label_raw);
-            const value = common.trimAscii(try value_node.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
+            const value = try common.innerTextTrimmedOwned(a, value_node);
 
             if (std.mem.indexOf(u8, label, "language") != null) language_raw = value;
             if (std.mem.indexOf(u8, label, "release") != null) release_date = value;
@@ -194,6 +195,8 @@ test "moviesubtitlesrt parse key language" {
 
 test "live moviesubtitlesrt search and details" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
+    if (!common.shouldRunNamedLiveTest(std.testing.allocator, "MOVIESUBTITLESRT_COM")) return error.SkipZigTest;
+    if (suite.shouldRunExtensiveLiveSuite(std.testing.allocator)) return error.SkipZigTest;
 
     var client: std.http.Client = .{ .allocator = std.testing.allocator };
     defer client.deinit();

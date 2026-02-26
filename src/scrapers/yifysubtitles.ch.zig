@@ -102,7 +102,7 @@ pub const Scraper = struct {
 
         const title_node = parsed.doc.queryOne("title");
         const title = if (title_node) |n|
-            try n.innerTextWithOptions(a, .{ .normalize_whitespace = true })
+            try common.innerTextTrimmedOwned(a, n)
         else
             "";
 
@@ -112,7 +112,7 @@ pub const Scraper = struct {
         while (rows.next()) |row| {
             had_rows = true;
             const lang = if (row.queryOne("span.sub-lang")) |lang_node|
-                try lang_node.innerTextWithOptions(a, .{ .normalize_whitespace = true })
+                try common.innerTextTrimmedOwned(a, lang_node)
             else
                 "";
 
@@ -125,25 +125,25 @@ pub const Scraper = struct {
             const zip_url = try subtitleToZipUrl(a, details_url);
 
             const release_text = if (row.queryOne("a > span.text-muted")) |release_node|
-                try release_node.innerTextWithOptions(a, .{ .normalize_whitespace = true })
+                try common.innerTextTrimmedOwned(a, release_node)
             else
                 "";
 
             const rating = if (row.queryOne("span.label")) |rating_node|
-                try rating_node.innerTextWithOptions(a, .{ .normalize_whitespace = true })
+                try common.innerTextTrimmedOwned(a, rating_node)
             else
                 null;
 
             const uploader = if (row.queryOne("a[href*='/user/']")) |uploader_node|
-                try uploader_node.innerTextWithOptions(a, .{ .normalize_whitespace = true })
+                try common.innerTextTrimmedOwned(a, uploader_node)
             else
                 null;
 
             try subtitles.append(a, .{
-                .language = common.trimAscii(lang),
+                .language = lang,
                 .rating = rating,
                 .uploader = uploader,
-                .release_text = common.trimAscii(release_text),
+                .release_text = release_text,
                 .details_url = details_url,
                 .zip_url = zip_url,
             });

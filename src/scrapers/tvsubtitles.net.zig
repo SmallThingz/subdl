@@ -173,7 +173,7 @@ pub const Scraper = struct {
                             direct_zip_url = self.resolveDownloadUrl(a, download_page_url) catch null;
                         }
 
-                        const lang = languageFromSubtitleAnchor(anchor, href);
+                        const lang = try dupOptionalSlice(a, languageFromSubtitleAnchor(anchor, href));
                         const filename = buildFilename(a, episode_title, lang) catch "subtitle.zip";
 
                         try subtitles.append(a, .{
@@ -242,7 +242,7 @@ fn collectSearchItems(allocator: Allocator, doc: *const html.Document, out: *std
         if (seen.contains(show_url)) continue;
         try seen.put(allocator, show_url, {});
 
-        const title = common.trimAscii(try anchor.innerTextWithOptions(allocator, .{ .normalize_whitespace = true }));
+        const title = try common.innerTextTrimmedOwned(allocator, anchor);
         if (title.len == 0) continue;
 
         try out.append(allocator, .{ .title = title, .show_url = show_url });
@@ -259,7 +259,7 @@ fn collectSearchItems(allocator: Allocator, doc: *const html.Document, out: *std
             if (seen.contains(show_url)) continue;
             try seen.put(allocator, show_url, {});
 
-            const title = common.trimAscii(try anchor.innerTextWithOptions(allocator, .{ .normalize_whitespace = true }));
+            const title = try common.innerTextTrimmedOwned(allocator, anchor);
             if (title.len == 0) continue;
 
             try out.append(allocator, .{ .title = title, .show_url = show_url });
@@ -279,7 +279,7 @@ fn extractNextPageUrl(allocator: Allocator, doc: *const html.Document, current_u
         const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
         if (std.mem.indexOf(u8, href, "page=") == null and std.mem.indexOf(u8, href, "search.php") == null) continue;
 
-        const text = common.trimAscii(try anchor.innerTextWithOptions(allocator, .{ .normalize_whitespace = true }));
+        const text = try common.innerTextTrimmedOwned(allocator, anchor);
         if (!isLikelyNextText(text)) continue;
 
         const resolved = try common.resolveUrl(allocator, site, href);
@@ -299,11 +299,11 @@ fn isLikelyNextText(text: []const u8) bool {
 
 fn episodeTitle(row: html.Node, allocator: Allocator) !?[]const u8 {
     if (row.queryOne("td:nth-child(2) a b")) |node| {
-        const text = common.trimAscii(try node.innerTextWithOptions(allocator, .{ .normalize_whitespace = true }));
+        const text = try common.innerTextTrimmedOwned(allocator, node);
         if (text.len > 0) return text;
     }
     if (row.queryOne("td:nth-child(2) a")) |node| {
-        const text = common.trimAscii(try node.innerTextWithOptions(allocator, .{ .normalize_whitespace = true }));
+        const text = try common.innerTextTrimmedOwned(allocator, node);
         if (text.len > 0) return text;
     }
     return null;
@@ -348,6 +348,11 @@ fn mapLanguageCode(raw: []const u8) []const u8 {
     if (std.ascii.eqlIgnoreCase(raw, "es")) return "es";
     if (std.ascii.eqlIgnoreCase(raw, "de")) return "de";
     return raw;
+}
+
+fn dupOptionalSlice(allocator: Allocator, value: ?[]const u8) !?[]const u8 {
+    if (value) |v| return try allocator.dupe(u8, v);
+    return null;
 }
 
 fn buildFilename(allocator: Allocator, episode_title: ?[]const u8, language_code: ?[]const u8) ![]const u8 {

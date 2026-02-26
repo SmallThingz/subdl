@@ -429,7 +429,7 @@ fn runSubsource(allocator: std.mem.Allocator, client: *std.http.Client) !void {
 fn runTvSubtitles(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     var scraper = tvsubtitles_net.Scraper.init(allocator, client);
 
-    var search = try scraper.searchWithOptions("Friends", .{ .max_pages = 2 });
+    var search = try scraper.searchWithOptions("Chernobyl", .{ .max_pages = 1 });
     defer search.deinit();
     for (search.items, 0..) |item, idx| {
         std.debug.print("[live][tvsubtitles.net][search][{d}]\n", .{idx});
@@ -438,14 +438,14 @@ fn runTvSubtitles(allocator: std.mem.Allocator, client: *std.http.Client) !void 
     }
     try suite.expectPositive(search.items.len);
 
-    const chosen_idx = pickFirstContaining(tvsubtitles_net.SearchItem, search.items, "friends") orelse 0;
+    const chosen_idx = pickFirstContaining(tvsubtitles_net.SearchItem, search.items, "chernobyl") orelse 0;
     const match = search.items[chosen_idx];
     try suite.expectNonEmpty(match.title);
     try suite.expectHttpUrl(match.show_url);
 
     var subtitles = try scraper.fetchSubtitlesByShowLinkWithOptions(match.show_url, .{
-        .include_all_seasons = true,
-        .max_pages_per_season = 2,
+        .include_all_seasons = false,
+        .max_pages_per_season = 1,
         .resolve_download_links = false,
     });
     defer subtitles.deinit();

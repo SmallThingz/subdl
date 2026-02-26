@@ -457,9 +457,12 @@ fn parseLanguageFromCell(allocator: Allocator, cols: []const std.json.Value, idx
     const wrapped = try std.fmt.allocPrint(allocator, "<div>{s}</div>", .{html});
     var parsed = try common.parseHtmlTurbo(allocator, wrapped);
     defer parsed.deinit();
-    if (parsed.doc.queryOne("*[title]")) |n| return n.getAttributeValue("title");
+    if (parsed.doc.queryOne("*[title]")) |n| {
+        const title = n.getAttributeValue("title") orelse return null;
+        return try allocator.dupe(u8, title);
+    }
     const node = parsed.doc.queryOne("div") orelse return null;
-    return common.trimAscii(try node.innerTextWithOptions(allocator, .{ .normalize_whitespace = true }));
+    return try common.innerTextTrimmedOwned(allocator, node);
 }
 
 fn parseFilenameFromCell(allocator: Allocator, cols: []const std.json.Value, idx: usize) !?[]const u8 {
@@ -472,7 +475,7 @@ fn parseFilenameFromCell(allocator: Allocator, cols: []const std.json.Value, idx
     var parsed = try common.parseHtmlTurbo(allocator, wrapped);
     defer parsed.deinit();
     const div = parsed.doc.queryOne("div") orelse return null;
-    const txt = common.trimAscii(try div.innerTextWithOptions(allocator, .{ .normalize_whitespace = true }));
+    const txt = try common.innerTextTrimmedOwned(allocator, div);
     if (txt.len == 0) return null;
     return txt;
 }
@@ -490,7 +493,7 @@ fn summarizeRow(allocator: Allocator, cols: []const std.json.Value) !?[]const u8
         var parsed = try common.parseHtmlTurbo(allocator, wrapped);
         defer parsed.deinit();
         const div = parsed.doc.queryOne("div") orelse continue;
-        const txt = common.trimAscii(try div.innerTextWithOptions(allocator, .{ .normalize_whitespace = true }));
+        const txt = try common.innerTextTrimmedOwned(allocator, div);
         if (txt.len == 0) continue;
         if (out.items.len > 0) try out.appendSlice(allocator, " | ");
         try out.appendSlice(allocator, txt);
@@ -560,7 +563,7 @@ test "parse opensubtitles.com file_download" {
 
 test "live opensubtitles.com search and resolve" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
-    if (!shouldRunOpenSubtitlesComLive(std.testing.allocator)) return error.SkipZigTest;
+    if (!common.shouldRunNamedLiveTest(std.testing.allocator, "OPENSUBTITLES_COM")) return error.SkipZigTest;
 
     var client: std.http.Client = .{ .allocator = std.testing.allocator };
     defer client.deinit();
@@ -597,11 +600,4 @@ test "live opensubtitles.com search and resolve" {
         try common.livePrintOptionalField(std.testing.allocator, "resolved_filename", sub.resolved_filename);
         try common.livePrintOptionalField(std.testing.allocator, "verified_download_url", sub.verified_download_url);
     }
-}
-
-fn shouldRunOpenSubtitlesComLive(allocator: Allocator) bool {
-    const value = std.process.getEnvVarOwned(allocator, "SCRAPERS_LIVE_TEST_OPENSUBTITLES_COM") catch return false;
-    defer allocator.free(value);
-    if (value.len == 0) return false;
-    return !std.mem.eql(u8, value, "0");
 }

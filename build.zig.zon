@@ -37,8 +37,8 @@
             .hash = "vaxis-0.5.1-BWNV_IxJCQC5OGNaXQfNnqgn9_Vku0PMgey-dplubcQK",
         },
         .htmlparser = .{
-            .url = "git+https://github.com/SmallThingz/html_parser.git#55b5c01ad12d3c2f5d5e7c20704b6c32a88af213",
-            .hash = "htmlparser-0.0.0-80cNI2O9BQCvLPT19bXUHz1ay1pVrOhXxm-jjJ7Hzu3A",
+            .url = "git+https://github.com/SmallThingz/html_parser.git#6298d766ac2bbf75f191c81a4d98e9fb1202fe0d",
+            .hash = "htmlparser-0.0.0-80cNIzbfBQA_ob7iS-4FR0pz7ornpztOiuI1cRsaMbbz",
         },
         .alldriver = .{
             .url = "git+https://github.com/SmallThingz/alldriver.git#78131f163677d527f4a49b84ea3e760fa8ef0346",

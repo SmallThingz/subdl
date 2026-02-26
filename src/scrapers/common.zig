@@ -1,5 +1,6 @@
 const std = @import("std");
 const html = @import("htmlparser");
+const build_options = @import("build_options");
 
 pub const Allocator = std.mem.Allocator;
 
@@ -157,6 +158,16 @@ pub fn trimAscii(input: []const u8) []const u8 {
     return std.mem.trim(u8, input, " \t\r\n");
 }
 
+pub fn innerTextOwnedWithOptions(allocator: Allocator, node: anytype, opts: html.TextOptions) ![]const u8 {
+    const text = try node.innerTextWithOptions(allocator, opts);
+    return allocator.dupe(u8, text);
+}
+
+pub fn innerTextTrimmedOwned(allocator: Allocator, node: anytype) ![]const u8 {
+    const text = try node.innerTextWithOptions(allocator, .{ .normalize_whitespace = true });
+    return allocator.dupe(u8, trimAscii(text));
+}
+
 pub fn collapseWhitespace(allocator: Allocator, input: []const u8) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -253,19 +264,45 @@ pub fn resolveUrl(allocator: Allocator, base: []const u8, href: []const u8) ![]c
 }
 
 pub fn shouldRunLiveTests(allocator: Allocator) bool {
-    const value = std.process.getEnvVarOwned(allocator, "SCRAPERS_LIVE_TEST") catch return false;
-    defer allocator.free(value);
-    if (value.len == 0) return false;
-    return !std.mem.eql(u8, value, "0");
+    _ = allocator;
+    return build_options.live_tests_enabled;
 }
 
 pub fn shouldRunNamedLiveTest(allocator: Allocator, name: []const u8) bool {
-    const key = std.fmt.allocPrint(allocator, "SCRAPERS_LIVE_TEST_{s}", .{name}) catch return false;
-    defer allocator.free(key);
-    const value = std.process.getEnvVarOwned(allocator, key) catch return false;
-    defer allocator.free(value);
-    if (value.len == 0) return false;
-    return !std.mem.eql(u8, value, "0");
+    _ = allocator;
+    if (!build_options.live_named_tests_enabled) return false;
+
+    const provider_name = namedLiveProvider(name) orelse return false;
+    if (isCaptchaProviderName(provider_name) and !build_options.live_include_captcha) return false;
+    return providerMatchesLiveFilter(liveProviderFilter(), provider_name);
+}
+
+pub fn liveExtensiveSuiteEnabled() bool {
+    return build_options.live_extensive_suite;
+}
+
+pub fn liveTuiSuiteEnabled() bool {
+    return build_options.live_tui_suite;
+}
+
+pub fn liveProviderFilter() ?[]const u8 {
+    const trimmed = trimAscii(build_options.live_provider_filter);
+    if (trimmed.len == 0) return null;
+    return trimmed;
+}
+
+pub fn providerMatchesLiveFilter(filter: ?[]const u8, provider_name: []const u8) bool {
+    const f = filter orelse return true;
+    var it = std.mem.splitScalar(u8, f, ',');
+    while (it.next()) |entry_raw| {
+        const entry = trimAscii(entry_raw);
+        if (entry.len == 0) continue;
+        if (std.mem.eql(u8, entry, "*")) return true;
+        if (std.ascii.eqlIgnoreCase(entry, "all")) return true;
+        if (providerNameEq(entry, provider_name)) return true;
+        if (providerNameContains(provider_name, entry)) return true;
+    }
+    return false;
 }
 
 pub fn sanitizeUtf8ForLog(allocator: Allocator, input: []const u8) ![]u8 {
@@ -313,6 +350,7 @@ pub fn sanitizeUtf8ForLog(allocator: Allocator, input: []const u8) ![]u8 {
 }
 
 pub fn livePrintField(allocator: Allocator, label: []const u8, value: []const u8) !void {
+    try validateLiveUtf8(value);
     const safe = try sanitizeUtf8ForLog(allocator, value);
     defer allocator.free(safe);
     std.debug.print("[live] {s}: {s}\n", .{ label, safe });
@@ -324,6 +362,23 @@ pub fn livePrintOptionalField(allocator: Allocator, label: []const u8, value: ?[
         return;
     }
     std.debug.print("[live] {s}: <null>\n", .{label});
+}
+
+fn validateLiveUtf8(value: []const u8) !void {
+    if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8Data;
+
+    var i: usize = 0;
+    while (i < value.len) {
+        const first = value[i];
+        const seq_len_raw = std.unicode.utf8ByteSequenceLength(first) catch return error.InvalidUtf8Data;
+        const seq_len: usize = @intCast(seq_len_raw);
+        if (i + seq_len > value.len) return error.InvalidUtf8Data;
+
+        const cp = std.unicode.utf8Decode(value[i .. i + seq_len]) catch return error.InvalidUtf8Data;
+        if (cp == 0xFFFD) return error.InvalidUtf8Data;
+
+        i += seq_len;
+    }
 }
 
 pub fn getAttributeValueSafe(node: anytype, attr_name: []const u8) ?[]const u8 {
@@ -406,7 +461,7 @@ pub fn findTableColumnIndexByAliases(allocator: Allocator, header_row: anytype, 
         const cell = header_row.doc.nodeAt(child_idx) orelse continue;
         if (!isTableCellTag(cell.tagName())) continue;
 
-        const raw = trimAscii(try cell.innerTextWithOptions(allocator, .{ .normalize_whitespace = true }));
+        const raw = try innerTextTrimmedOwned(allocator, cell);
         if (raw.len == 0) {
             col += 1;
             continue;
@@ -430,7 +485,7 @@ pub fn tableCellTextByColumnIndex(allocator: Allocator, row: anytype, maybe_col:
         const cell = row.doc.nodeAt(child_idx) orelse continue;
         if (!isTableCellTag(cell.tagName())) continue;
         if (cell_index == col) {
-            const text = trimAscii(try cell.innerTextWithOptions(allocator, .{ .normalize_whitespace = true }));
+            const text = try innerTextTrimmedOwned(allocator, cell);
             if (text.len == 0) return null;
             return text;
         }
@@ -459,6 +514,57 @@ fn sleepBackoff(initial_ms: u64, attempt: usize) void {
 fn appendHexEscape(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), value: u8) !void {
     const hex = "0123456789ABCDEF";
     try out.appendSlice(allocator, &.{ '\\', 'x', hex[value >> 4], hex[value & 0x0F] });
+}
+
+fn namedLiveProvider(name: []const u8) ?[]const u8 {
+    if (std.ascii.eqlIgnoreCase(name, "MOVIESUBTITLES_ORG")) return "moviesubtitles.org";
+    if (std.ascii.eqlIgnoreCase(name, "MOVIESUBTITLESRT_COM")) return "moviesubtitlesrt.com";
+    if (std.ascii.eqlIgnoreCase(name, "PODNAPISI")) return "podnapisi.net";
+    if (std.ascii.eqlIgnoreCase(name, "SUBTITLECAT")) return "subtitlecat.com";
+    if (std.ascii.eqlIgnoreCase(name, "YIFY")) return "yifysubtitles.ch";
+    if (std.ascii.eqlIgnoreCase(name, "OPENSUBTITLES_ORG")) return "opensubtitles.org";
+    if (std.ascii.eqlIgnoreCase(name, "OPENSUBTITLES_COM")) return "opensubtitles.com";
+    return null;
+}
+
+fn isCaptchaProviderName(provider_name: []const u8) bool {
+    return providerNameEq(provider_name, "opensubtitles.org") or
+        providerNameEq(provider_name, "opensubtitles.com") or
+        providerNameEq(provider_name, "yifysubtitles.ch");
+}
+
+fn providerNameEq(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ac, bc| {
+        if (normalizeProviderChar(ac) != normalizeProviderChar(bc)) return false;
+    }
+    return true;
+}
+
+fn providerNameContains(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) : (start += 1) {
+        var ok = true;
+        var i: usize = 0;
+        while (i < needle.len) : (i += 1) {
+            if (normalizeProviderChar(haystack[start + i]) != normalizeProviderChar(needle[i])) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return true;
+    }
+    return false;
+}
+
+fn normalizeProviderChar(c: u8) u8 {
+    return switch (c) {
+        '.', '-' => '_',
+        else => std.ascii.toLower(c),
+    };
 }
 
 fn parseBoolLike(attr_name: []const u8, value: []const u8) ?bool {
@@ -612,4 +718,20 @@ test "sanitize utf8 for log preserves valid unicode" {
 
     try std.testing.expectEqualStrings("Cрпски", safe);
     try std.testing.expect(std.unicode.utf8ValidateSlice(safe));
+}
+
+test "validate live utf8 rejects invalid and replacement" {
+    try std.testing.expectError(error.InvalidUtf8Data, validateLiveUtf8(&.{0xAA}));
+    try std.testing.expectError(error.InvalidUtf8Data, validateLiveUtf8("\xEF\xBF\xBD"));
+    try validateLiveUtf8("Matrix");
+}
+
+test "provider filter matching" {
+    try std.testing.expect(providerMatchesLiveFilter(null, "tvsubtitles.net"));
+    try std.testing.expect(providerMatchesLiveFilter("tvsubtitles.net", "tvsubtitles.net"));
+    try std.testing.expect(providerMatchesLiveFilter("tvsubtitles_net", "tvsubtitles.net"));
+    try std.testing.expect(providerMatchesLiveFilter("tvsubtitles", "tvsubtitles.net"));
+    try std.testing.expect(providerMatchesLiveFilter("*", "tvsubtitles.net"));
+    try std.testing.expect(providerMatchesLiveFilter("all", "tvsubtitles.net"));
+    try std.testing.expect(!providerMatchesLiveFilter("podnapisi.net", "tvsubtitles.net"));
 }

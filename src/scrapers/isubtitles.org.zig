@@ -150,9 +150,9 @@ pub const Scraper = struct {
 
             if (title.len == 0) {
                 if (parsed.doc.queryOne("h1")) |h1| {
-                    title = common.trimAscii(try h1.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
+                    title = try common.innerTextTrimmedOwned(a, h1);
                 } else if (parsed.doc.queryOne("title")) |t| {
-                    title = common.trimAscii(try t.innerTextWithOptions(a, .{ .normalize_whitespace = true }));
+                    title = try common.innerTextTrimmedOwned(a, t);
                 }
             }
 
@@ -222,7 +222,7 @@ fn collectSearchItemsFromSelector(
         if (seen.contains(details_url)) continue;
         try seen.put(allocator, details_url, {});
 
-        const raw_title = common.trimAscii(try anchor.innerTextWithOptions(allocator, .{ .normalize_whitespace = true }));
+        const raw_title = try common.innerTextTrimmedOwned(allocator, anchor);
         const split = splitTitleAndYear(raw_title);
         try out.append(allocator, .{
             .title = split.title,
@@ -271,7 +271,7 @@ fn collectSearchItemsFromRawHtml(
 
 fn textAt(node: html.Node, allocator: Allocator, comptime selector: []const u8) !?[]const u8 {
     const found = node.queryOne(selector) orelse return null;
-    const text = common.trimAscii(try found.innerTextWithOptions(allocator, .{ .normalize_whitespace = true }));
+    const text = try common.innerTextTrimmedOwned(allocator, found);
     if (text.len == 0) return null;
     return text;
 }
@@ -317,7 +317,7 @@ fn extractNextPageUrl(allocator: Allocator, doc: *const html.Document, current_u
         const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
         if (std.mem.indexOf(u8, href, "page=") == null) continue;
 
-        const text = common.trimAscii(try anchor.innerTextWithOptions(allocator, .{ .normalize_whitespace = true }));
+        const text = try common.innerTextTrimmedOwned(allocator, anchor);
         if (!isLikelyNextText(text)) continue;
 
         const resolved = try common.resolveUrl(allocator, site, href);
