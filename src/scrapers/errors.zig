@@ -1,0 +1,15 @@
+pub const Error = error{
+    UnexpectedHttpStatus,
+    HttpRequestFailed,
+    RateLimited,
+    ParseFailed,
+    MissingField,
+    InvalidField,
+    InvalidSelector,
+    CloudflareChallenge,
+    CloudflareSessionUnavailable,
+    BrowserAutomationFailed,
+    SessionExpired,
+    UnsupportedSearchLanguage,
+    InvalidDownloadUrl,
+};
