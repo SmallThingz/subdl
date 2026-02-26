@@ -3,6 +3,9 @@ const upstream = @import("htmlparser_upstream");
 pub const ParseOptions = upstream.ParseOptions;
 pub const TextOptions = upstream.TextOptions;
 pub const Selector = upstream.Selector;
+pub const QueryDebugReport = upstream.QueryDebugReport;
+pub const DebugFailureKind = upstream.DebugFailureKind;
+pub const NearMiss = upstream.NearMiss;
 
 const default_options: ParseOptions = .{};
 

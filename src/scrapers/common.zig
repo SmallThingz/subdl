@@ -39,6 +39,11 @@ fn debugTimingEnabled() bool {
     return value.len > 0 and !std.mem.eql(u8, value, "0");
 }
 
+fn selectorDebugEnabled() bool {
+    const value = std.posix.getenv("SCRAPERS_SELECTOR_DEBUG") orelse return false;
+    return value.len > 0 and !std.mem.eql(u8, value, "0");
+}
+
 pub fn fetchBytes(client: *std.http.Client, allocator: Allocator, url: []const u8, opts: FetchOptions) !HttpResponse {
     var attempts: usize = 0;
     while (true) : (attempts += 1) {
@@ -113,7 +118,10 @@ pub fn parseHtmlTurbo(allocator: Allocator, source: []const u8) !ParsedHtml {
     var doc = html.Document.init(allocator);
     errdefer doc.deinit();
 
-    try doc.parse(html_bytes, .{ .eager_child_views = false });
+    try doc.parse(html_bytes, .{
+        .eager_child_views = false,
+        .drop_whitespace_text_nodes = true,
+    });
 
     if (debug_timing) {
         const elapsed_ns = std.time.nanoTimestamp() - started_ns;
@@ -133,7 +141,10 @@ pub fn parseHtmlStable(allocator: Allocator, source: []const u8) !ParsedHtml {
 
     var doc = html.Document.init(allocator);
     errdefer doc.deinit();
-    try doc.parse(html_bytes, .{});
+    try doc.parse(html_bytes, .{
+        .eager_child_views = true,
+        .drop_whitespace_text_nodes = false,
+    });
 
     if (debug_timing) {
         const elapsed_ns = std.time.nanoTimestamp() - started_ns;
@@ -341,8 +352,49 @@ pub fn parseAttrBool(node: anytype, attr_name: []const u8) ?bool {
 }
 
 pub fn firstTableHeaderRow(table: anytype) ?@TypeOf(table) {
-    if (table.queryOne("thead tr")) |header_row| return header_row;
-    if (table.queryOne("tr")) |header_row| return header_row;
+    if (queryOneWithOptionalDebug(table, "thead tr", "firstTableHeaderRow:thead")) |header_row| return header_row;
+    if (queryOneWithOptionalDebug(table, "tr", "firstTableHeaderRow:any-tr")) |header_row| return header_row;
+    return null;
+}
+
+pub fn queryOneWithOptionalDebug(
+    scope: anytype,
+    comptime selector: []const u8,
+    context: []const u8,
+) ?@TypeOf(scope.queryOne(selector).?) {
+    if (!selectorDebugEnabled()) return scope.queryOne(selector);
+
+    var report: html.QueryDebugReport = .{};
+    const node = scope.queryOneDebug(selector, &report);
+    if (node != null) return node;
+
+    std.debug.print(
+        "[selector-debug] context={s} selector={s} visited={d} groups={d} parse_error={any}\n",
+        .{
+            context,
+            selector,
+            report.visited_elements,
+            report.group_count,
+            report.runtime_parse_error,
+        },
+    );
+
+    var i: usize = 0;
+    while (i < report.near_miss_len) : (i += 1) {
+        const miss = report.near_misses[i];
+        std.debug.print(
+            "[selector-debug] near_miss[{d}] node={d} kind={s} group={d} compound={d} predicate={d}\n",
+            .{
+                i,
+                miss.node_index,
+                @tagName(miss.reason.kind),
+                miss.reason.group_index,
+                miss.reason.compound_index,
+                miss.reason.predicate_index,
+            },
+        );
+    }
+
     return null;
 }
 
