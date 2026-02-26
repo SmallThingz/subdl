@@ -41,8 +41,8 @@
             .hash = "htmlparser-0.0.0-80cNIyYdBQBinwIW32B-gwx_JQZXc2nFti4IcnVp6npx",
         },
         .alldriver = .{
-            .url = "git+https://github.com/SmallThingz/alldriver.git#aaa07dcfbd9d4fa83b946f1152de390cea2cb187",
-            .hash = "alldriver-0.0.0-IXnEoQ5UCQACrtI5AlJS0HWnwNWdlez5qR-yDlRmuJcZ",
+            .url = "git+https://github.com/SmallThingz/alldriver.git#78131f163677d527f4a49b84ea3e760fa8ef0346",
+            .hash = "alldriver-0.0.0-IXnEoU1GCgBd5-w2beaQcat38MXJvU2f0UfHswJyT3EQ",
         },
     },
     .paths = .{

@@ -577,8 +577,30 @@ test "live opensubtitles.org search and subtitles" {
     var search = try scraper.search("The Matrix");
     defer search.deinit();
     try std.testing.expect(search.items.len > 0);
+    for (search.items, 0..) |item, idx| {
+        std.debug.print("[live][opensubtitles.org][search][{d}]\n", .{idx});
+        try common.livePrintField(std.testing.allocator, "title", item.title);
+        try common.livePrintField(std.testing.allocator, "page_url", item.page_url);
+    }
 
     var subtitles = try scraper.fetchSubtitlesByMoviePage(search.items[0].page_url);
     defer subtitles.deinit();
     try std.testing.expect(subtitles.subtitles.len > 0);
+    try common.livePrintField(std.testing.allocator, "subtitles_title", subtitles.title);
+    for (subtitles.subtitles, 0..) |sub, idx| {
+        std.debug.print("[live][opensubtitles.org][subtitle][{d}]\n", .{idx});
+        try common.livePrintOptionalField(std.testing.allocator, "language_code", sub.language_code);
+        try common.livePrintOptionalField(std.testing.allocator, "filename", sub.filename);
+        try common.livePrintOptionalField(std.testing.allocator, "release", sub.release);
+        try common.livePrintOptionalField(std.testing.allocator, "fps", sub.fps);
+        try common.livePrintOptionalField(std.testing.allocator, "cds", sub.cds);
+        try common.livePrintOptionalField(std.testing.allocator, "rating", sub.rating);
+        try common.livePrintOptionalField(std.testing.allocator, "downloads", sub.downloads);
+        try common.livePrintOptionalField(std.testing.allocator, "uploaded_at", sub.uploaded_at);
+        std.debug.print("[live] hearing_impaired={any}\n", .{sub.hearing_impaired});
+        std.debug.print("[live] trusted={any}\n", .{sub.trusted});
+        std.debug.print("[live] hd={any}\n", .{sub.hd});
+        try common.livePrintField(std.testing.allocator, "details_url", sub.details_url);
+        try common.livePrintField(std.testing.allocator, "direct_zip_url", sub.direct_zip_url);
+    }
 }

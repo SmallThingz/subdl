@@ -1567,24 +1567,66 @@ fn printFitted(
 ) !void {
     if (max_width == 0) return;
 
-    if (text.len <= max_width) {
+    if (win.gwidth(text) <= max_width) {
         const segs = [_]vaxis.Segment{.{ .text = text, .style = style }};
         _ = win.print(&segs, .{ .row_offset = row, .col_offset = col, .wrap = .none });
         return;
     }
 
     if (max_width <= 3) {
-        const segs = [_]vaxis.Segment{.{ .text = text[0..max_width], .style = style }};
+        const prefix = utf8PrefixForDisplayWidth(win, text, max_width);
+        const segs = [_]vaxis.Segment{.{ .text = prefix, .style = style }};
         _ = win.print(&segs, .{ .row_offset = row, .col_offset = col, .wrap = .none });
         return;
     }
 
-    const cut = max_width - 3;
+    const prefix = utf8PrefixForDisplayWidth(win, text, max_width - 3);
     const segs = [_]vaxis.Segment{
-        .{ .text = text[0..cut], .style = style },
+        .{ .text = prefix, .style = style },
         .{ .text = "...", .style = style },
     };
     _ = win.print(&segs, .{ .row_offset = row, .col_offset = col, .wrap = .none });
+}
+
+fn utf8PrefixForDisplayWidth(win: anytype, text: []const u8, max_width: usize) []const u8 {
+    if (max_width == 0 or text.len == 0) return text[0..0];
+
+    var idx: usize = 0;
+    var best: usize = 0;
+
+    while (idx < text.len) {
+        const seq_len_raw = std.unicode.utf8ByteSequenceLength(text[idx]) catch break;
+        const seq_len: usize = @intCast(seq_len_raw);
+        if (idx + seq_len > text.len) break;
+
+        _ = std.unicode.utf8Decode(text[idx .. idx + seq_len]) catch break;
+
+        const next = idx + seq_len;
+        if (win.gwidth(text[0..next]) > max_width) break;
+
+        best = next;
+        idx = next;
+    }
+
+    return text[0..best];
+}
+
+test "utf8PrefixForDisplayWidth does not split utf8 sequences" {
+    const FakeWin = struct {
+        pub fn gwidth(_: @This(), s: []const u8) usize {
+            return std.unicode.utf8CountCodepoints(s) catch s.len;
+        }
+    };
+
+    const win = FakeWin{};
+    const text = "Српски Matrix";
+
+    const prefix = utf8PrefixForDisplayWidth(win, text, 3);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(prefix));
+    try std.testing.expectEqual(@as(usize, 3), std.unicode.utf8CountCodepoints(prefix) catch 0);
+
+    const full = utf8PrefixForDisplayWidth(win, text, 64);
+    try std.testing.expectEqualStrings(text, full);
 }
 
 fn subtitleSortName(mode: SubtitleSort) []const u8 {

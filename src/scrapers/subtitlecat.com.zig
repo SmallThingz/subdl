@@ -282,8 +282,28 @@ test "live subtitlecat search and subtitles" {
     var search = try scraper.search("The Matrix");
     defer search.deinit();
     try std.testing.expect(search.items.len > 0);
+    for (search.items, 0..) |item, idx| {
+        std.debug.print("[live][subtitlecat.com][search][{d}]\n", .{idx});
+        try common.livePrintField(std.testing.allocator, "title", item.title);
+        try common.livePrintField(std.testing.allocator, "details_url", item.details_url);
+        try common.livePrintOptionalField(std.testing.allocator, "source_language", item.source_language);
+    }
 
     var subtitles = try scraper.fetchSubtitlesByDetailsLink(search.items[0].details_url);
     defer subtitles.deinit();
     try std.testing.expect(subtitles.subtitles.len > 0);
+    for (subtitles.subtitles, 0..) |sub, idx| {
+        std.debug.print("[live][subtitlecat.com][subtitle][{d}]\n", .{idx});
+        try common.livePrintOptionalField(std.testing.allocator, "language_code", sub.language_code);
+        try common.livePrintOptionalField(std.testing.allocator, "language_label", sub.language_label);
+        try common.livePrintField(std.testing.allocator, "filename", sub.filename);
+        std.debug.print("[live] mode={s}\n", .{@tagName(sub.mode)});
+        try common.livePrintOptionalField(std.testing.allocator, "source_url", sub.source_url);
+        try common.livePrintOptionalField(std.testing.allocator, "download_url", sub.download_url);
+        if (sub.translate_spec) |spec| {
+            try common.livePrintOptionalField(std.testing.allocator, "translate_spec.source_url", spec.source_url);
+        } else {
+            std.debug.print("[live] translate_spec=<null>\n", .{});
+        }
+    }
 }

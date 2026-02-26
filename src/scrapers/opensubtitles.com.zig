@@ -569,12 +569,34 @@ test "live opensubtitles.com search and resolve" {
     var search = try scraper.search("The Matrix");
     defer search.deinit();
     try std.testing.expect(search.items.len > 0);
+    for (search.items, 0..) |item, idx| {
+        std.debug.print("[live][opensubtitles.com][search][{d}]\n", .{idx});
+        try common.livePrintField(std.testing.allocator, "title", item.title);
+        try common.livePrintOptionalField(std.testing.allocator, "year", item.year);
+        try common.livePrintOptionalField(std.testing.allocator, "item_type", item.item_type);
+        try common.livePrintField(std.testing.allocator, "path", item.path);
+        if (item.subtitles_count) |count| {
+            std.debug.print("[live] subtitles_count={d}\n", .{count});
+        } else {
+            std.debug.print("[live] subtitles_count=<null>\n", .{});
+        }
+        try common.livePrintField(std.testing.allocator, "subtitles_list_url", item.subtitles_list_url);
+    }
 
     var subtitles = try scraper.fetchSubtitlesBySearchItemWithOptions(search.items[0], .{
         .resolve_downloads = false,
     });
     defer subtitles.deinit();
     try std.testing.expect(subtitles.subtitles.len > 0);
+    for (subtitles.subtitles, 0..) |sub, idx| {
+        std.debug.print("[live][opensubtitles.com][subtitle][{d}]\n", .{idx});
+        try common.livePrintOptionalField(std.testing.allocator, "language", sub.language);
+        try common.livePrintOptionalField(std.testing.allocator, "filename", sub.filename);
+        try common.livePrintOptionalField(std.testing.allocator, "row_summary", sub.row_summary);
+        try common.livePrintField(std.testing.allocator, "remote_endpoint", sub.remote_endpoint);
+        try common.livePrintOptionalField(std.testing.allocator, "resolved_filename", sub.resolved_filename);
+        try common.livePrintOptionalField(std.testing.allocator, "verified_download_url", sub.verified_download_url);
+    }
 }
 
 fn shouldRunOpenSubtitlesComLive(allocator: Allocator) bool {

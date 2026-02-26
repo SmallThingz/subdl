@@ -202,8 +202,23 @@ test "live moviesubtitlesrt search and details" {
     var results = try scraper.search("The Matrix");
     defer results.deinit();
     try std.testing.expect(results.items.len > 0);
+    for (results.items, 0..) |item, idx| {
+        std.debug.print("[live][moviesubtitlesrt.com][search][{d}]\n", .{idx});
+        try common.livePrintField(std.testing.allocator, "title", item.title);
+        try common.livePrintField(std.testing.allocator, "page_url", item.page_url);
+    }
 
     var details = try scraper.fetchSubtitleByLink(results.items[0].page_url);
     defer details.deinit();
     try std.testing.expect(details.subtitle.download_url.len > 0);
+    std.debug.print("[live][moviesubtitlesrt.com][subtitle]\n", .{});
+    try common.livePrintField(std.testing.allocator, "title", details.subtitle.title);
+    try common.livePrintOptionalField(std.testing.allocator, "language_raw", details.subtitle.language_raw);
+    try common.livePrintOptionalField(std.testing.allocator, "language_code", details.subtitle.language_code);
+    try common.livePrintOptionalField(std.testing.allocator, "release_date", details.subtitle.release_date);
+    try common.livePrintOptionalField(std.testing.allocator, "running_time", details.subtitle.running_time);
+    try common.livePrintOptionalField(std.testing.allocator, "file_type", details.subtitle.file_type);
+    try common.livePrintOptionalField(std.testing.allocator, "author", details.subtitle.author);
+    try common.livePrintOptionalField(std.testing.allocator, "posted_date", details.subtitle.posted_date);
+    try common.livePrintField(std.testing.allocator, "download_url", details.subtitle.download_url);
 }

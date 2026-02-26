@@ -279,8 +279,23 @@ test "live moviesubtitles.org search and subtitles" {
     var search = try scraper.search("The Matrix");
     defer search.deinit();
     try std.testing.expect(search.items.len > 0);
+    for (search.items, 0..) |item, idx| {
+        std.debug.print("[live][moviesubtitles.org][search][{d}]\n", .{idx});
+        try common.livePrintField(std.testing.allocator, "title", item.title);
+        try common.livePrintField(std.testing.allocator, "link", item.link);
+    }
 
     var subtitles = try scraper.fetchSubtitlesByMovieLink(search.items[0].link);
     defer subtitles.deinit();
     try std.testing.expect(subtitles.subtitles.len > 0);
+    try common.livePrintField(std.testing.allocator, "subtitles_title", subtitles.title);
+    for (subtitles.subtitles, 0..) |sub, idx| {
+        std.debug.print("[live][moviesubtitles.org][subtitle][{d}]\n", .{idx});
+        try common.livePrintOptionalField(std.testing.allocator, "language_code", sub.language_code);
+        try common.livePrintField(std.testing.allocator, "filename", sub.filename);
+        try common.livePrintField(std.testing.allocator, "details_url", sub.details_url);
+        try common.livePrintField(std.testing.allocator, "download_url", sub.download_url);
+        try common.livePrintOptionalField(std.testing.allocator, "rating_good", sub.rating_good);
+        try common.livePrintOptionalField(std.testing.allocator, "rating_bad", sub.rating_bad);
+    }
 }

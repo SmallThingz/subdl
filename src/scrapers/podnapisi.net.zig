@@ -303,8 +303,31 @@ test "live podnapisi search and subtitles" {
     var search = try scraper.search("The Matrix");
     defer search.deinit();
     try std.testing.expect(search.items.len > 0);
+    for (search.items, 0..) |item, idx| {
+        std.debug.print("[live][podnapisi.net][search][{d}]\n", .{idx});
+        try common.livePrintField(std.testing.allocator, "id", item.id);
+        try common.livePrintField(std.testing.allocator, "title", item.title);
+        try common.livePrintField(std.testing.allocator, "media_type", item.media_type);
+        if (item.year) |year| {
+            std.debug.print("[live] year={d}\n", .{year});
+        } else {
+            std.debug.print("[live] year=<null>\n", .{});
+        }
+        try common.livePrintField(std.testing.allocator, "subtitles_page_url", item.subtitles_page_url);
+    }
 
     var subtitles = try scraper.fetchSubtitlesBySearchLink(search.items[0].subtitles_page_url);
     defer subtitles.deinit();
     try std.testing.expect(subtitles.subtitles.len > 0);
+    for (subtitles.subtitles, 0..) |sub, idx| {
+        std.debug.print("[live][podnapisi.net][subtitle][{d}]\n", .{idx});
+        try common.livePrintOptionalField(std.testing.allocator, "language", sub.language);
+        try common.livePrintOptionalField(std.testing.allocator, "release", sub.release);
+        try common.livePrintOptionalField(std.testing.allocator, "fps", sub.fps);
+        try common.livePrintOptionalField(std.testing.allocator, "cds", sub.cds);
+        try common.livePrintOptionalField(std.testing.allocator, "rating", sub.rating);
+        try common.livePrintOptionalField(std.testing.allocator, "uploader", sub.uploader);
+        try common.livePrintOptionalField(std.testing.allocator, "uploaded_at", sub.uploaded_at);
+        try common.livePrintField(std.testing.allocator, "download_url", sub.download_url);
+    }
 }

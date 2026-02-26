@@ -38,6 +38,16 @@ fn runSubdl(allocator: std.mem.Allocator, client: *std.http.Client) !void {
 
     var search = try scraper.search("The Matrix");
     defer search.deinit();
+    for (search.items, 0..) |item, idx| {
+        std.debug.print("[live][subdl.com][search][{d}]\n", .{idx});
+        std.debug.print("[live] media_type={s}\n", .{@tagName(item.media_type)});
+        try common.livePrintField(allocator, "name", item.name);
+        try common.livePrintField(allocator, "poster_url", item.poster_url);
+        std.debug.print("[live] year={d}\n", .{item.year});
+        try common.livePrintField(allocator, "link", item.link);
+        try common.livePrintField(allocator, "original_name", item.original_name);
+        std.debug.print("[live] subtitles_count={d}\n", .{item.subtitles_count});
+    }
 
     try suite.expectPositive(search.items.len);
     const item = search.items[0];
@@ -46,6 +56,49 @@ fn runSubdl(allocator: std.mem.Allocator, client: *std.http.Client) !void {
 
     var movie = try scraper.fetchMovieByLink(item.link);
     defer movie.deinit();
+    std.debug.print("[live][subdl.com][movie]\n", .{});
+    std.debug.print("[live] media_type={s}\n", .{@tagName(movie.movie.media_type)});
+    std.debug.print("[live] sd_id={d}\n", .{movie.movie.sd_id});
+    try common.livePrintField(allocator, "slug", movie.movie.slug);
+    try common.livePrintField(allocator, "name", movie.movie.name);
+    try common.livePrintField(allocator, "second_name", movie.movie.second_name);
+    try common.livePrintField(allocator, "poster_url", movie.movie.poster_url);
+    std.debug.print("[live] year={d}\n", .{movie.movie.year});
+    std.debug.print("[live] total_seasons={d}\n", .{movie.movie.total_seasons});
+    for (movie.languages, 0..) |group, group_idx| {
+        std.debug.print("[live][subdl.com][language_group][{d}]\n", .{group_idx});
+        try common.livePrintField(allocator, "language", group.language);
+        std.debug.print("[live] subtitles_len={d}\n", .{group.subtitles.len});
+        for (group.subtitles, 0..) |sub, sub_idx| {
+            std.debug.print("[live][subdl.com][subtitle][{d}][{d}]\n", .{ group_idx, sub_idx });
+            std.debug.print("[live] id={d}\n", .{sub.id});
+            try common.livePrintField(allocator, "language", sub.language);
+            try common.livePrintField(allocator, "quality", sub.quality);
+            try common.livePrintField(allocator, "link", sub.link);
+            try common.livePrintField(allocator, "bucket_link", sub.bucket_link);
+            try common.livePrintField(allocator, "author", sub.author);
+            std.debug.print("[live] season={d}\n", .{sub.season});
+            std.debug.print("[live] episode={d}\n", .{sub.episode});
+            try common.livePrintField(allocator, "title", sub.title);
+            try common.livePrintField(allocator, "extra", sub.extra);
+            std.debug.print("[live] enabled={any}\n", .{sub.enabled});
+            try common.livePrintField(allocator, "n_id", sub.n_id);
+            std.debug.print("[live] downloads={d}\n", .{sub.downloads});
+            std.debug.print("[live] hearing_impaired={any}\n", .{sub.hearing_impaired});
+            if (sub.rate) |rate| {
+                std.debug.print("[live] rate={d}\n", .{rate});
+            } else {
+                std.debug.print("[live] rate=<null>\n", .{});
+            }
+            std.debug.print("[live] date_ms={d}\n", .{sub.date_ms});
+            try common.livePrintField(allocator, "comment", sub.comment);
+            try common.livePrintOptionalField(allocator, "slug", sub.slug);
+            for (sub.releases, 0..) |release, release_idx| {
+                std.debug.print("[live][subdl.com][subtitle_release][{d}][{d}][{d}]\n", .{ group_idx, sub_idx, release_idx });
+                try common.livePrintField(allocator, "release", release);
+            }
+        }
+    }
 
     try suite.expectNonEmpty(movie.movie.name);
     try suite.expectPositive(movie.languages.len);
@@ -65,6 +118,12 @@ fn runISubtitles(allocator: std.mem.Allocator, client: *std.http.Client) !void {
 
     var search = try scraper.searchWithOptions("The Matrix", .{ .max_pages = 2 });
     defer search.deinit();
+    for (search.items, 0..) |item, idx| {
+        std.debug.print("[live][isubtitles.org][search][{d}]\n", .{idx});
+        try common.livePrintField(allocator, "title", item.title);
+        try common.livePrintOptionalField(allocator, "year", item.year);
+        try common.livePrintField(allocator, "details_url", item.details_url);
+    }
     try suite.expectPositive(search.items.len);
 
     const chosen_idx = pickFirstContaining(isubtitles_org.SearchItem, search.items, "matrix") orelse 0;
@@ -74,6 +133,20 @@ fn runISubtitles(allocator: std.mem.Allocator, client: *std.http.Client) !void {
 
     var subtitles = try scraper.fetchSubtitlesByMovieLinkWithOptions(match.details_url, .{ .max_pages = 2 });
     defer subtitles.deinit();
+    try common.livePrintField(allocator, "subtitles_title", subtitles.title);
+    for (subtitles.subtitles, 0..) |sub, idx| {
+        std.debug.print("[live][isubtitles.org][subtitle][{d}]\n", .{idx});
+        try common.livePrintOptionalField(allocator, "language_raw", sub.language_raw);
+        try common.livePrintOptionalField(allocator, "language_code", sub.language_code);
+        try common.livePrintOptionalField(allocator, "release", sub.release);
+        try common.livePrintOptionalField(allocator, "created_at", sub.created_at);
+        try common.livePrintOptionalField(allocator, "file_count", sub.file_count);
+        try common.livePrintOptionalField(allocator, "size", sub.size);
+        try common.livePrintOptionalField(allocator, "comment", sub.comment);
+        try common.livePrintField(allocator, "filename", sub.filename);
+        try common.livePrintField(allocator, "details_url", sub.details_url);
+        try common.livePrintField(allocator, "download_page_url", sub.download_page_url);
+    }
     try suite.expectPositive(subtitles.subtitles.len);
 
     const first = subtitles.subtitles[0];
@@ -86,6 +159,11 @@ fn runMovieSubtitlesOrg(allocator: std.mem.Allocator, client: *std.http.Client) 
 
     var search = try scraper.search("The Matrix");
     defer search.deinit();
+    for (search.items, 0..) |item, idx| {
+        std.debug.print("[live][moviesubtitles.org][search][{d}]\n", .{idx});
+        try common.livePrintField(allocator, "title", item.title);
+        try common.livePrintField(allocator, "link", item.link);
+    }
     try suite.expectPositive(search.items.len);
 
     var validated = false;
@@ -96,6 +174,16 @@ fn runMovieSubtitlesOrg(allocator: std.mem.Allocator, client: *std.http.Client) 
         var subtitles = scraper.fetchSubtitlesByMovieLink(movie.link) catch continue;
         defer subtitles.deinit();
         if (subtitles.subtitles.len == 0) continue;
+        try common.livePrintField(allocator, "subtitles_title", subtitles.title);
+        for (subtitles.subtitles, 0..) |sub, idx| {
+            std.debug.print("[live][moviesubtitles.org][subtitle][{d}]\n", .{idx});
+            try common.livePrintOptionalField(allocator, "language_code", sub.language_code);
+            try common.livePrintField(allocator, "filename", sub.filename);
+            try common.livePrintField(allocator, "details_url", sub.details_url);
+            try common.livePrintField(allocator, "download_url", sub.download_url);
+            try common.livePrintOptionalField(allocator, "rating_good", sub.rating_good);
+            try common.livePrintOptionalField(allocator, "rating_bad", sub.rating_bad);
+        }
 
         const first = subtitles.subtitles[0];
         try suite.expectNonEmpty(first.filename);
@@ -113,6 +201,11 @@ fn runMovieSubtitlesRt(allocator: std.mem.Allocator, client: *std.http.Client) !
 
     var search = try scraper.search("The Matrix");
     defer search.deinit();
+    for (search.items, 0..) |item, idx| {
+        std.debug.print("[live][moviesubtitlesrt.com][search][{d}]\n", .{idx});
+        try common.livePrintField(allocator, "title", item.title);
+        try common.livePrintField(allocator, "page_url", item.page_url);
+    }
     try suite.expectPositive(search.items.len);
 
     const chosen_idx = pickFirstContaining(moviesubtitlesrt_com.SearchItem, search.items, "matrix") orelse 0;
@@ -122,6 +215,16 @@ fn runMovieSubtitlesRt(allocator: std.mem.Allocator, client: *std.http.Client) !
 
     var details = try scraper.fetchSubtitleByLink(hit.page_url);
     defer details.deinit();
+    std.debug.print("[live][moviesubtitlesrt.com][subtitle]\n", .{});
+    try common.livePrintField(allocator, "title", details.subtitle.title);
+    try common.livePrintOptionalField(allocator, "language_raw", details.subtitle.language_raw);
+    try common.livePrintOptionalField(allocator, "language_code", details.subtitle.language_code);
+    try common.livePrintOptionalField(allocator, "release_date", details.subtitle.release_date);
+    try common.livePrintOptionalField(allocator, "running_time", details.subtitle.running_time);
+    try common.livePrintOptionalField(allocator, "file_type", details.subtitle.file_type);
+    try common.livePrintOptionalField(allocator, "author", details.subtitle.author);
+    try common.livePrintOptionalField(allocator, "posted_date", details.subtitle.posted_date);
+    try common.livePrintField(allocator, "download_url", details.subtitle.download_url);
 
     try suite.expectNonEmpty(details.subtitle.title);
     try suite.expectHttpUrl(details.subtitle.download_url);
@@ -133,6 +236,12 @@ fn runMySubs(allocator: std.mem.Allocator, client: *std.http.Client) !void {
 
     var search = try scraper.searchWithOptions("The Matrix", .{ .max_pages = 2 });
     defer search.deinit();
+    for (search.items, 0..) |item, idx| {
+        std.debug.print("[live][my-subs.co][search][{d}]\n", .{idx});
+        try common.livePrintField(allocator, "title", item.title);
+        try common.livePrintField(allocator, "details_url", item.details_url);
+        std.debug.print("[live] media_kind={s}\n", .{@tagName(item.media_kind)});
+    }
     try suite.expectPositive(search.items.len);
 
     const chosen_idx = pickFirstContaining(my_subs_co.SearchItem, search.items, "matrix") orelse 0;
@@ -146,6 +255,21 @@ fn runMySubs(allocator: std.mem.Allocator, client: *std.http.Client) !void {
         .resolve_download_links = false,
     });
     defer subtitles.deinit();
+    for (subtitles.subtitles, 0..) |sub, idx| {
+        std.debug.print("[live][my-subs.co][subtitle][{d}]\n", .{idx});
+        try common.livePrintOptionalField(allocator, "language_raw", sub.language_raw);
+        try common.livePrintOptionalField(allocator, "language_code", sub.language_code);
+        try common.livePrintField(allocator, "filename", sub.filename);
+        try common.livePrintOptionalField(allocator, "release_version", sub.release_version);
+        try common.livePrintField(allocator, "details_url", sub.details_url);
+        try common.livePrintField(allocator, "download_page_url", sub.download_page_url);
+        try common.livePrintOptionalField(allocator, "resolved_download_url", sub.resolved_download_url);
+        if (sub.is_archive) |is_archive| {
+            std.debug.print("[live] is_archive={any}\n", .{is_archive});
+        } else {
+            std.debug.print("[live] is_archive=<null>\n", .{});
+        }
+    }
     try suite.expectPositive(subtitles.subtitles.len);
 
     const first = subtitles.subtitles[0];
@@ -158,6 +282,18 @@ fn runPodnapisi(allocator: std.mem.Allocator, client: *std.http.Client) !void {
 
     var search = try scraper.search("The Matrix");
     defer search.deinit();
+    for (search.items, 0..) |item, idx| {
+        std.debug.print("[live][podnapisi.net][search][{d}]\n", .{idx});
+        try common.livePrintField(allocator, "id", item.id);
+        try common.livePrintField(allocator, "title", item.title);
+        try common.livePrintField(allocator, "media_type", item.media_type);
+        if (item.year) |year| {
+            std.debug.print("[live] year={d}\n", .{year});
+        } else {
+            std.debug.print("[live] year=<null>\n", .{});
+        }
+        try common.livePrintField(allocator, "subtitles_page_url", item.subtitles_page_url);
+    }
     try suite.expectPositive(search.items.len);
 
     const chosen_idx = pickFirstContaining(podnapisi_net.SearchItem, search.items, "matrix") orelse 0;
@@ -167,6 +303,17 @@ fn runPodnapisi(allocator: std.mem.Allocator, client: *std.http.Client) !void {
 
     var subtitles = try scraper.fetchSubtitlesBySearchLink(match.subtitles_page_url);
     defer subtitles.deinit();
+    for (subtitles.subtitles, 0..) |sub, idx| {
+        std.debug.print("[live][podnapisi.net][subtitle][{d}]\n", .{idx});
+        try common.livePrintOptionalField(allocator, "language", sub.language);
+        try common.livePrintOptionalField(allocator, "release", sub.release);
+        try common.livePrintOptionalField(allocator, "fps", sub.fps);
+        try common.livePrintOptionalField(allocator, "cds", sub.cds);
+        try common.livePrintOptionalField(allocator, "rating", sub.rating);
+        try common.livePrintOptionalField(allocator, "uploader", sub.uploader);
+        try common.livePrintOptionalField(allocator, "uploaded_at", sub.uploaded_at);
+        try common.livePrintField(allocator, "download_url", sub.download_url);
+    }
     try suite.expectPositive(subtitles.subtitles.len);
 
     const first = subtitles.subtitles[0];
@@ -179,6 +326,12 @@ fn runSubtitleCat(allocator: std.mem.Allocator, client: *std.http.Client) !void 
 
     var search = try scraper.search("The Matrix");
     defer search.deinit();
+    for (search.items, 0..) |item, idx| {
+        std.debug.print("[live][subtitlecat.com][search][{d}]\n", .{idx});
+        try common.livePrintField(allocator, "title", item.title);
+        try common.livePrintField(allocator, "details_url", item.details_url);
+        try common.livePrintOptionalField(allocator, "source_language", item.source_language);
+    }
     try suite.expectPositive(search.items.len);
 
     const chosen_idx = pickFirstContaining(subtitlecat_com.SearchItem, search.items, "matrix") orelse 0;
@@ -188,6 +341,20 @@ fn runSubtitleCat(allocator: std.mem.Allocator, client: *std.http.Client) !void 
 
     var subtitles = try scraper.fetchSubtitlesByDetailsLink(entry.details_url);
     defer subtitles.deinit();
+    for (subtitles.subtitles, 0..) |sub, idx| {
+        std.debug.print("[live][subtitlecat.com][subtitle][{d}]\n", .{idx});
+        try common.livePrintOptionalField(allocator, "language_code", sub.language_code);
+        try common.livePrintOptionalField(allocator, "language_label", sub.language_label);
+        try common.livePrintField(allocator, "filename", sub.filename);
+        std.debug.print("[live] mode={s}\n", .{@tagName(sub.mode)});
+        try common.livePrintOptionalField(allocator, "source_url", sub.source_url);
+        try common.livePrintOptionalField(allocator, "download_url", sub.download_url);
+        if (sub.translate_spec) |spec| {
+            try common.livePrintOptionalField(allocator, "translate_spec.source_url", spec.source_url);
+        } else {
+            std.debug.print("[live] translate_spec=<null>\n", .{});
+        }
+    }
     try suite.expectPositive(subtitles.subtitles.len);
 
     const first = subtitles.subtitles[0];
@@ -204,6 +371,29 @@ fn runSubsource(allocator: std.mem.Allocator, client: *std.http.Client) !void {
         .auto_cloudflare_session = false,
     });
     defer search.deinit();
+    try common.livePrintField(allocator, "query_used", search.query_used);
+    for (search.items, 0..) |item, idx| {
+        std.debug.print("[live][subsource.net][search][{d}]\n", .{idx});
+        std.debug.print("[live] id={d}\n", .{item.id});
+        try common.livePrintField(allocator, "title", item.title);
+        try common.livePrintField(allocator, "media_type", item.media_type);
+        try common.livePrintField(allocator, "link", item.link);
+        if (item.release_year) |release_year| {
+            std.debug.print("[live] release_year={d}\n", .{release_year});
+        } else {
+            std.debug.print("[live] release_year=<null>\n", .{});
+        }
+        if (item.subtitle_count) |subtitle_count| {
+            std.debug.print("[live] subtitle_count={d}\n", .{subtitle_count});
+        } else {
+            std.debug.print("[live] subtitle_count=<null>\n", .{});
+        }
+        for (item.seasons, 0..) |season, season_idx| {
+            std.debug.print("[live][subsource.net][season][{d}][{d}]\n", .{ idx, season_idx });
+            std.debug.print("[live] season={d}\n", .{season.season});
+            try common.livePrintField(allocator, "link", season.link);
+        }
+    }
     try suite.expectPositive(search.items.len);
 
     const chosen_idx = pickFirstContaining(subsource_net.SearchItem, search.items, "matrix") orelse 0;
@@ -218,6 +408,18 @@ fn runSubsource(allocator: std.mem.Allocator, client: *std.http.Client) !void {
         .auto_cloudflare_session = false,
     });
     defer subtitles.deinit();
+    try common.livePrintField(allocator, "subtitles_title", subtitles.title);
+    for (subtitles.subtitles, 0..) |sub, idx| {
+        std.debug.print("[live][subsource.net][subtitle][{d}]\n", .{idx});
+        std.debug.print("[live] id={d}\n", .{sub.id});
+        try common.livePrintOptionalField(allocator, "language_raw", sub.language_raw);
+        try common.livePrintOptionalField(allocator, "language_code", sub.language_code);
+        try common.livePrintOptionalField(allocator, "release_info", sub.release_info);
+        try common.livePrintOptionalField(allocator, "release_type", sub.release_type);
+        try common.livePrintField(allocator, "details_path", sub.details_path);
+        try common.livePrintOptionalField(allocator, "download_token", sub.download_token);
+        try common.livePrintOptionalField(allocator, "download_url", sub.download_url);
+    }
     try suite.expectPositive(subtitles.subtitles.len);
 
     const first = subtitles.subtitles[0];
@@ -229,6 +431,11 @@ fn runTvSubtitles(allocator: std.mem.Allocator, client: *std.http.Client) !void 
 
     var search = try scraper.searchWithOptions("Friends", .{ .max_pages = 2 });
     defer search.deinit();
+    for (search.items, 0..) |item, idx| {
+        std.debug.print("[live][tvsubtitles.net][search][{d}]\n", .{idx});
+        try common.livePrintField(allocator, "title", item.title);
+        try common.livePrintField(allocator, "show_url", item.show_url);
+    }
     try suite.expectPositive(search.items.len);
 
     const chosen_idx = pickFirstContaining(tvsubtitles_net.SearchItem, search.items, "friends") orelse 0;
@@ -242,6 +449,16 @@ fn runTvSubtitles(allocator: std.mem.Allocator, client: *std.http.Client) !void 
         .resolve_download_links = false,
     });
     defer subtitles.deinit();
+    for (subtitles.subtitles, 0..) |sub, idx| {
+        std.debug.print("[live][tvsubtitles.net][subtitle][{d}]\n", .{idx});
+        try common.livePrintOptionalField(allocator, "language_code", sub.language_code);
+        try common.livePrintOptionalField(allocator, "episode_title", sub.episode_title);
+        try common.livePrintField(allocator, "filename", sub.filename);
+        try common.livePrintField(allocator, "season_page_url", sub.season_page_url);
+        try common.livePrintField(allocator, "subtitle_page_url", sub.subtitle_page_url);
+        try common.livePrintField(allocator, "download_page_url", sub.download_page_url);
+        try common.livePrintOptionalField(allocator, "direct_zip_url", sub.direct_zip_url);
+    }
     try suite.expectPositive(subtitles.subtitles.len);
 
     const first = subtitles.subtitles[0];

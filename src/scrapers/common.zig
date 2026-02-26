@@ -257,6 +257,64 @@ pub fn shouldRunNamedLiveTest(allocator: Allocator, name: []const u8) bool {
     return !std.mem.eql(u8, value, "0");
 }
 
+pub fn sanitizeUtf8ForLog(allocator: Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < input.len) {
+        const first = input[i];
+        const seq_len = std.unicode.utf8ByteSequenceLength(first) catch {
+            try appendHexEscape(allocator, &out, first);
+            i += 1;
+            continue;
+        };
+
+        if (i + seq_len > input.len) {
+            try appendHexEscape(allocator, &out, first);
+            i += 1;
+            continue;
+        }
+
+        const segment = input[i .. i + seq_len];
+        _ = std.unicode.utf8Decode(segment) catch {
+            try appendHexEscape(allocator, &out, first);
+            i += 1;
+            continue;
+        };
+
+        if (seq_len == 1 and (first < 0x20 or first == 0x7F)) {
+            switch (first) {
+                '\n' => try out.appendSlice(allocator, "\\n"),
+                '\r' => try out.appendSlice(allocator, "\\r"),
+                '\t' => try out.appendSlice(allocator, "\\t"),
+                else => try appendHexEscape(allocator, &out, first),
+            }
+            i += 1;
+            continue;
+        }
+
+        try out.appendSlice(allocator, segment);
+        i += seq_len;
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn livePrintField(allocator: Allocator, label: []const u8, value: []const u8) !void {
+    const safe = try sanitizeUtf8ForLog(allocator, value);
+    defer allocator.free(safe);
+    std.debug.print("[live] {s}: {s}\n", .{ label, safe });
+}
+
+pub fn livePrintOptionalField(allocator: Allocator, label: []const u8, value: ?[]const u8) !void {
+    if (value) |v| {
+        try livePrintField(allocator, label, v);
+        return;
+    }
+    std.debug.print("[live] {s}: <null>\n", .{label});
+}
+
 pub fn getAttributeValueSafe(node: anytype, attr_name: []const u8) ?[]const u8 {
     return node.getAttributeValue(attr_name);
 }
@@ -344,6 +402,11 @@ fn sleepBackoff(initial_ms: u64, attempt: usize) void {
     const shift: u6 = @intCast(@min(attempt, 6));
     const multiplier = (@as(u64, 1) << shift);
     std.Thread.sleep(initial_ms * multiplier * std.time.ns_per_ms);
+}
+
+fn appendHexEscape(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), value: u8) !void {
+    const hex = "0123456789ABCDEF";
+    try out.appendSlice(allocator, &.{ '\\', 'x', hex[value >> 4], hex[value & 0x0F] });
 }
 
 fn parseBoolLike(attr_name: []const u8, value: []const u8) ?bool {
@@ -478,4 +541,23 @@ test "table helpers find columns and extract cells" {
     const uploaded = try tableCellTextByHeaderAliases(a, row, header_row, &.{ "uploaded at", "upload date" });
     try std.testing.expect(uploaded != null);
     try std.testing.expectEqualStrings("2024-01-01", uploaded.?);
+}
+
+test "sanitize utf8 for log escapes invalid bytes" {
+    const allocator = std.testing.allocator;
+    const raw = [_]u8{ 'A', 0xFF, 'B', 0xC3 };
+    const safe = try sanitizeUtf8ForLog(allocator, &raw);
+    defer allocator.free(safe);
+
+    try std.testing.expectEqualStrings("A\\xFFB\\xC3", safe);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(safe));
+}
+
+test "sanitize utf8 for log preserves valid unicode" {
+    const allocator = std.testing.allocator;
+    const safe = try sanitizeUtf8ForLog(allocator, "Cрпски");
+    defer allocator.free(safe);
+
+    try std.testing.expectEqualStrings("Cрпски", safe);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(safe));
 }

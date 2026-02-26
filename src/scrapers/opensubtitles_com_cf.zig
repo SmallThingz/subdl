@@ -288,7 +288,7 @@ fn acquireSessionViaAllDriver(allocator: Allocator, domain: []const u8, challeng
 
         var page = browser.page();
         page.navigate(challenge_url) catch continue;
-        browser.base.waitFor(.dom_ready, 120_000) catch {};
+        _ = browser.base.waitFor(.{ .dom_ready = {} }, .{ .timeout_ms = 120_000 }) catch {};
 
         if (!headless) {
             std.log.info("cloudflare verification opened for {s}; complete challenge if prompted", .{challenge_url});
