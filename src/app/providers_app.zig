@@ -1268,9 +1268,13 @@ pub fn downloadSubtitleWithProgress(
     defer allocator.free(response.body);
     if (response.status != .ok) return error.UnexpectedHttpStatus;
 
+    const preferred_name = subtitle.filename orelse inferFilenameFromUrl(url) orelse "subtitle";
+    const archive_kind = detectArchiveKind(preferred_name, url, response.body);
+    const raw_name = try ensureFilenameExtension(allocator, preferred_name, url, archive_kind, ".srt");
+    defer allocator.free(raw_name);
+
     emitDownloadPhase(progress, .writing_output);
     try std.fs.cwd().makePath(out_dir);
-    const raw_name = subtitle.filename orelse inferFilenameFromUrl(url) orelse "subtitle.bin";
     const safe_name = try sanitizeFilename(allocator, raw_name);
     defer allocator.free(safe_name);
 
@@ -1280,7 +1284,6 @@ pub fn downloadSubtitleWithProgress(
     defer file.close();
     try file.writeAll(response.body);
 
-    const archive_kind = detectArchiveKind(safe_name, url, response.body);
     if (archive_kind == .none) {
         return .{
             .file_path = output_path,
@@ -1460,7 +1463,9 @@ fn downloadSubtitlecatTranslated(
     emitDownloadPhase(progress, .writing_output);
     try std.fs.cwd().makePath(out_dir);
     const preferred_name = if (subtitle.filename) |name| name else token.filename;
-    const safe_name = try sanitizeFilename(allocator, preferred_name);
+    const raw_name = try ensureFilenameExtension(allocator, preferred_name, token.source_url, .none, ".srt");
+    defer allocator.free(raw_name);
+    const safe_name = try sanitizeFilename(allocator, raw_name);
     defer allocator.free(safe_name);
 
     const output_path = try nextAvailableOutputPath(allocator, out_dir, safe_name);
@@ -1939,6 +1944,35 @@ fn inferFilenameFromUrl(url: []const u8) ?[]const u8 {
     return trimmed[slash + 1 ..];
 }
 
+fn ensureFilenameExtension(
+    allocator: Allocator,
+    preferred_name: []const u8,
+    source_url: []const u8,
+    archive_kind: ArchiveKind,
+    fallback_ext: []const u8,
+) ![]u8 {
+    if (filenameExtension(preferred_name) != null) return try allocator.dupe(u8, preferred_name);
+
+    if (inferFilenameFromUrl(source_url)) |url_name| {
+        if (filenameExtension(url_name)) |ext| {
+            return try std.fmt.allocPrint(allocator, "{s}{s}", .{ preferred_name, ext });
+        }
+    }
+
+    const ext = switch (archive_kind) {
+        .zip => ".zip",
+        .rar => ".rar",
+        .none => fallback_ext,
+    };
+    return try std.fmt.allocPrint(allocator, "{s}{s}", .{ preferred_name, ext });
+}
+
+fn filenameExtension(name: []const u8) ?[]const u8 {
+    const ext = std.fs.path.extension(name);
+    if (ext.len <= 1) return null;
+    return ext;
+}
+
 fn sanitizeFilename(allocator: Allocator, input: []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -2277,6 +2311,32 @@ test "subtitleLabel uses Without release fallback for missing filename" {
     const c = try subtitleLabel(allocator, "  ", " \t ", null);
     defer allocator.free(c);
     try std.testing.expectEqualStrings("Without release [no direct download]", c);
+}
+
+test "ensureFilenameExtension uses url extension when missing in preferred name" {
+    const allocator = std.testing.allocator;
+    const name = try ensureFilenameExtension(
+        allocator,
+        "S01E01-13",
+        "https://api.subsource.net/v1/subtitle/download/abc.zip",
+        .none,
+        ".srt",
+    );
+    defer allocator.free(name);
+    try std.testing.expectEqualStrings("S01E01-13.zip", name);
+}
+
+test "ensureFilenameExtension falls back to archive extension from kind" {
+    const allocator = std.testing.allocator;
+    const name = try ensureFilenameExtension(
+        allocator,
+        "subtitle_pack",
+        "https://api.example.com/download/token",
+        .rar,
+        ".srt",
+    );
+    defer allocator.free(name);
+    try std.testing.expectEqualStrings("subtitle_pack.rar", name);
 }
 
 const ProviderSmokeState = struct {

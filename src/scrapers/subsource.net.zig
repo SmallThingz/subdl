@@ -106,17 +106,23 @@ pub const Scraper = struct {
         const a = arena.allocator();
 
         const query_trimmed = common.trimAscii(query);
-        var query_used = try resolveSearchQuery(self.client, a, query);
         var auth = try resolveAuth(a, options.cf_clearance, options.user_agent, false, options.auto_cloudflare_session);
 
         var out: std.ArrayListUnmanaged(SearchItem) = .empty;
         var seen = std.AutoHashMapUnmanaged(i64, void).empty;
+        var query_used: []const u8 = if (query_trimmed.len > 0)
+            try a.dupe(u8, query_trimmed)
+        else
+            try a.dupe(u8, query);
+
+        // Keep broad queries broad. Only try the suggestion endpoint as fallback.
         try appendSearchResults(self.client, a, &out, &seen, query_used, options, &auth);
-        // SubSource's suggestion endpoint can occasionally return a title that does not
-        // map back to the desired result set. Fall back to the raw query when needed.
-        if (out.items.len == 0 and query_trimmed.len > 0 and !std.mem.eql(u8, query_trimmed, query_used)) {
-            query_used = try a.dupe(u8, query_trimmed);
-            try appendSearchResults(self.client, a, &out, &seen, query_used, options, &auth);
+        if (out.items.len == 0 and query_trimmed.len > 0) {
+            const suggested = try resolveSearchQuery(self.client, a, query_trimmed);
+            if (!std.mem.eql(u8, suggested, query_used)) {
+                query_used = suggested;
+                try appendSearchResults(self.client, a, &out, &seen, query_used, options, &auth);
+            }
         }
 
         return .{
