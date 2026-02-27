@@ -339,7 +339,7 @@ fn downloadTaskMain(task: *DownloadTask) void {
         .on_units = onDownloadProgressUnits,
     };
 
-    task.result = app.downloadSubtitleWithProgress(std.heap.page_allocator, &client, task.subtitle, task.out_dir, &progress) catch |err| {
+    task.result = app.downloadSubtitleWithProgressAndOptions(std.heap.page_allocator, &client, task.subtitle, task.out_dir, &progress, .{}) catch |err| {
         task.err = err;
         task.done.store(1, .release);
         return;

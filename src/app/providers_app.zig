@@ -96,18 +96,18 @@ pub fn providerSupportsSubtitlesPagination(provider: Provider) bool {
 }
 
 pub fn parseProvider(value: []const u8) ?Provider {
-    if (matchesProvider(value, "subdl") or matchesProvider(value, "subdl_com")) return .subdl_com;
+    if (matchesProvider(value, "subdl_com")) return .subdl_com;
     if (matchesProvider(value, "opensubtitles_com")) return .opensubtitles_com;
     if (matchesProvider(value, "opensubtitles_org")) return .opensubtitles_org;
     if (matchesProvider(value, "moviesubtitles_org")) return .moviesubtitles_org;
     if (matchesProvider(value, "moviesubtitlesrt_com")) return .moviesubtitlesrt_com;
     if (matchesProvider(value, "podnapisi_net")) return .podnapisi_net;
-    if (matchesProvider(value, "yifysubtitles_ch") or matchesProvider(value, "yify")) return .yifysubtitles_ch;
-    if (matchesProvider(value, "subtitlecat_com") or matchesProvider(value, "subtitlecat")) return .subtitlecat_com;
-    if (matchesProvider(value, "isubtitles_org") or matchesProvider(value, "isubtitles")) return .isubtitles_org;
-    if (matchesProvider(value, "my_subs_co") or matchesProvider(value, "my_subs")) return .my_subs_co;
-    if (matchesProvider(value, "subsource_net") or matchesProvider(value, "subsource")) return .subsource_net;
-    if (matchesProvider(value, "tvsubtitles_net") or matchesProvider(value, "tvsubtitles")) return .tvsubtitles_net;
+    if (matchesProvider(value, "yifysubtitles_ch")) return .yifysubtitles_ch;
+    if (matchesProvider(value, "subtitlecat_com")) return .subtitlecat_com;
+    if (matchesProvider(value, "isubtitles_org")) return .isubtitles_org;
+    if (matchesProvider(value, "my_subs_co")) return .my_subs_co;
+    if (matchesProvider(value, "subsource_net")) return .subsource_net;
+    if (matchesProvider(value, "tvsubtitles_net")) return .tvsubtitles_net;
     return null;
 }
 
@@ -1247,10 +1247,6 @@ fn titleFromRef(ref: SearchRef) []const u8 {
     };
 }
 
-pub fn downloadSubtitle(allocator: Allocator, client: *std.http.Client, subtitle: SubtitleChoice, out_dir: []const u8) !DownloadResult {
-    return downloadSubtitleWithOptions(allocator, client, subtitle, out_dir, .{});
-}
-
 pub fn downloadSubtitleWithOptions(
     allocator: Allocator,
     client: *std.http.Client,
@@ -1259,16 +1255,6 @@ pub fn downloadSubtitleWithOptions(
     options: DownloadOptions,
 ) !DownloadResult {
     return downloadSubtitleWithProgressAndOptions(allocator, client, subtitle, out_dir, null, options);
-}
-
-pub fn downloadSubtitleWithProgress(
-    allocator: Allocator,
-    client: *std.http.Client,
-    subtitle: SubtitleChoice,
-    out_dir: []const u8,
-    progress: ?*const DownloadProgress,
-) !DownloadResult {
-    return downloadSubtitleWithProgressAndOptions(allocator, client, subtitle, out_dir, progress, .{});
 }
 
 pub fn downloadSubtitleWithProgressAndOptions(
@@ -2298,6 +2284,16 @@ test "parseProvider accepts dotted/hyphenated js provider names" {
     try std.testing.expect(parseProvider("my-subs.co") == .my_subs_co);
     try std.testing.expect(parseProvider("subsource.net") == .subsource_net);
     try std.testing.expect(parseProvider("tvsubtitles.net") == .tvsubtitles_net);
+}
+
+test "parseProvider rejects deprecated short aliases" {
+    try std.testing.expect(parseProvider("subdl") == null);
+    try std.testing.expect(parseProvider("yify") == null);
+    try std.testing.expect(parseProvider("subtitlecat") == null);
+    try std.testing.expect(parseProvider("isubtitles") == null);
+    try std.testing.expect(parseProvider("my_subs") == null);
+    try std.testing.expect(parseProvider("subsource") == null);
+    try std.testing.expect(parseProvider("tvsubtitles") == null);
 }
 
 test "provider pagination support flags" {

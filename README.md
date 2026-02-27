@@ -70,6 +70,14 @@ zig build build-all-targets
 zig build build-all-targets -Doptimize=ReleaseFast -Dstrip=true
 ```
 
+Targets produced by `build-all-targets`:
+
+- `scrapers-x86_64-linux-gnu`
+- `scrapers-aarch64-linux-gnu`
+- `scrapers-x86_64-macos-none`
+- `scrapers-aarch64-macos-none`
+- `scrapers-x86_64-windows-gnu.exe`
+
 Tunable build flags:
 
 - `-Doptimize=Debug|ReleaseSafe|ReleaseFast|ReleaseSmall`

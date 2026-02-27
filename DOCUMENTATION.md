@@ -56,6 +56,14 @@ zig build build-all-targets
 zig build build-all-targets -Doptimize=ReleaseFast -Dstrip=true
 ```
 
+`build-all-targets` currently emits:
+
+- `scrapers-x86_64-linux-gnu`
+- `scrapers-aarch64-linux-gnu`
+- `scrapers-x86_64-macos-none`
+- `scrapers-aarch64-macos-none`
+- `scrapers-x86_64-windows-gnu.exe`
+
 ## Provider IDs
 
 The canonical provider IDs accepted by the app layer and CLI are:
@@ -73,7 +81,7 @@ The canonical provider IDs accepted by the app layer and CLI are:
 - `subsource_net`
 - `tvsubtitles_net`
 
-Alias parsing is supported for selected providers (for example `subsource`, `isubtitles`, `subtitlecat`, `yify`).
+Only canonical provider IDs (and dotted/hyphenated site forms like `subsource.net`) are accepted.
 
 ## Pagination Support Matrix
 
@@ -110,7 +118,7 @@ scrapers --list-providers
 
 Options:
 
-- `--provider <name>`: provider ID (or accepted alias)
+- `--provider <name>`: provider ID
 - `--query <text>`: search query
 - `--title-index <N>`: selected title from search results (default `0`)
 - `--subtitle-index <N>`: selected subtitle row (default: first downloadable row)
@@ -221,8 +229,8 @@ Common app-layer entry points:
 - `providers_app.searchPage()`
 - `providers_app.fetchSubtitles()`
 - `providers_app.fetchSubtitlesPage()`
-- `providers_app.downloadSubtitle()`
-- `providers_app.downloadSubtitleWithProgress()`
+- `providers_app.downloadSubtitleWithOptions()`
+- `providers_app.downloadSubtitleWithProgressAndOptions()`
 
 ### Library Example: Search -> Subtitle Rows -> Download
 
@@ -260,11 +268,12 @@ pub fn main() !void {
     const selected = subtitles.items[0];
     if (selected.download_url == null) return;
 
-    var result = try scrapers.providers_app.downloadSubtitle(
+    var result = try scrapers.providers_app.downloadSubtitleWithOptions(
         allocator,
         &client,
         selected,
         "downloads",
+        .{ .extract_archive = false },
     );
     defer result.deinit(allocator);
 
@@ -344,12 +353,13 @@ pub fn main() !void {
         .on_units = onUnits,
     };
 
-    var result = try scrapers.providers_app.downloadSubtitleWithProgress(
+    var result = try scrapers.providers_app.downloadSubtitleWithProgressAndOptions(
         allocator,
         &client,
         subs.items[0],
         "downloads",
         &progress,
+        .{ .extract_archive = false },
     );
     defer result.deinit(allocator);
 }

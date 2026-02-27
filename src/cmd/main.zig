@@ -3,11 +3,11 @@ const cli = @import("cli.zig");
 const tui = @import("tui.zig");
 
 pub fn main() !void {
-    const args = try std.process.argsAlloc(std.heap.page_allocator);
-    defer std.process.argsFree(std.heap.page_allocator, args);
+    var args = try std.process.argsWithAllocator(std.heap.page_allocator);
+    defer args.deinit();
 
-    if (args.len >= 2) {
-        const mode = args[1];
+    _ = args.next();
+    if (args.next()) |mode| {
         if (std.mem.eql(u8, mode, "tui") or std.mem.eql(u8, mode, "--tui")) {
             try tui.main();
             return;
