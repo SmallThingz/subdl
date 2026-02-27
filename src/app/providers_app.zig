@@ -1463,17 +1463,27 @@ fn runProviderSmokeWorker(state: *ProviderSmokeState) void {
     var client: std.http.Client = .{ .allocator = allocator };
     defer client.deinit();
 
+    var phase = common.LivePhase.init(providerName(state.provider), "providers_app_tui_smoke");
+    phase.start();
     runProviderTuiSmoke(allocator, &client, state.provider) catch |err| {
+        phase.finish();
         state.err = err;
+        return;
     };
+    phase.finish();
 }
 
 fn runProviderTuiSmoke(allocator: std.mem.Allocator, client: *std.http.Client, provider: Provider) !void {
     const query = liveQueryForProvider(provider);
     std.debug.print("[live][providers_app][{s}] query={s}\n", .{ providerName(provider), query });
 
+    std.debug.print("[live][providers_app][{s}] phase=search_start\n", .{providerName(provider)});
     var search_response = try search(allocator, client, provider, query);
     defer search_response.deinit();
+    std.debug.print("[live][providers_app][{s}] phase=search_done items={d}\n", .{
+        providerName(provider),
+        search_response.items.len,
+    });
 
     if (search_response.items.len == 0) return error.TestUnexpectedResult;
     std.debug.print("[live][providers_app][{s}] search_items={d}\n", .{ providerName(provider), search_response.items.len });
@@ -1488,7 +1498,12 @@ fn runProviderTuiSmoke(allocator: std.mem.Allocator, client: *std.http.Client, p
     }
 
     var chosen_idx: ?usize = null;
+    std.debug.print("[live][providers_app][{s}] phase=preview_subtitles_scan_start\n", .{providerName(provider)});
     for (search_response.items, 0..) |item, idx| {
+        std.debug.print("[live][providers_app][{s}] phase=preview_subtitles_fetch idx={d}\n", .{
+            providerName(provider),
+            idx,
+        });
         var subtitles_preview = fetchSubtitles(allocator, client, item.ref) catch continue;
         defer subtitles_preview.deinit();
 
@@ -1498,14 +1513,26 @@ fn runProviderTuiSmoke(allocator: std.mem.Allocator, client: *std.http.Client, p
         }
     }
     if (chosen_idx == null) return error.TestUnexpectedResult;
+    std.debug.print("[live][providers_app][{s}] phase=preview_subtitles_scan_done chosen={d}\n", .{
+        providerName(provider),
+        chosen_idx.?,
+    });
 
     const picked_search = search_response.items[chosen_idx.?];
     std.debug.print("[live][providers_app][{s}] chosen_search={d}\n", .{ providerName(provider), chosen_idx.? });
     try common.livePrintField(allocator, "chosen_search_title", picked_search.title);
     try common.livePrintField(allocator, "chosen_search_url", searchRefLogUrl(picked_search.ref));
 
+    std.debug.print("[live][providers_app][{s}] phase=fetch_chosen_subtitles_start idx={d}\n", .{
+        providerName(provider),
+        chosen_idx.?,
+    });
     var subtitles = try fetchSubtitles(allocator, client, picked_search.ref);
     defer subtitles.deinit();
+    std.debug.print("[live][providers_app][{s}] phase=fetch_chosen_subtitles_done items={d}\n", .{
+        providerName(provider),
+        subtitles.items.len,
+    });
 
     if (subtitles.items.len == 0) return error.TestUnexpectedResult;
     try validateUtfNoReplacement(subtitles.title);
@@ -1616,45 +1643,35 @@ fn runProviderTuiSmoke(allocator: std.mem.Allocator, client: *std.http.Client, p
     });
 }
 
-test "live providers_app tui-path smoke: non-captcha providers" {
-    if (!shouldRunTuiLiveSmoke(std.testing.allocator)) return error.SkipZigTest;
-    std.debug.print("[live][providers_app] tui-path smoke enabled\n", .{});
+const tui_smoke_providers = [_]Provider{
+    .subdl_com,
+    .isubtitles_org,
+    .moviesubtitles_org,
+    .moviesubtitlesrt_com,
+    .my_subs_co,
+    .podnapisi_net,
+    .subtitlecat_com,
+    .subsource_net,
+    .tvsubtitles_net,
+};
 
-    const filter = common.liveProviderFilter();
-    const smoke_providers = [_]Provider{
-        .subdl_com,
-        .isubtitles_org,
-        .moviesubtitles_org,
-        .moviesubtitlesrt_com,
-        .my_subs_co,
-        .podnapisi_net,
-        .subtitlecat_com,
-        .subsource_net,
-        .tvsubtitles_net,
-    };
+fn runProvidersSmokeBatch(allocator: std.mem.Allocator, selected: []const Provider) !void {
+    if (selected.len == 0) return error.SkipZigTest;
+    std.debug.print("[live][providers_app] starting threaded smoke batch count={d}\n", .{selected.len});
 
-    var selected: std.ArrayListUnmanaged(Provider) = .empty;
-    defer selected.deinit(std.testing.allocator);
-    for (smoke_providers) |provider| {
-        if (!common.providerMatchesLiveFilter(filter, providerName(provider))) continue;
-        try selected.append(std.testing.allocator, provider);
-    }
-    if (selected.items.len == 0) return error.SkipZigTest;
-    std.debug.print("[live][providers_app] starting threaded smoke batch count={d}\n", .{selected.items.len});
-
-    const states = try std.testing.allocator.alloc(ProviderSmokeState, selected.items.len);
-    defer std.testing.allocator.free(states);
-    for (selected.items, 0..) |provider, idx| {
+    const states = try allocator.alloc(ProviderSmokeState, selected.len);
+    defer allocator.free(states);
+    for (selected, 0..) |provider, idx| {
         states[idx] = .{ .provider = provider };
     }
 
-    const threads = try std.testing.allocator.alloc(std.Thread, selected.items.len);
-    defer std.testing.allocator.free(threads);
+    const threads = try allocator.alloc(std.Thread, selected.len);
+    defer allocator.free(threads);
     for (threads, states) |*thread, *state| {
         thread.* = try std.Thread.spawn(.{}, runProviderSmokeWorker, .{state});
     }
     for (threads) |thread| thread.join();
-    std.debug.print("[live][providers_app] threaded smoke batch complete count={d}\n", .{selected.items.len});
+    std.debug.print("[live][providers_app] threaded smoke batch complete count={d}\n", .{selected.len});
 
     var first_err: ?anyerror = null;
     for (states) |state| {
@@ -1667,4 +1684,113 @@ test "live providers_app tui-path smoke: non-captcha providers" {
         }
     }
     if (first_err) |err| return err;
+}
+
+fn isWholeSelection(filter: ?[]const u8) bool {
+    const f = filter orelse return true;
+    const trimmed = std.mem.trim(u8, f, " \t\r\n");
+    if (trimmed.len == 0) return true;
+    if (std.mem.indexOfScalar(u8, trimmed, ',') != null) return true;
+    if (std.mem.eql(u8, trimmed, "*")) return true;
+    if (std.ascii.eqlIgnoreCase(trimmed, "all")) return true;
+    return false;
+}
+
+fn liveBatchEnabled() bool {
+    const value = std.posix.getenv("SCRAPERS_LIVE_BATCH") orelse return false;
+    return value.len > 0 and !std.mem.eql(u8, value, "0");
+}
+
+fn isCaptchaProvider(provider: Provider) bool {
+    return switch (provider) {
+        .opensubtitles_com, .opensubtitles_org, .yifysubtitles_ch => true,
+        else => false,
+    };
+}
+
+fn shouldRunSingleProviderSmoke(provider: Provider) bool {
+    if (!shouldRunTuiLiveSmoke(std.testing.allocator)) return false;
+    if (isCaptchaProvider(provider) and !common.liveIncludeCaptchaEnabled()) return false;
+    return common.providerMatchesLiveFilter(common.liveProviderFilter(), providerName(provider));
+}
+
+fn runSingleProviderSmokeTest(provider: Provider) !void {
+    if (!shouldRunSingleProviderSmoke(provider)) return error.SkipZigTest;
+    std.debug.print("[live][providers_app][{s}] test_start\n", .{providerName(provider)});
+    defer std.debug.print("[live][providers_app][{s}] test_end\n", .{providerName(provider)});
+    const selected = [_]Provider{provider};
+    try runProvidersSmokeBatch(std.testing.allocator, &selected);
+}
+
+test "live providers_app tui-path smoke: non-captcha providers" {
+    if (!shouldRunTuiLiveSmoke(std.testing.allocator)) return error.SkipZigTest;
+    if (!liveBatchEnabled()) return error.SkipZigTest;
+    std.debug.print("[live][providers_app] tui-path smoke enabled\n", .{});
+
+    const filter = common.liveProviderFilter();
+    const whole_selection = isWholeSelection(filter);
+    if (filter) |f| {
+        std.debug.print("[live][providers_app] filter={s} is_whole={any}\n", .{ f, whole_selection });
+    } else {
+        std.debug.print("[live][providers_app] filter=<null> is_whole={any}\n", .{whole_selection});
+    }
+    if (!whole_selection) return error.SkipZigTest;
+
+    var selected: std.ArrayListUnmanaged(Provider) = .empty;
+    defer selected.deinit(std.testing.allocator);
+    for (tui_smoke_providers) |provider| {
+        if (isCaptchaProvider(provider) and !common.liveIncludeCaptchaEnabled()) continue;
+        if (!common.providerMatchesLiveFilter(filter, providerName(provider))) continue;
+        try selected.append(std.testing.allocator, provider);
+    }
+    if (selected.items.len == 0) return error.SkipZigTest;
+    try runProvidersSmokeBatch(std.testing.allocator, selected.items);
+}
+
+test "live providers_app tui-path smoke provider: subdl.com" {
+    try runSingleProviderSmokeTest(.subdl_com);
+}
+
+test "live providers_app tui-path smoke provider: isubtitles.org" {
+    try runSingleProviderSmokeTest(.isubtitles_org);
+}
+
+test "live providers_app tui-path smoke provider: moviesubtitles.org" {
+    try runSingleProviderSmokeTest(.moviesubtitles_org);
+}
+
+test "live providers_app tui-path smoke provider: moviesubtitlesrt.com" {
+    try runSingleProviderSmokeTest(.moviesubtitlesrt_com);
+}
+
+test "live providers_app tui-path smoke provider: my-subs.co" {
+    try runSingleProviderSmokeTest(.my_subs_co);
+}
+
+test "live providers_app tui-path smoke provider: podnapisi.net" {
+    try runSingleProviderSmokeTest(.podnapisi_net);
+}
+
+test "live providers_app tui-path smoke provider: subtitlecat.com" {
+    try runSingleProviderSmokeTest(.subtitlecat_com);
+}
+
+test "live providers_app tui-path smoke provider: subsource.net" {
+    try runSingleProviderSmokeTest(.subsource_net);
+}
+
+test "live providers_app tui-path smoke provider: tvsubtitles.net" {
+    try runSingleProviderSmokeTest(.tvsubtitles_net);
+}
+
+test "live providers_app tui-path smoke provider: opensubtitles.com" {
+    try runSingleProviderSmokeTest(.opensubtitles_com);
+}
+
+test "live providers_app tui-path smoke provider: opensubtitles.org" {
+    try runSingleProviderSmokeTest(.opensubtitles_org);
+}
+
+test "live providers_app tui-path smoke provider: yifysubtitles.ch" {
+    try runSingleProviderSmokeTest(.yifysubtitles_ch);
 }

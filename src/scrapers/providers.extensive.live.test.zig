@@ -13,31 +13,101 @@ const subtitlecat_com = @import("subtitlecat.com.zig");
 const subsource_net = @import("subsource.net.zig");
 const tvsubtitles_net = @import("tvsubtitles.net.zig");
 
-test "extensive live suite: non-captcha providers" {
-    if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
-    if (!suite.shouldRunExtensiveLiveSuite(std.testing.allocator)) return error.SkipZigTest;
+test "extensive live suite provider: subdl.com" {
+    if (!extensiveProbeEnabled("subdl.com")) return error.SkipZigTest;
+    try runExtensiveProbe("subdl.com", runSubdl);
+}
 
-    const probes = [_]suite.ProviderProbe{
-        .{ .name = "subdl.com", .run = runSubdl },
-        .{ .name = "isubtitles.org", .run = runISubtitles },
-        .{ .name = "moviesubtitles.org", .run = runMovieSubtitlesOrg },
-        .{ .name = "moviesubtitlesrt.com", .run = runMovieSubtitlesRt },
-        .{ .name = "my-subs.co", .run = runMySubs },
-        .{ .name = "podnapisi.net", .run = runPodnapisi },
-        .{ .name = "subtitlecat.com", .run = runSubtitleCat },
-        .{ .name = "subsource.net", .run = runSubsource },
-        .{ .name = "tvsubtitles.net", .run = runTvSubtitles },
-    };
+test "extensive live suite provider: isubtitles.org" {
+    if (!extensiveProbeEnabled("isubtitles.org")) return error.SkipZigTest;
+    try runExtensiveProbe("isubtitles.org", runISubtitles);
+}
 
-    try suite.runSuite(std.testing.allocator, &probes);
+test "extensive live suite provider: moviesubtitles.org" {
+    if (!extensiveProbeEnabled("moviesubtitles.org")) return error.SkipZigTest;
+    try runExtensiveProbe("moviesubtitles.org", runMovieSubtitlesOrg);
+}
+
+test "extensive live suite provider: moviesubtitlesrt.com" {
+    if (!extensiveProbeEnabled("moviesubtitlesrt.com")) return error.SkipZigTest;
+    try runExtensiveProbe("moviesubtitlesrt.com", runMovieSubtitlesRt);
+}
+
+test "extensive live suite provider: my-subs.co" {
+    if (!extensiveProbeEnabled("my-subs.co")) return error.SkipZigTest;
+    try runExtensiveProbe("my-subs.co", runMySubs);
+}
+
+test "extensive live suite provider: podnapisi.net" {
+    if (!extensiveProbeEnabled("podnapisi.net")) return error.SkipZigTest;
+    try runExtensiveProbe("podnapisi.net", runPodnapisi);
+}
+
+test "extensive live suite provider: subtitlecat.com" {
+    if (!extensiveProbeEnabled("subtitlecat.com")) return error.SkipZigTest;
+    try runExtensiveProbe("subtitlecat.com", runSubtitleCat);
+}
+
+test "extensive live suite provider: subsource.net" {
+    if (!extensiveProbeEnabled("subsource.net")) return error.SkipZigTest;
+    try runExtensiveProbe("subsource.net", runSubsource);
+}
+
+test "extensive live suite provider: tvsubtitles.net" {
+    if (!extensiveProbeEnabled("tvsubtitles.net")) return error.SkipZigTest;
+    try runExtensiveProbe("tvsubtitles.net", runTvSubtitles);
+}
+
+fn extensiveProbeEnabled(provider_name: []const u8) bool {
+    if (!common.shouldRunLiveTests(std.testing.allocator)) return false;
+    if (!suite.shouldRunExtensiveLiveSuite(std.testing.allocator)) return false;
+    return common.providerMatchesLiveFilter(common.liveProviderFilter(), provider_name);
+}
+
+fn runExtensiveProbe(
+    provider_name: []const u8,
+    run: *const fn (allocator: std.mem.Allocator, client: *std.http.Client) anyerror!void,
+) !void {
+    const started_ms = std.time.milliTimestamp();
+    std.debug.print("[live][extensive][{s}] test_start\n", .{provider_name});
+    defer {
+        const elapsed_ms = std.time.milliTimestamp() - started_ms;
+        std.debug.print("[live][extensive][{s}] test_end elapsed_ms={d}\n", .{ provider_name, elapsed_ms });
+    }
+
+    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    try run(allocator, &client);
+}
+
+fn phaseStart(provider: []const u8, phase: []const u8) i64 {
+    const started_ms = std.time.milliTimestamp();
+    std.debug.print("[live][phase][{s}] start {s}\n", .{ provider, phase });
+    return started_ms;
+}
+
+fn phaseDone(provider: []const u8, phase: []const u8, started_ms: i64) void {
+    const elapsed_ms = std.time.milliTimestamp() - started_ms;
+    std.debug.print("[live][phase][{s}] done {s} elapsed_ms={d}\n", .{
+        provider,
+        phase,
+        elapsed_ms,
+    });
 }
 
 fn runSubdl(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     var scraper = subdl_com.Scraper.initWithOptions(allocator, client, .{ .include_empty_subtitle_groups = false });
     defer scraper.deinit();
 
+    const search_started_ms = phaseStart("subdl.com", "search");
     var search = try scraper.search("The Matrix");
     defer search.deinit();
+    phaseDone("subdl.com", "search", search_started_ms);
     for (search.items, 0..) |item, idx| {
         std.debug.print("[live][subdl.com][search][{d}]\n", .{idx});
         std.debug.print("[live] media_type={s}\n", .{@tagName(item.media_type)});
@@ -54,8 +124,10 @@ fn runSubdl(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     try suite.expectNonEmpty(item.name);
     try suite.expectNonEmpty(item.link);
 
+    const movie_started_ms = phaseStart("subdl.com", "fetch_movie");
     var movie = try scraper.fetchMovieByLink(item.link);
     defer movie.deinit();
+    phaseDone("subdl.com", "fetch_movie", movie_started_ms);
     std.debug.print("[live][subdl.com][movie]\n", .{});
     std.debug.print("[live] media_type={s}\n", .{@tagName(movie.movie.media_type)});
     std.debug.print("[live] sd_id={d}\n", .{movie.movie.sd_id});
@@ -116,8 +188,10 @@ fn runSubdl(allocator: std.mem.Allocator, client: *std.http.Client) !void {
 fn runISubtitles(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     var scraper = isubtitles_org.Scraper.init(allocator, client);
 
+    const search_started_ms = phaseStart("isubtitles.org", "search");
     var search = try scraper.searchWithOptions("The Matrix", .{ .max_pages = 2 });
     defer search.deinit();
+    phaseDone("isubtitles.org", "search", search_started_ms);
     for (search.items, 0..) |item, idx| {
         std.debug.print("[live][isubtitles.org][search][{d}]\n", .{idx});
         try common.livePrintField(allocator, "title", item.title);
@@ -131,8 +205,10 @@ fn runISubtitles(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     try suite.expectNonEmpty(match.title);
     try suite.expectHttpUrl(match.details_url);
 
+    const subtitles_started_ms = phaseStart("isubtitles.org", "fetch_subtitles");
     var subtitles = try scraper.fetchSubtitlesByMovieLinkWithOptions(match.details_url, .{ .max_pages = 2 });
     defer subtitles.deinit();
+    phaseDone("isubtitles.org", "fetch_subtitles", subtitles_started_ms);
     try common.livePrintField(allocator, "subtitles_title", subtitles.title);
     for (subtitles.subtitles, 0..) |sub, idx| {
         std.debug.print("[live][isubtitles.org][subtitle][{d}]\n", .{idx});
@@ -157,8 +233,10 @@ fn runISubtitles(allocator: std.mem.Allocator, client: *std.http.Client) !void {
 fn runMovieSubtitlesOrg(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     var scraper = moviesubtitles_org.Scraper.init(allocator, client);
 
+    const search_started_ms = phaseStart("moviesubtitles.org", "search");
     var search = try scraper.search("The Matrix");
     defer search.deinit();
+    phaseDone("moviesubtitles.org", "search", search_started_ms);
     for (search.items, 0..) |item, idx| {
         std.debug.print("[live][moviesubtitles.org][search][{d}]\n", .{idx});
         try common.livePrintField(allocator, "title", item.title);
@@ -171,8 +249,10 @@ fn runMovieSubtitlesOrg(allocator: std.mem.Allocator, client: *std.http.Client) 
     for (search.items[0..limit]) |movie| {
         if (movie.link.len == 0) continue;
 
+        const subtitles_started_ms = phaseStart("moviesubtitles.org", "fetch_subtitles");
         var subtitles = scraper.fetchSubtitlesByMovieLink(movie.link) catch continue;
         defer subtitles.deinit();
+        phaseDone("moviesubtitles.org", "fetch_subtitles", subtitles_started_ms);
         if (subtitles.subtitles.len == 0) continue;
         try common.livePrintField(allocator, "subtitles_title", subtitles.title);
         for (subtitles.subtitles, 0..) |sub, idx| {
@@ -199,8 +279,10 @@ fn runMovieSubtitlesOrg(allocator: std.mem.Allocator, client: *std.http.Client) 
 fn runMovieSubtitlesRt(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     var scraper = moviesubtitlesrt_com.Scraper.init(allocator, client);
 
+    const search_started_ms = phaseStart("moviesubtitlesrt.com", "search");
     var search = try scraper.search("The Matrix");
     defer search.deinit();
+    phaseDone("moviesubtitlesrt.com", "search", search_started_ms);
     for (search.items, 0..) |item, idx| {
         std.debug.print("[live][moviesubtitlesrt.com][search][{d}]\n", .{idx});
         try common.livePrintField(allocator, "title", item.title);
@@ -213,8 +295,10 @@ fn runMovieSubtitlesRt(allocator: std.mem.Allocator, client: *std.http.Client) !
     try suite.expectNonEmpty(hit.title);
     try suite.expectHttpUrl(hit.page_url);
 
+    const details_started_ms = phaseStart("moviesubtitlesrt.com", "fetch_subtitle_details");
     var details = try scraper.fetchSubtitleByLink(hit.page_url);
     defer details.deinit();
+    phaseDone("moviesubtitlesrt.com", "fetch_subtitle_details", details_started_ms);
     std.debug.print("[live][moviesubtitlesrt.com][subtitle]\n", .{});
     try common.livePrintField(allocator, "title", details.subtitle.title);
     try common.livePrintOptionalField(allocator, "language_raw", details.subtitle.language_raw);
@@ -234,8 +318,10 @@ fn runMovieSubtitlesRt(allocator: std.mem.Allocator, client: *std.http.Client) !
 fn runMySubs(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     var scraper = my_subs_co.Scraper.init(allocator, client);
 
+    const search_started_ms = phaseStart("my-subs.co", "search");
     var search = try scraper.searchWithOptions("The Matrix", .{ .max_pages = 2 });
     defer search.deinit();
+    phaseDone("my-subs.co", "search", search_started_ms);
     for (search.items, 0..) |item, idx| {
         std.debug.print("[live][my-subs.co][search][{d}]\n", .{idx});
         try common.livePrintField(allocator, "title", item.title);
@@ -249,12 +335,14 @@ fn runMySubs(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     try suite.expectNonEmpty(match.title);
     try suite.expectHttpUrl(match.details_url);
 
+    const subtitles_started_ms = phaseStart("my-subs.co", "fetch_subtitles");
     var subtitles = try scraper.fetchSubtitlesByDetailsLinkWithOptions(match.details_url, match.media_kind, .{
         .include_seasons = true,
         .max_pages_per_entry = 2,
         .resolve_download_links = false,
     });
     defer subtitles.deinit();
+    phaseDone("my-subs.co", "fetch_subtitles", subtitles_started_ms);
     for (subtitles.subtitles, 0..) |sub, idx| {
         std.debug.print("[live][my-subs.co][subtitle][{d}]\n", .{idx});
         try common.livePrintOptionalField(allocator, "language_raw", sub.language_raw);
@@ -280,8 +368,10 @@ fn runMySubs(allocator: std.mem.Allocator, client: *std.http.Client) !void {
 fn runPodnapisi(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     var scraper = podnapisi_net.Scraper.init(allocator, client);
 
+    const search_started_ms = phaseStart("podnapisi.net", "search");
     var search = try scraper.search("The Matrix");
     defer search.deinit();
+    phaseDone("podnapisi.net", "search", search_started_ms);
     for (search.items, 0..) |item, idx| {
         std.debug.print("[live][podnapisi.net][search][{d}]\n", .{idx});
         try common.livePrintField(allocator, "id", item.id);
@@ -301,8 +391,10 @@ fn runPodnapisi(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     try suite.expectNonEmpty(match.title);
     try suite.expectHttpUrl(match.subtitles_page_url);
 
+    const subtitles_started_ms = phaseStart("podnapisi.net", "fetch_subtitles");
     var subtitles = try scraper.fetchSubtitlesBySearchLink(match.subtitles_page_url);
     defer subtitles.deinit();
+    phaseDone("podnapisi.net", "fetch_subtitles", subtitles_started_ms);
     for (subtitles.subtitles, 0..) |sub, idx| {
         std.debug.print("[live][podnapisi.net][subtitle][{d}]\n", .{idx});
         try common.livePrintOptionalField(allocator, "language", sub.language);
@@ -324,8 +416,10 @@ fn runPodnapisi(allocator: std.mem.Allocator, client: *std.http.Client) !void {
 fn runSubtitleCat(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     var scraper = subtitlecat_com.Scraper.init(allocator, client);
 
+    const search_started_ms = phaseStart("subtitlecat.com", "search");
     var search = try scraper.search("The Matrix");
     defer search.deinit();
+    phaseDone("subtitlecat.com", "search", search_started_ms);
     for (search.items, 0..) |item, idx| {
         std.debug.print("[live][subtitlecat.com][search][{d}]\n", .{idx});
         try common.livePrintField(allocator, "title", item.title);
@@ -339,8 +433,10 @@ fn runSubtitleCat(allocator: std.mem.Allocator, client: *std.http.Client) !void 
     try suite.expectNonEmpty(entry.title);
     try suite.expectHttpUrl(entry.details_url);
 
+    const subtitles_started_ms = phaseStart("subtitlecat.com", "fetch_subtitles");
     var subtitles = try scraper.fetchSubtitlesByDetailsLink(entry.details_url);
     defer subtitles.deinit();
+    phaseDone("subtitlecat.com", "fetch_subtitles", subtitles_started_ms);
     for (subtitles.subtitles, 0..) |sub, idx| {
         std.debug.print("[live][subtitlecat.com][subtitle][{d}]\n", .{idx});
         try common.livePrintOptionalField(allocator, "language_code", sub.language_code);
@@ -365,12 +461,14 @@ fn runSubtitleCat(allocator: std.mem.Allocator, client: *std.http.Client) !void 
 fn runSubsource(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     var scraper = subsource_net.Scraper.init(allocator, client);
 
+    const search_started_ms = phaseStart("subsource.net", "search");
     var search = try scraper.searchWithOptions("The Matrix", .{
         .include_seasons = true,
         .max_pages = 1,
         .auto_cloudflare_session = false,
     });
     defer search.deinit();
+    phaseDone("subsource.net", "search", search_started_ms);
     try common.livePrintField(allocator, "query_used", search.query_used);
     for (search.items, 0..) |item, idx| {
         std.debug.print("[live][subsource.net][search][{d}]\n", .{idx});
@@ -401,6 +499,7 @@ fn runSubsource(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     try suite.expectNonEmpty(match.title);
     try suite.expectUrlOrAbsolutePath(match.link);
 
+    const subtitles_started_ms = phaseStart("subsource.net", "fetch_subtitles");
     var subtitles = try scraper.fetchSubtitlesBySearchItemWithOptions(match, .{
         .include_seasons = true,
         .max_pages = 1,
@@ -408,6 +507,7 @@ fn runSubsource(allocator: std.mem.Allocator, client: *std.http.Client) !void {
         .auto_cloudflare_session = false,
     });
     defer subtitles.deinit();
+    phaseDone("subsource.net", "fetch_subtitles", subtitles_started_ms);
     try common.livePrintField(allocator, "subtitles_title", subtitles.title);
     for (subtitles.subtitles, 0..) |sub, idx| {
         std.debug.print("[live][subsource.net][subtitle][{d}]\n", .{idx});
@@ -429,8 +529,10 @@ fn runSubsource(allocator: std.mem.Allocator, client: *std.http.Client) !void {
 fn runTvSubtitles(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     var scraper = tvsubtitles_net.Scraper.init(allocator, client);
 
+    const search_started_ms = phaseStart("tvsubtitles.net", "search");
     var search = try scraper.searchWithOptions("Chernobyl", .{ .max_pages = 1 });
     defer search.deinit();
+    phaseDone("tvsubtitles.net", "search", search_started_ms);
     for (search.items, 0..) |item, idx| {
         std.debug.print("[live][tvsubtitles.net][search][{d}]\n", .{idx});
         try common.livePrintField(allocator, "title", item.title);
@@ -443,12 +545,14 @@ fn runTvSubtitles(allocator: std.mem.Allocator, client: *std.http.Client) !void 
     try suite.expectNonEmpty(match.title);
     try suite.expectHttpUrl(match.show_url);
 
+    const subtitles_started_ms = phaseStart("tvsubtitles.net", "fetch_subtitles");
     var subtitles = try scraper.fetchSubtitlesByShowLinkWithOptions(match.show_url, .{
         .include_all_seasons = false,
         .max_pages_per_season = 1,
         .resolve_download_links = false,
     });
     defer subtitles.deinit();
+    phaseDone("tvsubtitles.net", "fetch_subtitles", subtitles_started_ms);
     for (subtitles.subtitles, 0..) |sub, idx| {
         std.debug.print("[live][tvsubtitles.net][subtitle][{d}]\n", .{idx});
         try common.livePrintOptionalField(allocator, "language_code", sub.language_code);

@@ -270,12 +270,17 @@ pub const Scraper = struct {
         var writer = std.Io.Writer.Allocating.init(allocator);
         defer writer.deinit();
 
-        const result = self.client.fetch(.{
-            .location = .{ .url = url },
-            .method = .HEAD,
-            .extra_headers = &verify_headers,
-            .response_writer = &writer.writer,
-        }) catch return error.InvalidDownloadUrl;
+        const result = blk: {
+            var phase = common.LivePhase.init("opensubtitles.com", "verify_download_head");
+            phase.start();
+            defer phase.finish();
+            break :blk self.client.fetch(.{
+                .location = .{ .url = url },
+                .method = .HEAD,
+                .extra_headers = &verify_headers,
+                .response_writer = &writer.writer,
+            });
+        } catch return error.InvalidDownloadUrl;
 
         if (result.status != .ok and result.status != .found and result.status != .moved_permanently and result.status != .see_other and result.status != .temporary_redirect and result.status != .permanent_redirect) {
             // Some mirrors/challenge edges reject HEAD while the URL is still valid for GET.

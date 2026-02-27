@@ -40,6 +40,60 @@ fn debugTimingEnabled() bool {
     return value.len > 0 and !std.mem.eql(u8, value, "0");
 }
 
+fn livePhaseLoggingEnabled() bool {
+    return build_options.live_tests_enabled;
+}
+
+pub const LivePhase = struct {
+    scope: []const u8,
+    phase: []const u8,
+    tick_ms: u64 = 1000,
+    start_ms: i64 = 0,
+    enabled: bool = false,
+    stopped: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    thread: ?std.Thread = null,
+
+    pub fn init(scope: []const u8, phase: []const u8) LivePhase {
+        return .{
+            .scope = scope,
+            .phase = phase,
+            .enabled = livePhaseLoggingEnabled(),
+        };
+    }
+
+    pub fn start(self: *LivePhase) void {
+        if (!self.enabled) return;
+        self.start_ms = std.time.milliTimestamp();
+        std.debug.print("[live][phase][{s}] start {s}\n", .{ self.scope, self.phase });
+        self.thread = std.Thread.spawn(.{}, run, .{self}) catch null;
+    }
+
+    pub fn finish(self: *LivePhase) void {
+        if (!self.enabled) return;
+        self.stopped.store(true, .release);
+        if (self.thread) |thread| thread.join();
+        const elapsed_ms = std.time.milliTimestamp() - self.start_ms;
+        std.debug.print("[live][phase][{s}] done {s} elapsed_ms={d}\n", .{
+            self.scope,
+            self.phase,
+            elapsed_ms,
+        });
+    }
+
+    fn run(self: *LivePhase) void {
+        while (!self.stopped.load(.acquire)) {
+            std.Thread.sleep(self.tick_ms * std.time.ns_per_ms);
+            if (self.stopped.load(.acquire)) break;
+            const elapsed_ms = std.time.milliTimestamp() - self.start_ms;
+            std.debug.print("[live][phase][{s}] running {s} elapsed_ms={d}\n", .{
+                self.scope,
+                self.phase,
+                elapsed_ms,
+            });
+        }
+    }
+};
+
 fn selectorDebugEnabled() bool {
     const value = std.posix.getenv("SCRAPERS_SELECTOR_DEBUG") orelse return false;
     return value.len > 0 and !std.mem.eql(u8, value, "0");
@@ -71,13 +125,26 @@ pub fn fetchBytes(client: *std.http.Client, allocator: Allocator, url: []const u
             header_len += 1;
         }
 
-        const result = client.fetch(.{
-            .location = .{ .url = url },
-            .method = opts.method,
-            .payload = opts.payload,
-            .extra_headers = header_buf[0..header_len],
-            .response_writer = &writer.writer,
-        }) catch |err| {
+        if (livePhaseLoggingEnabled()) {
+            std.debug.print(
+                "[live][phase][http.fetch] method={s} attempt={d}/{d} url={s}\n",
+                .{ @tagName(opts.method), attempts + 1, opts.max_attempts, url },
+            );
+        }
+
+        const result = blk: {
+            var phase = LivePhase.init("http.fetch", url);
+            phase.start();
+            defer phase.finish();
+
+            break :blk client.fetch(.{
+                .location = .{ .url = url },
+                .method = opts.method,
+                .payload = opts.payload,
+                .extra_headers = header_buf[0..header_len],
+                .response_writer = &writer.writer,
+            });
+        } catch |err| {
             if (attempts + 1 < opts.max_attempts) {
                 sleepBackoff(opts.retry_initial_backoff_ms, attempts);
                 continue;
@@ -119,10 +186,15 @@ pub fn parseHtmlTurbo(allocator: Allocator, source: []const u8) !ParsedHtml {
     var doc = html.Document.init(allocator);
     errdefer doc.deinit();
 
-    try doc.parse(html_bytes, .{
-        .eager_child_views = false,
-        .drop_whitespace_text_nodes = true,
-    });
+    {
+        var phase = LivePhase.init("html.parse", "turbo");
+        phase.start();
+        defer phase.finish();
+        try doc.parse(html_bytes, .{
+            .eager_child_views = false,
+            .drop_whitespace_text_nodes = true,
+        });
+    }
 
     if (debug_timing) {
         const elapsed_ns = std.time.nanoTimestamp() - started_ns;
@@ -142,10 +214,15 @@ pub fn parseHtmlStable(allocator: Allocator, source: []const u8) !ParsedHtml {
 
     var doc = html.Document.init(allocator);
     errdefer doc.deinit();
-    try doc.parse(html_bytes, .{
-        .eager_child_views = true,
-        .drop_whitespace_text_nodes = false,
-    });
+    {
+        var phase = LivePhase.init("html.parse", "stable");
+        phase.start();
+        defer phase.finish();
+        try doc.parse(html_bytes, .{
+            .eager_child_views = true,
+            .drop_whitespace_text_nodes = false,
+        });
+    }
 
     if (debug_timing) {
         const elapsed_ns = std.time.nanoTimestamp() - started_ns;
@@ -273,7 +350,7 @@ pub fn shouldRunNamedLiveTest(allocator: Allocator, name: []const u8) bool {
     if (!build_options.live_named_tests_enabled) return false;
 
     const provider_name = namedLiveProvider(name) orelse return false;
-    if (isCaptchaProviderName(provider_name) and !build_options.live_include_captcha) return false;
+    if (isCaptchaProviderName(provider_name) and !liveIncludeCaptchaEnabled()) return false;
     return providerMatchesLiveFilter(liveProviderFilter(), provider_name);
 }
 
@@ -285,10 +362,40 @@ pub fn liveTuiSuiteEnabled() bool {
     return build_options.live_tui_suite;
 }
 
+pub fn liveIncludeCaptchaEnabled() bool {
+    if (envBool("SCRAPERS_LIVE_INCLUDE_CAPTCHA")) |value| return value;
+    return build_options.live_include_captcha;
+}
+
 pub fn liveProviderFilter() ?[]const u8 {
+    if (std.posix.getenv("SCRAPERS_LIVE_PROVIDER_FILTER")) |value| {
+        const trimmed_env = trimAscii(value);
+        if (trimmed_env.len == 0) return null;
+        return trimmed_env;
+    }
+    if (std.posix.getenv("SCRAPERS_LIVE_PROVIDERS")) |value| {
+        const trimmed_env = trimAscii(value);
+        if (trimmed_env.len == 0) return null;
+        return trimmed_env;
+    }
     const trimmed = trimAscii(build_options.live_provider_filter);
     if (trimmed.len == 0) return null;
     return trimmed;
+}
+
+fn envBool(name: []const u8) ?bool {
+    const raw = std.posix.getenv(name) orelse return null;
+    const value = trimAscii(raw);
+    if (value.len == 0) return null;
+    if (std.mem.eql(u8, value, "1")) return true;
+    if (std.mem.eql(u8, value, "0")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "true")) return true;
+    if (std.ascii.eqlIgnoreCase(value, "false")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "yes")) return true;
+    if (std.ascii.eqlIgnoreCase(value, "no")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "on")) return true;
+    if (std.ascii.eqlIgnoreCase(value, "off")) return false;
+    return null;
 }
 
 pub fn providerMatchesLiveFilter(filter: ?[]const u8, provider_name: []const u8) bool {
@@ -517,6 +624,7 @@ fn appendHexEscape(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), value
 }
 
 fn namedLiveProvider(name: []const u8) ?[]const u8 {
+    if (std.ascii.eqlIgnoreCase(name, "SUBDL_COM")) return "subdl.com";
     if (std.ascii.eqlIgnoreCase(name, "MOVIESUBTITLES_ORG")) return "moviesubtitles.org";
     if (std.ascii.eqlIgnoreCase(name, "MOVIESUBTITLESRT_COM")) return "moviesubtitlesrt.com";
     if (std.ascii.eqlIgnoreCase(name, "PODNAPISI")) return "podnapisi.net";

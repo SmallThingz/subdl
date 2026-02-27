@@ -1,4 +1,6 @@
 const std = @import("std");
+const common = @import("common.zig");
+const suite = @import("test_suite.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -458,23 +460,22 @@ pub const Scraper = struct {
     }
 
     fn fetchBytes(self: *Scraper, allocator: Allocator, url: []const u8, accept: []const u8) ![]u8 {
-        var writer = std.Io.Writer.Allocating.init(allocator);
-        defer writer.deinit();
-
         const headers = [_]std.http.Header{
             .{ .name = "accept", .value = accept },
             .{ .name = "user-agent", .value = user_agent },
         };
 
-        const result = try self.client.fetch(.{
-            .location = .{ .url = url },
-            .method = .GET,
+        const response = try common.fetchBytes(self.client, allocator, url, .{
+            .accept = accept,
             .extra_headers = &headers,
-            .response_writer = &writer.writer,
+            .max_attempts = 3,
+            .retry_initial_backoff_ms = 400,
         });
-
-        if (result.status != .ok) return error.UnexpectedHttpStatus;
-        return try writer.toOwnedSlice();
+        if (response.status != .ok) {
+            allocator.free(response.body);
+            return error.UnexpectedHttpStatus;
+        }
+        return response.body;
     }
 };
 
@@ -785,6 +786,10 @@ fn findSeasonSlug(seasons: []const SeasonInfo, wanted: []const u8) ?[]const u8 {
 }
 
 test "movie scraping works for The Thing" {
+    if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
+    if (!common.shouldRunNamedLiveTest(std.testing.allocator, "SUBDL_COM")) return error.SkipZigTest;
+    if (suite.shouldRunExtensiveLiveSuite(std.testing.allocator)) return error.SkipZigTest;
+
     var client: std.http.Client = .{ .allocator = std.testing.allocator };
     defer client.deinit();
 
@@ -800,6 +805,10 @@ test "movie scraping works for The Thing" {
 }
 
 test "tv scraping works for Shadowhunters seasons and season subtitles" {
+    if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
+    if (!common.shouldRunNamedLiveTest(std.testing.allocator, "SUBDL_COM")) return error.SkipZigTest;
+    if (suite.shouldRunExtensiveLiveSuite(std.testing.allocator)) return error.SkipZigTest;
+
     var client: std.http.Client = .{ .allocator = std.testing.allocator };
     defer client.deinit();
 
