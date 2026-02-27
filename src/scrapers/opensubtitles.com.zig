@@ -267,24 +267,12 @@ pub const Scraper = struct {
             .{ .name = "accept", .value = "application/zip,application/octet-stream,*/*" },
         };
 
-        var writer = std.Io.Writer.Allocating.init(allocator);
-        defer writer.deinit();
-
-        const result = blk: {
-            var phase = common.LivePhase.init("opensubtitles.com", "verify_download_head");
-            phase.start();
-            defer phase.finish();
-            break :blk self.client.fetch(.{
-                .location = .{ .url = url },
-                .method = .HEAD,
-                .extra_headers = &verify_headers,
-                .response_writer = &writer.writer,
-            });
-        } catch return error.InvalidDownloadUrl;
-
-        if (result.status != .ok and result.status != .found and result.status != .moved_permanently and result.status != .see_other and result.status != .temporary_redirect and result.status != .permanent_redirect) {
-            // Some mirrors/challenge edges reject HEAD while the URL is still valid for GET.
-            return .{ .filename = parsed.filename, .verified_url = url };
+        const verify_status = verifyDownloadHeadWithCurlSession(allocator, session.*, url, &verify_headers) catch null;
+        if (verify_status) |status| {
+            if (status != .ok and status != .found and status != .moved_permanently and status != .see_other and status != .temporary_redirect and status != .permanent_redirect) {
+                // Some mirrors/challenge edges reject HEAD while the URL is still valid for GET.
+                return .{ .filename = parsed.filename, .verified_url = url };
+            }
         }
 
         return .{ .filename = parsed.filename, .verified_url = url };
@@ -451,6 +439,75 @@ fn fetchWithCurlSession(allocator: Allocator, session: cf.Session, url: []const 
         .status = @enumFromInt(status_code),
         .body = try allocator.dupe(u8, body),
     };
+}
+
+fn verifyDownloadHeadWithCurlSession(
+    allocator: Allocator,
+    session: cf.Session,
+    url: []const u8,
+    headers: []const std.http.Header,
+) !?std.http.Status {
+    var phase = common.LivePhase.init("opensubtitles.com", "verify_download_head");
+    phase.start();
+    defer phase.finish();
+
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv.deinit(allocator);
+
+    var owned_args: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (owned_args.items) |arg| allocator.free(arg);
+        owned_args.deinit(allocator);
+    }
+
+    try argv.appendSlice(allocator, &.{
+        "curl",
+        "-sS",
+        "--location",
+        "--max-time",
+        "45",
+        "--compressed",
+        "-I",
+        "-A",
+        session.user_agent,
+    });
+
+    const cookie_header = try std.fmt.allocPrint(allocator, "Cookie: {s}", .{session.cookie_header});
+    try owned_args.append(allocator, cookie_header);
+    try argv.appendSlice(allocator, &.{ "-H", cookie_header });
+
+    for (headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "cookie")) continue;
+        if (std.ascii.eqlIgnoreCase(h.name, "user-agent")) continue;
+        const header_line = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ h.name, h.value });
+        try owned_args.append(allocator, header_line);
+        try argv.appendSlice(allocator, &.{ "-H", header_line });
+    }
+
+    try argv.appendSlice(allocator, &.{ "-w", "\n%{http_code}", url });
+
+    const run_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv.items,
+        .max_output_bytes = 64 * 1024,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(run_result.stdout);
+    defer allocator.free(run_result.stderr);
+
+    switch (run_result.term) {
+        .Exited => |code| {
+            if (code != 0) return null;
+        },
+        else => return null,
+    }
+
+    const sep = std.mem.lastIndexOfScalar(u8, run_result.stdout, '\n') orelse return null;
+    const status_raw = std.mem.trim(u8, run_result.stdout[sep + 1 ..], " \t\r\n");
+    const status_code = std.fmt.parseInt(u10, status_raw, 10) catch return null;
+    return @enumFromInt(status_code);
 }
 
 fn parseLanguageFromCell(allocator: Allocator, cols: []const std.json.Value, idx: usize) !?[]const u8 {
