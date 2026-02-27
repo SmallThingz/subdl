@@ -334,16 +334,10 @@ fn appendSearchResults(
     options: SearchOptions,
     auth: *Auth,
 ) !void {
-    const limit = if (options.limit_per_page == 0) 5000 else options.limit_per_page;
-    const payload = try std.fmt.allocPrint(
-        allocator,
-        "{{\"query\":\"{s}\",\"includeSeasons\":{s},\"limit\":{d}}}",
-        .{
-            try escapeJson(allocator, query),
-            if (options.include_seasons) "true" else "false",
-            limit,
-        },
-    );
+    _ = options.include_seasons;
+    _ = options.limit_per_page;
+
+    const payload = try buildSearchPayload(allocator, query);
 
     var response = try postJson(client, allocator, api_base ++ "/movie/search", payload, auth.*, true);
     if (response.status == .forbidden and options.auto_cloudflare_session) {
@@ -377,7 +371,8 @@ fn appendSearchResults(
 
         const title = objString(obj, "title") orelse continue;
         const media_type = objString(obj, "type") orelse "unknown";
-        const link = objString(obj, "link") orelse continue;
+        const raw_link = objString(obj, "link") orelse continue;
+        const link = try toAbsoluteSiteLink(allocator, raw_link);
         const release_year = objInt(obj, "releaseYear");
         const subtitle_count = objInt(obj, "subtitleCount");
 
@@ -390,7 +385,8 @@ fn appendSearchResults(
                         else => continue,
                     };
                     const season_num = objInt(season_obj, "season") orelse continue;
-                    const season_link = objString(season_obj, "link") orelse continue;
+                    const season_link_raw = objString(season_obj, "link") orelse continue;
+                    const season_link = try toAbsoluteSiteLink(allocator, season_link_raw);
                     try seasons_out.append(allocator, .{ .season = season_num, .link = season_link });
                 }
             }
@@ -406,6 +402,16 @@ fn appendSearchResults(
             .seasons = try seasons_out.toOwnedSlice(allocator),
         });
     }
+}
+
+fn buildSearchPayload(allocator: Allocator, query: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"query\":\"{s}\",\"signal\":{{}},\"includeSeasons\":false,\"limit\":9999}}",
+        .{
+            try escapeJson(allocator, query),
+        },
+    );
 }
 
 fn resolveAuth(allocator: Allocator, cf_clearance_opt: ?[]const u8, user_agent_opt: ?[]const u8, force_refresh: bool, auto_cloudflare_session: bool) !Auth {
@@ -506,6 +512,18 @@ fn pathToSubtitles(allocator: Allocator, link: []const u8) !?[]const u8 {
     return try std.fmt.allocPrint(allocator, "/subtitles{s}", .{normalized});
 }
 
+fn toAbsoluteSiteLink(allocator: Allocator, link: []const u8) ![]const u8 {
+    const trimmed = common.trimAscii(link);
+    if (trimmed.len == 0) return try allocator.dupe(u8, trimmed);
+    if (std.mem.startsWith(u8, trimmed, "http://") or std.mem.startsWith(u8, trimmed, "https://")) {
+        return try allocator.dupe(u8, trimmed);
+    }
+    if (std.mem.startsWith(u8, trimmed, "/")) {
+        return try std.fmt.allocPrint(allocator, "{s}{s}", .{ site, trimmed });
+    }
+    return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ site, trimmed });
+}
+
 fn objString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const v = obj.get(key) orelse return null;
     return switch (v) {
@@ -565,4 +583,30 @@ test "subsource path to subtitles" {
 test "subsource language normalization" {
     try std.testing.expectEqualStrings("fa", normalizeSubsourceLanguage("farsi/persian").?);
     try std.testing.expectEqualStrings("zh-tw", normalizeSubsourceLanguage("chinese traditional").?);
+}
+
+test "subsource absolute site link normalization" {
+    const allocator = std.testing.allocator;
+
+    const a = try toAbsoluteSiteLink(allocator, "/series/the-matrix-1999");
+    defer allocator.free(a);
+    try std.testing.expectEqualStrings("https://subsource.net/series/the-matrix-1999", a);
+
+    const b = try toAbsoluteSiteLink(allocator, "series/the-matrix-1999");
+    defer allocator.free(b);
+    try std.testing.expectEqualStrings("https://subsource.net/series/the-matrix-1999", b);
+
+    const c = try toAbsoluteSiteLink(allocator, "https://subsource.net/series/the-matrix-1999");
+    defer allocator.free(c);
+    try std.testing.expectEqualStrings("https://subsource.net/series/the-matrix-1999", c);
+}
+
+test "subsource search payload is fixed schema" {
+    const allocator = std.testing.allocator;
+    const payload = try buildSearchPayload(allocator, "The Matrix");
+    defer allocator.free(payload);
+    try std.testing.expectEqualStrings(
+        "{\"query\":\"The Matrix\",\"signal\":{},\"includeSeasons\":false,\"limit\":9999}",
+        payload,
+    );
 }

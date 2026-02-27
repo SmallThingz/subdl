@@ -2393,6 +2393,24 @@ test "sanitizeUtf8ForDisplay escapes invalid bytes" {
     try std.testing.expect(std.unicode.utf8ValidateSlice(safe));
 }
 
+test "subtitleFilenameForDisplay uses Without release fallback" {
+    const with_name: app.SubtitleChoice = .{
+        .label = "x",
+        .language = null,
+        .filename = "  Matrix.Release  ",
+        .download_url = null,
+    };
+    try std.testing.expectEqualStrings("Matrix.Release", subtitleFilenameForDisplay(with_name));
+
+    const missing: app.SubtitleChoice = .{
+        .label = "x",
+        .language = null,
+        .filename = null,
+        .download_url = null,
+    };
+    try std.testing.expectEqualStrings("Without release", subtitleFilenameForDisplay(missing));
+}
+
 fn subtitleSortName(mode: SubtitleSort) []const u8 {
     return switch (mode) {
         .relevance => "relevance",
@@ -2547,7 +2565,7 @@ fn renderSubtitleDetails(
     row += 1;
 
     if (row >= max_row) return;
-    try printLabelValue(ui, win, row, col, pane_width, "Filename: ", subtitle.filename orelse "(unknown)");
+    try printLabelValue(ui, win, row, col, pane_width, "Filename: ", subtitleFilenameForDisplay(subtitle));
     row += 1;
 
     if (row >= max_row) return;
@@ -2570,6 +2588,14 @@ fn renderSubtitleDetails(
         .{},
         pane_width,
     );
+}
+
+fn subtitleFilenameForDisplay(subtitle: app.SubtitleChoice) []const u8 {
+    if (subtitle.filename) |name| {
+        const trimmed = std.mem.trim(u8, name, " \t\r\n");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return "Without release";
 }
 
 fn isSubtitlecatTranslateToken(download_url: ?[]const u8) bool {

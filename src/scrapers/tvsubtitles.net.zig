@@ -9,14 +9,11 @@ const Allocator = std.mem.Allocator;
 const site = "https://www.tvsubtitles.net";
 
 pub const SearchOptions = struct {
-    page_start: usize = 1,
-    max_pages: usize = 1,
+    _unused: void = {},
 };
 
 pub const SubtitlesOptions = struct {
     include_all_seasons: bool = true,
-    page_start_per_season: usize = 1,
-    max_pages_per_season: usize = 1,
     resolve_download_links: bool = false,
 };
 
@@ -79,39 +76,25 @@ pub const Scraper = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+        _ = options;
 
         var out: std.ArrayListUnmanaged(SearchItem) = .empty;
         var seen = std.StringHashMapUnmanaged(void).empty;
 
-        const max_pages = if (options.max_pages == 0) 1 else options.max_pages;
-        const page_start = if (options.page_start == 0) 1 else options.page_start;
-        var page_index: usize = page_start;
-        var collected_pages: usize = 0;
-        var has_next_page = false;
-        var last_page = page_start;
-
-        while (collected_pages < max_pages) : (page_index += 1) {
-            last_page = page_index;
-            const page_url = try buildSearchUrl(a, query, page_index);
-            const response = try fetchSearchPage(self.client, a, query, page_index, page_url);
-            if (response.body.len == 0) break;
-
+        const page_url = try buildSearchUrl(a, query);
+        const response = try fetchSearchPage(self.client, a, query, page_url);
+        if (response.body.len > 0) {
             var doc = try common.parseHtmlStable(a, response.body);
             defer doc.deinit();
-
             try collectSearchItems(a, &doc.doc, &out, &seen);
-            collected_pages += 1;
-
-            has_next_page = (try extractNextPageUrl(a, &doc.doc, page_url)) != null;
-            if (!has_next_page) break;
         }
 
         return .{
             .arena = arena,
             .items = try out.toOwnedSlice(a),
-            .page = last_page,
-            .has_prev_page = last_page > 1,
-            .has_next_page = has_next_page,
+            .page = 1,
+            .has_prev_page = false,
+            .has_next_page = false,
         };
     }
 
@@ -146,78 +129,58 @@ pub const Scraper = struct {
         var seen_season = std.StringHashMapUnmanaged(void).empty;
         var seen_subtitle = std.StringHashMapUnmanaged(void).empty;
         var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
-        var has_next_page = false;
-        var observed_page = if (options.page_start_per_season == 0) 1 else options.page_start_per_season;
 
         for (season_urls.items) |initial_season_url| {
             if (seen_season.contains(initial_season_url)) continue;
             try seen_season.put(a, initial_season_url, {});
 
-            const page_start = if (options.page_start_per_season == 0) 1 else options.page_start_per_season;
-            var page_number = page_start;
-            var page_url: ?[]const u8 = if (page_start <= 1)
-                initial_season_url
-            else
-                try addOrReplacePageQuery(a, initial_season_url, page_start);
-            var traversed: usize = 0;
-            const max_pages = if (options.max_pages_per_season == 0) 1 else options.max_pages_per_season;
+            const response = try common.fetchBytes(self.client, a, initial_season_url, .{ .accept = "text/html", .max_attempts = 2, .allow_non_ok = true });
+            if (response.body.len == 0) continue;
 
-            while (page_url) |url| : (traversed += 1) {
-                if (traversed >= max_pages) break;
-                observed_page = page_number;
+            var doc = try common.parseHtmlStable(a, response.body);
+            defer doc.deinit();
 
-                const response = try common.fetchBytes(self.client, a, url, .{ .accept = "text/html", .max_attempts = 2, .allow_non_ok = true });
-                if (response.body.len == 0) break;
+            var rows = doc.doc.queryAll("table#table5 tr[align='middle']");
+            while (rows.next()) |row| {
+                const episode_title = episodeTitle(row, a) catch null;
 
-                var doc = try common.parseHtmlStable(a, response.body);
-                defer doc.deinit();
+                var anchors = row.queryAll("a[href*='subtitle-']");
+                while (anchors.next()) |anchor| {
+                    const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
+                    const subtitle_page_url = try common.resolveUrl(a, site, href);
+                    if (seen_subtitle.contains(subtitle_page_url)) continue;
+                    try seen_subtitle.put(a, subtitle_page_url, {});
 
-                var rows = doc.doc.queryAll("table#table5 tr[align='middle']");
-                while (rows.next()) |row| {
-                    const episode_title = episodeTitle(row, a) catch null;
+                    const subtitle_id = parseSubtitleId(subtitle_page_url) orelse continue;
+                    const download_page_url = try std.fmt.allocPrint(a, "{s}/download-{s}.html", .{ site, subtitle_id });
 
-                    var anchors = row.queryAll("a[href*='subtitle-']");
-                    while (anchors.next()) |anchor| {
-                        const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
-                        const subtitle_page_url = try common.resolveUrl(a, site, href);
-                        if (seen_subtitle.contains(subtitle_page_url)) continue;
-                        try seen_subtitle.put(a, subtitle_page_url, {});
-
-                        const subtitle_id = parseSubtitleId(subtitle_page_url) orelse continue;
-                        const download_page_url = try std.fmt.allocPrint(a, "{s}/download-{s}.html", .{ site, subtitle_id });
-
-                        var direct_zip_url: ?[]const u8 = null;
-                        if (options.resolve_download_links) {
-                            direct_zip_url = self.resolveDownloadUrl(a, download_page_url) catch null;
-                        }
-
-                        const lang = try dupOptionalSlice(a, languageFromSubtitleAnchor(anchor, href));
-                        const filename = buildFilename(a, episode_title, lang) catch "subtitle.zip";
-
-                        try subtitles.append(a, .{
-                            .language_code = lang,
-                            .episode_title = episode_title,
-                            .filename = filename,
-                            .season_page_url = url,
-                            .subtitle_page_url = subtitle_page_url,
-                            .download_page_url = download_page_url,
-                            .direct_zip_url = direct_zip_url,
-                        });
+                    var direct_zip_url: ?[]const u8 = null;
+                    if (options.resolve_download_links) {
+                        direct_zip_url = self.resolveDownloadUrl(a, download_page_url) catch null;
                     }
-                }
 
-                page_url = try extractNextPageUrl(a, &doc.doc, url);
-                has_next_page = page_url != null;
-                if (page_url != null) page_number += 1;
+                    const lang = try dupOptionalSlice(a, languageFromSubtitleAnchor(anchor, href));
+                    const filename = buildFilename(a, episode_title, lang) catch "subtitle.zip";
+
+                    try subtitles.append(a, .{
+                        .language_code = lang,
+                        .episode_title = episode_title,
+                        .filename = filename,
+                        .season_page_url = initial_season_url,
+                        .subtitle_page_url = subtitle_page_url,
+                        .download_page_url = download_page_url,
+                        .direct_zip_url = direct_zip_url,
+                    });
+                }
             }
         }
 
         return .{
             .arena = arena,
             .subtitles = try subtitles.toOwnedSlice(a),
-            .page = observed_page,
-            .has_prev_page = observed_page > 1,
-            .has_next_page = has_next_page,
+            .page = 1,
+            .has_prev_page = false,
+            .has_next_page = false,
         };
     }
 
@@ -256,40 +219,22 @@ fn submitSearch(client: *std.http.Client, allocator: Allocator, query: []const u
     });
 }
 
-fn buildSearchUrl(allocator: Allocator, query: []const u8, page: usize) ![]const u8 {
+fn buildSearchUrl(allocator: Allocator, query: []const u8) ![]const u8 {
     const encoded = try common.encodeUriComponent(allocator, query);
-    if (page <= 1) return std.fmt.allocPrint(allocator, "{s}/search.php?qs={s}", .{ site, encoded });
-    return std.fmt.allocPrint(allocator, "{s}/search.php?qs={s}&page={d}", .{ site, encoded, page });
+    return std.fmt.allocPrint(allocator, "{s}/search.php?qs={s}", .{ site, encoded });
 }
 
-fn fetchSearchPage(client: *std.http.Client, allocator: Allocator, query: []const u8, page: usize, page_url: []const u8) !common.HttpResponse {
+fn fetchSearchPage(client: *std.http.Client, allocator: Allocator, query: []const u8, page_url: []const u8) !common.HttpResponse {
     var response = try common.fetchBytes(client, allocator, page_url, .{
         .accept = "text/html",
         .max_attempts = 2,
         .allow_non_ok = true,
     });
-    if (page == 1 and response.body.len == 0) {
+    if (response.body.len == 0) {
         allocator.free(response.body);
         response = try submitSearch(client, allocator, query);
     }
     return response;
-}
-
-fn addOrReplacePageQuery(allocator: Allocator, base_url: []const u8, page: usize) ![]const u8 {
-    if (page <= 1) return try allocator.dupe(u8, base_url);
-
-    if (std.mem.indexOf(u8, base_url, "page=")) |idx| {
-        const end = std.mem.indexOfAnyPos(u8, base_url, idx, "&?#") orelse base_url.len;
-        var out: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer out.deinit(allocator);
-        try out.appendSlice(allocator, base_url[0..idx]);
-        try out.writer(allocator).print("page={d}", .{page});
-        try out.appendSlice(allocator, base_url[end..]);
-        return try out.toOwnedSlice(allocator);
-    }
-
-    const sep: u8 = if (std.mem.indexOfScalar(u8, base_url, '?') == null) '?' else '&';
-    return try std.fmt.allocPrint(allocator, "{s}{c}page={d}", .{ base_url, sep, page });
 }
 
 fn collectSearchItems(allocator: Allocator, doc: *const HtmlDocument, out: *std.ArrayListUnmanaged(SearchItem), seen: *std.StringHashMapUnmanaged(void)) !void {
@@ -327,36 +272,6 @@ fn collectSearchItems(allocator: Allocator, doc: *const HtmlDocument, out: *std.
             try out.append(allocator, .{ .title = title, .show_url = show_url });
         }
     }
-}
-
-fn extractNextPageUrl(allocator: Allocator, doc: *const HtmlDocument, current_url: []const u8) !?[]const u8 {
-    if (doc.queryOne("a[rel='next'][href]")) |a| {
-        if (common.getAttributeValueSafe(a, "href")) |href| {
-            return try common.resolveUrl(allocator, site, href);
-        }
-    }
-
-    var anchors = doc.queryAll("a[href]");
-    while (anchors.next()) |anchor| {
-        const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
-        if (std.mem.indexOf(u8, href, "page=") == null and std.mem.indexOf(u8, href, "search.php") == null) continue;
-
-        const text = try common.innerTextTrimmedOwned(allocator, anchor);
-        if (!isLikelyNextText(text)) continue;
-
-        const resolved = try common.resolveUrl(allocator, site, href);
-        if (std.mem.eql(u8, resolved, current_url)) continue;
-        return resolved;
-    }
-
-    return null;
-}
-
-fn isLikelyNextText(text: []const u8) bool {
-    if (text.len == 0) return false;
-    if (std.ascii.indexOfIgnoreCase(text, "next") != null) return true;
-    if (std.ascii.indexOfIgnoreCase(text, "more") != null) return true;
-    return std.mem.eql(u8, text, ">") or std.mem.eql(u8, text, "›") or std.mem.eql(u8, text, "»");
 }
 
 fn episodeTitle(row: HtmlNode, allocator: Allocator) !?[]const u8 {

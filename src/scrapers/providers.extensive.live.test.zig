@@ -181,7 +181,7 @@ fn runISubtitles(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     var scraper = isubtitles_org.Scraper.init(allocator, client);
 
     const search_started_ms = phaseStart("isubtitles.org", "search");
-    var search = try scraper.searchWithOptions("The Matrix", .{ .max_pages = 2 });
+    var search = try scraper.search("The Matrix");
     defer search.deinit();
     phaseDone("isubtitles.org", "search", search_started_ms);
     try suite.expectPositive(search.items.len);
@@ -294,7 +294,7 @@ fn runMySubs(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     var scraper = my_subs_co.Scraper.init(allocator, client);
 
     const search_started_ms = phaseStart("my-subs.co", "search");
-    var search = try scraper.searchWithOptions("The Matrix", .{ .max_pages = 2 });
+    var search = try scraper.search("The Matrix");
     defer search.deinit();
     phaseDone("my-subs.co", "search", search_started_ms);
     try suite.expectPositive(search.items.len);
@@ -311,7 +311,6 @@ fn runMySubs(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     const subtitles_started_ms = phaseStart("my-subs.co", "fetch_subtitles");
     var subtitles = try scraper.fetchSubtitlesByDetailsLinkWithOptions(match.details_url, match.media_kind, .{
         .include_seasons = true,
-        .max_pages_per_entry = 2,
         .resolve_download_links = false,
     });
     defer subtitles.deinit();
@@ -490,7 +489,7 @@ fn runTvSubtitles(allocator: std.mem.Allocator, client: *std.http.Client) !void 
     var scraper = tvsubtitles_net.Scraper.init(allocator, client);
 
     const search_started_ms = phaseStart("tvsubtitles.net", "search");
-    var search = try scraper.searchWithOptions("Chernobyl", .{ .max_pages = 1 });
+    var search = try scraper.search("Chernobyl");
     defer search.deinit();
     phaseDone("tvsubtitles.net", "search", search_started_ms);
     try suite.expectPositive(search.items.len);
@@ -506,7 +505,6 @@ fn runTvSubtitles(allocator: std.mem.Allocator, client: *std.http.Client) !void 
     const subtitles_started_ms = phaseStart("tvsubtitles.net", "fetch_subtitles");
     var subtitles = try scraper.fetchSubtitlesByShowLinkWithOptions(match.show_url, .{
         .include_all_seasons = false,
-        .max_pages_per_season = 1,
         .resolve_download_links = false,
     });
     defer subtitles.deinit();

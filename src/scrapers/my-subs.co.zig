@@ -14,14 +14,11 @@ pub const MediaKind = enum {
 };
 
 pub const SearchOptions = struct {
-    page_start: usize = 1,
-    max_pages: usize = 1,
+    _unused: void = {},
 };
 
 pub const SubtitlesOptions = struct {
     include_seasons: bool = true,
-    page_start_per_entry: usize = 1,
-    max_pages_per_entry: usize = 1,
     resolve_download_links: bool = false,
 };
 
@@ -86,24 +83,14 @@ pub const Scraper = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+        _ = options;
 
         var out: std.ArrayListUnmanaged(SearchItem) = .empty;
         var seen = std.StringHashMapUnmanaged(void).empty;
 
-        const max_pages = if (options.max_pages == 0) 1 else options.max_pages;
-        var page = if (options.page_start == 0) 1 else options.page_start;
-        const page_start = page;
-        var next_url: ?[]const u8 = null;
-        var last_page = page_start;
-        var has_next_page = false;
-
-        var traversed: usize = 0;
-        while (traversed < max_pages) : (traversed += 1) {
-            last_page = page;
-            const page_url = if (next_url) |u| u else try buildSearchUrl(a, query, page);
-            const response = try common.fetchBytes(self.client, a, page_url, .{ .accept = "text/html", .max_attempts = 2, .allow_non_ok = true });
-            if (response.body.len == 0) break;
-
+        const page_url = try buildSearchUrl(a, query);
+        const response = try common.fetchBytes(self.client, a, page_url, .{ .accept = "text/html", .max_attempts = 2, .allow_non_ok = true });
+        if (response.body.len > 0) {
             var parsed = try common.parseHtmlStable(a, response.body);
             defer parsed.deinit();
 
@@ -130,20 +117,14 @@ pub const Scraper = struct {
                     .media_kind = if (std.mem.indexOf(u8, href, "/showlistsubtitles-") != null) .tv else .movie,
                 });
             }
-
-            next_url = try extractNextPageUrl(a, &parsed.doc, page_url);
-            has_next_page = next_url != null;
-            page += 1;
-            if (next_url == null and options.page_start > 1) break;
-            if (next_url == null and page > 128) break;
         }
 
         return .{
             .arena = arena,
             .items = try out.toOwnedSlice(a),
-            .page = last_page,
-            .has_prev_page = last_page > 1,
-            .has_next_page = has_next_page,
+            .page = 1,
+            .has_prev_page = false,
+            .has_next_page = false,
         };
     }
 
@@ -178,95 +159,70 @@ pub const Scraper = struct {
         }
 
         var entry_seen = std.StringHashMapUnmanaged(void).empty;
-        var has_next_page = false;
-        var observed_page = if (options.page_start_per_entry == 0) 1 else options.page_start_per_entry;
 
         for (page_urls.items) |entry_url| {
             if (entry_seen.contains(entry_url)) continue;
             try entry_seen.put(a, entry_url, {});
 
-            const page_start = if (options.page_start_per_entry == 0) 1 else options.page_start_per_entry;
-            var page_number = page_start;
-            var cursor_url: ?[]const u8 = if (page_start <= 1)
-                entry_url
+            const response = try common.fetchBytes(self.client, a, entry_url, .{ .accept = "text/html", .max_attempts = 2, .allow_non_ok = true });
+            if (response.body.len == 0) continue;
+
+            var parsed = try common.parseHtmlStable(a, response.body);
+            defer parsed.deinit();
+
+            const page_title = if (parsed.doc.queryOne("h1")) |h1|
+                try common.innerTextTrimmedOwned(a, h1)
             else
-                try addOrReplacePageQuery(a, entry_url, page_start);
-            var traversed: usize = 0;
-            const max_pages = if (options.max_pages_per_entry == 0) 1 else options.max_pages_per_entry;
-            while (cursor_url) |page_url| : (traversed += 1) {
-                if (traversed >= max_pages) break;
-                observed_page = page_number;
+                "";
 
-                const response = try common.fetchBytes(self.client, a, page_url, .{ .accept = "text/html", .max_attempts = 2, .allow_non_ok = true });
-                if (response.body.len == 0) break;
+            var anchors = parsed.doc.queryAll("a[href*='/downloads/']");
+            while (anchors.next()) |anchor| {
+                const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
+                const download_page_url = try common.resolveUrl(a, site, href);
+                if (seen.contains(download_page_url)) continue;
+                try seen.put(a, download_page_url, {});
 
-                var parsed = try common.parseHtmlStable(a, response.body);
-                defer parsed.deinit();
+                const lang_meta = extractLanguage(anchor);
+                const release_version = extractReleaseVersion(anchor, a) catch null;
 
-                const page_title = if (parsed.doc.queryOne("h1")) |h1|
-                    try common.innerTextTrimmedOwned(a, h1)
-                else
-                    "";
+                var filename = if (release_version) |rv| rv else page_title;
+                if (filename.len == 0) {
+                    filename = try common.innerTextTrimmedOwned(a, anchor);
+                }
+                if (filename.len == 0) filename = "subtitle.srt";
 
-                var anchors = parsed.doc.queryAll("a[href*='/downloads/']");
-                while (anchors.next()) |anchor| {
-                    const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
-                    const download_page_url = try common.resolveUrl(a, site, href);
-                    if (seen.contains(download_page_url)) continue;
-                    try seen.put(a, download_page_url, {});
+                const language_raw = if (lang_meta.raw) |raw| try a.dupe(u8, raw) else null;
+                const language_code = if (lang_meta.code) |code| try a.dupe(u8, code) else null;
 
-                    const lang_meta = extractLanguage(anchor);
-                    const release_version = extractReleaseVersion(anchor, a) catch null;
-
-                    var filename = if (release_version) |rv| rv else page_title;
-                    if (filename.len == 0) {
-                        filename = try common.innerTextTrimmedOwned(a, anchor);
+                var resolved_download_url: ?[]const u8 = null;
+                var is_archive: ?bool = null;
+                if (options.resolve_download_links) {
+                    const resolved = self.resolveDownloadPage(a, download_page_url) catch null;
+                    if (resolved) |url| {
+                        resolved_download_url = url;
+                        is_archive = looksArchive(url);
                     }
-                    if (filename.len == 0) filename = "subtitle.srt";
-
-                    const language_raw = if (lang_meta.raw) |raw| try a.dupe(u8, raw) else null;
-                    const language_code = if (lang_meta.code) |code| try a.dupe(u8, code) else null;
-
-                    var resolved_download_url: ?[]const u8 = null;
-                    var is_archive: ?bool = null;
-                    if (options.resolve_download_links) {
-                        const resolved = self.resolveDownloadPage(a, download_page_url) catch null;
-                        if (resolved) |url| {
-                            resolved_download_url = url;
-                            is_archive = looksArchive(url);
-                        }
-                    }
-
-                    try subtitles.append(a, .{
-                        .language_raw = language_raw,
-                        .language_code = language_code,
-                        .filename = filename,
-                        .release_version = release_version,
-                        .details_url = page_url,
-                        .download_page_url = download_page_url,
-                        .resolved_download_url = resolved_download_url,
-                        .is_archive = is_archive,
-                    });
                 }
 
-                const next = try extractNextPageUrl(a, &parsed.doc, page_url);
-                has_next_page = next != null;
-                if (next) |next_page| {
-                    if (std.mem.eql(u8, next_page, page_url)) break;
-                    cursor_url = next_page;
-                    page_number += 1;
-                } else {
-                    cursor_url = null;
-                }
+                try subtitles.append(a, .{
+                    .language_raw = language_raw,
+                    .language_code = language_code,
+                    .filename = filename,
+                    .release_version = release_version,
+                    .details_url = entry_url,
+                    .download_page_url = download_page_url,
+                    .resolved_download_url = resolved_download_url,
+                    .is_archive = is_archive,
+                });
             }
         }
 
         return .{
             .arena = arena,
             .subtitles = try subtitles.toOwnedSlice(a),
-            .page = observed_page,
-            .has_prev_page = observed_page > 1,
-            .has_next_page = has_next_page,
+            .page = 1,
+            .has_prev_page = false,
+            .has_next_page = false,
         };
     }
 
@@ -285,56 +241,9 @@ pub const Scraper = struct {
     }
 };
 
-fn buildSearchUrl(allocator: Allocator, query: []const u8, page: usize) ![]const u8 {
+fn buildSearchUrl(allocator: Allocator, query: []const u8) ![]const u8 {
     const encoded = try common.encodeUriComponent(allocator, query);
-    if (page <= 1) return std.fmt.allocPrint(allocator, "{s}/search.php?key={s}", .{ site, encoded });
-    return std.fmt.allocPrint(allocator, "{s}/search.php?key={s}&page={d}", .{ site, encoded, page });
-}
-
-fn addOrReplacePageQuery(allocator: Allocator, base_url: []const u8, page: usize) ![]const u8 {
-    if (page <= 1) return try allocator.dupe(u8, base_url);
-
-    if (std.mem.indexOf(u8, base_url, "page=")) |idx| {
-        const end = std.mem.indexOfAnyPos(u8, base_url, idx, "&?#") orelse base_url.len;
-        var out: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer out.deinit(allocator);
-        try out.appendSlice(allocator, base_url[0..idx]);
-        try out.writer(allocator).print("page={d}", .{page});
-        try out.appendSlice(allocator, base_url[end..]);
-        return try out.toOwnedSlice(allocator);
-    }
-
-    const sep: u8 = if (std.mem.indexOfScalar(u8, base_url, '?') == null) '?' else '&';
-    return try std.fmt.allocPrint(allocator, "{s}{c}page={d}", .{ base_url, sep, page });
-}
-
-fn extractNextPageUrl(allocator: Allocator, doc: *const HtmlDocument, current_url: []const u8) !?[]const u8 {
-    if (doc.queryOne("a[rel='next'][href]")) |a| {
-        if (common.getAttributeValueSafe(a, "href")) |href| {
-            return try common.resolveUrl(allocator, site, href);
-        }
-    }
-
-    var anchors = doc.queryAll("a[href]");
-    while (anchors.next()) |anchor| {
-        const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
-        if (std.mem.indexOf(u8, href, "page=") == null) continue;
-
-        const text = try common.innerTextTrimmedOwned(allocator, anchor);
-        if (!isLikelyNextText(text)) continue;
-
-        const resolved = try common.resolveUrl(allocator, site, href);
-        if (std.mem.eql(u8, resolved, current_url)) continue;
-        return resolved;
-    }
-
-    return null;
-}
-
-fn isLikelyNextText(text: []const u8) bool {
-    if (text.len == 0) return false;
-    if (std.ascii.indexOfIgnoreCase(text, "next") != null) return true;
-    return std.mem.eql(u8, text, ">") or std.mem.eql(u8, text, "›") or std.mem.eql(u8, text, "»");
+    return std.fmt.allocPrint(allocator, "{s}/search.php?key={s}", .{ site, encoded });
 }
 
 fn extractLanguage(anchor: HtmlNode) struct { raw: ?[]const u8, code: ?[]const u8 } {

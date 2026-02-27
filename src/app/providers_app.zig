@@ -77,14 +77,14 @@ pub fn providerName(provider: Provider) []const u8 {
 
 pub fn providerSupportsSearchPagination(provider: Provider) bool {
     return switch (provider) {
-        .opensubtitles_org, .moviesubtitlesrt_com, .podnapisi_net, .isubtitles_org, .my_subs_co, .tvsubtitles_net => true,
+        .opensubtitles_org, .moviesubtitlesrt_com, .podnapisi_net, .isubtitles_org => true,
         else => false,
     };
 }
 
 pub fn providerSupportsSubtitlesPagination(provider: Provider) bool {
     return switch (provider) {
-        .opensubtitles_org, .isubtitles_org, .my_subs_co, .tvsubtitles_net => true,
+        .opensubtitles_org, .isubtitles_org => true,
         else => false,
     };
 }
@@ -467,7 +467,7 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
         .my_subs_co => {
             var scraper = subdl.my_subs_co.Scraper.init(a, client);
             defer scraper.deinit();
-            var response = try scraper.searchWithOptions(query, .{ .max_pages = 3 });
+            var response = try scraper.search(query);
             defer response.deinit();
 
             for (response.items) |item| {
@@ -517,7 +517,7 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
         .tvsubtitles_net => {
             var scraper = subdl.tvsubtitles_net.Scraper.init(a, client);
             defer scraper.deinit();
-            var response = try scraper.searchWithOptions(query, .{ .max_pages = 3 });
+            var response = try scraper.search(query);
             defer response.deinit();
 
             for (response.items) |item| {
@@ -668,10 +668,7 @@ pub fn searchPage(allocator: Allocator, client: *std.http.Client, provider: Prov
         .my_subs_co => {
             var scraper = subdl.my_subs_co.Scraper.init(a, client);
             defer scraper.deinit();
-            var response = try scraper.searchWithOptions(query, .{
-                .page_start = requested_page,
-                .max_pages = 1,
-            });
+            var response = try scraper.search(query);
             defer response.deinit();
             has_next_page = response.has_next_page;
 
@@ -693,10 +690,7 @@ pub fn searchPage(allocator: Allocator, client: *std.http.Client, provider: Prov
         .tvsubtitles_net => {
             var scraper = subdl.tvsubtitles_net.Scraper.init(a, client);
             defer scraper.deinit();
-            var response = try scraper.searchWithOptions(query, .{
-                .page_start = requested_page,
-                .max_pages = 1,
-            });
+            var response = try scraper.search(query);
             defer response.deinit();
             has_next_page = response.has_next_page;
 
@@ -1074,7 +1068,6 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
             defer scraper.deinit();
             var subtitles = try scraper.fetchSubtitlesByDetailsLinkWithOptions(item.details_url, item.media_kind, .{
                 .resolve_download_links = false,
-                .max_pages_per_entry = 3,
                 .include_seasons = true,
             });
             defer subtitles.deinit();
@@ -1130,7 +1123,6 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
             defer scraper.deinit();
             var subtitles = try scraper.fetchSubtitlesByShowLinkWithOptions(item.show_url, .{
                 .include_all_seasons = true,
-                .max_pages_per_season = 2,
                 .resolve_download_links = false,
             });
             defer subtitles.deinit();
@@ -1228,8 +1220,6 @@ pub fn fetchSubtitlesPage(allocator: Allocator, client: *std.http.Client, ref: S
             defer scraper.deinit();
             var subtitles = try scraper.fetchSubtitlesByDetailsLinkWithOptions(item.details_url, item.media_kind, .{
                 .include_seasons = false,
-                .page_start_per_entry = requested_page,
-                .max_pages_per_entry = 1,
                 .resolve_download_links = false,
             });
             defer subtitles.deinit();
@@ -1250,8 +1240,6 @@ pub fn fetchSubtitlesPage(allocator: Allocator, client: *std.http.Client, ref: S
             defer scraper.deinit();
             var subtitles = try scraper.fetchSubtitlesByShowLinkWithOptions(item.show_url, .{
                 .include_all_seasons = false,
-                .page_start_per_season = requested_page,
-                .max_pages_per_season = 1,
                 .resolve_download_links = false,
             });
             defer subtitles.deinit();
@@ -2199,18 +2187,27 @@ fn toAbsoluteSubdlLink(allocator: Allocator, link: []const u8) ![]const u8 {
 }
 
 fn subtitleLabel(allocator: Allocator, language: ?[]const u8, filename: ?[]const u8, download_url: ?[]const u8) ![]const u8 {
-    const base = if (language) |lang|
-        if (filename) |name|
-            try std.fmt.allocPrint(allocator, "{s} | {s}", .{ lang, name })
-        else
-            try allocator.dupe(u8, lang)
-    else if (filename) |name|
-        try allocator.dupe(u8, name)
-    else
-        try allocator.dupe(u8, "subtitle");
+    const language_trimmed = nonEmptyTrimmed(language);
+    const filename_trimmed = nonEmptyTrimmed(filename) orelse "Without release";
+    if (download_url == null) {
+        if (language_trimmed) |lang| {
+            return try std.fmt.allocPrint(allocator, "{s} | {s} [no direct download]", .{ lang, filename_trimmed });
+        }
+        return try std.fmt.allocPrint(allocator, "{s} [no direct download]", .{filename_trimmed});
+    }
 
-    if (download_url == null) return try std.fmt.allocPrint(allocator, "{s} [no direct download]", .{base});
-    return base;
+    if (language_trimmed) |lang| {
+        return try std.fmt.allocPrint(allocator, "{s} | {s}", .{ lang, filename_trimmed });
+    }
+    return try allocator.dupe(u8, filename_trimmed);
+}
+
+fn nonEmptyTrimmed(value: ?[]const u8) ?[]const u8 {
+    if (value) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return null;
 }
 
 fn makeOpenSubtitlesRemoteToken(allocator: Allocator, remote_endpoint: []const u8) ![]const u8 {
@@ -2443,14 +2440,14 @@ test "provider pagination support flags" {
     try std.testing.expect(providerSupportsSearchPagination(.moviesubtitlesrt_com));
     try std.testing.expect(providerSupportsSearchPagination(.podnapisi_net));
     try std.testing.expect(providerSupportsSearchPagination(.isubtitles_org));
-    try std.testing.expect(providerSupportsSearchPagination(.my_subs_co));
-    try std.testing.expect(providerSupportsSearchPagination(.tvsubtitles_net));
+    try std.testing.expect(!providerSupportsSearchPagination(.my_subs_co));
+    try std.testing.expect(!providerSupportsSearchPagination(.tvsubtitles_net));
     try std.testing.expect(!providerSupportsSearchPagination(.subdl_com));
 
     try std.testing.expect(providerSupportsSubtitlesPagination(.opensubtitles_org));
     try std.testing.expect(providerSupportsSubtitlesPagination(.isubtitles_org));
-    try std.testing.expect(providerSupportsSubtitlesPagination(.my_subs_co));
-    try std.testing.expect(providerSupportsSubtitlesPagination(.tvsubtitles_net));
+    try std.testing.expect(!providerSupportsSubtitlesPagination(.my_subs_co));
+    try std.testing.expect(!providerSupportsSubtitlesPagination(.tvsubtitles_net));
     try std.testing.expect(!providerSupportsSubtitlesPagination(.moviesubtitlesrt_com));
     try std.testing.expect(!providerSupportsSubtitlesPagination(.subdl_com));
     try std.testing.expect(!providerSupportsSubtitlesPagination(.opensubtitles_com));
@@ -2541,6 +2538,22 @@ test "yify referer is only added for yifysubtitles hosts" {
 test "cloudflare target excludes yify downloads" {
     try std.testing.expect(cloudflareTargetForUrl("https://yifysubtitles.ch/subtitle/test.zip") == null);
     try std.testing.expect(cloudflareTargetForUrl("https://www.opensubtitles.com/nocache/download/123") != null);
+}
+
+test "subtitleLabel uses Without release fallback for missing filename" {
+    const allocator = std.testing.allocator;
+
+    const a = try subtitleLabel(allocator, null, null, "https://example.com/sub.zip");
+    defer allocator.free(a);
+    try std.testing.expectEqualStrings("Without release", a);
+
+    const b = try subtitleLabel(allocator, "English", "", "https://example.com/sub.zip");
+    defer allocator.free(b);
+    try std.testing.expectEqualStrings("English | Without release", b);
+
+    const c = try subtitleLabel(allocator, "  ", " \t ", null);
+    defer allocator.free(c);
+    try std.testing.expectEqualStrings("Without release [no direct download]", c);
 }
 
 const ProviderSmokeState = struct {
