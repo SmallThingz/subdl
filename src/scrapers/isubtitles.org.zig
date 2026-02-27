@@ -412,7 +412,7 @@ fn extractNextPageUrl(allocator: Allocator, doc: *const HtmlDocument, current_ur
 
 fn maybeDebugDumpFirstPage(status: std.http.Status, page_url: []const u8, body: []const u8, traversed: usize) void {
     if (traversed != 0) return;
-    if (std.posix.getenv("SCRAPERS_DEBUG_ISUB") == null) return;
+    if (common.getenv("SCRAPERS_DEBUG_ISUB") == null) return;
 
     std.debug.print("[isubtitles] status={d} body_len={d} url={s}\n", .{ @intFromEnum(status), body.len, page_url });
     std.fs.cwd().writeFile(.{ .sub_path = "/tmp/isubtitles_response_debug.html", .data = body }) catch {};

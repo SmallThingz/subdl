@@ -2725,7 +2725,7 @@ fn isWholeSelection(filter: ?[]const u8) bool {
 }
 
 fn liveBatchEnabled() bool {
-    const value = std.posix.getenv("SCRAPERS_LIVE_BATCH") orelse return false;
+    const value = common.getenv("SCRAPERS_LIVE_BATCH") orelse return false;
     return value.len > 0 and !std.mem.eql(u8, value, "0");
 }
 

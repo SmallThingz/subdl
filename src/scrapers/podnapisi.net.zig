@@ -472,7 +472,7 @@ fn dedupeSearchItemsById(items: *std.ArrayListUnmanaged(SearchItem)) void {
 }
 
 fn debugTimingEnabled() bool {
-    const value = std.posix.getenv("SCRAPERS_DEBUG_TIMING") orelse return false;
+    const value = common.getenv("SCRAPERS_DEBUG_TIMING") orelse return false;
     return value.len > 0 and !std.mem.eql(u8, value, "0");
 }
 

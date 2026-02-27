@@ -118,28 +118,10 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const cli_exe = b.addExecutable(.{
-        .name = "scrapers_cli",
+    const app_exe = b.addExecutable(.{
+        .name = "scrapers",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/cmd/cli.zig"),
-            .target = target,
-            .optimize = optimize,
-            .strip = strip,
-            .single_threaded = single_threaded,
-            .omit_frame_pointer = omit_frame_pointer,
-            .error_tracing = error_tracing,
-            .pic = pic,
-            .imports = &.{
-                .{ .name = "scrapers", .module = scrapers_mod },
-                .{ .name = "runtime_alloc", .module = runtime_alloc_mod },
-            },
-        }),
-    });
-
-    const tui_exe = b.addExecutable(.{
-        .name = "scrapers_tui",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/cmd/tui.zig"),
+            .root_source_file = b.path("src/cmd/main.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
@@ -159,34 +141,57 @@ pub fn build(b: *std.Build) void {
     const cross_targets = [_]struct {
         suffix: []const u8,
         query: std.Target.Query,
+        static_libc: bool,
     }{
         .{
             .suffix = "x86_64-linux-gnu",
             .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu },
+            .static_libc = true,
         },
         .{
             .suffix = "aarch64-linux-gnu",
             .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu },
+            .static_libc = true,
+        },
+        .{
+            .suffix = "x86_64-windows-gnu",
+            .query = .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu },
+            .static_libc = false,
+        },
+        .{
+            .suffix = "x86_64-macos-none",
+            .query = .{ .cpu_arch = .x86_64, .os_tag = .macos },
+            .static_libc = false,
+        },
+        .{
+            .suffix = "aarch64-macos-none",
+            .query = .{ .cpu_arch = .aarch64, .os_tag = .macos },
+            .static_libc = false,
         },
     };
 
-    b.installArtifact(cli_exe);
-    b.installArtifact(tui_exe);
+    b.installArtifact(app_exe);
 
-    const run_step = b.step("run", "Run the CLI app");
-    const run_cli_cmd = b.addRunArtifact(cli_exe);
-    run_step.dependOn(&run_cli_cmd.step);
-    run_cli_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cli_cmd.addArgs(args);
+    const run_step = b.step("run", "Run the app (CLI mode by default)");
+    const run_cmd = b.addRunArtifact(app_exe);
+    run_step.dependOn(&run_cmd.step);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_cmd.addArgs(args);
 
-    const run_tui_step = b.step("run-tui", "Run the Vaxis TUI app");
-    const run_tui_cmd = b.addRunArtifact(tui_exe);
+    const run_tui_step = b.step("run-tui", "Run the app in TUI mode");
+    const run_tui_cmd = b.addRunArtifact(app_exe);
     run_tui_step.dependOn(&run_tui_cmd.step);
     run_tui_cmd.step.dependOn(b.getInstallStep());
+    run_tui_cmd.addArg("--tui");
+    if (b.args) |args| run_tui_cmd.addArgs(args);
 
-    const all_targets_step = b.step("build-all-targets", "Build scrapers_cli for all configured targets into zig-out/bin");
+    const all_targets_step = b.step("build-all-targets", "Build scrapers for all configured targets into zig-out/bin");
     for (cross_targets) |cross| {
         const cross_target = b.resolveTargetQuery(cross.query);
+        const cross_libvaxis_dep = b.dependency("libvaxis", .{
+            .target = cross_target,
+            .optimize = all_targets_optimize,
+        });
         const cross_htmlparser_dep = b.dependency("htmlparser", .{
             .target = cross_target,
             .optimize = all_targets_optimize,
@@ -211,7 +216,7 @@ pub fn build(b: *std.Build) void {
         const cross_unarr_dep = b.dependency("unarr", .{
             .target = cross_target,
             .optimize = all_targets_optimize,
-            .static_libc = true,
+            .static_libc = cross.static_libc,
         });
         const cross_runtime_alloc_mod = b.createModule(.{
             .root_source_file = b.path("src/alloc/runtime_allocator.zig"),
@@ -242,11 +247,12 @@ pub fn build(b: *std.Build) void {
         });
 
         const cross_exe = b.addExecutable(.{
-            .name = b.fmt("scrapers_cli-{s}", .{cross.suffix}),
+            .name = b.fmt("scrapers-{s}", .{cross.suffix}),
             .root_module = b.createModule(.{
-                .root_source_file = b.path("src/cmd/cli.zig"),
+                .root_source_file = b.path("src/cmd/main.zig"),
                 .target = cross_target,
                 .optimize = all_targets_optimize,
+                .link_libc = true,
                 .strip = all_targets_strip,
                 .single_threaded = single_threaded,
                 .omit_frame_pointer = omit_frame_pointer,
@@ -254,6 +260,7 @@ pub fn build(b: *std.Build) void {
                 .pic = pic,
                 .imports = &.{
                     .{ .name = "scrapers", .module = cross_scrapers_mod },
+                    .{ .name = "vaxis", .module = cross_libvaxis_dep.module("vaxis") },
                     .{ .name = "runtime_alloc", .module = cross_runtime_alloc_mod },
                 },
             }),
@@ -275,21 +282,15 @@ pub fn build(b: *std.Build) void {
     run_scrapers_mod_tests_live.addFileArg(scrapers_mod_tests.getEmittedBin());
     run_scrapers_mod_tests_live.stdio = .inherit;
 
-    const cli_tests = b.addTest(.{
-        .root_module = cli_exe.root_module,
+    const app_tests = b.addTest(.{
+        .root_module = app_exe.root_module,
     });
-    const run_cli_tests = b.addRunArtifact(cli_tests);
-
-    const tui_tests = b.addTest(.{
-        .root_module = tui_exe.root_module,
-    });
-    const run_tui_tests = b.addRunArtifact(tui_tests);
+    const run_app_tests = b.addRunArtifact(app_tests);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_subdl_mod_tests.step);
     test_step.dependOn(&run_scrapers_mod_tests.step);
-    test_step.dependOn(&run_cli_tests.step);
-    test_step.dependOn(&run_tui_tests.step);
+    test_step.dependOn(&run_app_tests.step);
 
     const test_live_single_step = b.step("test-live-single", "Run live tests for the current provider filter");
     test_live_single_step.dependOn(&run_scrapers_mod_tests_live.step);

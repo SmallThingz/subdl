@@ -9,9 +9,8 @@ Subtitle scrapers in Zig with a shared provider API, a CLI, and a Vaxis TUI.
 ## What This Project Provides
 
 - 12 provider integrations behind one unified app layer (`providers_app`).
-- Two binaries:
-  - `scrapers_cli` for scripted/non-interactive use.
-  - `scrapers_tui` for interactive search, browse, and download.
+- One binary:
+  - `scrapers` (CLI mode by default, TUI mode via `--tui` or `tui`).
 - Library API exported from `src/lib.zig`.
 - Runtime networking through Zig `std.http.Client` (no `curl` dependency in runtime flows).
 
@@ -64,7 +63,7 @@ Install binaries:
 zig build install
 ```
 
-Build cross-target CLI binaries into `zig-out/bin`:
+Build cross-target binaries into `zig-out/bin`:
 
 ```bash
 zig build build-all-targets

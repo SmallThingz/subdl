@@ -1,5 +1,6 @@
 const std = @import("std");
 const html = @import("htmlparser");
+const builtin = @import("builtin");
 const HtmlParseOptions: html.ParseOptions = .{};
 const HtmlDocument = HtmlParseOptions.GetDocument();
 const HtmlNode = HtmlParseOptions.GetNode();
@@ -39,7 +40,7 @@ pub const ParsedHtml = struct {
 };
 
 fn debugTimingEnabled() bool {
-    const value = std.posix.getenv("SCRAPERS_DEBUG_TIMING") orelse return false;
+    const value = getenv("SCRAPERS_DEBUG_TIMING") orelse return false;
     return value.len > 0 and !std.mem.eql(u8, value, "0");
 }
 
@@ -98,7 +99,7 @@ pub const LivePhase = struct {
 };
 
 fn selectorDebugEnabled() bool {
-    const value = std.posix.getenv("SCRAPERS_SELECTOR_DEBUG") orelse return false;
+    const value = getenv("SCRAPERS_SELECTOR_DEBUG") orelse return false;
     return value.len > 0 and !std.mem.eql(u8, value, "0");
 }
 
@@ -438,12 +439,12 @@ pub fn liveIncludeCaptchaEnabled() bool {
 }
 
 pub fn liveProviderFilter() ?[]const u8 {
-    if (std.posix.getenv("SCRAPERS_LIVE_PROVIDER_FILTER")) |value| {
+    if (getenv("SCRAPERS_LIVE_PROVIDER_FILTER")) |value| {
         const trimmed_env = trimAscii(value);
         if (trimmed_env.len == 0) return null;
         return trimmed_env;
     }
-    if (std.posix.getenv("SCRAPERS_LIVE_PROVIDERS")) |value| {
+    if (getenv("SCRAPERS_LIVE_PROVIDERS")) |value| {
         const trimmed_env = trimAscii(value);
         if (trimmed_env.len == 0) return null;
         return trimmed_env;
@@ -454,7 +455,7 @@ pub fn liveProviderFilter() ?[]const u8 {
 }
 
 fn envBool(name: []const u8) ?bool {
-    const raw = std.posix.getenv(name) orelse return null;
+    const raw = getenv(name) orelse return null;
     const value = trimAscii(raw);
     if (value.len == 0) return null;
     if (std.mem.eql(u8, value, "1")) return true;
@@ -466,6 +467,13 @@ fn envBool(name: []const u8) ?bool {
     if (std.ascii.eqlIgnoreCase(value, "on")) return true;
     if (std.ascii.eqlIgnoreCase(value, "off")) return false;
     return null;
+}
+
+pub fn getenv(name: []const u8) ?[]const u8 {
+    if (builtin.os.tag == .windows) {
+        return null;
+    }
+    return std.posix.getenv(name);
 }
 
 pub fn providerMatchesLiveFilter(filter: ?[]const u8, provider_name: []const u8) bool {

@@ -261,7 +261,7 @@ fn detailToDownloadUrl(allocator: Allocator, details_url: []const u8) ?[]const u
 }
 
 fn debugTimingEnabled() bool {
-    const value = std.posix.getenv("SCRAPERS_DEBUG_TIMING") orelse return false;
+    const value = common.getenv("SCRAPERS_DEBUG_TIMING") orelse return false;
     return value.len > 0 and !std.mem.eql(u8, value, "0");
 }
 

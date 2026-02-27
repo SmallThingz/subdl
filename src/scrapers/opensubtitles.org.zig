@@ -221,7 +221,7 @@ pub const Scraper = struct {
 
             const ip = try self.resolveHostViaDoh(allocator, opensubtitles_host);
             const raw = try fetchHttpsByIp(allocator, opensubtitles_host, ip, target, "text/html");
-            if (std.posix.getenv("SCRAPERS_DEBUG_OPENSUB_ORG_DOH") != null) {
+            if (common.getenv("SCRAPERS_DEBUG_OPENSUB_ORG_DOH") != null) {
                 std.debug.print("[opensubtitles.org][doh] ip={s} path={s} status={d}\n", .{
                     ip,
                     target,
@@ -366,7 +366,7 @@ fn fetchHttpsByIp(
 fn readHttpResponse(allocator: Allocator, reader: *std.Io.Reader) !RawHttpResponse {
     const status_line = try readLine(allocator, reader);
     const status_code = parseHttpStatusCode(status_line) orelse {
-        if (std.posix.getenv("SCRAPERS_DEBUG_OPENSUB_ORG_DOH") != null) {
+        if (common.getenv("SCRAPERS_DEBUG_OPENSUB_ORG_DOH") != null) {
             std.debug.print("[opensubtitles.org][doh] invalid status line: {s}\n", .{status_line});
         }
         return error.UnexpectedHttpStatus;

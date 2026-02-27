@@ -1,5 +1,6 @@
 const std = @import("std");
 const driver = @import("alldriver");
+const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
 const opensubtitles_domain = "www.opensubtitles.com";
@@ -262,7 +263,7 @@ fn freeCacheRecords(allocator: Allocator, records: *std.ArrayListUnmanaged(Cache
 }
 
 fn cachePath(allocator: Allocator) ![]u8 {
-    const home = std.posix.getenv("HOME") orelse return error.EnvironmentVariableNotFound;
+    const home = getenv("HOME") orelse return error.EnvironmentVariableNotFound;
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, shared_cache_relpath });
 }
 
@@ -478,12 +479,19 @@ fn normalizeDomain(allocator: Allocator, input: []const u8) ![]u8 {
 }
 
 fn shouldLaunchHeadless() bool {
-    if (std.posix.getenv("SUBDL_CF_HEADLESS")) |raw| {
+    if (getenv("SUBDL_CF_HEADLESS")) |raw| {
         if (std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true") or std.ascii.eqlIgnoreCase(raw, "yes")) return true;
         if (std.mem.eql(u8, raw, "0") or std.ascii.eqlIgnoreCase(raw, "false") or std.ascii.eqlIgnoreCase(raw, "no")) return false;
     }
 
-    return std.posix.getenv("DISPLAY") == null and std.posix.getenv("WAYLAND_DISPLAY") == null;
+    return getenv("DISPLAY") == null and getenv("WAYLAND_DISPLAY") == null;
+}
+
+fn getenv(name: []const u8) ?[]const u8 {
+    if (builtin.os.tag == .windows) {
+        return null;
+    }
+    return std.posix.getenv(name);
 }
 
 fn getString(obj: std.json.ObjectMap, field: []const u8) ![]const u8 {

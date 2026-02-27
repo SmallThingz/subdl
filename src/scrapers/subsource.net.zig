@@ -436,10 +436,10 @@ fn buildSearchPayload(allocator: Allocator, query: []const u8, include_seasons: 
 fn resolveAuth(allocator: Allocator, cf_clearance_opt: ?[]const u8, user_agent_opt: ?[]const u8, force_refresh: bool, auto_cloudflare_session: bool) !Auth {
     var cf_clearance = cf_clearance_opt;
     if (cf_clearance == null) {
-        cf_clearance = std.posix.getenv("SUBSOURCE_CF_CLEARANCE");
+        cf_clearance = common.getenv("SUBSOURCE_CF_CLEARANCE");
     }
 
-    var user_agent = user_agent_opt orelse std.posix.getenv("SUBSOURCE_USER_AGENT") orelse default_subsource_user_agent;
+    var user_agent = user_agent_opt orelse common.getenv("SUBSOURCE_USER_AGENT") orelse default_subsource_user_agent;
 
     if (cf_clearance == null and auto_cloudflare_session and force_refresh) {
         const session = try cf_shared.ensureDomainSession(allocator, .{

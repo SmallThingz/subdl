@@ -5,8 +5,7 @@
 This project provides subtitle scraping and download workflows across multiple providers using:
 
 - A shared app layer in `src/app/providers_app.zig`
-- A CLI binary: `scrapers_cli`
-- A TUI binary: `scrapers_tui`
+- A single user-facing binary: `scrapers` (`CLI` by default, `TUI` via `--tui`)
 - A library surface exported from `src/lib.zig`
 
 The runtime HTTP path uses Zig `std.http.Client`.
@@ -50,7 +49,7 @@ Run TUI:
 zig build run-tui
 ```
 
-Build cross-target CLI binaries (installed into `zig-out/bin`):
+Build cross-target binaries (installed into `zig-out/bin`):
 
 ```bash
 zig build build-all-targets
@@ -100,13 +99,13 @@ No pagination:
 
 For non-paginated providers, page `1` returns data and page `>1` returns empty page results.
 
-## CLI Reference (`scrapers_cli`)
+## CLI Reference (`scrapers`)
 
 Usage:
 
 ```text
-scrapers_cli --provider <name> --query <text> [--title-index N] [--subtitle-index N] [--out-dir DIR] [--extract]
-scrapers_cli --list-providers
+scrapers --provider <name> --query <text> [--title-index N] [--subtitle-index N] [--out-dir DIR] [--extract]
+scrapers --list-providers
 ```
 
 Options:
@@ -168,15 +167,17 @@ zig build run -- \
 Use the installed binary directly:
 
 ```bash
-./zig-out/bin/scrapers_cli --provider isubtitles_org --query "Interstellar"
+./zig-out/bin/scrapers --provider isubtitles_org --query "Interstellar"
 ```
 
-## TUI Reference (`scrapers_tui`)
+## TUI Reference (`scrapers --tui`)
 
 Launch:
 
 ```bash
 zig build run-tui
+# or:
+zig build run -- --tui
 ```
 
 Flow:

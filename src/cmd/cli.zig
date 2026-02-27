@@ -207,13 +207,13 @@ fn printProviders(writer: *std.Io.Writer) !void {
 fn printUsage(writer: *std.Io.Writer) !void {
     try writer.print(
         \\Usage:
-        \\  scrapers_cli --provider <name> --query <text> [--title-index N] [--subtitle-index N] [--out-dir DIR] [--extract]
-        \\  scrapers_cli --list-providers
+        \\  scrapers --provider <name> --query <text> [--title-index N] [--subtitle-index N] [--out-dir DIR] [--extract]
+        \\  scrapers --list-providers
         \\
         \\Examples:
-        \\  scrapers_cli --provider subdl_com --query "The Matrix"
-        \\  scrapers_cli --provider podnapisi_net --query "The Matrix" --title-index 0 --subtitle-index 1 --out-dir downloads
-        \\  scrapers_cli --provider subsource_net --query "The Matrix" --extract
+        \\  scrapers --provider subdl_com --query "The Matrix"
+        \\  scrapers --provider podnapisi_net --query "The Matrix" --title-index 0 --subtitle-index 1 --out-dir downloads
+        \\  scrapers --provider subsource_net --query "The Matrix" --extract
         \\
     ,
         .{},
