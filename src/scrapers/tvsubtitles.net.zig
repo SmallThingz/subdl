@@ -1,6 +1,9 @@
 const std = @import("std");
 const common = @import("common.zig");
 const html = @import("htmlparser");
+const HtmlParseOptions: html.ParseOptions = .{};
+const HtmlDocument = HtmlParseOptions.GetDocument();
+const HtmlNode = HtmlParseOptions.GetNode();
 
 const Allocator = std.mem.Allocator;
 const site = "https://www.tvsubtitles.net";
@@ -289,7 +292,7 @@ fn addOrReplacePageQuery(allocator: Allocator, base_url: []const u8, page: usize
     return try std.fmt.allocPrint(allocator, "{s}{c}page={d}", .{ base_url, sep, page });
 }
 
-fn collectSearchItems(allocator: Allocator, doc: *const html.Document, out: *std.ArrayListUnmanaged(SearchItem), seen: *std.StringHashMapUnmanaged(void)) !void {
+fn collectSearchItems(allocator: Allocator, doc: *const HtmlDocument, out: *std.ArrayListUnmanaged(SearchItem), seen: *std.StringHashMapUnmanaged(void)) !void {
     const before_len = out.items.len;
     var anchors = doc.queryAll(".left_articles a[href*='tvshow-']");
     while (anchors.next()) |anchor| {
@@ -326,7 +329,7 @@ fn collectSearchItems(allocator: Allocator, doc: *const html.Document, out: *std
     }
 }
 
-fn extractNextPageUrl(allocator: Allocator, doc: *const html.Document, current_url: []const u8) !?[]const u8 {
+fn extractNextPageUrl(allocator: Allocator, doc: *const HtmlDocument, current_url: []const u8) !?[]const u8 {
     if (doc.queryOne("a[rel='next'][href]")) |a| {
         if (common.getAttributeValueSafe(a, "href")) |href| {
             return try common.resolveUrl(allocator, site, href);
@@ -356,7 +359,7 @@ fn isLikelyNextText(text: []const u8) bool {
     return std.mem.eql(u8, text, ">") or std.mem.eql(u8, text, "›") or std.mem.eql(u8, text, "»");
 }
 
-fn episodeTitle(row: html.Node, allocator: Allocator) !?[]const u8 {
+fn episodeTitle(row: HtmlNode, allocator: Allocator) !?[]const u8 {
     if (row.queryOne("td:nth-child(2) a b")) |node| {
         const text = try common.innerTextTrimmedOwned(allocator, node);
         if (text.len > 0) return text;
@@ -378,7 +381,7 @@ fn parseSubtitleId(subtitle_page_url: []const u8) ?[]const u8 {
     return tail[0..end];
 }
 
-fn languageFromSubtitleAnchor(anchor: html.Node, href: []const u8) ?[]const u8 {
+fn languageFromSubtitleAnchor(anchor: HtmlNode, href: []const u8) ?[]const u8 {
     if (anchor.queryOne("img")) |img| {
         if (common.getAttributeValueSafe(img, "alt")) |alt| {
             const code = common.trimAscii(alt);

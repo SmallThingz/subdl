@@ -1,6 +1,9 @@
 const std = @import("std");
 const common = @import("common.zig");
 const html = @import("htmlparser");
+const HtmlParseOptions: html.ParseOptions = .{};
+const HtmlDocument = HtmlParseOptions.GetDocument();
+const HtmlNode = HtmlParseOptions.GetNode();
 const suite = @import("test_suite.zig");
 
 const Allocator = std.mem.Allocator;
@@ -96,7 +99,7 @@ pub const Scraper = struct {
         var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
         var blocks = parsed.doc.queryAll("div.sub-single");
         while (blocks.next()) |block| {
-            var spans: [3]?html.Node = .{ null, null, null };
+            var spans: [3]?HtmlNode = .{ null, null, null };
             var span_count: usize = 0;
             for (block.children()) |child_idx| {
                 const child = block.doc.nodeAt(child_idx) orelse continue;
@@ -256,7 +259,7 @@ fn asciiEndsWithIgnoreCase(input: []const u8, suffix: []const u8) bool {
     return true;
 }
 
-fn findDescendantByTag(node: html.Node, tag_name: []const u8) ?html.Node {
+fn findDescendantByTag(node: HtmlNode, tag_name: []const u8) ?HtmlNode {
     for (node.children()) |child_idx| {
         const child = node.doc.nodeAt(child_idx) orelse continue;
         if (std.mem.eql(u8, child.tagName(), tag_name)) return child;
@@ -265,7 +268,7 @@ fn findDescendantByTag(node: html.Node, tag_name: []const u8) ?html.Node {
     return null;
 }
 
-fn findDescendantByTagWithAttr(node: html.Node, tag_name: []const u8, attr_name: []const u8) ?html.Node {
+fn findDescendantByTagWithAttr(node: HtmlNode, tag_name: []const u8, attr_name: []const u8) ?HtmlNode {
     for (node.children()) |child_idx| {
         const child = node.doc.nodeAt(child_idx) orelse continue;
         if (std.mem.eql(u8, child.tagName(), tag_name) and common.getAttributeValueSafe(child, attr_name) != null) return child;

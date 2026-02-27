@@ -1,6 +1,9 @@
 const std = @import("std");
 const common = @import("common.zig");
 const html = @import("htmlparser");
+const HtmlParseOptions: html.ParseOptions = .{};
+const HtmlDocument = HtmlParseOptions.GetDocument();
+const HtmlNode = HtmlParseOptions.GetNode();
 
 const Allocator = std.mem.Allocator;
 const site = "https://my-subs.co";
@@ -305,7 +308,7 @@ fn addOrReplacePageQuery(allocator: Allocator, base_url: []const u8, page: usize
     return try std.fmt.allocPrint(allocator, "{s}{c}page={d}", .{ base_url, sep, page });
 }
 
-fn extractNextPageUrl(allocator: Allocator, doc: *const html.Document, current_url: []const u8) !?[]const u8 {
+fn extractNextPageUrl(allocator: Allocator, doc: *const HtmlDocument, current_url: []const u8) !?[]const u8 {
     if (doc.queryOne("a[rel='next'][href]")) |a| {
         if (common.getAttributeValueSafe(a, "href")) |href| {
             return try common.resolveUrl(allocator, site, href);
@@ -334,7 +337,7 @@ fn isLikelyNextText(text: []const u8) bool {
     return std.mem.eql(u8, text, ">") or std.mem.eql(u8, text, "›") or std.mem.eql(u8, text, "»");
 }
 
-fn extractLanguage(anchor: html.Node) struct { raw: ?[]const u8, code: ?[]const u8 } {
+fn extractLanguage(anchor: HtmlNode) struct { raw: ?[]const u8, code: ?[]const u8 } {
     if (anchor.queryOne("span[class*='flag-icon-']")) |flag| {
         const class_name = common.getAttributeValueSafe(flag, "class") orelse "";
         const flag_code = parseFlagCodeFromClass(class_name);
@@ -380,7 +383,7 @@ fn languageFromFlag(flag_code: ?[]const u8, raw: ?[]const u8) ?[]const u8 {
     return null;
 }
 
-fn extractReleaseVersion(anchor: html.Node, allocator: Allocator) !?[]const u8 {
+fn extractReleaseVersion(anchor: HtmlNode, allocator: Allocator) !?[]const u8 {
     if (anchor.queryOne("strong")) |strong| {
         const text = try common.innerTextTrimmedOwned(allocator, strong);
         if (text.len > 0) return text;

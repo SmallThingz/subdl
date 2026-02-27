@@ -1,6 +1,9 @@
 const std = @import("std");
 const common = @import("common.zig");
 const html = @import("htmlparser");
+const HtmlParseOptions: html.ParseOptions = .{};
+const HtmlDocument = HtmlParseOptions.GetDocument();
+const HtmlNode = HtmlParseOptions.GetNode();
 
 const Allocator = std.mem.Allocator;
 const site = "https://isubtitles.org";
@@ -241,7 +244,7 @@ pub const Scraper = struct {
 
 fn collectSearchItemsFromSelector(
     allocator: Allocator,
-    doc: *const html.Document,
+    doc: *const HtmlDocument,
     comptime selector: []const u8,
     seen: *std.StringHashMapUnmanaged(void),
     out: *std.ArrayListUnmanaged(SearchItem),
@@ -300,7 +303,7 @@ fn collectSearchItemsFromRawHtml(
     }
 }
 
-fn textAt(node: html.Node, allocator: Allocator, comptime selector: []const u8) !?[]const u8 {
+fn textAt(node: HtmlNode, allocator: Allocator, comptime selector: []const u8) !?[]const u8 {
     const found = node.queryOne(selector) orelse return null;
     const text = try common.innerTextTrimmedOwned(allocator, found);
     if (text.len == 0) return null;
@@ -336,7 +339,7 @@ fn addOrReplacePageQuery(allocator: Allocator, base_url: []const u8, page: usize
     return try out.toOwnedSlice(allocator);
 }
 
-fn extractNextPageUrl(allocator: Allocator, doc: *const html.Document, current_url: []const u8) !?[]const u8 {
+fn extractNextPageUrl(allocator: Allocator, doc: *const HtmlDocument, current_url: []const u8) !?[]const u8 {
     if (doc.queryOne("a[rel='next'][href]")) |a| {
         if (common.getAttributeValueSafe(a, "href")) |href| {
             return try common.resolveUrl(allocator, site, href);

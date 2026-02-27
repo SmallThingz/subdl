@@ -1,5 +1,8 @@
 const std = @import("std");
 const html = @import("htmlparser");
+const HtmlParseOptions: html.ParseOptions = .{};
+const HtmlDocument = HtmlParseOptions.GetDocument();
+const HtmlNode = HtmlParseOptions.GetNode();
 const build_options = @import("build_options");
 
 pub const Allocator = std.mem.Allocator;
@@ -26,7 +29,7 @@ pub const FetchOptions = struct {
 pub const ParsedHtml = struct {
     allocator: Allocator,
     source: []u8,
-    doc: html.Document,
+    doc: HtmlDocument,
 
     pub fn deinit(self: *ParsedHtml) void {
         self.doc.deinit();
@@ -188,7 +191,10 @@ fn fetchBytesViaCurl(allocator: Allocator, url: []const u8, opts: FetchOptions) 
         try argv.appendSlice(allocator, &.{ "-H", header_line });
     }
 
-    try argv.appendSlice(allocator, &.{ "-w", "\n%{http_code}", url });
+    const normalized_url = try normalizeUrlForFetch(allocator, url);
+    defer allocator.free(normalized_url);
+
+    try argv.appendSlice(allocator, &.{ "-w", "\n%{http_code}", normalized_url });
 
     const run_result = try std.process.Child.run(.{
         .allocator = allocator,
@@ -214,6 +220,51 @@ fn fetchBytesViaCurl(allocator: Allocator, url: []const u8, opts: FetchOptions) 
         .status = @enumFromInt(status_code),
         .body = try allocator.dupe(u8, body),
     };
+}
+
+pub fn normalizeUrlForFetch(allocator: Allocator, url: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < url.len) {
+        const c = url[i];
+
+        if (c == '%' and i + 2 < url.len and isHex(url[i + 1]) and isHex(url[i + 2])) {
+            try out.appendSlice(allocator, url[i .. i + 3]);
+            i += 3;
+            continue;
+        }
+
+        if (isSafeUrlByte(c)) {
+            try out.append(allocator, c);
+        } else {
+            const hi = "0123456789ABCDEF"[c >> 4];
+            const lo = "0123456789ABCDEF"[c & 0xF];
+            try out.appendSlice(allocator, &.{ '%', hi, lo });
+        }
+        i += 1;
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn isHex(c: u8) bool {
+    return (c >= '0' and c <= '9') or
+        (c >= 'a' and c <= 'f') or
+        (c >= 'A' and c <= 'F');
+}
+
+fn isSafeUrlByte(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or
+        (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or
+        c == '-' or c == '_' or c == '.' or c == '~' or
+        c == ':' or c == '/' or c == '?' or c == '#' or
+        c == '@' or
+        c == '!' or c == '$' or c == '&' or c == '\'' or
+        c == '(' or c == ')' or c == '*' or c == '+' or
+        c == ',' or c == ';' or c == '=' or c == '%';
 }
 
 fn methodToString(method: std.http.Method) []const u8 {
@@ -245,7 +296,7 @@ pub fn parseHtmlTurbo(allocator: Allocator, source: []const u8) !ParsedHtml {
     const html_bytes = try allocator.dupe(u8, source);
     errdefer allocator.free(html_bytes);
 
-    var doc = html.Document.init(allocator);
+    var doc = HtmlDocument.init(allocator);
     errdefer doc.deinit();
 
     {
@@ -274,7 +325,7 @@ pub fn parseHtmlStable(allocator: Allocator, source: []const u8) !ParsedHtml {
     const html_bytes = try allocator.dupe(u8, source);
     errdefer allocator.free(html_bytes);
 
-    var doc = html.Document.init(allocator);
+    var doc = HtmlDocument.init(allocator);
     errdefer doc.deinit();
     {
         var phase = LivePhase.init("html.parse", "stable");
@@ -815,6 +866,20 @@ test "encode uri component" {
     try std.testing.expectEqualStrings("The%20Matrix%20%281999%29", encoded);
 }
 
+test "normalize url for fetch preserves valid escapes and encodes unsafe bytes" {
+    const allocator = std.testing.allocator;
+    const normalized = try normalizeUrlForFetch(
+        allocator,
+        "https://www.subtitlecat.com/subs/1366/[Chinese Traditional] A❤️ B.srt?x=1 2&y=%2F",
+    );
+    defer allocator.free(normalized);
+
+    try std.testing.expectEqualStrings(
+        "https://www.subtitlecat.com/subs/1366/%5BChinese%20Traditional%5D%20A%E2%9D%A4%EF%B8%8F%20B.srt?x=1%202&y=%2F",
+        normalized,
+    );
+}
+
 test "hasHeader detects custom user-agent case-insensitively" {
     const headers = [_]std.http.Header{
         .{ .name = "User-Agent", .value = "custom-agent" },
@@ -826,7 +891,7 @@ test "hasHeader detects custom user-agent case-insensitively" {
 test "parse attr helpers" {
     var source =
         "<div id='root' data-i='42' data-f='3.25' data-b1='true' data-b2='0' disabled></div>".*;
-    var doc = html.Document.init(std.testing.allocator);
+    var doc = HtmlDocument.init(std.testing.allocator);
     defer doc.deinit();
     try doc.parse(&source, .{});
 
@@ -846,7 +911,7 @@ test "table helpers find columns and extract cells" {
         "<thead><tr><th>Upload Date</th><th>FPS</th><th>CDs</th></tr></thead>" ++
         "<tbody><tr><td>2024-01-01</td><td>23.976</td><td>2</td></tr></tbody>" ++
         "</table>";
-    var doc = html.Document.init(std.testing.allocator);
+    var doc = HtmlDocument.init(std.testing.allocator);
     defer doc.deinit();
     var buf = source.*;
     try doc.parse(&buf, .{});

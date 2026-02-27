@@ -1,6 +1,9 @@
 const std = @import("std");
 const common = @import("common.zig");
 const html = @import("htmlparser");
+const HtmlParseOptions: html.ParseOptions = .{};
+const HtmlDocument = HtmlParseOptions.GetDocument();
+const HtmlNode = HtmlParseOptions.GetNode();
 const suite = @import("test_suite.zig");
 
 const Allocator = std.mem.Allocator;
@@ -228,7 +231,7 @@ fn appendSearchItemsFromRawHtml(allocator: Allocator, html_body: []const u8, ite
     }
 }
 
-fn findAncestorWithStyleFragment(node: html.Node, style_fragment: []const u8) ?html.Node {
+fn findAncestorWithStyleFragment(node: HtmlNode, style_fragment: []const u8) ?HtmlNode {
     var current = node.parentNode();
     while (current) |n| : (current = n.parentNode()) {
         if (!std.mem.eql(u8, n.tagName(), "div")) continue;
@@ -238,7 +241,7 @@ fn findAncestorWithStyleFragment(node: html.Node, style_fragment: []const u8) ?h
     return null;
 }
 
-fn findDescendantImgWithSrcFragment(node: html.Node, src_fragment: []const u8) ?html.Node {
+fn findDescendantImgWithSrcFragment(node: HtmlNode, src_fragment: []const u8) ?HtmlNode {
     for (node.children()) |child_idx| {
         const child = node.doc.nodeAt(child_idx) orelse continue;
         if (std.mem.eql(u8, child.tagName(), "img")) {

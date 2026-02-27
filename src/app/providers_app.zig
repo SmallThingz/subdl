@@ -1960,7 +1960,9 @@ fn fetchBytesViaCurl(allocator: Allocator, url: []const u8, accept: []const u8, 
         try argv.appendSlice(allocator, &.{ "-H", referer_header });
     }
 
-    try argv.appendSlice(allocator, &.{ "-w", "\n%{http_code}", url });
+    const normalized_url = try common.normalizeUrlForFetch(allocator, url);
+    defer allocator.free(normalized_url);
+    try argv.appendSlice(allocator, &.{ "-w", "\n%{http_code}", normalized_url });
 
     const run_result = std.process.Child.run(.{
         .allocator = allocator,
@@ -2054,7 +2056,9 @@ fn fetchBytesViaCurlUsingSession(
     try owned_args.append(allocator, accept_header);
     try argv.appendSlice(allocator, &.{ "-H", accept_header });
 
-    try argv.appendSlice(allocator, &.{ "-w", "\n%{http_code}", url });
+    const normalized_url = try common.normalizeUrlForFetch(allocator, url);
+    defer allocator.free(normalized_url);
+    try argv.appendSlice(allocator, &.{ "-w", "\n%{http_code}", normalized_url });
 
     const run_result = std.process.Child.run(.{
         .allocator = allocator,
@@ -2375,6 +2379,11 @@ fn likelyArchiveSource(url: []const u8, filename: ?[]const u8) bool {
     return false;
 }
 
+fn isSubtitlecatTranslateTokenUrl(download_url: ?[]const u8) bool {
+    const url = download_url orelse return false;
+    return std.mem.startsWith(u8, url, subtitlecat_translate_prefix);
+}
+
 fn prepareDownloadOutDir(path: []const u8) !void {
     try std.fs.cwd().makePath(path);
 }
@@ -2650,12 +2659,82 @@ fn runProviderTuiSmoke(allocator: std.mem.Allocator, client: *std.http.Client, p
         try std.fs.cwd().access(path, .{});
     }
 
-    if (!(download.bytes_written > 0 and download.extracted_files.len > 0)) return error.TestUnexpectedResult;
-    std.debug.print("[live][providers_app][{s}] extraction_ok idx={d} files={d}\n", .{
-        providerName(provider),
-        download_idx,
-        download.extracted_files.len,
-    });
+    if (download.bytes_written == 0) return error.TestUnexpectedResult;
+    if (download.archive_path != null and download.extracted_files.len == 0) return error.TestUnexpectedResult;
+    if (download.extracted_files.len > 0) {
+        std.debug.print("[live][providers_app][{s}] extraction_ok idx={d} files={d}\n", .{
+            providerName(provider),
+            download_idx,
+            download.extracted_files.len,
+        });
+    } else {
+        std.debug.print("[live][providers_app][{s}] direct_download_ok idx={d}\n", .{
+            providerName(provider),
+            download_idx,
+        });
+    }
+}
+
+fn runSubtitlecatTranslateDownloadLive(allocator: std.mem.Allocator, client: *std.http.Client) !void {
+    const provider_name = "subtitlecat_com";
+    std.debug.print("[live][providers_app][subtitlecat_com][translate] start\n", .{});
+
+    var search_response = try search(allocator, client, .subtitlecat_com, "The Matrix");
+    defer search_response.deinit();
+    if (search_response.items.len == 0) return error.TestUnexpectedResult;
+
+    var chosen_subtitle: ?SubtitleChoice = null;
+    var chosen_listing_idx: ?usize = null;
+
+    const max_listings = @min(search_response.items.len, @as(usize, 8));
+    var i: usize = 0;
+    while (i < max_listings and chosen_subtitle == null) : (i += 1) {
+        const listing = search_response.items[i];
+        var subtitles = fetchSubtitles(allocator, client, listing.ref) catch |err| {
+            std.debug.print("[live][providers_app][subtitlecat_com][translate] skip listing={d} err={s}\n", .{ i, @errorName(err) });
+            continue;
+        };
+        defer subtitles.deinit();
+
+        for (subtitles.items) |sub| {
+            if (!isSubtitlecatTranslateTokenUrl(sub.download_url)) continue;
+            chosen_subtitle = .{
+                .label = try allocator.dupe(u8, sub.label),
+                .language = try dupOptional(allocator, sub.language),
+                .filename = try dupOptional(allocator, sub.filename),
+                .download_url = try dupOptional(allocator, sub.download_url),
+            };
+            chosen_listing_idx = i;
+            break;
+        }
+    }
+
+    if (chosen_subtitle == null) return error.TestUnexpectedResult;
+    defer {
+        const sub = chosen_subtitle.?;
+        allocator.free(sub.label);
+        if (sub.language) |v| allocator.free(v);
+        if (sub.filename) |v| allocator.free(v);
+        if (sub.download_url) |v| allocator.free(v);
+    }
+
+    std.debug.print("[live][providers_app][subtitlecat_com][translate] chosen_listing={d}\n", .{chosen_listing_idx.?});
+    try common.livePrintField(allocator, "provider", provider_name);
+    try common.livePrintField(allocator, "subtitle_label", chosen_subtitle.?.label);
+    try common.livePrintOptionalField(allocator, "download_url", chosen_subtitle.?.download_url);
+
+    const unique = std.time.nanoTimestamp();
+    const out_dir = try std.fmt.allocPrint(allocator, ".zig-cache/live-downloads/subtitlecat-translate-{d}", .{unique});
+    defer allocator.free(out_dir);
+    try prepareDownloadOutDir(out_dir);
+    defer cleanupDownloadOutDir(out_dir);
+
+    var download = try downloadSubtitle(allocator, client, chosen_subtitle.?, out_dir);
+    defer download.deinit(allocator);
+    std.debug.print("[live][providers_app][subtitlecat_com][translate] download_ok bytes={d}\n", .{download.bytes_written});
+    try common.livePrintField(allocator, "download_file_path", download.file_path);
+    try std.fs.cwd().access(download.file_path, .{});
+    if (download.bytes_written == 0) return error.TestUnexpectedResult;
 }
 
 const tui_smoke_providers = [_]Provider{
@@ -2788,6 +2867,15 @@ test "live providers_app tui-path smoke provider: podnapisi.net" {
 
 test "live providers_app tui-path smoke provider: subtitlecat.com" {
     try runSingleProviderSmokeTest(.subtitlecat_com);
+}
+
+test "live providers_app subtitlecat translated download path" {
+    if (!shouldRunTuiLiveSmoke(std.testing.allocator)) return error.SkipZigTest;
+    if (!common.providerMatchesLiveFilter(common.liveProviderFilter(), "subtitlecat_com")) return error.SkipZigTest;
+
+    var client: std.http.Client = .{ .allocator = std.testing.allocator };
+    defer client.deinit();
+    try runSubtitlecatTranslateDownloadLive(std.testing.allocator, &client);
 }
 
 test "live providers_app tui-path smoke provider: subsource.net" {

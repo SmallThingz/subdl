@@ -1,6 +1,9 @@
 const std = @import("std");
 const common = @import("common.zig");
 const html = @import("htmlparser");
+const HtmlParseOptions: html.ParseOptions = .{};
+const HtmlDocument = HtmlParseOptions.GetDocument();
+const HtmlNode = HtmlParseOptions.GetNode();
 const suite = @import("test_suite.zig");
 
 const Allocator = std.mem.Allocator;
@@ -380,7 +383,7 @@ fn deriveJsonItemTitle(allocator: Allocator, obj: anytype, id: []const u8) ![]co
     return std.fmt.allocPrint(allocator, "Podnapisi #{s}", .{id});
 }
 
-fn deriveHtmlAnchorTitle(allocator: Allocator, anchor: html.Node, absolute_url: []const u8, id: []const u8) ![]const u8 {
+fn deriveHtmlAnchorTitle(allocator: Allocator, anchor: HtmlNode, absolute_url: []const u8, id: []const u8) ![]const u8 {
     const text = try common.innerTextTrimmedOwned(allocator, anchor);
     if (text.len > 0) return text;
 
@@ -415,7 +418,7 @@ fn slugToTitle(allocator: Allocator, slug: []const u8) ![]const u8 {
     return duped;
 }
 
-fn hasNextHtmlSearchPage(doc: *const html.Document, current_page: usize) !bool {
+fn hasNextHtmlSearchPage(doc: *const HtmlDocument, current_page: usize) !bool {
     if (doc.queryOne("link[rel='next'][href]")) |_| return true;
     if (doc.queryOne("a[rel='next'][href]")) |_| return true;
     if (doc.queryOne("a.next[href]")) |_| return true;
@@ -473,7 +476,7 @@ fn debugTimingEnabled() bool {
     return value.len > 0 and !std.mem.eql(u8, value, "0");
 }
 
-fn findDescendantByTag(node: html.Node, tag_name: []const u8) ?html.Node {
+fn findDescendantByTag(node: HtmlNode, tag_name: []const u8) ?HtmlNode {
     for (node.children()) |child_idx| {
         const child = node.doc.nodeAt(child_idx) orelse continue;
         if (std.mem.eql(u8, child.tagName(), tag_name)) return child;
@@ -482,7 +485,7 @@ fn findDescendantByTag(node: html.Node, tag_name: []const u8) ?html.Node {
     return null;
 }
 
-fn findDescendantAnchorByRelNoFollow(node: html.Node) ?html.Node {
+fn findDescendantAnchorByRelNoFollow(node: HtmlNode) ?HtmlNode {
     for (node.children()) |child_idx| {
         const child = node.doc.nodeAt(child_idx) orelse continue;
         if (std.mem.eql(u8, child.tagName(), "a")) {
@@ -494,7 +497,7 @@ fn findDescendantAnchorByRelNoFollow(node: html.Node) ?html.Node {
     return null;
 }
 
-fn findDescendantSpanWithClass(node: html.Node, class_fragment: []const u8) ?html.Node {
+fn findDescendantSpanWithClass(node: HtmlNode, class_fragment: []const u8) ?HtmlNode {
     for (node.children()) |child_idx| {
         const child = node.doc.nodeAt(child_idx) orelse continue;
         if (std.mem.eql(u8, child.tagName(), "span")) {

@@ -1,6 +1,9 @@
 const std = @import("std");
 const common = @import("common.zig");
 const html = @import("htmlparser");
+const HtmlParseOptions: html.ParseOptions = .{};
+const HtmlDocument = HtmlParseOptions.GetDocument();
+const HtmlNode = HtmlParseOptions.GetNode();
 const suite = @import("test_suite.zig");
 
 const Allocator = std.mem.Allocator;
@@ -187,10 +190,10 @@ fn asciiLowerDup(allocator: Allocator, input: []const u8) ![]u8 {
     return out;
 }
 
-fn firstAndLastTd(row: html.Node) ?struct { first: html.Node, last: html.Node } {
+fn firstAndLastTd(row: HtmlNode) ?struct { first: HtmlNode, last: HtmlNode } {
     const children = row.children();
-    var first: ?html.Node = null;
-    var last: ?html.Node = null;
+    var first: ?HtmlNode = null;
+    var last: ?HtmlNode = null;
     for (children) |child_idx| {
         const child = row.doc.nodeAt(child_idx) orelse continue;
         if (!std.mem.eql(u8, child.tagName(), "td")) continue;
@@ -202,7 +205,7 @@ fn firstAndLastTd(row: html.Node) ?struct { first: html.Node, last: html.Node } 
     return .{ .first = first_td, .last = last_td };
 }
 
-fn findFirstLinkByPredicate(doc: *const html.Document, predicate: fn ([]const u8) bool) ?html.Node {
+fn findFirstLinkByPredicate(doc: *const HtmlDocument, predicate: fn ([]const u8) bool) ?HtmlNode {
     var links = doc.queryAll("a");
     while (links.next()) |link| {
         const href = common.getAttributeValueSafe(link, "href") orelse continue;
@@ -224,7 +227,7 @@ fn buildSearchUrl(allocator: Allocator, encoded_query: []const u8, page: usize) 
     return std.fmt.allocPrint(allocator, "{s}/page/{d}/?s={s}", .{ site, page, encoded_query });
 }
 
-fn hasNextSearchPage(doc: *const html.Document, current_page: usize) bool {
+fn hasNextSearchPage(doc: *const HtmlDocument, current_page: usize) bool {
     if (doc.queryOne("link[rel='next'][href]")) |_| return true;
     if (doc.queryOne("a.next.page-numbers[href]")) |_| return true;
     if (doc.queryOne("a.page-numbers.next[href]")) |_| return true;

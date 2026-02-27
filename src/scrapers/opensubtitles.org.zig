@@ -1,5 +1,9 @@
 const std = @import("std");
 const common = @import("common.zig");
+const html = @import("htmlparser");
+const HtmlParseOptions: html.ParseOptions = .{};
+const HtmlDocument = HtmlParseOptions.GetDocument();
+const HtmlNode = HtmlParseOptions.GetNode();
 
 const Allocator = std.mem.Allocator;
 const site = "https://www.opensubtitles.org";
@@ -559,7 +563,7 @@ fn addOrReplaceOffsetPage(allocator: Allocator, base_url: []const u8, page: usiz
     return try std.fmt.allocPrint(allocator, "{s}{s}offset-{d}{s}", .{ head, sep, offset, tail });
 }
 
-fn extractNextPageUrl(allocator: Allocator, doc: *@import("htmlparser").Document, current_url: []const u8) !?[]const u8 {
+fn extractNextPageUrl(allocator: Allocator, doc: *HtmlDocument, current_url: []const u8) !?[]const u8 {
     if (doc.queryOne("link[rel='next'][href]")) |n| {
         if (n.getAttributeValue("href")) |href| {
             const resolved = try common.resolveUrl(allocator, site, href);
@@ -579,7 +583,7 @@ fn extractNextPageUrl(allocator: Allocator, doc: *@import("htmlparser").Document
     return null;
 }
 
-fn extractFlagLanguage(row: @import("htmlparser").Node, allocator: Allocator) !?[]const u8 {
+fn extractFlagLanguage(row: HtmlNode, allocator: Allocator) !?[]const u8 {
     const flag_div = row.queryOne("td:nth-child(2) div[class*='flag']") orelse return null;
     const class = flag_div.getAttributeValue("class") orelse return null;
     var it = std.mem.tokenizeScalar(u8, class, ' ');
@@ -590,7 +594,7 @@ fn extractFlagLanguage(row: @import("htmlparser").Node, allocator: Allocator) !?
     return null;
 }
 
-fn extractFilename(row: @import("htmlparser").Node, allocator: Allocator) !?[]const u8 {
+fn extractFilename(row: HtmlNode, allocator: Allocator) !?[]const u8 {
     const main = row.queryOne("td[id^='main']") orelse return null;
     if (main.queryOne("span[title]")) |n| {
         if (n.getAttributeValue("title")) |title| {
@@ -604,7 +608,7 @@ fn extractFilename(row: @import("htmlparser").Node, allocator: Allocator) !?[]co
     return null;
 }
 
-fn extractSubCellText(row: @import("htmlparser").Node, allocator: Allocator, cell_idx_one_based: usize) !?[]const u8 {
+fn extractSubCellText(row: HtmlNode, allocator: Allocator, cell_idx_one_based: usize) !?[]const u8 {
     var cells = row.queryAll("td");
     var idx: usize = 1;
     while (cells.next()) |cell| : (idx += 1) {
@@ -618,7 +622,7 @@ fn extractSubCellText(row: @import("htmlparser").Node, allocator: Allocator, cel
 
 fn appendSubtitleFromRow(
     allocator: Allocator,
-    row: @import("htmlparser").Node,
+    row: HtmlNode,
     seen_details: *std.StringHashMapUnmanaged(void),
     out: *std.ArrayListUnmanaged(SubtitleItem),
 ) !void {
