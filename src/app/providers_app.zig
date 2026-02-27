@@ -1,6 +1,7 @@
 const std = @import("std");
 const subdl = @import("../scrapers/subdl.zig");
 const runtime_alloc = @import("runtime_alloc");
+const unarr = @import("unarr");
 
 const Allocator = std.mem.Allocator;
 const common = subdl.common;
@@ -23,6 +24,10 @@ pub const DownloadProgress = struct {
     user_data: ?*anyopaque = null,
     on_phase: ?*const fn (user_data: ?*anyopaque, phase: DownloadPhase) void = null,
     on_units: ?*const fn (user_data: ?*anyopaque, done: usize, total: usize) void = null,
+};
+
+pub const DownloadOptions = struct {
+    extract_archive: bool = false,
 };
 
 pub const Provider = enum {
@@ -1243,7 +1248,17 @@ fn titleFromRef(ref: SearchRef) []const u8 {
 }
 
 pub fn downloadSubtitle(allocator: Allocator, client: *std.http.Client, subtitle: SubtitleChoice, out_dir: []const u8) !DownloadResult {
-    return downloadSubtitleWithProgress(allocator, client, subtitle, out_dir, null);
+    return downloadSubtitleWithOptions(allocator, client, subtitle, out_dir, .{});
+}
+
+pub fn downloadSubtitleWithOptions(
+    allocator: Allocator,
+    client: *std.http.Client,
+    subtitle: SubtitleChoice,
+    out_dir: []const u8,
+    options: DownloadOptions,
+) !DownloadResult {
+    return downloadSubtitleWithProgressAndOptions(allocator, client, subtitle, out_dir, null, options);
 }
 
 pub fn downloadSubtitleWithProgress(
@@ -1252,6 +1267,17 @@ pub fn downloadSubtitleWithProgress(
     subtitle: SubtitleChoice,
     out_dir: []const u8,
     progress: ?*const DownloadProgress,
+) !DownloadResult {
+    return downloadSubtitleWithProgressAndOptions(allocator, client, subtitle, out_dir, progress, .{});
+}
+
+pub fn downloadSubtitleWithProgressAndOptions(
+    allocator: Allocator,
+    client: *std.http.Client,
+    subtitle: SubtitleChoice,
+    out_dir: []const u8,
+    progress: ?*const DownloadProgress,
+    options: DownloadOptions,
 ) !DownloadResult {
     const source_url = subtitle.download_url orelse return error.MissingField;
 
@@ -1293,13 +1319,29 @@ pub fn downloadSubtitleWithProgress(
         };
     }
 
-    emitDownloadPhase(progress, .extracting_archive);
     const archive_copy = try allocator.dupe(u8, output_path);
     errdefer allocator.free(archive_copy);
+
+    if (!options.extract_archive) {
+        return .{
+            .file_path = output_path,
+            .archive_path = archive_copy,
+            .bytes_written = response.body.len,
+            .source_url = source_url,
+        };
+    }
+
+    emitDownloadPhase(progress, .extracting_archive);
+    const extracted_files = try extractArchiveFiles(allocator, response.body, archive_kind, out_dir);
+    errdefer {
+        for (extracted_files) |path| allocator.free(path);
+        allocator.free(extracted_files);
+    }
 
     return .{
         .file_path = output_path,
         .archive_path = archive_copy,
+        .extracted_files = extracted_files,
         .bytes_written = response.body.len,
         .source_url = source_url,
     };
@@ -1877,17 +1919,99 @@ const ArchiveKind = enum {
     none,
     zip,
     rar,
+    seven_z,
 };
 
 fn detectArchiveKind(file_name: []const u8, url: []const u8, body: []const u8) ArchiveKind {
     if (asciiEndsWithIgnoreCase(file_name, ".zip") or asciiEndsWithIgnoreCase(url, ".zip")) return .zip;
     if (asciiEndsWithIgnoreCase(file_name, ".rar") or asciiEndsWithIgnoreCase(url, ".rar")) return .rar;
+    if (asciiEndsWithIgnoreCase(file_name, ".7z") or asciiEndsWithIgnoreCase(url, ".7z")) return .seven_z;
     if (body.len >= 4 and std.mem.eql(u8, body[0..4], "PK\x03\x04")) return .zip;
     if (body.len >= 4 and std.mem.eql(u8, body[0..4], "PK\x05\x06")) return .zip;
     if (body.len >= 4 and std.mem.eql(u8, body[0..4], "PK\x07\x08")) return .zip;
     if (body.len >= 7 and std.mem.eql(u8, body[0..7], "Rar!\x1A\x07\x00")) return .rar;
     if (body.len >= 8 and std.mem.eql(u8, body[0..8], "Rar!\x1A\x07\x01\x00")) return .rar;
+    if (body.len >= 6 and std.mem.eql(u8, body[0..6], "\x37\x7A\xBC\xAF\x27\x1C")) return .seven_z;
     return .none;
+}
+
+const max_archive_entry_size_bytes: usize = 64 * 1024 * 1024;
+const max_archive_entries: usize = 256;
+
+fn extractArchiveFiles(
+    allocator: Allocator,
+    archive_body: []const u8,
+    archive_kind: ArchiveKind,
+    out_dir: []const u8,
+) ![]const []const u8 {
+    const archive_format: unarr.Format = switch (archive_kind) {
+        .zip => .zip,
+        .rar => .rar,
+        .seven_z => .@"7z",
+        .none => return error.ArchiveExtractionFailed,
+    };
+
+    var archive = unarr.Archive.openMemory(archive_format, archive_body, .{}) catch return error.ArchiveExtractionFailed;
+    defer archive.deinit();
+
+    var extracted: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (extracted.items) |path| allocator.free(path);
+        extracted.deinit(allocator);
+    }
+
+    var entry_index: usize = 0;
+    while (entry_index < max_archive_entries) : (entry_index += 1) {
+        const maybe_entry = archive.nextEntry() catch return error.ArchiveExtractionFailed;
+        const entry = maybe_entry orelse break;
+        if (entry.size() == 0) continue;
+
+        const entry_name = entry.name() orelse entry.rawName() orelse "";
+        if (std.mem.endsWith(u8, entry_name, "/") or std.mem.endsWith(u8, entry_name, "\\")) continue;
+
+        const entry_base_name = try archiveEntryOutputName(allocator, entry_name, entry_index + 1);
+        defer allocator.free(entry_base_name);
+
+        const entry_data = entry.readAlloc(allocator, max_archive_entry_size_bytes) catch |err| switch (err) {
+            error.EntryTooLarge => continue,
+            else => return error.ArchiveExtractionFailed,
+        };
+        defer allocator.free(entry_data);
+        if (entry_data.len == 0) continue;
+
+        const output_path = try nextAvailableOutputPath(allocator, out_dir, entry_base_name);
+        errdefer allocator.free(output_path);
+
+        var out_file = std.fs.cwd().createFile(output_path, .{ .truncate = true }) catch return error.ArchiveExtractionFailed;
+        defer out_file.close();
+        out_file.writeAll(entry_data) catch return error.ArchiveExtractionFailed;
+
+        try extracted.append(allocator, output_path);
+    }
+
+    if (extracted.items.len == 0) return error.ArchiveExtractionFailed;
+    return try extracted.toOwnedSlice(allocator);
+}
+
+fn archiveEntryOutputName(allocator: Allocator, entry_name: []const u8, entry_num: usize) ![]u8 {
+    const trimmed = std.mem.trim(u8, entry_name, " \t\r\n");
+    const leaf = archiveEntryLeafName(trimmed);
+    const fallback = if (leaf.len == 0)
+        try std.fmt.allocPrint(allocator, "entry-{d}.bin", .{entry_num})
+    else
+        try allocator.dupe(u8, leaf);
+    defer allocator.free(fallback);
+    return sanitizeFilename(allocator, fallback);
+}
+
+fn archiveEntryLeafName(path: []const u8) []const u8 {
+    if (path.len == 0) return "";
+    const sep = std.mem.lastIndexOfAny(u8, path, "/\\");
+    if (sep) |idx| {
+        if (idx + 1 >= path.len) return "";
+        return path[idx + 1 ..];
+    }
+    return path;
 }
 
 fn toAbsoluteSubdlLink(allocator: Allocator, link: []const u8) ![]const u8 {
@@ -1963,6 +2087,7 @@ fn ensureFilenameExtension(
     const ext = switch (archive_kind) {
         .zip => ".zip",
         .rar => ".rar",
+        .seven_z => ".7z",
         .none => fallback_ext,
     };
     return try std.fmt.allocPrint(allocator, "{s}{s}", .{ preferred_name, ext });
@@ -2340,6 +2465,14 @@ test "ensureFilenameExtension falls back to archive extension from kind" {
     try std.testing.expectEqualStrings("subtitle_pack.rar", name);
 }
 
+test "detectArchiveKind recognizes 7z from extension and signature" {
+    try std.testing.expectEqual(ArchiveKind.seven_z, detectArchiveKind("pack.7z", "https://example.com/file", ""));
+    try std.testing.expectEqual(
+        ArchiveKind.seven_z,
+        detectArchiveKind("pack", "https://example.com/file", "\x37\x7A\xBC\xAF\x27\x1C\x00\x00"),
+    );
+}
+
 const ProviderSmokeState = struct {
     provider: Provider,
     err: ?anyerror = null,
@@ -2445,7 +2578,9 @@ fn runProviderTuiSmoke(allocator: std.mem.Allocator, client: *std.http.Client, p
     defer cleanupDownloadOutDir(out_dir);
 
     std.debug.print("[live][providers_app][{s}] download_attempt idx={d} mode=single\n", .{ providerName(provider), download_idx });
-    var download = try downloadSubtitle(allocator, client, chosen_subtitle, out_dir);
+    var download = try downloadSubtitleWithOptions(allocator, client, chosen_subtitle, out_dir, .{
+        .extract_archive = true,
+    });
     defer download.deinit(allocator);
 
     std.debug.print("[live][providers_app][{s}] download_ok idx={d} bytes={d}\n", .{ providerName(provider), download_idx, download.bytes_written });
@@ -2526,7 +2661,9 @@ fn runSubtitlecatTranslateDownloadLive(allocator: std.mem.Allocator, client: *st
     try prepareDownloadOutDir(out_dir);
     defer cleanupDownloadOutDir(out_dir);
 
-    var download = try downloadSubtitle(allocator, client, chosen_subtitle.?, out_dir);
+    var download = try downloadSubtitleWithOptions(allocator, client, chosen_subtitle.?, out_dir, .{
+        .extract_archive = true,
+    });
     defer download.deinit(allocator);
     std.debug.print("[live][providers_app][subtitlecat_com][translate] download_ok bytes={d}\n", .{download.bytes_written});
     try common.livePrintField(allocator, "download_file_path", download.file_path);

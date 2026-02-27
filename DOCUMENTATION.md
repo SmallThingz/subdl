@@ -50,6 +50,12 @@ Run TUI:
 zig build run-tui
 ```
 
+Build cross-target CLI binaries (installed into `zig-out/bin`):
+
+```bash
+zig build cross-bin -Doptimize=ReleaseFast -Dstrip=true
+```
+
 ## Provider IDs
 
 The canonical provider IDs accepted by the app layer and CLI are:
@@ -98,7 +104,7 @@ For non-paginated providers, page `1` returns data and page `>1` returns empty p
 Usage:
 
 ```text
-scrapers_cli --provider <name> --query <text> [--title-index N] [--subtitle-index N] [--out-dir DIR]
+scrapers_cli --provider <name> --query <text> [--title-index N] [--subtitle-index N] [--out-dir DIR] [--extract]
 scrapers_cli --list-providers
 ```
 
@@ -109,6 +115,7 @@ Options:
 - `--title-index <N>`: selected title from search results (default `0`)
 - `--subtitle-index <N>`: selected subtitle row (default: first downloadable row)
 - `--out-dir <DIR>`: destination directory (default `downloads`)
+- `--extract`: extract downloaded archive contents into `out-dir` (disabled by default)
 - `--list-providers`: print all provider IDs
 - `--help`, `-h`: print usage
 
@@ -130,6 +137,12 @@ Basic query and download (defaults to first title and first downloadable subtitl
 
 ```bash
 zig build run -- --provider subsource_net --query "The Matrix"
+```
+
+Query, download, and extract archive contents:
+
+```bash
+zig build run -- --provider subsource_net --query "The Matrix" --extract
 ```
 
 Select explicit search and subtitle rows:
@@ -394,6 +407,17 @@ Run parallel provider fan-out when supported:
 zig build test-live -Dlive=all -Dlive-providers=* -Dlive-include-captcha=true -Dlive-parallel-on-all=true
 ```
 
+## Build Flags
+
+Build flags you can toggle from `zig build`:
+
+- `-Doptimize=Debug|ReleaseSafe|ReleaseFast|ReleaseSmall`
+- `-Dstrip=true|false`
+- `-Dsingle-threaded=auto|on|off`
+- `-Domit-frame-pointer=auto|on|off`
+- `-Derror-tracing=auto|on|off`
+- `-Dpic=auto|on|off`
+
 ## Troubleshooting
 
 No results:
@@ -422,4 +446,3 @@ Key paths:
 - `src/cmd/tui.zig`: TUI entrypoint
 - `src/scrapers/*.zig`: provider implementations
 - `build.zig`: build graph, binaries, and test steps
-

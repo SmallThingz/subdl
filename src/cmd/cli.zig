@@ -10,6 +10,7 @@ const Config = struct {
     title_index: usize = 0,
     subtitle_index: ?usize = null,
     out_dir: []const u8 = "downloads",
+    extract_archive: bool = false,
     list_providers: bool = false,
 };
 
@@ -113,7 +114,9 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
-    var result = app.downloadSubtitle(allocator, &client, selected, config.out_dir) catch |err| {
+    var result = app.downloadSubtitleWithOptions(allocator, &client, selected, config.out_dir, .{
+        .extract_archive = config.extract_archive,
+    }) catch |err| {
         try stderr.print("download failed: {s}\n", .{@errorName(err)});
         try stderr.flush();
         std.process.exit(1);
@@ -168,6 +171,10 @@ fn parseArgs(allocator: std.mem.Allocator, stderr: *std.Io.Writer) !Config {
             cfg.out_dir = args.next() orelse return error.MissingArgumentValue;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--extract")) {
+            cfg.extract_archive = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--list-providers")) {
             cfg.list_providers = true;
             continue;
@@ -200,12 +207,13 @@ fn printProviders(writer: *std.Io.Writer) !void {
 fn printUsage(writer: *std.Io.Writer) !void {
     try writer.print(
         \\Usage:
-        \\  scrapers_cli --provider <name> --query <text> [--title-index N] [--subtitle-index N] [--out-dir DIR]
+        \\  scrapers_cli --provider <name> --query <text> [--title-index N] [--subtitle-index N] [--out-dir DIR] [--extract]
         \\  scrapers_cli --list-providers
         \\
         \\Examples:
         \\  scrapers_cli --provider subdl_com --query "The Matrix"
         \\  scrapers_cli --provider podnapisi_net --query "The Matrix" --title-index 0 --subtitle-index 1 --out-dir downloads
+        \\  scrapers_cli --provider subsource_net --query "The Matrix" --extract
         \\
     ,
         .{},

@@ -49,6 +49,7 @@ Run CLI:
 
 ```bash
 zig build run -- --provider subsource_net --query "The Matrix"
+zig build run -- --provider subsource_net --query "The Matrix" --extract
 ```
 
 Run TUI:
@@ -62,6 +63,21 @@ Install binaries:
 ```bash
 zig build install
 ```
+
+Build cross-target CLI binaries into `zig-out/bin`:
+
+```bash
+zig build cross-bin -Doptimize=ReleaseFast -Dstrip=true
+```
+
+Tunable build flags:
+
+- `-Doptimize=Debug|ReleaseSafe|ReleaseFast|ReleaseSmall`
+- `-Dstrip=true|false`
+- `-Dsingle-threaded=auto|on|off`
+- `-Domit-frame-pointer=auto|on|off`
+- `-Derror-tracing=auto|on|off`
+- `-Dpic=auto|on|off`
 
 ## Docs
 

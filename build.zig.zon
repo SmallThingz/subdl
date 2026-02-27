@@ -44,6 +44,10 @@
             .url = "git+https://github.com/SmallThingz/alldriver.git#78131f163677d527f4a49b84ea3e760fa8ef0346",
             .hash = "alldriver-0.0.0-IXnEoU1GCgBd5-w2beaQcat38MXJvU2f0UfHswJyT3EQ",
         },
+        .unarr = .{
+            .url = "git+https://github.com/SmallThingz/unarr.git#8f0d9d47122a923a94d6c6db9b09be478238aa04",
+            .hash = "unarr-0.0.0-9UpXAweIAAAtzJuOufOaFMr3OfE1RuZ9zwIwkNsqIwbn",
+        },
     },
     .paths = .{
         "build.zig",

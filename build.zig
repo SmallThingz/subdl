@@ -3,6 +3,11 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const strip = b.option(bool, "strip", "Strip debug symbols from binaries") orelse false;
+    const single_threaded = parseToggleBool("single-threaded", b.option([]const u8, "single-threaded", "Single-threaded mode: auto | on | off") orelse "auto");
+    const omit_frame_pointer = parseToggleBool("omit-frame-pointer", b.option([]const u8, "omit-frame-pointer", "Frame pointer mode: auto | on | off") orelse "auto");
+    const error_tracing = parseToggleBool("error-tracing", b.option([]const u8, "error-tracing", "Error tracing mode: auto | on | off") orelse "auto");
+    const pic = parseToggleBool("pic", b.option([]const u8, "pic", "PIC mode: auto | on | off") orelse "auto");
     const live_mode = b.option([]const u8, "live", "Live test mode: off | smoke | named | extensive | all (tui is alias of smoke)") orelse "off";
     const live_providers = b.option([]const u8, "live-providers", "Comma-separated provider filter for live tests, or '*' for all") orelse "*";
     const live_include_captcha = b.option(bool, "live-include-captcha", "Include captcha/cloudflare providers in live test runs") orelse false;
@@ -46,6 +51,12 @@ pub fn build(b: *std.Build) void {
     const htmlparser_compat_mod = b.createModule(.{
         .root_source_file = b.path("src/deps/htmlparser_compat.zig"),
         .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .single_threaded = single_threaded,
+        .omit_frame_pointer = omit_frame_pointer,
+        .error_tracing = error_tracing,
+        .pic = pic,
         .imports = &.{
             .{ .name = "htmlparser_upstream", .module = htmlparser_dep.module("htmlparser") },
         },
@@ -54,13 +65,30 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const unarr_dep = b.dependency("unarr", .{
+        .target = target,
+        .optimize = optimize,
+        .static_libc = true,
+    });
     const runtime_alloc_mod = b.createModule(.{
         .root_source_file = b.path("src/alloc/runtime_allocator.zig"),
         .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .single_threaded = single_threaded,
+        .omit_frame_pointer = omit_frame_pointer,
+        .error_tracing = error_tracing,
+        .pic = pic,
     });
     const subdl_mod = b.addModule("subdl", .{
         .root_source_file = b.path("src/scrapers/subdl.zig"),
         .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .single_threaded = single_threaded,
+        .omit_frame_pointer = omit_frame_pointer,
+        .error_tracing = error_tracing,
+        .pic = pic,
         .imports = &.{
             .{ .name = "htmlparser", .module = htmlparser_compat_mod },
             .{ .name = "alldriver", .module = alldriver_dep.module("alldriver") },
@@ -71,11 +99,18 @@ pub fn build(b: *std.Build) void {
     const scrapers_mod = b.addModule("scrapers", .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .single_threaded = single_threaded,
+        .omit_frame_pointer = omit_frame_pointer,
+        .error_tracing = error_tracing,
+        .pic = pic,
         .imports = &.{
             .{ .name = "htmlparser", .module = htmlparser_compat_mod },
             .{ .name = "alldriver", .module = alldriver_dep.module("alldriver") },
             .{ .name = "build_options", .module = build_options_mod },
             .{ .name = "runtime_alloc", .module = runtime_alloc_mod },
+            .{ .name = "unarr", .module = unarr_dep.module("unarr") },
         },
     });
 
@@ -85,6 +120,11 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/cmd/cli.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
+            .single_threaded = single_threaded,
+            .omit_frame_pointer = omit_frame_pointer,
+            .error_tracing = error_tracing,
+            .pic = pic,
             .imports = &.{
                 .{ .name = "scrapers", .module = scrapers_mod },
                 .{ .name = "runtime_alloc", .module = runtime_alloc_mod },
@@ -99,6 +139,11 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .strip = strip,
+            .single_threaded = single_threaded,
+            .omit_frame_pointer = omit_frame_pointer,
+            .error_tracing = error_tracing,
+            .pic = pic,
             .imports = &.{
                 .{ .name = "scrapers", .module = scrapers_mod },
                 .{ .name = "vaxis", .module = libvaxis_dep.module("vaxis") },
@@ -106,6 +151,20 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+
+    const cross_targets = [_]struct {
+        suffix: []const u8,
+        query: std.Target.Query,
+    }{
+        .{
+            .suffix = "x86_64-linux-gnu",
+            .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu },
+        },
+        .{
+            .suffix = "aarch64-linux-gnu",
+            .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu },
+        },
+    };
 
     b.installArtifact(cli_exe);
     b.installArtifact(tui_exe);
@@ -120,6 +179,84 @@ pub fn build(b: *std.Build) void {
     const run_tui_cmd = b.addRunArtifact(tui_exe);
     run_tui_step.dependOn(&run_tui_cmd.step);
     run_tui_cmd.step.dependOn(b.getInstallStep());
+
+    const cross_bin_step = b.step("cross-bin", "Build cross-platform scrapers_cli binaries into zig-out/bin");
+    for (cross_targets) |cross| {
+        const cross_target = b.resolveTargetQuery(cross.query);
+        const cross_htmlparser_dep = b.dependency("htmlparser", .{
+            .target = cross_target,
+            .optimize = optimize,
+        });
+        const cross_htmlparser_compat_mod = b.createModule(.{
+            .root_source_file = b.path("src/deps/htmlparser_compat.zig"),
+            .target = cross_target,
+            .optimize = optimize,
+            .strip = strip,
+            .single_threaded = single_threaded,
+            .omit_frame_pointer = omit_frame_pointer,
+            .error_tracing = error_tracing,
+            .pic = pic,
+            .imports = &.{
+                .{ .name = "htmlparser_upstream", .module = cross_htmlparser_dep.module("htmlparser") },
+            },
+        });
+        const cross_alldriver_dep = b.dependency("alldriver", .{
+            .target = cross_target,
+            .optimize = optimize,
+        });
+        const cross_unarr_dep = b.dependency("unarr", .{
+            .target = cross_target,
+            .optimize = optimize,
+            .static_libc = true,
+        });
+        const cross_runtime_alloc_mod = b.createModule(.{
+            .root_source_file = b.path("src/alloc/runtime_allocator.zig"),
+            .target = cross_target,
+            .optimize = optimize,
+            .strip = strip,
+            .single_threaded = single_threaded,
+            .omit_frame_pointer = omit_frame_pointer,
+            .error_tracing = error_tracing,
+            .pic = pic,
+        });
+        const cross_scrapers_mod = b.createModule(.{
+            .root_source_file = b.path("src/lib.zig"),
+            .target = cross_target,
+            .optimize = optimize,
+            .strip = strip,
+            .single_threaded = single_threaded,
+            .omit_frame_pointer = omit_frame_pointer,
+            .error_tracing = error_tracing,
+            .pic = pic,
+            .imports = &.{
+                .{ .name = "htmlparser", .module = cross_htmlparser_compat_mod },
+                .{ .name = "alldriver", .module = cross_alldriver_dep.module("alldriver") },
+                .{ .name = "build_options", .module = build_options_mod },
+                .{ .name = "runtime_alloc", .module = cross_runtime_alloc_mod },
+                .{ .name = "unarr", .module = cross_unarr_dep.module("unarr") },
+            },
+        });
+
+        const cross_exe = b.addExecutable(.{
+            .name = b.fmt("scrapers_cli-{s}", .{cross.suffix}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/cmd/cli.zig"),
+                .target = cross_target,
+                .optimize = optimize,
+                .strip = strip,
+                .single_threaded = single_threaded,
+                .omit_frame_pointer = omit_frame_pointer,
+                .error_tracing = error_tracing,
+                .pic = pic,
+                .imports = &.{
+                    .{ .name = "scrapers", .module = cross_scrapers_mod },
+                    .{ .name = "runtime_alloc", .module = cross_runtime_alloc_mod },
+                },
+            }),
+        });
+        const install_cross = b.addInstallArtifact(cross_exe, .{});
+        cross_bin_step.dependOn(&install_cross.step);
+    }
 
     const subdl_mod_tests = b.addTest(.{
         .root_module = subdl_mod,
@@ -303,4 +440,11 @@ fn makeParallelLiveRunScript(
     ) catch @panic("oom");
 
     return out.toOwnedSlice(b.allocator) catch @panic("oom");
+}
+
+fn parseToggleBool(option_name: []const u8, raw: []const u8) ?bool {
+    if (std.ascii.eqlIgnoreCase(raw, "auto")) return null;
+    if (std.ascii.eqlIgnoreCase(raw, "on") or std.ascii.eqlIgnoreCase(raw, "true")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "off") or std.ascii.eqlIgnoreCase(raw, "false")) return false;
+    std.debug.panic("invalid -D{s} value '{s}', expected: auto|on|off", .{ option_name, raw });
 }
