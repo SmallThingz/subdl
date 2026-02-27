@@ -5,6 +5,17 @@ const builtin = @import("builtin");
 
 const app = scrapers.providers_app;
 
+pub const panic = std.debug.FullPanic(tuiPanic);
+
+fn tuiPanic(msg: []const u8, ret_addr: ?usize) noreturn {
+    restoreTerminalOnPanic();
+    std.debug.defaultPanic(msg, ret_addr);
+}
+
+fn restoreTerminalOnPanic() void {
+    vaxis.recover();
+}
+
 const hard_cancel_supported = std.Thread.use_pthreads and switch (builtin.os.tag) {
     .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .openbsd, .netbsd, .dragonfly, .solaris, .illumos => true,
     else => false,
