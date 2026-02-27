@@ -163,6 +163,7 @@ pub const Scraper = struct {
         var has_next_page = false;
         var title: []const u8 = "";
         var out: std.ArrayListUnmanaged(SubtitleItem) = .empty;
+        var seen_details = std.StringHashMapUnmanaged(void).empty;
 
         while (traversed < max_pages) : (traversed += 1) {
             last_page = page;
@@ -179,53 +180,16 @@ pub const Scraper = struct {
                 };
             }
 
+            const before_rows = out.items.len;
             var rows = parsed.doc.queryAll("table#search_results tr[id^='name']");
             while (rows.next()) |row| {
-                const subtitle_anchor = row.queryOne("td[id^='main'] strong a.bnone[href*='/subtitles/']") orelse continue;
-                const details_href = subtitle_anchor.getAttributeValue("href") orelse continue;
-                const details_url = try common.resolveUrl(a, site, details_href);
-
-                const subtitle_id = blk_id: {
-                    const serve_anchor = row.queryOne("a[href*='/subtitleserve/sub/']") orelse break :blk_id null;
-                    const href = serve_anchor.getAttributeValue("href") orelse break :blk_id null;
-                    const marker = "/subtitleserve/sub/";
-                    const start = std.mem.indexOf(u8, href, marker) orelse break :blk_id null;
-                    const tail = href[start + marker.len ..];
-                    const end = std.mem.indexOfAny(u8, tail, "/?#") orelse tail.len;
-                    break :blk_id tail[0..end];
-                };
-                const direct_zip_url = if (subtitle_id) |sid|
-                    try std.fmt.allocPrint(a, "https://dl.opensubtitles.org/en/download/sub/{s}", .{sid})
-                else
-                    "";
-
-                const language_code = extractFlagLanguage(row, a) catch null;
-                const filename = extractFilename(row, a) catch null;
-                const release = extractSubCellText(row, a, 1) catch null;
-                const fps = extractSubCellText(row, a, 5) catch null;
-                const cds = extractSubCellText(row, a, 4) catch null;
-                const rating = extractSubCellText(row, a, 8) catch null;
-                const downloads = extractSubCellText(row, a, 7) catch null;
-                const uploaded_at = extractSubCellText(row, a, 6) catch null;
-
-                const row_text = try common.innerTextTrimmedOwned(a, row);
-                const lower_row = try lowerDup(a, row_text);
-
-                try out.append(a, .{
-                    .language_code = language_code,
-                    .filename = filename,
-                    .release = release,
-                    .fps = fps,
-                    .cds = cds,
-                    .rating = rating,
-                    .downloads = downloads,
-                    .uploaded_at = uploaded_at,
-                    .hearing_impaired = std.mem.indexOf(u8, lower_row, "hearing") != null,
-                    .trusted = std.mem.indexOf(u8, lower_row, "trusted") != null,
-                    .hd = std.mem.indexOf(u8, lower_row, "hd") != null,
-                    .details_url = details_url,
-                    .direct_zip_url = direct_zip_url,
-                });
+                try appendSubtitleFromRow(a, row, &seen_details, &out);
+            }
+            if (out.items.len == before_rows) {
+                var fallback_rows = parsed.doc.queryAll("table#search_results tr.change");
+                while (fallback_rows.next()) |row| {
+                    try appendSubtitleFromRow(a, row, &seen_details, &out);
+                }
             }
 
             next_url = try extractNextPageUrl(a, &parsed.doc, url);
@@ -650,6 +614,63 @@ fn extractSubCellText(row: @import("htmlparser").Node, allocator: Allocator, cel
         return text;
     }
     return null;
+}
+
+fn appendSubtitleFromRow(
+    allocator: Allocator,
+    row: @import("htmlparser").Node,
+    seen_details: *std.StringHashMapUnmanaged(void),
+    out: *std.ArrayListUnmanaged(SubtitleItem),
+) !void {
+    const subtitle_anchor = row.queryOne("td[id^='main'] strong a.bnone[href*='/subtitles/']") orelse
+        row.queryOne("a.bnone[href*='/subtitles/']") orelse
+        row.queryOne("a[href*='/subtitles/']") orelse return;
+    const details_href = subtitle_anchor.getAttributeValue("href") orelse return;
+    const details_url = try common.resolveUrl(allocator, site, details_href);
+    if (seen_details.contains(details_url)) return;
+    try seen_details.put(allocator, details_url, {});
+
+    const subtitle_id = blk_id: {
+        const serve_anchor = row.queryOne("a[href*='/subtitleserve/sub/']") orelse break :blk_id null;
+        const href = serve_anchor.getAttributeValue("href") orelse break :blk_id null;
+        const marker = "/subtitleserve/sub/";
+        const start = std.mem.indexOf(u8, href, marker) orelse break :blk_id null;
+        const tail = href[start + marker.len ..];
+        const end = std.mem.indexOfAny(u8, tail, "/?#") orelse tail.len;
+        break :blk_id tail[0..end];
+    };
+    const direct_zip_url = if (subtitle_id) |sid|
+        try std.fmt.allocPrint(allocator, "https://dl.opensubtitles.org/en/download/sub/{s}", .{sid})
+    else
+        "";
+
+    const language_code = extractFlagLanguage(row, allocator) catch null;
+    const filename = extractFilename(row, allocator) catch null;
+    const release = extractSubCellText(row, allocator, 1) catch null;
+    const fps = extractSubCellText(row, allocator, 5) catch null;
+    const cds = extractSubCellText(row, allocator, 4) catch null;
+    const rating = extractSubCellText(row, allocator, 8) catch null;
+    const downloads = extractSubCellText(row, allocator, 7) catch null;
+    const uploaded_at = extractSubCellText(row, allocator, 6) catch null;
+
+    const row_text = try common.innerTextTrimmedOwned(allocator, row);
+    const lower_row = try lowerDup(allocator, row_text);
+
+    try out.append(allocator, .{
+        .language_code = language_code,
+        .filename = filename,
+        .release = release,
+        .fps = fps,
+        .cds = cds,
+        .rating = rating,
+        .downloads = downloads,
+        .uploaded_at = uploaded_at,
+        .hearing_impaired = std.mem.indexOf(u8, lower_row, "hearing") != null,
+        .trusted = std.mem.indexOf(u8, lower_row, "trusted") != null,
+        .hd = std.mem.indexOf(u8, lower_row, "hd") != null,
+        .details_url = details_url,
+        .direct_zip_url = direct_zip_url,
+    });
 }
 
 fn lowerDup(allocator: Allocator, input: []const u8) ![]u8 {

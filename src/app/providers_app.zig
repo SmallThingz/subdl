@@ -186,6 +186,23 @@ pub const SearchResponse = struct {
     }
 };
 
+pub const SubdlSeasonChoice = struct {
+    label: []const u8,
+    season_slug: []const u8,
+    season_name: []const u8,
+};
+
+pub const SubdlSeasonsResponse = struct {
+    arena: std.heap.ArenaAllocator,
+    title: []const u8,
+    items: []const SubdlSeasonChoice,
+
+    pub fn deinit(self: *SubdlSeasonsResponse) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const SubtitleChoice = struct {
     label: []const u8,
     language: ?[]const u8,
@@ -637,6 +654,119 @@ pub fn searchPage(allocator: Allocator, client: *std.http.Client, provider: Prov
         .page = requested_page,
         .has_prev_page = requested_page > 1,
         .has_next_page = has_next_page,
+    };
+}
+
+pub fn fetchSubdlSeasons(allocator: Allocator, client: *std.http.Client, ref: SearchRef) !SubdlSeasonsResponse {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    var out: std.ArrayListUnmanaged(SubdlSeasonChoice) = .empty;
+    var title: []const u8 = "";
+
+    switch (ref) {
+        .subdl_com => |item| {
+            if (item.media_type != .tv) return error.UnexpectedTitleType;
+            var scraper = subdl.subdl_com.Scraper.init(a, client);
+            defer scraper.deinit();
+
+            var seasons = try scraper.fetchTvSeasonsByLink(item.link);
+            defer seasons.deinit();
+            title = try a.dupe(u8, seasons.tv.name);
+
+            for (seasons.seasons) |season| {
+                const season_slug = try a.dupe(u8, season.number);
+                const season_name = try a.dupe(u8, season.name);
+                const label = if (season.name.len == 0 or std.mem.eql(u8, season.name, season.number))
+                    try a.dupe(u8, season.number)
+                else
+                    try std.fmt.allocPrint(a, "{s} ({s})", .{ season.name, season.number });
+                try out.append(a, .{
+                    .label = label,
+                    .season_slug = season_slug,
+                    .season_name = season_name,
+                });
+            }
+        },
+        else => return error.UnsupportedProvider,
+    }
+
+    return .{
+        .arena = arena,
+        .title = title,
+        .items = try out.toOwnedSlice(a),
+    };
+}
+
+pub fn fetchSubdlSeasonSubtitles(allocator: Allocator, client: *std.http.Client, ref: SearchRef, season_slug: []const u8) !SubtitlesResponse {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    var out: std.ArrayListUnmanaged(SubtitleChoice) = .empty;
+    var title: []const u8 = "";
+
+    switch (ref) {
+        .subdl_com => |item| {
+            if (item.media_type != .tv) return error.UnexpectedTitleType;
+            var scraper = subdl.subdl_com.Scraper.init(a, client);
+            defer scraper.deinit();
+
+            var season_data = try scraper.fetchTvSeasonByLink(item.link, season_slug);
+            defer season_data.deinit();
+            title = try std.fmt.allocPrint(a, "{s} | {s}", .{ season_data.tv.name, season_slug });
+
+            for (season_data.languages) |group| {
+                for (group.subtitles) |subtitle| {
+                    const download_url = try std.fmt.allocPrint(a, "https://dl.subdl.com/subtitle/{s}", .{subtitle.link});
+                    const label = try std.fmt.allocPrint(a, "{s} | {s}", .{ group.language, subtitle.title });
+                    try out.append(a, .{
+                        .label = label,
+                        .language = try a.dupe(u8, group.language),
+                        .filename = try a.dupe(u8, subtitle.title),
+                        .download_url = download_url,
+                    });
+                }
+            }
+        },
+        else => return error.UnsupportedProvider,
+    }
+
+    return .{
+        .arena = arena,
+        .provider = .subdl_com,
+        .title = title,
+        .items = try out.toOwnedSlice(a),
+    };
+}
+
+pub fn fetchSubdlSeasonSubtitlesPage(
+    allocator: Allocator,
+    client: *std.http.Client,
+    ref: SearchRef,
+    season_slug: []const u8,
+    page: usize,
+) !SubtitlesResponse {
+    const requested_page = if (page == 0) 1 else page;
+    if (requested_page == 1) {
+        var first = try fetchSubdlSeasonSubtitles(allocator, client, ref, season_slug);
+        first.page = 1;
+        first.has_prev_page = false;
+        first.has_next_page = false;
+        return first;
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    return .{
+        .arena = arena,
+        .provider = .subdl_com,
+        .title = titleFromRef(ref),
+        .items = &.{},
+        .page = requested_page,
+        .has_prev_page = true,
+        .has_next_page = false,
     };
 }
 

@@ -134,9 +134,17 @@ const SearchTask = struct {
 const SubtitlesTask = struct {
     ref: app.SearchRef,
     page: usize = 1,
+    subdl_season_slug: ?[]const u8 = null,
     done: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     err: ?anyerror = null,
     result: ?app.SubtitlesResponse = null,
+};
+
+const SubdlSeasonsTask = struct {
+    ref: app.SearchRef,
+    done: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    err: ?anyerror = null,
+    result: ?app.SubdlSeasonsResponse = null,
 };
 
 const DownloadTask = struct {
@@ -155,6 +163,7 @@ const Ui = struct {
     theme_index: usize = 0,
     skip_confirm: bool = false,
     context_line: ?[]const u8 = null,
+    context_owned: ?[]u8 = null,
 
     fn writer(self: *Ui) *std.Io.Writer {
         return self.tty.writer();
@@ -270,7 +279,25 @@ fn subtitlesTaskMain(task: *SubtitlesTask) void {
     var client: std.http.Client = .{ .allocator = std.heap.page_allocator };
     defer client.deinit();
 
-    task.result = app.fetchSubtitlesPage(std.heap.page_allocator, &client, task.ref, task.page) catch |err| {
+    const fetch_result = if (task.subdl_season_slug) |season_slug|
+        app.fetchSubdlSeasonSubtitlesPage(std.heap.page_allocator, &client, task.ref, season_slug, task.page)
+    else
+        app.fetchSubtitlesPage(std.heap.page_allocator, &client, task.ref, task.page);
+
+    task.result = fetch_result catch |err| {
+        task.err = err;
+        task.done.store(1, .release);
+        return;
+    };
+    task.done.store(1, .release);
+}
+
+fn subdlSeasonsTaskMain(task: *SubdlSeasonsTask) void {
+    configureWorkerHardCancel();
+    var client: std.http.Client = .{ .allocator = std.heap.page_allocator };
+    defer client.deinit();
+
+    task.result = app.fetchSubdlSeasons(std.heap.page_allocator, &client, task.ref) catch |err| {
         task.err = err;
         task.done.store(1, .release);
         return;
@@ -359,7 +386,16 @@ fn finalizeWorkerThread(thread: std.Thread, control: FetchControl) void {
 }
 
 fn setContext(ui: *Ui, context_line: ?[]const u8) void {
-    ui.context_line = context_line;
+    if (ui.context_owned) |buf| {
+        ui.allocator.free(buf);
+        ui.context_owned = null;
+    }
+    ui.context_line = null;
+
+    const src = context_line orelse return;
+    const copied = ui.allocator.dupe(u8, src) catch return;
+    ui.context_owned = copied;
+    ui.context_line = copied;
 }
 
 fn providerHomeUrl(provider: app.Provider) []const u8 {
@@ -396,7 +432,23 @@ fn searchRefUrl(ref: app.SearchRef) []const u8 {
     };
 }
 
+fn isSubdlSeriesRef(ref: app.SearchRef) bool {
+    return switch (ref) {
+        .subdl_com => |item| item.media_type == .tv,
+        else => false,
+    };
+}
+
+fn subdlSeasonUrl(allocator: std.mem.Allocator, title_url: []const u8, season_slug: []const u8) ![]u8 {
+    if (season_slug.len == 0) return allocator.dupe(u8, title_url);
+    if (std.mem.endsWith(u8, title_url, "/")) {
+        return std.fmt.allocPrint(allocator, "{s}{s}", .{ title_url, season_slug });
+    }
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ title_url, season_slug });
+}
+
 fn runTui(ui: *Ui, client: *std.http.Client) !void {
+    defer setContext(ui, null);
     _ = client;
     const provider_names = try buildProviderNames(ui.allocator);
     defer freeOwnedStrings(ui.allocator, provider_names);
@@ -610,6 +662,112 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
 
                 const selected_title = search_result.items[title_idx];
                 const title_ref_url = searchRefUrl(selected_title.ref);
+                var selected_subdl_season_slug: ?[]u8 = null;
+                defer if (selected_subdl_season_slug) |slug| ui.allocator.free(slug);
+                var selected_subdl_season_label: ?[]u8 = null;
+                defer if (selected_subdl_season_label) |label| ui.allocator.free(label);
+
+                if (isSubdlSeriesRef(selected_title.ref)) {
+                    const seasons_detail = try std.fmt.allocPrint(
+                        ui.allocator,
+                        "{s}",
+                        .{selected_title.label},
+                    );
+                    defer ui.allocator.free(seasons_detail);
+                    const seasons_context = try std.fmt.allocPrint(
+                        ui.allocator,
+                        "Series URL: {s}",
+                        .{title_ref_url},
+                    );
+                    defer ui.allocator.free(seasons_context);
+                    setContext(ui, seasons_context);
+
+                    var seasons_task: SubdlSeasonsTask = .{
+                        .ref = selected_title.ref,
+                    };
+                    const seasons_thread = try std.Thread.spawn(.{}, subdlSeasonsTaskMain, .{&seasons_task});
+                    const seasons_control = try waitForTask(ui, &seasons_task.done, "Seasons", seasons_detail);
+                    finalizeWorkerThread(seasons_thread, seasons_control);
+
+                    if (seasons_control == .quit) {
+                        if (seasons_task.result) |*r| r.deinit();
+                        return;
+                    }
+                    if (seasons_control == .canceled) {
+                        if (seasons_task.result) |*r| r.deinit();
+                        const msg_result = try vaxisMessage(
+                            ui,
+                            "Fetch Canceled",
+                            "Canceled season list fetch.",
+                            "Press any key to continue.",
+                            ui.styleWarn(),
+                        );
+                        switch (msg_result) {
+                            .ok => continue :title_loop,
+                            .to_query => continue :query_loop,
+                            .quit => return,
+                        }
+                    }
+
+                    if (seasons_task.err) |err| {
+                        const msg_result = try showFriendlyError(ui, "Could not load seasons", err);
+                        switch (msg_result) {
+                            .ok => continue :title_loop,
+                            .to_query => continue :query_loop,
+                            .quit => return,
+                        }
+                    }
+
+                    var seasons = seasons_task.result orelse return error.UnexpectedHttpStatus;
+                    defer seasons.deinit();
+
+                    if (seasons.items.len == 0) {
+                        const msg_result = try vaxisMessage(
+                            ui,
+                            "No Seasons",
+                            "No season rows were returned.",
+                            "Press any key to continue.",
+                            ui.styleWarn(),
+                        );
+                        switch (msg_result) {
+                            .ok => continue :title_loop,
+                            .to_query => continue :query_loop,
+                            .quit => return,
+                        }
+                    }
+
+                    const season_labels = try borrowSubdlSeasonLabels(ui.allocator, seasons.items);
+                    defer ui.allocator.free(season_labels);
+                    setContext(ui, seasons_context);
+
+                    const season_choice = try vaxisSelect(
+                        ui,
+                        "Select Season",
+                        "Use filter/sort keys. Esc titles.",
+                        season_labels,
+                        null,
+                        null,
+                        null,
+                    );
+
+                    const season_idx = switch (season_choice) {
+                        .selected => |idx| idx,
+                        .back => continue :title_loop,
+                        .to_query => continue :query_loop,
+                        .page_prev, .page_next => continue :title_loop,
+                        .quit => return,
+                    };
+
+                    const season = seasons.items[season_idx];
+                    selected_subdl_season_slug = try ui.allocator.dupe(u8, season.season_slug);
+                    selected_subdl_season_label = try ui.allocator.dupe(u8, season.label);
+                }
+
+                const subtitle_ref_url = if (selected_subdl_season_slug) |season_slug|
+                    try subdlSeasonUrl(ui.allocator, title_ref_url, season_slug)
+                else
+                    try ui.allocator.dupe(u8, title_ref_url);
+                defer ui.allocator.free(subtitle_ref_url);
 
                 var subtitle_pages: std.ArrayListUnmanaged(SubtitlesPageCacheEntry) = .empty;
                 defer deinitSubtitlesPageCache(ui.allocator, &subtitle_pages);
@@ -617,7 +775,20 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
 
                 subtitle_page_loop: while (true) {
                     const subtitles_idx = findSubtitlesPageCacheIndex(subtitle_pages.items, subtitle_page_current) orelse blk_fetch: {
-                        const subtitles_detail = if (supports_subtitles_pagination)
+                        const subtitles_detail = if (selected_subdl_season_label) |season_label|
+                            if (supports_subtitles_pagination)
+                                try std.fmt.allocPrint(
+                                    ui.allocator,
+                                    "{s} | {s} | page={d}",
+                                    .{ selected_title.label, season_label, subtitle_page_current },
+                                )
+                            else
+                                try std.fmt.allocPrint(
+                                    ui.allocator,
+                                    "{s} | {s}",
+                                    .{ selected_title.label, season_label },
+                                )
+                        else if (supports_subtitles_pagination)
                             try std.fmt.allocPrint(
                                 ui.allocator,
                                 "{s} | page={d}",
@@ -635,13 +806,13 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
                             try std.fmt.allocPrint(
                                 ui.allocator,
                                 "Title URL: {s} | page={d}",
-                                .{ title_ref_url, subtitle_page_current },
+                                .{ subtitle_ref_url, subtitle_page_current },
                             )
                         else
                             try std.fmt.allocPrint(
                                 ui.allocator,
                                 "Title URL: {s}",
-                                .{title_ref_url},
+                                .{subtitle_ref_url},
                             );
                         defer ui.allocator.free(subtitles_context);
                         setContext(ui, subtitles_context);
@@ -649,6 +820,7 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
                         var subtitles_task: SubtitlesTask = .{
                             .ref = selected_title.ref,
                             .page = subtitle_page_current,
+                            .subdl_season_slug = selected_subdl_season_slug,
                         };
                         const subtitles_thread = try std.Thread.spawn(.{}, subtitlesTaskMain, .{&subtitles_task});
                         const subtitles_control = try waitForTask(ui, &subtitles_task.done, "Subtitles", subtitles_detail);
@@ -723,13 +895,13 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
                         try std.fmt.allocPrint(
                             ui.allocator,
                             "Title URL: {s} | page={d}",
-                            .{ title_ref_url, subtitle_page_current },
+                            .{ subtitle_ref_url, subtitle_page_current },
                         )
                     else
                         try std.fmt.allocPrint(
                             ui.allocator,
                             "Title URL: {s}",
-                            .{title_ref_url},
+                            .{subtitle_ref_url},
                         );
                     defer ui.allocator.free(subtitle_context);
                     setContext(ui, subtitle_context);
@@ -793,7 +965,7 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
                             "Enter confirms download. Esc goes back.",
                         };
 
-                        setContext(ui, title_ref_url);
+                        setContext(ui, subtitle_ref_url);
                         const confirm_result = try vaxisConfirm(ui, "Confirm Selection", &confirm_lines);
                         switch (confirm_result) {
                             .confirm => {},
@@ -919,6 +1091,14 @@ fn buildProviderNames(allocator: std.mem.Allocator) ![][]u8 {
 }
 
 fn borrowSearchLabels(allocator: std.mem.Allocator, items: []const app.SearchChoice) ![][]const u8 {
+    const out = try allocator.alloc([]const u8, items.len);
+    for (items, 0..) |item, idx| {
+        out[idx] = item.label;
+    }
+    return out;
+}
+
+fn borrowSubdlSeasonLabels(allocator: std.mem.Allocator, items: []const app.SubdlSeasonChoice) ![][]const u8 {
     const out = try allocator.alloc([]const u8, items.len);
     for (items, 0..) |item, idx| {
         out[idx] = item.label;
