@@ -5,6 +5,24 @@ const Allocator = std.mem.Allocator;
 const common = subdl.common;
 const cf = subdl.opensubtitles_com_cf;
 const opensubtitles_remote_prefix = "oscom-remote:";
+const subtitlecat_translate_prefix = "subtitlecat-translate:";
+
+pub const DownloadPhase = enum(u8) {
+    idle,
+    resolving_url,
+    fetching_source,
+    downloading_file,
+    translating,
+    translating_fallback,
+    writing_output,
+    extracting_archive,
+};
+
+pub const DownloadProgress = struct {
+    user_data: ?*anyopaque = null,
+    on_phase: ?*const fn (user_data: ?*anyopaque, phase: DownloadPhase) void = null,
+    on_units: ?*const fn (user_data: ?*anyopaque, done: usize, total: usize) void = null,
+};
 
 pub const Provider = enum {
     subdl_com,
@@ -59,7 +77,7 @@ pub fn providerName(provider: Provider) []const u8 {
 
 pub fn providerSupportsSearchPagination(provider: Provider) bool {
     return switch (provider) {
-        .opensubtitles_org, .moviesubtitlesrt_com, .isubtitles_org, .my_subs_co, .tvsubtitles_net => true,
+        .opensubtitles_org, .moviesubtitlesrt_com, .podnapisi_net, .isubtitles_org, .my_subs_co, .tvsubtitles_net => true,
         else => false,
     };
 }
@@ -591,6 +609,34 @@ pub fn searchPage(allocator: Allocator, client: *std.http.Client, provider: Prov
                 });
             }
         },
+        .podnapisi_net => {
+            var scraper = subdl.podnapisi_net.Scraper.init(a, client);
+            defer scraper.deinit();
+            var response = try scraper.searchWithOptions(query, .{
+                .page_start = requested_page,
+                .max_pages = 1,
+            });
+            defer response.deinit();
+            has_next_page = response.has_next_page;
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                const subtitles_page_url = try a.dupe(u8, item.subtitles_page_url);
+                const label = if (item.year) |year|
+                    try std.fmt.allocPrint(a, "{s} ({d})", .{ title, year })
+                else
+                    try a.dupe(u8, title);
+
+                try out.append(a, .{
+                    .title = title,
+                    .label = label,
+                    .ref = .{ .podnapisi_net = .{
+                        .title = title,
+                        .subtitles_page_url = subtitles_page_url,
+                    } },
+                });
+            }
+        },
         .isubtitles_org => {
             var scraper = subdl.isubtitles_org.Scraper.init(a, client);
             defer scraper.deinit();
@@ -980,12 +1026,27 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
             defer subtitles.deinit();
 
             for (subtitles.subtitles) |subtitle| {
-                const label = try subtitleLabel(a, subtitle.language_code, subtitle.filename, subtitle.download_url);
+                var resolved_download_url: ?[]const u8 = try dupOptional(a, subtitle.download_url);
+                if (resolved_download_url == null and subtitle.mode == .translated) {
+                    const source_url = subtitle.source_url orelse if (subtitle.translate_spec) |spec|
+                        spec.source_url
+                    else
+                        null;
+                    if (source_url) |source| {
+                        const target_lang = subtitle.language_code orelse subtitle.language_label orelse "en";
+                        resolved_download_url = try makeSubtitlecatTranslateToken(a, source, target_lang, subtitle.filename);
+                    }
+                }
+
+                var label = try subtitleLabel(a, subtitle.language_code orelse subtitle.language_label, subtitle.filename, resolved_download_url);
+                if (subtitle.mode == .translated and resolved_download_url != null) {
+                    label = try std.fmt.allocPrint(a, "{s} [translate]", .{label});
+                }
                 try out.append(a, .{
                     .label = label,
-                    .language = try dupOptional(a, subtitle.language_code),
+                    .language = try dupOptional(a, subtitle.language_code orelse subtitle.language_label),
                     .filename = try a.dupe(u8, subtitle.filename),
-                    .download_url = try dupOptional(a, subtitle.download_url),
+                    .download_url = resolved_download_url,
                 });
             }
         },
@@ -1266,13 +1327,33 @@ fn titleFromRef(ref: SearchRef) []const u8 {
 }
 
 pub fn downloadSubtitle(allocator: Allocator, client: *std.http.Client, subtitle: SubtitleChoice, out_dir: []const u8) !DownloadResult {
+    return downloadSubtitleWithProgress(allocator, client, subtitle, out_dir, null);
+}
+
+pub fn downloadSubtitleWithProgress(
+    allocator: Allocator,
+    client: *std.http.Client,
+    subtitle: SubtitleChoice,
+    out_dir: []const u8,
+    progress: ?*const DownloadProgress,
+) !DownloadResult {
     const source_url = subtitle.download_url orelse return error.MissingField;
+
+    if (try parseSubtitlecatTranslateToken(allocator, source_url)) |token| {
+        defer token.deinit(allocator);
+        return downloadSubtitlecatTranslated(allocator, client, subtitle, out_dir, source_url, token, progress);
+    }
+
+    emitDownloadPhase(progress, .resolving_url);
     const url = try resolveDownloadUrlIfNeeded(allocator, client, source_url);
     defer allocator.free(url);
+
+    emitDownloadPhase(progress, .downloading_file);
     const response = try fetchDownloadBytes(client, allocator, url);
     defer allocator.free(response.body);
     if (response.status != .ok) return error.UnexpectedHttpStatus;
 
+    emitDownloadPhase(progress, .writing_output);
     try std.fs.cwd().makePath(out_dir);
     const raw_name = subtitle.filename orelse inferFilenameFromUrl(url) orelse "subtitle.bin";
     const safe_name = try sanitizeFilename(allocator, raw_name);
@@ -1304,6 +1385,7 @@ pub fn downloadSubtitle(allocator: Allocator, client: *std.http.Client, subtitle
     defer allocator.free(extract_dir);
     try std.fs.cwd().makePath(extract_dir);
 
+    emitDownloadPhase(progress, .extracting_archive);
     try extractArchive(allocator, archive_kind, output_path, extract_dir);
     const extracted_files = try collectExtractedSubtitleFiles(allocator, extract_dir);
     errdefer {
@@ -1324,6 +1406,444 @@ pub fn downloadSubtitle(allocator: Allocator, client: *std.http.Client, subtitle
         .bytes_written = response.body.len,
         .source_url = source_url,
     };
+}
+
+fn emitDownloadPhase(progress: ?*const DownloadProgress, phase: DownloadPhase) void {
+    const p = progress orelse return;
+    if (p.on_phase) |f| f(p.user_data, phase);
+}
+
+fn emitDownloadUnits(progress: ?*const DownloadProgress, done: usize, total: usize) void {
+    const p = progress orelse return;
+    if (p.on_units) |f| f(p.user_data, done, total);
+}
+
+const SubtitlecatTranslateToken = struct {
+    source_url: []u8,
+    target_lang: []u8,
+    filename: []u8,
+
+    fn deinit(self: SubtitlecatTranslateToken, allocator: Allocator) void {
+        allocator.free(self.source_url);
+        allocator.free(self.target_lang);
+        allocator.free(self.filename);
+    }
+};
+
+fn makeSubtitlecatTranslateToken(
+    allocator: Allocator,
+    source_url: []const u8,
+    target_lang: []const u8,
+    filename: []const u8,
+) ![]const u8 {
+    const source_encoded = try common.encodeUriComponent(allocator, source_url);
+    defer allocator.free(source_encoded);
+    const target_encoded = try common.encodeUriComponent(allocator, target_lang);
+    defer allocator.free(target_encoded);
+    const name_encoded = try common.encodeUriComponent(allocator, filename);
+    defer allocator.free(name_encoded);
+
+    return try std.fmt.allocPrint(
+        allocator,
+        "{s}source={s}&tl={s}&name={s}",
+        .{ subtitlecat_translate_prefix, source_encoded, target_encoded, name_encoded },
+    );
+}
+
+fn parseSubtitlecatTranslateToken(allocator: Allocator, download_url: []const u8) !?SubtitlecatTranslateToken {
+    if (!std.mem.startsWith(u8, download_url, subtitlecat_translate_prefix)) return null;
+
+    const payload = download_url[subtitlecat_translate_prefix.len..];
+    if (payload.len == 0) return error.InvalidDownloadUrl;
+
+    var source_url: ?[]u8 = null;
+    errdefer if (source_url) |v| allocator.free(v);
+    var target_lang: ?[]u8 = null;
+    errdefer if (target_lang) |v| allocator.free(v);
+    var filename: ?[]u8 = null;
+    errdefer if (filename) |v| allocator.free(v);
+
+    var it = std.mem.splitScalar(u8, payload, '&');
+    while (it.next()) |entry| {
+        if (entry.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+        const key = entry[0..eq];
+        const value = entry[eq + 1 ..];
+        const decoded = try decodeUriComponent(allocator, value);
+        errdefer allocator.free(decoded);
+
+        if (std.mem.eql(u8, key, "source")) {
+            if (source_url) |old| allocator.free(old);
+            source_url = decoded;
+        } else if (std.mem.eql(u8, key, "tl")) {
+            if (target_lang) |old| allocator.free(old);
+            target_lang = decoded;
+        } else if (std.mem.eql(u8, key, "name")) {
+            if (filename) |old| allocator.free(old);
+            filename = decoded;
+        } else {
+            allocator.free(decoded);
+        }
+    }
+
+    if (source_url == null) return error.InvalidDownloadUrl;
+    if (target_lang == null) target_lang = try allocator.dupe(u8, "");
+    if (filename == null) filename = try allocator.dupe(u8, "translated.srt");
+
+    return .{
+        .source_url = source_url.?,
+        .target_lang = target_lang.?,
+        .filename = filename.?,
+    };
+}
+
+fn decodeUriComponent(allocator: Allocator, value: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < value.len) : (i += 1) {
+        const ch = value[i];
+        if (ch == '+') {
+            try out.append(allocator, ' ');
+            continue;
+        }
+        if (ch == '%') {
+            if (i + 2 >= value.len) return error.InvalidField;
+            const hi = try fromHexDigit(value[i + 1]);
+            const lo = try fromHexDigit(value[i + 2]);
+            try out.append(allocator, @as(u8, (hi << 4) | lo));
+            i += 2;
+            continue;
+        }
+        try out.append(allocator, ch);
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn fromHexDigit(ch: u8) !u8 {
+    return switch (ch) {
+        '0'...'9' => ch - '0',
+        'a'...'f' => 10 + ch - 'a',
+        'A'...'F' => 10 + ch - 'A',
+        else => error.InvalidField,
+    };
+}
+
+const SubtitlecatBatch = struct {
+    text: []u8,
+    indices: []usize,
+};
+
+fn downloadSubtitlecatTranslated(
+    allocator: Allocator,
+    client: *std.http.Client,
+    subtitle: SubtitleChoice,
+    out_dir: []const u8,
+    source_token: []const u8,
+    token: SubtitlecatTranslateToken,
+    progress: ?*const DownloadProgress,
+) !DownloadResult {
+    emitDownloadPhase(progress, .fetching_source);
+    const source_response = try common.fetchBytes(client, allocator, token.source_url, .{
+        .accept = "text/plain,*/*",
+        .allow_non_ok = true,
+        .max_attempts = 2,
+    });
+    defer allocator.free(source_response.body);
+    if (source_response.status != .ok) return error.UnexpectedHttpStatus;
+
+    const target_lang = languageToGoogleCode(token.target_lang) orelse "";
+
+    emitDownloadPhase(progress, .translating);
+    const translated_text = if (target_lang.len > 0)
+        translateSubtitlecatSrt(allocator, client, source_response.body, target_lang, progress) catch
+            try allocator.dupe(u8, source_response.body)
+    else
+        try allocator.dupe(u8, source_response.body);
+    defer allocator.free(translated_text);
+
+    emitDownloadPhase(progress, .writing_output);
+    try std.fs.cwd().makePath(out_dir);
+    const preferred_name = if (subtitle.filename) |name| name else token.filename;
+    const safe_name = try sanitizeFilename(allocator, preferred_name);
+    defer allocator.free(safe_name);
+
+    const output_path = try nextAvailableOutputPath(allocator, out_dir, safe_name);
+    errdefer allocator.free(output_path);
+    var file = try std.fs.cwd().createFile(output_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(translated_text);
+
+    return .{
+        .file_path = output_path,
+        .bytes_written = translated_text.len,
+        .source_url = source_token,
+    };
+}
+
+fn languageToGoogleCode(input: []const u8) ?[]const u8 {
+    const trimmed = common.trimAscii(input);
+    if (trimmed.len == 0) return null;
+
+    if (common.normalizeLanguageCode(trimmed)) |normalized| {
+        if (std.mem.eql(u8, normalized, "pt-br")) return "pt";
+        if (std.mem.eql(u8, normalized, "zh-tw")) return "zh-TW";
+        return normalized;
+    }
+
+    var valid = true;
+    for (trimmed) |ch| {
+        const ok = (ch >= 'a' and ch <= 'z') or
+            (ch >= 'A' and ch <= 'Z') or
+            ch == '-' or
+            ch == '_';
+        if (!ok) {
+            valid = false;
+            break;
+        }
+    }
+    if (valid and trimmed.len <= 16) return trimmed;
+    return null;
+}
+
+fn translateSubtitlecatSrt(
+    allocator: Allocator,
+    client: *std.http.Client,
+    source: []const u8,
+    target_lang: []const u8,
+    progress: ?*const DownloadProgress,
+) ![]u8 {
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer lines.deinit(allocator);
+
+    var line_it = std.mem.splitScalar(u8, source, '\n');
+    while (line_it.next()) |line| {
+        try lines.append(allocator, line);
+    }
+
+    var translated: std.ArrayListUnmanaged(?[]u8) = .empty;
+    defer {
+        for (translated.items) |entry| {
+            if (entry) |line| allocator.free(line);
+        }
+        translated.deinit(allocator);
+    }
+    try translated.resize(allocator, lines.items.len);
+    @memset(translated.items, null);
+
+    const total_units = countTranslatableLines(lines.items);
+    emitDownloadUnits(progress, 0, total_units);
+    var done_units: usize = 0;
+
+    var batch_text: std.ArrayListUnmanaged(u8) = .empty;
+    defer batch_text.deinit(allocator);
+    var batch_indices: std.ArrayListUnmanaged(usize) = .empty;
+    defer batch_indices.deinit(allocator);
+    const batch_limit: usize = 500;
+
+    for (lines.items, 0..) |line, idx| {
+        if (!shouldTranslateSubtitleLine(line)) {
+            translated.items[idx] = try allocator.dupe(u8, line);
+            continue;
+        }
+
+        const sanitized = try sanitizeSubtitlecatTranslateLine(allocator, line);
+        defer allocator.free(sanitized);
+
+        const extra_len = sanitized.len + @as(usize, if (batch_indices.items.len > 0) 1 else 0);
+        if (batch_indices.items.len > 0 and batch_text.items.len + extra_len > batch_limit) {
+            const batch = SubtitlecatBatch{
+                .text = try batch_text.toOwnedSlice(allocator),
+                .indices = try batch_indices.toOwnedSlice(allocator),
+            };
+            defer allocator.free(batch.text);
+            defer allocator.free(batch.indices);
+            batch_text.clearRetainingCapacity();
+            batch_indices.clearRetainingCapacity();
+            try applySubtitlecatBatch(allocator, client, lines.items, translated.items, batch, target_lang, progress, &done_units, total_units);
+        }
+
+        if (batch_indices.items.len > 0) try batch_text.append(allocator, '\n');
+        try batch_text.appendSlice(allocator, sanitized);
+        try batch_indices.append(allocator, idx);
+    }
+
+    if (batch_indices.items.len > 0) {
+        const batch = SubtitlecatBatch{
+            .text = try batch_text.toOwnedSlice(allocator),
+            .indices = try batch_indices.toOwnedSlice(allocator),
+        };
+        defer allocator.free(batch.text);
+        defer allocator.free(batch.indices);
+        try applySubtitlecatBatch(allocator, client, lines.items, translated.items, batch, target_lang, progress, &done_units, total_units);
+    }
+
+    emitDownloadUnits(progress, total_units, total_units);
+
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer output.deinit(allocator);
+    for (translated.items, 0..) |entry, idx| {
+        const text = if (entry) |line| line else lines.items[idx];
+        try output.appendSlice(allocator, text);
+        if (idx + 1 < translated.items.len) try output.append(allocator, '\n');
+    }
+
+    return try output.toOwnedSlice(allocator);
+}
+
+fn applySubtitlecatBatch(
+    allocator: Allocator,
+    client: *std.http.Client,
+    source_lines: []const []const u8,
+    translated_lines: []?[]u8,
+    batch: SubtitlecatBatch,
+    target_lang: []const u8,
+    progress: ?*const DownloadProgress,
+    done_units: *usize,
+    total_units: usize,
+) !void {
+    const translated_batch = translateViaGoogle(allocator, client, batch.text, target_lang) catch null;
+    if (translated_batch) |batch_text| {
+        defer allocator.free(batch_text);
+        var out_lines: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer out_lines.deinit(allocator);
+
+        var line_it = std.mem.splitScalar(u8, batch_text, '\n');
+        while (line_it.next()) |line| try out_lines.append(allocator, line);
+
+        if (out_lines.items.len == batch.indices.len) {
+            for (batch.indices, 0..) |line_idx, i| {
+                translated_lines[line_idx] = try allocator.dupe(u8, out_lines.items[i]);
+            }
+            done_units.* += batch.indices.len;
+            emitDownloadUnits(progress, done_units.*, total_units);
+            return;
+        }
+    }
+
+    emitDownloadPhase(progress, .translating_fallback);
+    for (batch.indices) |line_idx| {
+        const source_line = source_lines[line_idx];
+        const translated_line = translateViaGoogle(allocator, client, source_line, target_lang) catch
+            try allocator.dupe(u8, source_line);
+        translated_lines[line_idx] = translated_line;
+        done_units.* += 1;
+        emitDownloadUnits(progress, done_units.*, total_units);
+    }
+    emitDownloadPhase(progress, .translating);
+}
+
+fn countTranslatableLines(lines: []const []const u8) usize {
+    var count: usize = 0;
+    for (lines) |line| {
+        if (shouldTranslateSubtitleLine(line)) count += 1;
+    }
+    return count;
+}
+
+fn shouldTranslateSubtitleLine(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    if (trimmed.len == 0) return false;
+
+    var numeric = true;
+    for (trimmed) |ch| {
+        if (ch < '0' or ch > '9') {
+            numeric = false;
+            break;
+        }
+    }
+    if (numeric) return false;
+
+    if (std.mem.indexOf(u8, trimmed, "-->") != null) return false;
+    if (std.mem.eql(u8, trimmed, "WEBVTT")) return false;
+    return true;
+}
+
+fn sanitizeSubtitlecatTranslateLine(allocator: Allocator, line: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < line.len) {
+        if (asciiStartsWithIgnoreCase(line[i..], "<font")) {
+            if (std.mem.indexOfScalarPos(u8, line, i, '>')) |end_idx| {
+                i = end_idx + 1;
+                continue;
+            }
+        }
+        if (asciiStartsWithIgnoreCase(line[i..], "</font>")) {
+            i += "</font>".len;
+            continue;
+        }
+        if (line[i] == '&') {
+            try out.appendSlice(allocator, "and");
+        } else {
+            try out.append(allocator, line[i]);
+        }
+        i += 1;
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn asciiStartsWithIgnoreCase(input: []const u8, prefix: []const u8) bool {
+    if (prefix.len > input.len) return false;
+    for (input[0..prefix.len], prefix) |a, b| {
+        if (std.ascii.toLower(a) != std.ascii.toLower(b)) return false;
+    }
+    return true;
+}
+
+fn translateViaGoogle(
+    allocator: Allocator,
+    client: *std.http.Client,
+    text: []const u8,
+    target_lang: []const u8,
+) ![]u8 {
+    const encoded_q = try common.encodeUriComponent(allocator, text);
+    defer allocator.free(encoded_q);
+    const encoded_tl = try common.encodeUriComponent(allocator, target_lang);
+    defer allocator.free(encoded_tl);
+
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={s}&dt=t&q={s}",
+        .{ encoded_tl, encoded_q },
+    );
+    defer allocator.free(url);
+
+    const response = try common.fetchBytes(client, allocator, url, .{
+        .accept = "application/json,text/plain,*/*",
+        .allow_non_ok = true,
+        .max_attempts = 2,
+    });
+    defer allocator.free(response.body);
+    if (response.status != .ok) return error.UnexpectedHttpStatus;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    return googleTranslateResultToString(allocator, parsed.value);
+}
+
+fn googleTranslateResultToString(allocator: Allocator, value: std.json.Value) ![]u8 {
+    if (value != .array) return error.InvalidFieldType;
+    const root_items = value.array.items;
+    if (root_items.len == 0) return error.InvalidField;
+    if (root_items[0] != .array) return error.InvalidFieldType;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    for (root_items[0].array.items) |part| {
+        if (part != .array) continue;
+        if (part.array.items.len == 0) continue;
+        if (part.array.items[0] != .string) continue;
+        try out.appendSlice(allocator, part.array.items[0].string);
+    }
+
+    return try out.toOwnedSlice(allocator);
 }
 
 fn resolveDownloadUrlIfNeeded(allocator: Allocator, client: *std.http.Client, download_url: []const u8) ![]const u8 {
@@ -1350,12 +1870,19 @@ fn resolveDownloadUrlIfNeeded(allocator: Allocator, client: *std.http.Client, do
 }
 
 fn fetchDownloadBytes(client: *std.http.Client, allocator: Allocator, url: []const u8) !common.HttpResponse {
+    const yify_referer = yifyRefererForUrl(url);
+    const yify_headers = if (yify_referer) |referer|
+        &[_]std.http.Header{.{ .name = "referer", .value = referer }}
+    else
+        &[_]std.http.Header{};
+
     const primary = common.fetchBytes(client, allocator, url, .{
         .accept = "*/*",
+        .extra_headers = yify_headers,
         .allow_non_ok = true,
         .max_attempts = 2,
     }) catch |err| {
-        if (try fetchBytesViaCurl(allocator, url, "*/*")) |fallback| {
+        if (try fetchBytesViaCurl(allocator, url, "*/*", yify_referer)) |fallback| {
             return fallback;
         }
         return err;
@@ -1373,7 +1900,7 @@ fn fetchDownloadBytes(client: *std.http.Client, allocator: Allocator, url: []con
         }
     }
 
-    if (try fetchBytesViaCurl(allocator, url, "*/*")) |fallback| {
+    if (try fetchBytesViaCurl(allocator, url, "*/*", yify_referer)) |fallback| {
         return fallback;
     }
     return error.UnexpectedHttpStatus;
@@ -1392,16 +1919,17 @@ fn cloudflareTargetForUrl(url: []const u8) ?CloudflareTarget {
         };
     }
 
+    return null;
+}
+
+fn yifyRefererForUrl(url: []const u8) ?[]const u8 {
     if (std.mem.indexOf(u8, url, "://yifysubtitles.ch/") != null) {
-        return .{
-            .domain = "yifysubtitles.ch",
-            .challenge_url = "https://yifysubtitles.ch/",
-        };
+        return "https://yifysubtitles.ch/";
     }
     return null;
 }
 
-fn fetchBytesViaCurl(allocator: Allocator, url: []const u8, accept: []const u8) !?common.HttpResponse {
+fn fetchBytesViaCurl(allocator: Allocator, url: []const u8, accept: []const u8, referer: ?[]const u8) !?common.HttpResponse {
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     defer argv.deinit(allocator);
 
@@ -1425,6 +1953,12 @@ fn fetchBytesViaCurl(allocator: Allocator, url: []const u8, accept: []const u8) 
     const accept_header = try std.fmt.allocPrint(allocator, "Accept: {s}", .{accept});
     try owned_args.append(allocator, accept_header);
     try argv.appendSlice(allocator, &.{ "-H", accept_header });
+
+    if (referer) |value| {
+        const referer_header = try std.fmt.allocPrint(allocator, "Referer: {s}", .{value});
+        try owned_args.append(allocator, referer_header);
+        try argv.appendSlice(allocator, &.{ "-H", referer_header });
+    }
 
     try argv.appendSlice(allocator, &.{ "-w", "\n%{http_code}", url });
 
@@ -1898,11 +2432,11 @@ test "parseProvider accepts dotted/hyphenated js provider names" {
 test "provider pagination support flags" {
     try std.testing.expect(providerSupportsSearchPagination(.opensubtitles_org));
     try std.testing.expect(providerSupportsSearchPagination(.moviesubtitlesrt_com));
+    try std.testing.expect(providerSupportsSearchPagination(.podnapisi_net));
     try std.testing.expect(providerSupportsSearchPagination(.isubtitles_org));
     try std.testing.expect(providerSupportsSearchPagination(.my_subs_co));
     try std.testing.expect(providerSupportsSearchPagination(.tvsubtitles_net));
     try std.testing.expect(!providerSupportsSearchPagination(.subdl_com));
-    try std.testing.expect(!providerSupportsSearchPagination(.podnapisi_net));
 
     try std.testing.expect(providerSupportsSubtitlesPagination(.opensubtitles_org));
     try std.testing.expect(providerSupportsSubtitlesPagination(.isubtitles_org));
@@ -1954,6 +2488,50 @@ test "opensubtitles remote token helpers" {
     const parsed = parseOpenSubtitlesRemoteToken(token) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("/en/subtitleserve/file/abc", parsed);
     try std.testing.expect(parseOpenSubtitlesRemoteToken("https://example.com/file.zip") == null);
+}
+
+test "subtitlecat translate token helpers" {
+    const allocator = std.testing.allocator;
+
+    const token = try makeSubtitlecatTranslateToken(
+        allocator,
+        "https://www.subtitlecat.com/subs/file-orig.srt",
+        "es",
+        "movie-es.srt",
+    );
+    defer allocator.free(token);
+
+    const parsed = (try parseSubtitlecatTranslateToken(allocator, token)) orelse return error.TestUnexpectedResult;
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqualStrings("https://www.subtitlecat.com/subs/file-orig.srt", parsed.source_url);
+    try std.testing.expectEqualStrings("es", parsed.target_lang);
+    try std.testing.expectEqualStrings("movie-es.srt", parsed.filename);
+
+    try std.testing.expect((try parseSubtitlecatTranslateToken(allocator, "https://example.com/file.srt")) == null);
+}
+
+test "google translate result parser extracts text chunks" {
+    const allocator = std.testing.allocator;
+    const raw =
+        \\[[["hello ","hola ",null,null,10],["world","mundo",null,null,10]],null,"en"]
+    ;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+
+    const text = try googleTranslateResultToString(allocator, parsed.value);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("hello world", text);
+}
+
+test "yify referer is only added for yifysubtitles hosts" {
+    try std.testing.expectEqualStrings("https://yifysubtitles.ch/", yifyRefererForUrl("https://yifysubtitles.ch/subtitle/test.zip").?);
+    try std.testing.expect(yifyRefererForUrl("https://www.opensubtitles.com/file.zip") == null);
+}
+
+test "cloudflare target excludes yify downloads" {
+    try std.testing.expect(cloudflareTargetForUrl("https://yifysubtitles.ch/subtitle/test.zip") == null);
+    try std.testing.expect(cloudflareTargetForUrl("https://www.opensubtitles.com/nocache/download/123") != null);
 }
 
 const ProviderSmokeState = struct {

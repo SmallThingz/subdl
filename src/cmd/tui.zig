@@ -161,6 +161,9 @@ const SubdlSeasonsTask = struct {
 const DownloadTask = struct {
     subtitle: app.SubtitleChoice,
     out_dir: []const u8,
+    phase: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(app.DownloadPhase.idle)),
+    phase_done: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    phase_total: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     done: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     err: ?anyerror = null,
     result: ?app.DownloadResult = null,
@@ -171,6 +174,7 @@ const Ui = struct {
     tty: *vaxis.Tty,
     vx: *vaxis.Vaxis,
     loop: *vaxis.Loop(Event),
+    frame_arena: std.heap.ArenaAllocator,
     theme_index: usize = 0,
     skip_confirm: bool = false,
     context_line: ?[]const u8 = null,
@@ -187,6 +191,11 @@ const Ui = struct {
     fn render(self: *Ui) !void {
         try self.vx.render(self.writer());
         try self.writer().flush();
+        _ = self.frame_arena.reset(.retain_capacity);
+    }
+
+    fn frameAllocator(self: *Ui) std.mem.Allocator {
+        return self.frame_arena.allocator();
     }
 
     fn theme(self: *Ui) Theme {
@@ -267,7 +276,9 @@ pub fn main() !void {
         .tty = &tty,
         .vx = &vx,
         .loop = &loop,
+        .frame_arena = std.heap.ArenaAllocator.init(gpa),
     };
+    defer ui.frame_arena.deinit();
 
     try runTui(&ui, &client);
 }
@@ -321,12 +332,40 @@ fn downloadTaskMain(task: *DownloadTask) void {
     var client: std.http.Client = .{ .allocator = std.heap.page_allocator };
     defer client.deinit();
 
-    task.result = app.downloadSubtitle(std.heap.page_allocator, &client, task.subtitle, task.out_dir) catch |err| {
+    const progress = app.DownloadProgress{
+        .user_data = task,
+        .on_phase = onDownloadProgressPhase,
+        .on_units = onDownloadProgressUnits,
+    };
+
+    task.result = app.downloadSubtitleWithProgress(std.heap.page_allocator, &client, task.subtitle, task.out_dir, &progress) catch |err| {
         task.err = err;
         task.done.store(1, .release);
         return;
     };
     task.done.store(1, .release);
+}
+
+fn onDownloadProgressPhase(user_data: ?*anyopaque, phase: app.DownloadPhase) void {
+    const task_ptr = user_data orelse return;
+    const task: *DownloadTask = @ptrCast(@alignCast(task_ptr));
+    task.phase.store(@intFromEnum(phase), .release);
+    if (phase != .translating and phase != .translating_fallback) {
+        task.phase_done.store(0, .release);
+        task.phase_total.store(0, .release);
+    }
+}
+
+fn onDownloadProgressUnits(user_data: ?*anyopaque, done: usize, total: usize) void {
+    const task_ptr = user_data orelse return;
+    const task: *DownloadTask = @ptrCast(@alignCast(task_ptr));
+    task.phase_done.store(toU32Saturating(done), .release);
+    task.phase_total.store(toU32Saturating(total), .release);
+}
+
+fn toU32Saturating(value: usize) u32 {
+    if (value > std.math.maxInt(u32)) return std.math.maxInt(u32);
+    return @intCast(value);
 }
 
 fn waitForFetch(ui: *Ui, done: *const std.atomic.Value(u8), title: []const u8, detail: []const u8) !FetchControl {
@@ -370,6 +409,89 @@ fn waitForFetch(ui: *Ui, done: *const std.atomic.Value(u8), title: []const u8, d
 
 fn waitForTask(ui: *Ui, done: *const std.atomic.Value(u8), title: []const u8, detail: []const u8) !FetchControl {
     return waitForFetch(ui, done, title, detail);
+}
+
+fn waitForDownloadTask(ui: *Ui, task: *const DownloadTask, title: []const u8, detail: []const u8) !FetchControl {
+    const spinner = [_][]const u8{ "|", "/", "-", "\\" };
+    var spinner_idx: usize = 0;
+
+    while (task.done.load(.acquire) == 0) {
+        const phase_raw = task.phase.load(.acquire);
+        const phase = std.meta.intToEnum(app.DownloadPhase, phase_raw) catch app.DownloadPhase.idle;
+        const done = task.phase_done.load(.acquire);
+        const total = task.phase_total.load(.acquire);
+
+        var message_buf: [256]u8 = undefined;
+        var progress_buf: [20]u8 = undefined;
+        const progress_bar = formatDownloadProgressBar(&progress_buf, done, total);
+        const message = if ((phase == .translating or phase == .translating_fallback) and total > 0)
+            std.fmt.bufPrint(
+                &message_buf,
+                "{s} {d}/{d} {s} {s}",
+                .{ downloadPhaseLabel(phase), done, total, progress_bar, spinner[spinner_idx % spinner.len] },
+            ) catch "Downloading..."
+        else
+            std.fmt.bufPrint(
+                &message_buf,
+                "{s} {s}",
+                .{ downloadPhaseLabel(phase), spinner[spinner_idx % spinner.len] },
+            ) catch "Downloading...";
+
+        try vaxisStatus(ui, title, message, detail);
+
+        while (ui.loop.tryEvent()) |event| {
+            switch (event) {
+                .winsize => |ws| try ui.resize(ws),
+                .key_press => |key| {
+                    if (key.matches(vaxis.Key.f2, .{})) {
+                        ui.toggleConfirm();
+                        continue;
+                    }
+                    if (key.matches(vaxis.Key.f3, .{})) {
+                        ui.toggleTheme();
+                        continue;
+                    }
+                    if (key.matches('d', .{ .ctrl = true })) {
+                        return .quit;
+                    }
+                    if (key.matches('c', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
+                        return .canceled;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        spinner_idx += 1;
+        std.Thread.sleep(90 * std.time.ns_per_ms);
+    }
+
+    return .completed;
+}
+
+fn downloadPhaseLabel(phase: app.DownloadPhase) []const u8 {
+    return switch (phase) {
+        .idle => "Preparing",
+        .resolving_url => "Resolving URL",
+        .fetching_source => "Fetching source",
+        .downloading_file => "Downloading file",
+        .translating => "Translating",
+        .translating_fallback => "Translating fallback",
+        .writing_output => "Writing output",
+        .extracting_archive => "Extracting archive",
+    };
+}
+
+fn formatDownloadProgressBar(buf: *[20]u8, done: u32, total: u32) []const u8 {
+    const width: u32 = 14;
+    const filled = if (total == 0) 0 else @min(width, (done * width) / total);
+    buf[0] = '[';
+    var i: u32 = 0;
+    while (i < width) : (i += 1) {
+        buf[i + 1] = if (i < filled) '#' else '-';
+    }
+    buf[width + 1] = ']';
+    return buf[0 .. width + 2];
 }
 
 fn configureWorkerHardCancel() void {
@@ -954,6 +1076,10 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
 
                     const selected_subtitle = subtitles.items[subtitle_idx];
                     const download_url = selected_subtitle.download_url orelse "(no direct URL)";
+                    const download_url_display = if (isSubtitlecatTranslateToken(selected_subtitle.download_url))
+                        "subtitlecat translate request"
+                    else
+                        download_url;
 
                     if (!ui.skip_confirm) {
                         var provider_buf: [224]u8 = undefined;
@@ -966,7 +1092,7 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
                         var subtitle_buf: [384]u8 = undefined;
                         const subtitle_line = std.fmt.bufPrint(&subtitle_buf, "Subtitle: {s}", .{selected_subtitle.label}) catch "Subtitle: (overflow)";
                         var url_buf: [320]u8 = undefined;
-                        const url_line = std.fmt.bufPrint(&url_buf, "URL: {s}", .{download_url}) catch "URL: (overflow)";
+                        const url_line = std.fmt.bufPrint(&url_buf, "URL: {s}", .{download_url_display}) catch "URL: (overflow)";
 
                         const confirm_lines = [_][]const u8{
                             provider_line,
@@ -995,7 +1121,7 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
                     const download_context = try std.fmt.allocPrint(
                         ui.allocator,
                         "Download URL: {s}",
-                        .{download_url},
+                        .{download_url_display},
                     );
                     defer ui.allocator.free(download_context);
                     setContext(ui, download_context);
@@ -1005,7 +1131,7 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
                         .out_dir = "downloads",
                     };
                     const download_thread = try std.Thread.spawn(.{}, downloadTaskMain, .{&download_task});
-                    const download_control = try waitForTask(ui, &download_task.done, "Download", download_detail);
+                    const download_control = try waitForDownloadTask(ui, &download_task, "Download", download_detail);
                     finalizeWorkerThread(download_thread, download_control);
 
                     if (download_control == .quit) {
@@ -1149,17 +1275,15 @@ fn vaxisStatus(ui: *Ui, title: []const u8, message: []const u8, detail: []const 
     win.clear();
     win.hideCursor();
 
-    const title_segments = [_]vaxis.Segment{.{ .text = title, .style = ui.styleTitle() }};
-    _ = win.print(&title_segments, .{ .row_offset = 0, .col_offset = 1, .wrap = .none });
-    try renderContextLine(ui, win, 1);
+    try renderTopBar(ui, win, .{ .title = title });
 
     const msg_segments = [_]vaxis.Segment{.{ .text = message, .style = ui.styleWarn() }};
     _ = win.print(&msg_segments, .{ .row_offset = 2, .col_offset = 1, .wrap = .none });
 
     const detail_segments = [_]vaxis.Segment{.{ .text = detail, .style = ui.styleMuted() }};
-    _ = win.print(&detail_segments, .{ .row_offset = 4, .col_offset = 1, .wrap = .none });
+    _ = win.print(&detail_segments, .{ .row_offset = 3, .col_offset = 1, .wrap = .none });
 
-    try renderGlobalFooter(ui, win, "Ctrl+C/Esc/q cancel fetch | Ctrl+D quit", null);
+    try renderBottomBar(ui, win, .{ .left = "Ctrl+C/Esc/q cancel fetch" });
     try ui.render();
 }
 
@@ -1182,12 +1306,10 @@ fn vaxisInput(
         win.hideCursor();
         win.setCursorShape(.beam);
 
-        const title_segments = [_]vaxis.Segment{.{ .text = title, .style = ui.styleTitle() }};
-        _ = win.print(&title_segments, .{ .row_offset = 0, .col_offset = 1, .wrap = .none });
+        try renderTopBar(ui, win, .{ .title = title });
 
         const hint_segments = [_]vaxis.Segment{.{ .text = hint }};
         _ = win.print(&hint_segments, .{ .row_offset = 1, .col_offset = 1, .wrap = .none });
-        try renderContextLine(ui, win, 2);
 
         const before_cursor = query.items[0..cursor_pos];
         const after_cursor = query.items[cursor_pos..];
@@ -1207,11 +1329,11 @@ fn vaxisInput(
             win.showCursor(@min(desired_col, max_col), 3);
         }
 
-        try renderGlobalFooter(ui, win, "Enter search | Esc back", null);
+        try renderBottomBar(ui, win, .{ .left = "Enter search | Esc back" });
 
         if (error_text) |txt| {
             const err_segments = [_]vaxis.Segment{.{ .text = txt, .style = ui.styleError() }};
-            _ = win.print(&err_segments, .{ .row_offset = 7, .col_offset = 1, .wrap = .none });
+            _ = win.print(&err_segments, .{ .row_offset = 6, .col_offset = 1, .wrap = .none });
         }
 
         try ui.render();
@@ -1299,21 +1421,17 @@ fn vaxisSelect(
 
     var scroll: usize = 0;
     var filter_mode = false;
+    var info_menu_open = false;
 
     while (true) {
         const win = ui.vx.window();
         win.clear();
         win.hideCursor();
 
-        const title_segments = [_]vaxis.Segment{.{ .text = title, .style = ui.styleTitle() }};
-        _ = win.print(&title_segments, .{ .row_offset = 0, .col_offset = 1, .wrap = .none });
+        try renderCompactTopLine(ui, win, title, ui.styleTitle());
 
-        const hint_segments = [_]vaxis.Segment{.{ .text = hint }};
-        _ = win.print(&hint_segments, .{ .row_offset = 1, .col_offset = 1, .wrap = .none });
-        try renderContextLine(ui, win, 2);
-
-        const list_top: u16 = if (ui.context_line != null) 4 else 3;
-        const footer_rows: u16 = 4;
+        const list_top: u16 = 1;
+        const footer_rows: u16 = 1;
         const list_bottom: u16 = if (win.height > footer_rows) win.height - footer_rows else win.height;
         const page_size: usize = if (list_bottom > list_top)
             @intCast(list_bottom - list_top)
@@ -1353,33 +1471,56 @@ fn vaxisSelect(
             _ = win.print(&empty_segments, .{ .row_offset = list_top, .col_offset = 1, .wrap = .none });
         }
 
-        const mode_text = if (filter_mode) "FILTER MODE" else "NAV MODE";
-        var filter_buf: [384]u8 = undefined;
-        const filter_line = std.fmt.bufPrint(&filter_buf, "Filter: {s}  [{s}]", .{ filter.items, mode_text }) catch "Filter: (overflow)";
+        const mode_text = if (filter_mode) "FILTER" else "NAV";
+        const filter_display = if (filter.items.len == 0) "-" else filter.items;
 
         const can_page = if (page_nav) |pn| pn.enabled else false;
         const help_line = if (filter_mode)
-            "Type to filter | Enter done | Esc exit | Backspace delete"
+            "type Enter/Esc BS"
         else if (can_page)
-            "j/k move | Enter select | [ prev page | ] next page | / filter | Esc back"
+            "j/k Enter / [ ] Esc"
         else
-            "j/k or arrows move | Enter select | / filter | Esc back";
+            "j/k Enter / Esc";
 
-        var count_buf: [96]u8 = undefined;
+        var count_buf: [128]u8 = undefined;
         const count_line = if (can_page)
             std.fmt.bufPrint(
                 &count_buf,
-                "Visible: {d}/{d} | Page: {d}",
+                "{d}/{d} p{d}",
                 .{ matches.items.len, options.len, if (page_nav) |pn| pn.page else 1 },
-            ) catch "Visible: ?"
+            ) catch "?/? p?"
         else
-            std.fmt.bufPrint(&count_buf, "Visible: {d}/{d}", .{ matches.items.len, options.len }) catch "Visible: ?";
+            std.fmt.bufPrint(&count_buf, "{d}/{d}", .{ matches.items.len, options.len }) catch "?/?";
 
-        try renderGlobalFooter(ui, win, help_line, count_line);
+        var compact_buf: [768]u8 = undefined;
+        const compact_line = std.fmt.bufPrint(
+            &compact_buf,
+            "{s} | {s}:{s} | {s}",
+            .{ help_line, mode_text, filter_display, count_line },
+        ) catch "j/k Enter / Esc";
+        try renderCompactBottomLine(ui, win, compact_line);
 
-        const filter_segments = [_]vaxis.Segment{.{ .text = filter_line, .style = ui.styleMuted() }};
-        const filter_row: u16 = if (win.height > 2) win.height - 2 else 0;
-        _ = win.print(&filter_segments, .{ .row_offset = filter_row, .col_offset = 1, .wrap = .none });
+        if (info_menu_open) {
+            var m1: [256]u8 = undefined;
+            var m2: [320]u8 = undefined;
+            var m3: [640]u8 = undefined;
+            var m4: [320]u8 = undefined;
+            var m5: [320]u8 = undefined;
+            const l1 = std.fmt.bufPrint(&m1, "screen: {s}", .{title}) catch "screen";
+            const l2 = std.fmt.bufPrint(&m2, "hint: {s}", .{hint}) catch "hint";
+            const l3 = std.fmt.bufPrint(&m3, "ctx: {s}", .{ui.context_line orelse "-"}) catch "ctx";
+            const l4 = std.fmt.bufPrint(&m4, "controls: {s}", .{help_line}) catch "controls";
+            const l5 = std.fmt.bufPrint(&m5, "state: mode={s} filter={s} count={s}", .{ mode_text, filter_display, count_line }) catch "state";
+            const lines = [_][]const u8{
+                l1,
+                l2,
+                l3,
+                l4,
+                l5,
+                "close: m/?/Esc",
+            };
+            try renderOverlayMenu(ui, win, "Menu", &lines);
+        }
 
         try ui.render();
 
@@ -1392,6 +1533,14 @@ fn vaxisSelect(
                     .consumed => continue,
                     .to_query => return .to_query,
                     .quit => return .quit,
+                }
+                if (key.matches('m', .{}) or key.matches('?', .{})) {
+                    info_menu_open = !info_menu_open;
+                    continue;
+                }
+                if (info_menu_open and key.matches(vaxis.Key.escape, .{})) {
+                    info_menu_open = false;
+                    continue;
                 }
 
                 if (filter_mode) {
@@ -1504,6 +1653,7 @@ fn vaxisSelectSubtitle(
     var selected_row: usize = 0;
     var scroll: usize = 0;
     var filter_mode = false;
+    var info_menu_open = false;
 
     while (true) {
         const win = ui.vx.window();
@@ -1515,15 +1665,10 @@ fn vaxisSelectSubtitle(
         const pane_col: u16 = left_width + 2;
         const pane_width: usize = if (show_pane and win.width > pane_col + 1) @intCast(win.width - pane_col - 1) else 0;
 
-        const title_segments = [_]vaxis.Segment{.{ .text = title, .style = ui.styleTitle() }};
-        _ = win.print(&title_segments, .{ .row_offset = 0, .col_offset = 1, .wrap = .none });
+        try renderCompactTopLine(ui, win, title, ui.styleTitle());
 
-        const hint_segments = [_]vaxis.Segment{.{ .text = hint }};
-        _ = win.print(&hint_segments, .{ .row_offset = 1, .col_offset = 1, .wrap = .none });
-        try renderContextLine(ui, win, 2);
-
-        const list_top: u16 = if (ui.context_line != null) 4 else 3;
-        const footer_rows: u16 = 4;
+        const list_top: u16 = 1;
+        const footer_rows: u16 = 1;
         const list_bottom: u16 = if (win.height > footer_rows) win.height - footer_rows else win.height;
         const page_size: usize = if (list_bottom > list_top)
             @intCast(list_bottom - list_top)
@@ -1561,14 +1706,14 @@ fn vaxisSelectSubtitle(
         }
 
         if (show_pane) {
-            var sep_row: u16 = 0;
+            var sep_row: u16 = 1;
             while (sep_row < win.height) : (sep_row += 1) {
                 const sep_segments = [_]vaxis.Segment{.{ .text = "|", .style = ui.styleMuted() }};
                 _ = win.print(&sep_segments, .{ .row_offset = sep_row, .col_offset = left_width + 1, .wrap = .none });
             }
 
             const pane_header = [_]vaxis.Segment{.{ .text = "Details", .style = ui.stylePaneTitle() }};
-            _ = win.print(&pane_header, .{ .row_offset = 0, .col_offset = pane_col, .wrap = .none });
+            _ = win.print(&pane_header, .{ .row_offset = 1, .col_offset = pane_col, .wrap = .none });
 
             if (matches.items.len > 0) {
                 const selected_subtitle = subtitles[matches.items[selected_row]];
@@ -1576,37 +1721,62 @@ fn vaxisSelectSubtitle(
             }
         }
 
-        const mode_text = if (filter_mode) "FILTER MODE" else "NAV MODE";
+        const mode_text = if (filter_mode) "FILTER" else "NAV";
+        const filter_display = if (filter.items.len == 0) "-" else filter.items;
         var sort_buf: [512]u8 = undefined;
         const sort_line = std.fmt.bufPrint(
             &sort_buf,
-            "Sort: {s} | Filter: {s}  [{s}]",
-            .{ subtitleSortName(sort_mode), filter.items, mode_text },
-        ) catch "Sort/Filter: (overflow)";
+            "s:{s} {s}:{s}",
+            .{ subtitleSortName(sort_mode), mode_text, filter_display },
+        ) catch "s:?";
 
         const can_page = if (page_nav) |pn| pn.enabled else false;
         const help_line = if (filter_mode)
-            "Type to filter | Enter done | Esc exit | Backspace delete"
+            "type Enter/Esc BS"
         else if (can_page)
-            "j/k move | Enter select | s sort | [ prev page | ] next page | / filter | Esc back"
+            "j/k Enter s / [ ] Esc"
         else
-            "j/k or arrows move | Enter select | s sort | / filter | Esc back";
+            "j/k Enter s / Esc";
 
-        var count_buf: [96]u8 = undefined;
+        var count_buf: [128]u8 = undefined;
         const count_line = if (can_page)
             std.fmt.bufPrint(
                 &count_buf,
-                "Visible: {d}/{d} | Page: {d}",
+                "{d}/{d} p{d}",
                 .{ matches.items.len, subtitles.len, if (page_nav) |pn| pn.page else 1 },
-            ) catch "Visible: ?"
+            ) catch "?/? p?"
         else
-            std.fmt.bufPrint(&count_buf, "Visible: {d}/{d}", .{ matches.items.len, subtitles.len }) catch "Visible: ?";
+            std.fmt.bufPrint(&count_buf, "{d}/{d}", .{ matches.items.len, subtitles.len }) catch "?/?";
 
-        try renderGlobalFooter(ui, win, help_line, count_line);
+        var compact_buf: [768]u8 = undefined;
+        const compact_line = std.fmt.bufPrint(
+            &compact_buf,
+            "{s} | {s} | {s}",
+            .{ help_line, sort_line, count_line },
+        ) catch "j/k Enter s / Esc";
+        try renderCompactBottomLine(ui, win, compact_line);
 
-        const filter_segments = [_]vaxis.Segment{.{ .text = sort_line, .style = ui.styleMuted() }};
-        const filter_row: u16 = if (win.height > 2) win.height - 2 else 0;
-        _ = win.print(&filter_segments, .{ .row_offset = filter_row, .col_offset = 1, .wrap = .none });
+        if (info_menu_open) {
+            var m1: [256]u8 = undefined;
+            var m2: [320]u8 = undefined;
+            var m3: [640]u8 = undefined;
+            var m4: [320]u8 = undefined;
+            var m5: [320]u8 = undefined;
+            const l1 = std.fmt.bufPrint(&m1, "screen: {s}", .{title}) catch "screen";
+            const l2 = std.fmt.bufPrint(&m2, "hint: {s}", .{hint}) catch "hint";
+            const l3 = std.fmt.bufPrint(&m3, "ctx: {s}", .{ui.context_line orelse "-"}) catch "ctx";
+            const l4 = std.fmt.bufPrint(&m4, "controls: {s}", .{help_line}) catch "controls";
+            const l5 = std.fmt.bufPrint(&m5, "state: {s} count={s}", .{ sort_line, count_line }) catch "state";
+            const lines = [_][]const u8{
+                l1,
+                l2,
+                l3,
+                l4,
+                l5,
+                "close: m/?/Esc",
+            };
+            try renderOverlayMenu(ui, win, "Menu", &lines);
+        }
 
         try ui.render();
 
@@ -1619,6 +1789,14 @@ fn vaxisSelectSubtitle(
                     .consumed => continue,
                     .to_query => return .to_query,
                     .quit => return .quit,
+                }
+                if (key.matches('m', .{}) or key.matches('?', .{})) {
+                    info_menu_open = !info_menu_open;
+                    continue;
+                }
+                if (info_menu_open and key.matches(vaxis.Key.escape, .{})) {
+                    info_menu_open = false;
+                    continue;
                 }
 
                 if (filter_mode) {
@@ -1720,9 +1898,7 @@ fn vaxisConfirm(ui: *Ui, title: []const u8, lines: []const []const u8) !ConfirmR
         win.clear();
         win.hideCursor();
 
-        const title_segments = [_]vaxis.Segment{.{ .text = title, .style = ui.styleTitle() }};
-        _ = win.print(&title_segments, .{ .row_offset = 0, .col_offset = 1, .wrap = .none });
-        try renderContextLine(ui, win, 1);
+        try renderTopBar(ui, win, .{ .title = title });
 
         var row: u16 = 2;
         for (lines) |line| {
@@ -1731,7 +1907,7 @@ fn vaxisConfirm(ui: *Ui, title: []const u8, lines: []const []const u8) !ConfirmR
             row += 1;
         }
 
-        try renderGlobalFooter(ui, win, "Enter confirm | Esc back", null);
+        try renderBottomBar(ui, win, .{ .left = "Enter confirm | Esc back" });
         try ui.render();
 
         const event = ui.loop.nextEvent();
@@ -1765,17 +1941,15 @@ fn vaxisMessage(
         win.clear();
         win.hideCursor();
 
-        const title_segments = [_]vaxis.Segment{.{ .text = title, .style = title_style }};
-        _ = win.print(&title_segments, .{ .row_offset = 0, .col_offset = 1, .wrap = .none });
-        try renderContextLine(ui, win, 1);
+        try renderTopBar(ui, win, .{ .title = title, .style = title_style });
 
         const message_segments = [_]vaxis.Segment{.{ .text = message }};
         _ = win.print(&message_segments, .{ .row_offset = 2, .col_offset = 1, .wrap = .none });
 
         const detail_segments = [_]vaxis.Segment{.{ .text = detail, .style = ui.styleMuted() }};
-        _ = win.print(&detail_segments, .{ .row_offset = 4, .col_offset = 1, .wrap = .none });
+        _ = win.print(&detail_segments, .{ .row_offset = 3, .col_offset = 1, .wrap = .none });
 
-        try renderGlobalFooter(ui, win, "Press any key to continue", null);
+        try renderBottomBar(ui, win, .{ .left = "Press any key to continue" });
         try ui.render();
 
         const event = ui.loop.nextEvent();
@@ -1795,35 +1969,115 @@ fn vaxisMessage(
     }
 }
 
-fn renderGlobalFooter(ui: *Ui, win: anytype, help_line: []const u8, extra_right: ?[]const u8) !void {
-    const row_help: u16 = if (win.height > 3) win.height - 3 else 0;
-    const row_status: u16 = if (win.height > 1) win.height - 1 else 0;
+const TopBarConfig = struct {
+    title: []const u8,
+    style: ?vaxis.Style = null,
+};
 
-    const help_segments = [_]vaxis.Segment{.{ .text = help_line, .style = ui.styleMuted() }};
-    _ = win.print(&help_segments, .{ .row_offset = row_help, .col_offset = 1, .wrap = .none });
+const BottomBarConfig = struct {
+    left: []const u8,
+};
 
-    const confirm_text = if (ui.skip_confirm) "F2 confirm:off" else "F2 confirm:on";
-    const status_segments = [_]vaxis.Segment{
-        .{ .text = confirm_text, .style = ui.styleMuted() },
-        .{ .text = "  ", .style = ui.styleMuted() },
-        .{ .text = "F3 theme:", .style = ui.styleMuted() },
-        .{ .text = ui.theme().name, .style = ui.styleMuted() },
-        .{ .text = "  Ctrl+D quit", .style = ui.styleMuted() },
-    };
-    _ = win.print(&status_segments, .{ .row_offset = row_status, .col_offset = 1, .wrap = .none });
+const BarLayout = struct {
+    // Centralized bar text so future tweaks are one-place edits.
+    pub const separator = " | ";
+    pub const menu_hint = "m:info";
+    pub const confirm_key = "F2";
+    pub const theme_key = "F3";
+    pub const quit_hint = "^D";
+};
 
-    if (extra_right) |text| {
-        const base_len = confirm_text.len + "  F3 theme:".len + ui.theme().name.len + "  Ctrl+D quit".len + 2;
-        const col: u16 = if (win.width > base_len + 1) @intCast(base_len) else 1;
-        const right_segments = [_]vaxis.Segment{.{ .text = text, .style = ui.styleMuted() }};
-        _ = win.print(&right_segments, .{ .row_offset = row_status, .col_offset = col, .wrap = .none });
-    }
+fn renderTopBar(ui: *Ui, win: anytype, cfg: TopBarConfig) !void {
+    try renderCompactTopLine(ui, win, cfg.title, cfg.style orelse ui.styleTitle());
 }
 
-fn renderContextLine(ui: *Ui, win: anytype, row: u16) !void {
-    const context = ui.context_line orelse return;
+fn renderBottomBar(ui: *Ui, win: anytype, cfg: BottomBarConfig) !void {
+    try renderCompactBottomLine(ui, win, cfg.left);
+}
+
+fn renderCompactTopLine(ui: *Ui, win: anytype, title: []const u8, style: vaxis.Style) !void {
     const width: usize = if (win.width > 2) @intCast(win.width - 2) else 0;
-    try printFitted(ui, win, row, 1, context, ui.styleMuted(), width);
+    if (width == 0) return;
+
+    const line = if (ui.context_line) |ctx|
+        try frameFmt(ui, "{s}{s}{s}", .{ title, BarLayout.separator, ctx })
+    else
+        title;
+    try printFitted(ui, win, 0, 1, line, style, width);
+}
+
+fn renderCompactBottomLine(ui: *Ui, win: anytype, left: []const u8) !void {
+    if (win.height == 0) return;
+    const row: u16 = win.height - 1;
+    const width: usize = if (win.width > 2) @intCast(win.width - 2) else 0;
+    if (width == 0) return;
+
+    const confirm_text = if (ui.skip_confirm) "off" else "on";
+    const status = try frameFmt(
+        ui,
+        "{s} {s}:{s} {s}:{s} {s}",
+        .{ BarLayout.menu_hint, BarLayout.confirm_key, confirm_text, BarLayout.theme_key, ui.theme().name, BarLayout.quit_hint },
+    );
+    const line = try frameFmt(ui, "{s}{s}{s}", .{ left, BarLayout.separator, status });
+    try printFitted(ui, win, row, 1, line, ui.styleMuted(), width);
+}
+
+fn frameFmt(ui: *Ui, comptime fmt: []const u8, args: anytype) ![]const u8 {
+    return std.fmt.allocPrint(ui.frameAllocator(), fmt, args);
+}
+
+fn frameRepeatByte(ui: *Ui, byte: u8, count: usize) ![]const u8 {
+    const out = try ui.frameAllocator().alloc(u8, count);
+    @memset(out, byte);
+    return out;
+}
+
+fn renderOverlayMenu(ui: *Ui, win: anytype, title: []const u8, lines: []const []const u8) !void {
+    if (win.width < 20 or win.height < 8) return;
+
+    const max_box_w: u16 = @min(win.width - 2, 80);
+    if (max_box_w < 12) return;
+    const box_h: u16 = @min(win.height - 2, @as(u16, @intCast(lines.len + 3)));
+    if (box_h < 5) return;
+
+    const x0: u16 = (win.width - max_box_w) / 2;
+    const y0: u16 = (win.height - box_h) / 2;
+    const inner_w: usize = @intCast(max_box_w - 2);
+
+    const dash_len = @min(inner_w, @as(usize, 96));
+    const dash = try frameRepeatByte(ui, '-', dash_len);
+
+    const top = [_]vaxis.Segment{
+        .{ .text = "+", .style = ui.stylePaneTitle() },
+        .{ .text = dash, .style = ui.stylePaneTitle() },
+        .{ .text = "+", .style = ui.stylePaneTitle() },
+    };
+    _ = win.print(&top, .{ .row_offset = y0, .col_offset = x0, .wrap = .none });
+
+    var r: u16 = y0 + 1;
+    while (r < y0 + box_h - 1) : (r += 1) {
+        const left = [_]vaxis.Segment{.{ .text = "|", .style = ui.stylePaneTitle() }};
+        _ = win.print(&left, .{ .row_offset = r, .col_offset = x0, .wrap = .none });
+        const right = [_]vaxis.Segment{.{ .text = "|", .style = ui.stylePaneTitle() }};
+        _ = win.print(&right, .{ .row_offset = r, .col_offset = x0 + max_box_w - 1, .wrap = .none });
+    }
+
+    const bottom = [_]vaxis.Segment{
+        .{ .text = "+", .style = ui.stylePaneTitle() },
+        .{ .text = dash, .style = ui.stylePaneTitle() },
+        .{ .text = "+", .style = ui.stylePaneTitle() },
+    };
+    _ = win.print(&bottom, .{ .row_offset = y0 + box_h - 1, .col_offset = x0, .wrap = .none });
+
+    try printFitted(ui, win, y0 + 1, x0 + 1, title, ui.styleAccent(), inner_w);
+    var line_row: u16 = y0 + 2;
+    var i: usize = 0;
+    while (i < lines.len and line_row < y0 + box_h - 1) : ({
+        i += 1;
+        line_row += 1;
+    }) {
+        try printFitted(ui, win, line_row, x0 + 1, lines[i], ui.styleMuted(), inner_w);
+    }
 }
 
 const KeyAction = enum {
@@ -2002,14 +2256,10 @@ fn printFitted(
 ) !void {
     if (max_width == 0) return;
 
-    var display_text = text;
-    var owned_sanitized: ?[]u8 = null;
-    defer if (owned_sanitized) |buf| ui.allocator.free(buf);
+    var display_text = try ui.frameAllocator().dupe(u8, text);
 
-    if (needsUtfSanitizeForDisplay(text)) {
-        const sanitized = try sanitizeUtf8ForDisplay(ui.allocator, text);
-        owned_sanitized = sanitized;
-        display_text = sanitized;
+    if (needsUtfSanitizeForDisplay(display_text)) {
+        display_text = try sanitizeUtf8ForDisplay(ui.frameAllocator(), display_text);
     }
 
     if (win.gwidth(display_text) <= max_width) {
@@ -2267,12 +2517,26 @@ fn renderSubtitleDetails(
 
     var row: u16 = 2;
     const max_row: u16 = if (win.height > 4) win.height - 4 else win.height;
+    const is_translate = isSubtitlecatTranslateToken(subtitle.download_url);
 
     try printFitted(ui, win, row, col, subtitle.label, ui.stylePaneTitle(), pane_width);
     row += 2;
 
     if (row >= max_row) return;
-    try printLabelValue(ui, win, row, col, pane_width, "Download: ", if (subtitle.download_url != null) "direct" else "no direct url");
+    try printLabelValue(
+        ui,
+        win,
+        row,
+        col,
+        pane_width,
+        "Download: ",
+        if (subtitle.download_url == null)
+            "no direct url"
+        else if (is_translate)
+            "translate"
+        else
+            "direct",
+    );
     row += 1;
 
     if (row >= max_row) return;
@@ -2288,7 +2552,26 @@ fn renderSubtitleDetails(
     row += 1;
 
     if (row >= max_row) return;
-    try printFitted(ui, win, row, col, subtitle.download_url orelse "(not available)", .{}, pane_width);
+    try printFitted(
+        ui,
+        win,
+        row,
+        col,
+        if (subtitle.download_url) |url|
+            if (is_translate)
+                "subtitlecat translate request"
+            else
+                url
+        else
+            "(not available)",
+        .{},
+        pane_width,
+    );
+}
+
+fn isSubtitlecatTranslateToken(download_url: ?[]const u8) bool {
+    const url = download_url orelse return false;
+    return std.mem.startsWith(u8, url, "subtitlecat-translate:");
 }
 
 fn printLabelValue(
