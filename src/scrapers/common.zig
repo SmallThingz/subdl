@@ -235,14 +235,14 @@ pub fn trimAscii(input: []const u8) []const u8 {
     return std.mem.trim(u8, input, " \t\r\n");
 }
 
-pub fn innerTextOwnedWithOptions(allocator: Allocator, node: anytype, opts: html.TextOptions) ![]const u8 {
-    const text = try node.innerTextWithOptions(allocator, opts);
-    return allocator.dupe(u8, text);
+// Pass the request-local arena allocator (`const a = arena.allocator()`).
+pub fn innerTextOwnedWithOptions(arena_alloc: Allocator, node: anytype, opts: html.TextOptions) ![]const u8 {
+    return node.innerTextOwnedWithOptions(arena_alloc, opts);
 }
 
-pub fn innerTextTrimmedOwned(allocator: Allocator, node: anytype) ![]const u8 {
-    const text = try node.innerTextWithOptions(allocator, .{ .normalize_whitespace = true });
-    return allocator.dupe(u8, trimAscii(text));
+// Returns an arena-backed slice; callers should not free it individually.
+pub fn innerTextTrimmedOwned(arena_alloc: Allocator, node: anytype) ![]const u8 {
+    return innerTextOwnedWithOptions(arena_alloc, node, .{ .normalize_whitespace = true });
 }
 
 pub fn collapseWhitespace(allocator: Allocator, input: []const u8) ![]const u8 {
