@@ -644,7 +644,7 @@ pub fn searchPage(allocator: Allocator, client: *std.http.Client, provider: Prov
                 });
             }
         },
-        else => unreachable,
+        else => return error.UnsupportedProvider,
     }
 
     return .{
@@ -1183,7 +1183,7 @@ pub fn fetchSubtitlesPage(allocator: Allocator, client: *std.http.Client, ref: S
                 });
             }
         },
-        else => unreachable,
+        else => return error.UnsupportedProvider,
     }
 
     return .{

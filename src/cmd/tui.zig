@@ -1255,7 +1255,7 @@ fn vaxisInput(
                     }
                     error_text = null;
                 } else if (isTextKey(key)) {
-                    const text = key.text.?;
+                    const text = key.text orelse continue;
                     if (query.items.len + text.len <= max_len) {
                         try query.insertSlice(ui.allocator, cursor_pos, text);
                         cursor_pos += text.len;
@@ -1367,7 +1367,11 @@ fn vaxisSelect(
 
         var count_buf: [96]u8 = undefined;
         const count_line = if (can_page)
-            std.fmt.bufPrint(&count_buf, "Visible: {d}/{d} | Page: {d}", .{ matches.items.len, options.len, page_nav.?.page }) catch "Visible: ?"
+            std.fmt.bufPrint(
+                &count_buf,
+                "Visible: {d}/{d} | Page: {d}",
+                .{ matches.items.len, options.len, if (page_nav) |pn| pn.page else 1 },
+            ) catch "Visible: ?"
         else
             std.fmt.bufPrint(&count_buf, "Visible: {d}/{d}", .{ matches.items.len, options.len }) catch "Visible: ?";
 
@@ -1410,7 +1414,8 @@ fn vaxisSelect(
                         continue;
                     }
                     if (isTextKey(key)) {
-                        try filter.appendSlice(ui.allocator, key.text.?);
+                        const text = key.text orelse continue;
+                        try filter.appendSlice(ui.allocator, text);
                         try rebuildOptionMatches(ui.allocator, options, filter.items, &matches);
                         selected_row = 0;
                         scroll = 0;
@@ -1589,7 +1594,11 @@ fn vaxisSelectSubtitle(
 
         var count_buf: [96]u8 = undefined;
         const count_line = if (can_page)
-            std.fmt.bufPrint(&count_buf, "Visible: {d}/{d} | Page: {d}", .{ matches.items.len, subtitles.len, page_nav.?.page }) catch "Visible: ?"
+            std.fmt.bufPrint(
+                &count_buf,
+                "Visible: {d}/{d} | Page: {d}",
+                .{ matches.items.len, subtitles.len, if (page_nav) |pn| pn.page else 1 },
+            ) catch "Visible: ?"
         else
             std.fmt.bufPrint(&count_buf, "Visible: {d}/{d}", .{ matches.items.len, subtitles.len }) catch "Visible: ?";
 
@@ -1632,7 +1641,8 @@ fn vaxisSelectSubtitle(
                         continue;
                     }
                     if (isTextKey(key)) {
-                        try filter.appendSlice(ui.allocator, key.text.?);
+                        const text = key.text orelse continue;
+                        try filter.appendSlice(ui.allocator, text);
                         try rebuildSubtitleMatches(ui.allocator, subtitles, order, filter.items, &matches);
                         selected_row = 0;
                         scroll = 0;
@@ -1840,11 +1850,11 @@ fn handleGlobalKey(ui: *Ui, key: vaxis.Key, is_query_screen: bool) KeyAction {
 }
 
 fn isTextKey(key: vaxis.Key) bool {
-    if (key.text == null) return false;
+    const text = key.text orelse return false;
     if (key.mods.ctrl or key.mods.alt or key.mods.super or key.mods.meta or key.mods.hyper) return false;
     if (key.matches(vaxis.Key.enter, .{})) return false;
     if (key.matches(vaxis.Key.tab, .{})) return false;
-    return key.text.?.len > 0;
+    return text.len > 0;
 }
 
 fn prevCodepointStart(text: []const u8, cursor_pos: usize) usize {
