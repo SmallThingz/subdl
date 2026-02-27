@@ -5,6 +5,7 @@ const cf_shared = @import("opensubtitles_com_cf.zig");
 const Allocator = std.mem.Allocator;
 const api_base = "https://api.subsource.net/v1";
 const site = "https://subsource.net";
+const default_subsource_user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 
 pub const SearchOptions = struct {
     include_seasons: bool = true,
@@ -170,10 +171,11 @@ pub const Scraper = struct {
                     try std.fmt.allocPrint(a, "{s}{s}?page={d}", .{ api_base, endpoint, page });
 
                 var response = try getJson(self.client, a, endpoint_url, auth, true);
-                if (response.status == .forbidden and options.auto_cloudflare_session) {
+                if ((response.status == .forbidden or response.status == .too_many_requests) and options.auto_cloudflare_session) {
                     auth = try resolveAuth(a, options.cf_clearance, options.user_agent, true, options.auto_cloudflare_session);
                     response = try getJson(self.client, a, endpoint_url, auth, true);
                 }
+                if (response.status == .too_many_requests) return error.RateLimited;
                 if (response.status != .ok) break;
 
                 var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body, .{});
@@ -196,16 +198,18 @@ pub const Scraper = struct {
                         else => continue,
                     };
 
-                    const details_path = objString(obj, "link") orelse continue;
+                    const details_path = objString(obj, "link") orelse
+                        objString(obj, "details_path") orelse
+                        objString(obj, "path") orelse continue;
                     if (seen_subtitle.contains(details_path)) continue;
                     try seen_subtitle.put(a, details_path, {});
                     new_count += 1;
 
                     const id = objInt(obj, "id") orelse 0;
-                    const language_raw = objString(obj, "language");
+                    const language_raw = objString(obj, "language") orelse objString(obj, "language_name");
                     const language_code = normalizeSubsourceLanguage(language_raw);
-                    const release_info = objString(obj, "release_info");
-                    const release_type = objString(obj, "release_type");
+                    const release_info = objString(obj, "release_info") orelse objFirstArrayString(obj, "release_info");
+                    const release_type = objString(obj, "release_type") orelse objString(obj, "type");
 
                     var download_token: ?[]const u8 = null;
                     var download_url: ?[]const u8 = null;
@@ -265,10 +269,14 @@ pub const Scraper = struct {
             else => return .{ .download_token = null, .download_url = null },
         };
 
-        const subtitle_v = root.get("subtitle") orelse return .{ .download_token = null, .download_url = null };
-        const subtitle_obj = switch (subtitle_v) {
-            .object => |o| o,
-            else => return .{ .download_token = null, .download_url = null },
+        const subtitle_obj = blk: {
+            if (root.get("subtitle")) |subtitle_v| {
+                break :blk switch (subtitle_v) {
+                    .object => |o| o,
+                    else => root,
+                };
+            }
+            break :blk root;
         };
 
         const token = objString(subtitle_obj, "download_token") orelse return .{ .download_token = null, .download_url = null };
@@ -337,10 +345,11 @@ fn appendSearchResults(
     const payload = try buildSearchPayload(allocator, query, options.include_seasons, options.limit_per_page);
 
     var response = try postJson(client, allocator, api_base ++ "/movie/search", payload, auth.*, true);
-    if (response.status == .forbidden and options.auto_cloudflare_session) {
+    if ((response.status == .forbidden or response.status == .too_many_requests) and options.auto_cloudflare_session) {
         auth.* = try resolveAuth(allocator, options.cf_clearance, options.user_agent, true, options.auto_cloudflare_session);
         response = try postJson(client, allocator, api_base ++ "/movie/search", payload, auth.*, true);
     }
+    if (response.status == .too_many_requests) return error.RateLimited;
     if (response.status != .ok) return;
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
@@ -366,12 +375,12 @@ fn appendSearchResults(
         if (seen.contains(id)) continue;
         try seen.put(allocator, id, {});
 
-        const title = objString(obj, "title") orelse continue;
-        const media_type = objString(obj, "type") orelse "unknown";
-        const raw_link = objString(obj, "link") orelse continue;
+        const title = objString(obj, "title") orelse objString(obj, "name") orelse continue;
+        const media_type = objString(obj, "type") orelse objString(obj, "media_type") orelse "unknown";
+        const raw_link = objString(obj, "link") orelse objString(obj, "url") orelse continue;
         const link = try toAbsoluteSiteLink(allocator, raw_link);
-        const release_year = objInt(obj, "releaseYear");
-        const subtitle_count = objInt(obj, "subtitleCount");
+        const release_year = objInt(obj, "releaseYear") orelse objInt(obj, "release_year");
+        const subtitle_count = objInt(obj, "subtitleCount") orelse objInt(obj, "subtitle_count");
 
         var seasons_out: std.ArrayListUnmanaged(SeasonItem) = .empty;
         if (obj.get("seasons")) |seasons_v| {
@@ -381,8 +390,8 @@ fn appendSearchResults(
                         .object => |o| o,
                         else => continue,
                     };
-                    const season_num = objInt(season_obj, "season") orelse continue;
-                    const season_link_raw = objString(season_obj, "link") orelse continue;
+                    const season_num = objInt(season_obj, "season") orelse objInt(season_obj, "number") orelse continue;
+                    const season_link_raw = objString(season_obj, "link") orelse objString(season_obj, "url") orelse continue;
                     const season_link = try toAbsoluteSiteLink(allocator, season_link_raw);
                     try seasons_out.append(allocator, .{ .season = season_num, .link = season_link });
                 }
@@ -424,7 +433,7 @@ fn resolveAuth(allocator: Allocator, cf_clearance_opt: ?[]const u8, user_agent_o
         cf_clearance = std.posix.getenv("SUBSOURCE_CF_CLEARANCE");
     }
 
-    var user_agent = user_agent_opt orelse std.posix.getenv("SUBSOURCE_USER_AGENT") orelse common.default_user_agent;
+    var user_agent = user_agent_opt orelse std.posix.getenv("SUBSOURCE_USER_AGENT") orelse default_subsource_user_agent;
 
     if (cf_clearance == null and auto_cloudflare_session and force_refresh) {
         const session = try cf_shared.ensureDomainSession(allocator, .{
@@ -504,15 +513,37 @@ fn pathToSubtitles(allocator: Allocator, link: []const u8) !?[]const u8 {
         normalized = normalized[start..];
     }
 
-    if (std.mem.startsWith(u8, normalized, "/subtitles/")) return try allocator.dupe(u8, normalized);
+    const marker = "/season=";
+
+    if (std.mem.startsWith(u8, normalized, "/subtitles/")) {
+        if (std.mem.indexOf(u8, normalized, marker)) |idx| {
+            const season = normalized[idx + marker.len ..];
+            if (season.len > 0) {
+                return try std.fmt.allocPrint(allocator, "{s}?season={s}", .{ normalized[0..idx], season });
+            }
+        }
+        return try allocator.dupe(u8, normalized);
+    }
     if (std.mem.startsWith(u8, normalized, "/series/")) {
         return try std.fmt.allocPrint(allocator, "/subtitles/{s}", .{normalized["/series/".len..]});
     }
 
     if (!std.mem.startsWith(u8, normalized, "/")) {
+        if (std.mem.indexOf(u8, normalized, marker)) |idx| {
+            const season = normalized[idx + marker.len ..];
+            if (season.len > 0) {
+                return try std.fmt.allocPrint(allocator, "/subtitles/{s}?season={s}", .{ normalized[0..idx], season });
+            }
+        }
         return try std.fmt.allocPrint(allocator, "/subtitles/{s}", .{normalized});
     }
 
+    if (std.mem.indexOf(u8, normalized, marker)) |idx| {
+        const season = normalized[idx + marker.len ..];
+        if (season.len > 0) {
+            return try std.fmt.allocPrint(allocator, "/subtitles{s}?season={s}", .{ normalized[0..idx], season });
+        }
+    }
     return try std.fmt.allocPrint(allocator, "/subtitles{s}", .{normalized});
 }
 
@@ -553,6 +584,24 @@ fn objInt(obj: std.json.ObjectMap, key: []const u8) ?i64 {
     };
 }
 
+fn objFirstArrayString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = obj.get(key) orelse return null;
+    const arr = switch (v) {
+        .array => |a| a,
+        else => return null,
+    };
+    for (arr.items) |entry| {
+        switch (entry) {
+            .string => |s| {
+                const trimmed = common.trimAscii(s);
+                if (trimmed.len > 0) return trimmed;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
 fn escapeJson(allocator: Allocator, input: []const u8) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -580,6 +629,14 @@ test "subsource path to subtitles" {
     const b = (try pathToSubtitles(allocator, "/series/the-matrix-1999")).?;
     defer allocator.free(b);
     try std.testing.expectEqualStrings("/subtitles/the-matrix-1999", b);
+
+    const c = (try pathToSubtitles(allocator, "/subtitles/friends/season=1")).?;
+    defer allocator.free(c);
+    try std.testing.expectEqualStrings("/subtitles/friends?season=1", c);
+
+    const d = (try pathToSubtitles(allocator, "https://subsource.net/subtitles/friends/season=10")).?;
+    defer allocator.free(d);
+    try std.testing.expectEqualStrings("/subtitles/friends?season=10", d);
 
     try std.testing.expect((try pathToSubtitles(allocator, "")) == null);
 }

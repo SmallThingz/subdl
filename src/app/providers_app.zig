@@ -177,6 +177,7 @@ pub const SearchRef = union(Provider) {
         title: []const u8,
         link: []const u8,
         media_type: []const u8,
+        seasons: []const subdl.subsource_net.SeasonItem,
     },
     tvsubtitles_net: struct {
         title: []const u8,
@@ -490,7 +491,7 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
             defer scraper.deinit();
             var response = try scraper.searchWithOptions(query, .{
                 .max_pages = 3,
-                .auto_cloudflare_session = false,
+                .auto_cloudflare_session = true,
             });
             defer response.deinit();
 
@@ -498,6 +499,13 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
                 const title = try a.dupe(u8, item.title);
                 const link = try a.dupe(u8, item.link);
                 const media_type = try a.dupe(u8, item.media_type);
+                var seasons: std.ArrayListUnmanaged(subdl.subsource_net.SeasonItem) = .empty;
+                for (item.seasons) |season| {
+                    try seasons.append(a, .{
+                        .season = season.season,
+                        .link = try a.dupe(u8, season.link),
+                    });
+                }
                 const label = if (item.release_year) |year|
                     try std.fmt.allocPrint(a, "{s} ({d})", .{ title, year })
                 else
@@ -510,6 +518,7 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
                         .title = title,
                         .link = link,
                         .media_type = media_type,
+                        .seasons = try seasons.toOwnedSlice(a),
                     } },
                 });
             }
@@ -1053,13 +1062,13 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 .link = item.link,
                 .release_year = null,
                 .subtitle_count = null,
-                .seasons = &[_]subdl.subsource_net.SeasonItem{},
+                .seasons = item.seasons,
             };
             var subtitles = try scraper.fetchSubtitlesBySearchItemWithOptions(fake_item, .{
                 .include_seasons = true,
-                .max_pages = 2,
+                .max_pages = 1,
                 .resolve_download_tokens = true,
-                .auto_cloudflare_session = false,
+                .auto_cloudflare_session = true,
             });
             defer subtitles.deinit();
             if (subtitles.title.len > 0) title = try a.dupe(u8, subtitles.title);
