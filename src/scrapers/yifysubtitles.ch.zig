@@ -207,24 +207,22 @@ test "live yify search and subtitle extraction" {
     var search = try scraper.search("The Matrix");
     defer search.deinit();
     try std.testing.expect(search.items.len > 0);
-    for (search.items, 0..) |item, idx| {
-        std.debug.print("[live][yifysubtitles.ch][search][{d}]\n", .{idx});
-        try common.livePrintField(std.testing.allocator, "movie", item.movie);
-        try common.livePrintField(std.testing.allocator, "imdb_id", item.imdb_id);
-        try common.livePrintField(std.testing.allocator, "movie_page_url", item.movie_page_url);
-    }
+    const item = search.items[0];
+    std.debug.print("[live][yifysubtitles.ch][search][0]\n", .{});
+    try common.livePrintField(std.testing.allocator, "movie", item.movie);
+    try common.livePrintField(std.testing.allocator, "imdb_id", item.imdb_id);
+    try common.livePrintField(std.testing.allocator, "movie_page_url", item.movie_page_url);
 
-    var subtitles = try scraper.fetchSubtitlesByMovieLink(search.items[0].movie_page_url);
+    var subtitles = try scraper.fetchSubtitlesByMovieLink(item.movie_page_url);
     defer subtitles.deinit();
     try std.testing.expect(subtitles.subtitles.len > 0);
     try common.livePrintField(std.testing.allocator, "subtitles_title", subtitles.title);
-    for (subtitles.subtitles, 0..) |sub, idx| {
-        std.debug.print("[live][yifysubtitles.ch][subtitle][{d}]\n", .{idx});
-        try common.livePrintField(std.testing.allocator, "language", sub.language);
-        try common.livePrintOptionalField(std.testing.allocator, "rating", sub.rating);
-        try common.livePrintOptionalField(std.testing.allocator, "uploader", sub.uploader);
-        try common.livePrintField(std.testing.allocator, "release_text", sub.release_text);
-        try common.livePrintField(std.testing.allocator, "details_url", sub.details_url);
-        try common.livePrintField(std.testing.allocator, "zip_url", sub.zip_url);
-    }
+    const sub = subtitles.subtitles[0];
+    std.debug.print("[live][yifysubtitles.ch][subtitle][0]\n", .{});
+    try common.livePrintField(std.testing.allocator, "language", sub.language);
+    try common.livePrintOptionalField(std.testing.allocator, "rating", sub.rating);
+    try common.livePrintOptionalField(std.testing.allocator, "uploader", sub.uploader);
+    try common.livePrintField(std.testing.allocator, "release_text", sub.release_text);
+    try common.livePrintField(std.testing.allocator, "details_url", sub.details_url);
+    try common.livePrintField(std.testing.allocator, "zip_url", sub.zip_url);
 }

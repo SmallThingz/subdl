@@ -3,25 +3,28 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const live_mode = b.option([]const u8, "live", "Live test mode: off | extensive | tui | all") orelse "off";
+    const live_mode = b.option([]const u8, "live", "Live test mode: off | smoke | named | extensive | all (tui is alias of smoke)") orelse "off";
     const live_providers = b.option([]const u8, "live-providers", "Comma-separated provider filter for live tests, or '*' for all") orelse "*";
     const live_include_captcha = b.option(bool, "live-include-captcha", "Include captcha/cloudflare providers in live test runs") orelse false;
     const live_parallel_on_all = b.option(bool, "live-parallel-on-all", "Run one live subprocess per provider when -Dlive-providers=all/*") orelse true;
 
     const valid_mode = std.mem.eql(u8, live_mode, "off") or
+        std.mem.eql(u8, live_mode, "smoke") or
+        std.mem.eql(u8, live_mode, "named") or
         std.mem.eql(u8, live_mode, "extensive") or
         std.mem.eql(u8, live_mode, "tui") or
         std.mem.eql(u8, live_mode, "all");
     if (!valid_mode) {
-        @panic("invalid -Dlive value, expected one of: off, extensive, tui, all");
+        @panic("invalid -Dlive value, expected one of: off, smoke, named, extensive, tui, all");
     }
 
     const live_tests_enabled = !std.mem.eql(u8, live_mode, "off");
     const live_extensive_suite = live_tests_enabled and
         (std.mem.eql(u8, live_mode, "extensive") or std.mem.eql(u8, live_mode, "all"));
     const live_tui_suite = live_tests_enabled and
-        (std.mem.eql(u8, live_mode, "tui") or std.mem.eql(u8, live_mode, "all"));
-    const live_named_tests_enabled = live_tests_enabled and !std.mem.eql(u8, live_mode, "tui");
+        (std.mem.eql(u8, live_mode, "smoke") or std.mem.eql(u8, live_mode, "tui") or std.mem.eql(u8, live_mode, "all"));
+    const live_named_tests_enabled = live_tests_enabled and
+        (std.mem.eql(u8, live_mode, "named") or std.mem.eql(u8, live_mode, "all"));
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "live_tests_enabled", live_tests_enabled);
