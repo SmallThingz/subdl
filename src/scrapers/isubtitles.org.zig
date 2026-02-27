@@ -96,7 +96,12 @@ pub const Scraper = struct {
 
         while (traversed < max_pages) : (traversed += 1) {
             last_page = page;
-            const page_url = if (next_url) |u| u else try buildSearchUrl(a, query, page);
+            const page_url = if (traversed == 0)
+                try buildSearchUrl(a, query, page)
+            else if (next_url) |u|
+                u
+            else
+                break;
             const response = try self.fetchHtmlPreferCurl(a, page_url);
             if (response.body.len == 0) break;
 
@@ -119,19 +124,12 @@ pub const Scraper = struct {
 
             const extracted_next = try extractNextPageUrl(a, &parsed.doc, page_url);
             has_next_page = extracted_next != null;
+            next_url = extracted_next;
 
-            if (next_url != null) {
-                next_url = extracted_next;
-            } else {
-                next_url = extracted_next;
-                page += 1;
-            }
-
-            if (next_url == null) {
-                if (options.page_start > 1 or options.max_pages == 1) break;
-                if (traversed + 1 >= max_pages) break;
-                if (page > 128) break;
-            }
+            if (traversed + 1 >= max_pages) break;
+            if (next_url == null) break;
+            page += 1;
+            if (page > 128) break;
         }
 
         return .{
@@ -160,14 +158,19 @@ pub const Scraper = struct {
         const max_pages = if (options.max_pages == 0) 1 else options.max_pages;
         var page = if (options.page_start == 0) 1 else options.page_start;
         const page_start = page;
-        var next_url: ?[]const u8 = if (options.page_start > 1) try addOrReplacePageQuery(a, details_url, page) else null;
+        var next_url: ?[]const u8 = null;
         var last_page = page_start;
         var has_next_page = false;
 
         var traversed: usize = 0;
         while (traversed < max_pages) : (traversed += 1) {
             last_page = page;
-            const page_url = if (next_url) |u| u else if (page == 1) details_url else try addOrReplacePageQuery(a, details_url, page);
+            const page_url = if (traversed == 0)
+                (if (page == 1) details_url else try addOrReplacePageQuery(a, details_url, page))
+            else if (next_url) |u|
+                u
+            else
+                break;
             const response = try self.fetchHtmlPreferCurl(a, page_url);
             if (response.body.len == 0) break;
 
@@ -215,9 +218,10 @@ pub const Scraper = struct {
 
             next_url = try extractNextPageUrl(a, &parsed.doc, page_url);
             has_next_page = next_url != null;
+            if (traversed + 1 >= max_pages) break;
+            if (next_url == null) break;
             page += 1;
-            if (next_url == null and page > 128) break;
-            if (next_url == null and options.page_start > 1) break;
+            if (page > 128) break;
         }
 
         return .{
@@ -312,53 +316,100 @@ fn textAt(node: HtmlNode, allocator: Allocator, comptime selector: []const u8) !
 
 fn buildSearchUrl(allocator: Allocator, query: []const u8, page: usize) ![]const u8 {
     const encoded = try common.encodeUriComponent(allocator, query);
+    defer allocator.free(encoded);
     if (page <= 1) return std.fmt.allocPrint(allocator, "{s}/search?kwd={s}", .{ site, encoded });
-    return std.fmt.allocPrint(allocator, "{s}/search?kwd={s}&page={d}", .{ site, encoded, page });
+    return std.fmt.allocPrint(allocator, "{s}/search?kwd={s}&p={d}", .{ site, encoded, page });
 }
 
 fn addOrReplacePageQuery(allocator: Allocator, base_url: []const u8, page: usize) ![]const u8 {
+    const hash_idx = std.mem.indexOfScalar(u8, base_url, '#');
+    const without_fragment = if (hash_idx) |idx| base_url[0..idx] else base_url;
+    const fragment = if (hash_idx) |idx| base_url[idx..] else "";
+
+    const question_idx = std.mem.indexOfScalar(u8, without_fragment, '?');
+    if (question_idx == null) {
+        return std.fmt.allocPrint(allocator, "{s}?p={d}{s}", .{ without_fragment, page, fragment });
+    }
+
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
-    if (std.mem.indexOf(u8, base_url, "page=")) |idx| {
-        const pre = base_url[0..idx];
-        const rest = base_url[idx..];
-        const amp = std.mem.indexOfScalar(u8, rest, '&');
+    const q_idx = question_idx.?;
+    const path = without_fragment[0 .. q_idx + 1];
+    const query = without_fragment[q_idx + 1 ..];
 
-        try out.appendSlice(allocator, pre);
-        try out.writer(allocator).print("page={d}", .{page});
-        if (amp) |amp_idx| {
-            try out.appendSlice(allocator, rest[amp_idx..]);
+    try out.appendSlice(allocator, path);
+
+    var replaced = false;
+    var wrote_any = false;
+    var pairs = std.mem.splitScalar(u8, query, '&');
+    while (pairs.next()) |pair| {
+        if (pair.len == 0) continue;
+
+        const eq_idx = std.mem.indexOfScalar(u8, pair, '=');
+        const key = if (eq_idx) |idx| pair[0..idx] else pair;
+        const is_page_key = std.mem.eql(u8, key, "p") or std.mem.eql(u8, key, "page");
+
+        if (wrote_any) try out.append(allocator, '&');
+        wrote_any = true;
+
+        if (is_page_key) {
+            try out.writer(allocator).print("p={d}", .{page});
+            replaced = true;
+        } else {
+            try out.appendSlice(allocator, pair);
         }
-        return try out.toOwnedSlice(allocator);
     }
 
-    try out.appendSlice(allocator, base_url);
-    try out.append(allocator, if (std.mem.indexOfScalar(u8, base_url, '?') == null) '?' else '&');
-    try out.writer(allocator).print("page={d}", .{page});
+    if (!replaced) {
+        if (wrote_any) try out.append(allocator, '&');
+        try out.writer(allocator).print("p={d}", .{page});
+    }
+
+    try out.appendSlice(allocator, fragment);
     return try out.toOwnedSlice(allocator);
 }
 
 fn extractNextPageUrl(allocator: Allocator, doc: *const HtmlDocument, current_url: []const u8) !?[]const u8 {
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const temp = scratch.allocator();
+
+    const current_page = pageFromUrl(current_url) orelse 1;
+
     if (doc.queryOne("a[rel='next'][href]")) |a| {
         if (common.getAttributeValueSafe(a, "href")) |href| {
-            return try common.resolveUrl(allocator, site, href);
+            const resolved = try common.resolveUrl(temp, site, href);
+            if (!std.mem.eql(u8, resolved, current_url)) return try allocator.dupe(u8, resolved);
         }
     }
+
+    var best_next_url: ?[]const u8 = null;
+    var best_next_page: ?usize = null;
 
     var anchors = doc.queryAll("a[href]");
     while (anchors.next()) |anchor| {
         const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
-        if (std.mem.indexOf(u8, href, "page=") == null) continue;
-
-        const text = try common.innerTextTrimmedOwned(allocator, anchor);
-        if (!isLikelyNextText(text)) continue;
-
-        const resolved = try common.resolveUrl(allocator, site, href);
+        const resolved = try common.resolveUrl(temp, site, href);
         if (std.mem.eql(u8, resolved, current_url)) continue;
-        return resolved;
+
+        if (pageFromUrl(resolved)) |candidate_page| {
+            if (candidate_page > current_page) {
+                if (best_next_page == null or candidate_page < best_next_page.?) {
+                    best_next_page = candidate_page;
+                    best_next_url = resolved;
+                }
+                continue;
+            }
+        }
+
+        const text = try common.innerTextTrimmedOwned(temp, anchor);
+        if (isLikelyNextText(text) and best_next_url == null) {
+            best_next_url = resolved;
+        }
     }
 
+    if (best_next_url) |resolved| return try allocator.dupe(u8, resolved);
     return null;
 }
 
@@ -422,6 +473,28 @@ fn isLikelyNextText(text: []const u8) bool {
     return std.mem.eql(u8, text, ">") or std.mem.eql(u8, text, "›") or std.mem.eql(u8, text, "»");
 }
 
+fn pageFromUrl(url: []const u8) ?usize {
+    const query_start = std.mem.indexOfScalar(u8, url, '?') orelse return null;
+    var query = url[query_start + 1 ..];
+    if (std.mem.indexOfScalar(u8, query, '#')) |hash_idx| {
+        query = query[0..hash_idx];
+    }
+
+    var fields = std.mem.splitScalar(u8, query, '&');
+    while (fields.next()) |field| {
+        if (field.len == 0) continue;
+        const eq_idx = std.mem.indexOfScalar(u8, field, '=') orelse continue;
+        const key = field[0..eq_idx];
+        if (!std.mem.eql(u8, key, "p") and !std.mem.eql(u8, key, "page")) continue;
+
+        const value = field[eq_idx + 1 ..];
+        if (value.len == 0) continue;
+        return std.fmt.parseInt(usize, value, 10) catch continue;
+    }
+
+    return null;
+}
+
 fn splitTitleAndYear(raw_title: []const u8) struct { title: []const u8, year: ?[]const u8 } {
     const trimmed = common.trimAscii(raw_title);
     if (trimmed.len < 7) return .{ .title = trimmed, .year = null };
@@ -457,4 +530,71 @@ test "isubtitles next-link text" {
     try std.testing.expect(isLikelyNextText("Next"));
     try std.testing.expect(isLikelyNextText(">"));
     try std.testing.expect(!isLikelyNextText("2"));
+}
+
+test "isubtitles build search url uses p query" {
+    const a = std.testing.allocator;
+    const page1 = try buildSearchUrl(a, "matrix", 1);
+    defer a.free(page1);
+    try std.testing.expectEqualStrings("https://isubtitles.org/search?kwd=matrix", page1);
+
+    const page2 = try buildSearchUrl(a, "matrix", 2);
+    defer a.free(page2);
+    try std.testing.expectEqualStrings("https://isubtitles.org/search?kwd=matrix&p=2", page2);
+}
+
+test "isubtitles addOrReplacePageQuery supports p and page" {
+    const a = std.testing.allocator;
+
+    const first = try addOrReplacePageQuery(a, "https://isubtitles.org/search?kwd=matrix", 3);
+    defer a.free(first);
+    try std.testing.expectEqualStrings("https://isubtitles.org/search?kwd=matrix&p=3", first);
+
+    const second = try addOrReplacePageQuery(a, "https://isubtitles.org/search?kwd=matrix&p=2", 4);
+    defer a.free(second);
+    try std.testing.expectEqualStrings("https://isubtitles.org/search?kwd=matrix&p=4", second);
+
+    const third = try addOrReplacePageQuery(a, "https://isubtitles.org/search?kwd=matrix&page=2", 5);
+    defer a.free(third);
+    try std.testing.expectEqualStrings("https://isubtitles.org/search?kwd=matrix&p=5", third);
+}
+
+test "isubtitles extractNextPageUrl from numeric pager without next text" {
+    const a = std.testing.allocator;
+    const html_source =
+        \\<div class="pageing-container">
+        \\  <div class="paging">
+        \\    <a href="javascript:;" class="current">1</a>
+        \\    <a href="/search?kwd=matrix&p=2">2</a>
+        \\  </div>
+        \\</div>
+    ;
+
+    var parsed = try common.parseHtmlStable(a, html_source);
+    defer parsed.deinit();
+
+    const next = try extractNextPageUrl(a, &parsed.doc, "https://isubtitles.org/search?kwd=matrix");
+    try std.testing.expect(next != null);
+    defer a.free(next.?);
+    try std.testing.expectEqualStrings("https://isubtitles.org/search?kwd=matrix&p=2", next.?);
+}
+
+test "isubtitles extractNextPageUrl prefers nearest greater numeric page" {
+    const a = std.testing.allocator;
+    const html_source =
+        \\<div class="paging">
+        \\  <a href="/search?kwd=matrix&p=1">1</a>
+        \\  <a href="/search?kwd=matrix&p=2" class="current">2</a>
+        \\  <a href="/search?kwd=matrix&p=3">3</a>
+        \\  <a href="/search?kwd=matrix&p=10">10</a>
+        \\</div>
+    ;
+
+    var parsed = try common.parseHtmlStable(a, html_source);
+    defer parsed.deinit();
+
+    const next = try extractNextPageUrl(a, &parsed.doc, "https://isubtitles.org/search?kwd=matrix&p=2");
+    try std.testing.expect(next != null);
+    defer a.free(next.?);
+    try std.testing.expectEqualStrings("https://isubtitles.org/search?kwd=matrix&p=3", next.?);
 }

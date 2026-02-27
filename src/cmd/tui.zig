@@ -2262,7 +2262,10 @@ fn printFitted(
         display_text = try sanitizeUtf8ForDisplay(ui.frameAllocator(), display_text);
     }
 
-    if (win.gwidth(display_text) <= max_width) {
+    // Never call gwidth on the full string: vaxis currently accumulates into u16
+    // and can overflow on very long untrusted strings.
+    const fitted = utf8PrefixForDisplayWidth(win, display_text, max_width);
+    if (fitted.len == display_text.len) {
         const segs = [_]vaxis.Segment{.{ .text = display_text, .style = style }};
         _ = win.print(&segs, .{ .row_offset = row, .col_offset = col, .wrap = .none });
         return;

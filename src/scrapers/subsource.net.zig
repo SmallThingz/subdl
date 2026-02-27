@@ -10,7 +10,7 @@ pub const SearchOptions = struct {
     include_seasons: bool = true,
     page_start: usize = 1,
     max_pages: usize = 1,
-    limit_per_page: usize = 500,
+    limit_per_page: usize = 5000,
     cf_clearance: ?[]const u8 = null,
     user_agent: ?[]const u8 = null,
     auto_cloudflare_session: bool = false,
@@ -104,111 +104,27 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        const query_used = try resolveSearchQuery(self.client, a, query);
+        const query_trimmed = common.trimAscii(query);
+        var query_used = try resolveSearchQuery(self.client, a, query);
         var auth = try resolveAuth(a, options.cf_clearance, options.user_agent, false, options.auto_cloudflare_session);
 
         var out: std.ArrayListUnmanaged(SearchItem) = .empty;
         var seen = std.AutoHashMapUnmanaged(i64, void).empty;
-
-        const max_pages = if (options.max_pages == 0) 1 else options.max_pages;
-        var page = if (options.page_start == 0) 1 else options.page_start;
-        const page_start = page;
-        var traversed: usize = 0;
-        var last_page = page_start;
-        var has_next_page = false;
-
-        while (traversed < max_pages) : (traversed += 1) {
-            last_page = page;
-            const payload = try std.fmt.allocPrint(
-                a,
-                "{{\"query\":\"{s}\",\"includeSeasons\":{s},\"limit\":{d},\"page\":{d},\"offset\":{d}}}",
-                .{
-                    try escapeJson(a, query_used),
-                    if (options.include_seasons) "true" else "false",
-                    options.limit_per_page,
-                    page,
-                    (page - 1) * options.limit_per_page,
-                },
-            );
-
-            var response = try postJson(self.client, a, api_base ++ "/movie/search", payload, auth, true);
-            if (response.status == .forbidden and options.auto_cloudflare_session) {
-                auth = try resolveAuth(a, options.cf_clearance, options.user_agent, true, options.auto_cloudflare_session);
-                response = try postJson(self.client, a, api_base ++ "/movie/search", payload, auth, true);
-            }
-            if (response.status != .ok) break;
-
-            var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body, .{});
-            defer parsed.deinit();
-
-            const root = switch (parsed.value) {
-                .object => |o| o,
-                else => break,
-            };
-            const results_v = root.get("results") orelse break;
-            const results = switch (results_v) {
-                .array => |arr| arr,
-                else => break,
-            };
-            has_next_page = false;
-
-            var new_count: usize = 0;
-            for (results.items) |entry| {
-                const obj = switch (entry) {
-                    .object => |o| o,
-                    else => continue,
-                };
-
-                const id = objInt(obj, "id") orelse continue;
-                if (seen.contains(id)) continue;
-                try seen.put(a, id, {});
-                new_count += 1;
-
-                const title = objString(obj, "title") orelse continue;
-                const media_type = objString(obj, "type") orelse "unknown";
-                const link = objString(obj, "link") orelse continue;
-                const release_year = objInt(obj, "releaseYear");
-                const subtitle_count = objInt(obj, "subtitleCount");
-
-                var seasons_out: std.ArrayListUnmanaged(SeasonItem) = .empty;
-                if (obj.get("seasons")) |seasons_v| {
-                    if (seasons_v == .array) {
-                        for (seasons_v.array.items) |season_v| {
-                            const season_obj = switch (season_v) {
-                                .object => |o| o,
-                                else => continue,
-                            };
-                            const season_num = objInt(season_obj, "season") orelse continue;
-                            const season_link = objString(season_obj, "link") orelse continue;
-                            try seasons_out.append(a, .{ .season = season_num, .link = season_link });
-                        }
-                    }
-                }
-
-                try out.append(a, .{
-                    .id = id,
-                    .title = title,
-                    .media_type = media_type,
-                    .link = link,
-                    .release_year = release_year,
-                    .subtitle_count = subtitle_count,
-                    .seasons = try seasons_out.toOwnedSlice(a),
-                });
-            }
-
-            if (new_count == 0) break;
-            if (results.items.len < options.limit_per_page) break;
-
-            page += 1;
+        try appendSearchResults(self.client, a, &out, &seen, query_used, options, &auth);
+        // SubSource's suggestion endpoint can occasionally return a title that does not
+        // map back to the desired result set. Fall back to the raw query when needed.
+        if (out.items.len == 0 and query_trimmed.len > 0 and !std.mem.eql(u8, query_trimmed, query_used)) {
+            query_used = try a.dupe(u8, query_trimmed);
+            try appendSearchResults(self.client, a, &out, &seen, query_used, options, &auth);
         }
 
         return .{
             .arena = arena,
             .query_used = query_used,
             .items = try out.toOwnedSlice(a),
-            .page = last_page,
-            .has_prev_page = last_page > 1,
-            .has_next_page = has_next_page,
+            .page = 1,
+            .has_prev_page = false,
+            .has_next_page = false,
         };
     }
 
@@ -382,12 +298,14 @@ fn resolveSearchQuery(client: *std.http.Client, allocator: Allocator, query: []c
     };
     defer parsed.deinit();
 
-    const root = switch (parsed.value) {
-        .object => |o| o,
-        else => return try allocator.dupe(u8, trimmed),
-    };
-    const results_v = root.get("results") orelse return try allocator.dupe(u8, trimmed);
-    const results = switch (results_v) {
+    const results = switch (parsed.value) {
+        .object => |o| blk: {
+            const results_v = o.get("results") orelse return try allocator.dupe(u8, trimmed);
+            break :blk switch (results_v) {
+                .array => |arr| arr,
+                else => return try allocator.dupe(u8, trimmed),
+            };
+        },
         .array => |arr| arr,
         else => return try allocator.dupe(u8, trimmed),
     };
@@ -398,13 +316,96 @@ fn resolveSearchQuery(client: *std.http.Client, allocator: Allocator, query: []c
         else => return try allocator.dupe(u8, trimmed),
     };
 
-    const candidate = objString(first, "title") orelse
-        objString(first, "name") orelse
-        objString(first, "original_title") orelse
-        objString(first, "original_name") orelse
+    const candidate = firstNonEmptyObjString(first, "title") orelse
+        firstNonEmptyObjString(first, "name") orelse
+        firstNonEmptyObjString(first, "original_title") orelse
+        firstNonEmptyObjString(first, "original_name") orelse
         trimmed;
 
-    return try allocator.dupe(u8, common.trimAscii(candidate));
+    return try allocator.dupe(u8, candidate);
+}
+
+fn appendSearchResults(
+    client: *std.http.Client,
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(SearchItem),
+    seen: *std.AutoHashMapUnmanaged(i64, void),
+    query: []const u8,
+    options: SearchOptions,
+    auth: *Auth,
+) !void {
+    const limit = if (options.limit_per_page == 0) 5000 else options.limit_per_page;
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"query\":\"{s}\",\"includeSeasons\":{s},\"limit\":{d}}}",
+        .{
+            try escapeJson(allocator, query),
+            if (options.include_seasons) "true" else "false",
+            limit,
+        },
+    );
+
+    var response = try postJson(client, allocator, api_base ++ "/movie/search", payload, auth.*, true);
+    if (response.status == .forbidden and options.auto_cloudflare_session) {
+        auth.* = try resolveAuth(allocator, options.cf_clearance, options.user_agent, true, options.auto_cloudflare_session);
+        response = try postJson(client, allocator, api_base ++ "/movie/search", payload, auth.*, true);
+    }
+    if (response.status != .ok) return;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return,
+    };
+    const results_v = root.get("results") orelse return;
+    const results = switch (results_v) {
+        .array => |arr| arr,
+        else => return,
+    };
+
+    for (results.items) |entry| {
+        const obj = switch (entry) {
+            .object => |o| o,
+            else => continue,
+        };
+
+        const id = objInt(obj, "id") orelse continue;
+        if (seen.contains(id)) continue;
+        try seen.put(allocator, id, {});
+
+        const title = objString(obj, "title") orelse continue;
+        const media_type = objString(obj, "type") orelse "unknown";
+        const link = objString(obj, "link") orelse continue;
+        const release_year = objInt(obj, "releaseYear");
+        const subtitle_count = objInt(obj, "subtitleCount");
+
+        var seasons_out: std.ArrayListUnmanaged(SeasonItem) = .empty;
+        if (obj.get("seasons")) |seasons_v| {
+            if (seasons_v == .array) {
+                for (seasons_v.array.items) |season_v| {
+                    const season_obj = switch (season_v) {
+                        .object => |o| o,
+                        else => continue,
+                    };
+                    const season_num = objInt(season_obj, "season") orelse continue;
+                    const season_link = objString(season_obj, "link") orelse continue;
+                    try seasons_out.append(allocator, .{ .season = season_num, .link = season_link });
+                }
+            }
+        }
+
+        try out.append(allocator, .{
+            .id = id,
+            .title = title,
+            .media_type = media_type,
+            .link = link,
+            .release_year = release_year,
+            .subtitle_count = subtitle_count,
+            .seasons = try seasons_out.toOwnedSlice(allocator),
+        });
+    }
 }
 
 fn resolveAuth(allocator: Allocator, cf_clearance_opt: ?[]const u8, user_agent_opt: ?[]const u8, force_refresh: bool, auto_cloudflare_session: bool) !Auth {
@@ -511,6 +512,13 @@ fn objString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
         .string => |s| s,
         else => null,
     };
+}
+
+fn firstNonEmptyObjString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = objString(obj, key) orelse return null;
+    const trimmed = common.trimAscii(value);
+    if (trimmed.len == 0) return null;
+    return trimmed;
 }
 
 fn objInt(obj: std.json.ObjectMap, key: []const u8) ?i64 {
