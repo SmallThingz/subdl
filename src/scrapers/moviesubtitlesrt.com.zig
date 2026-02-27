@@ -26,6 +26,7 @@ pub const SubtitleInfo = struct {
 pub const SearchResponse = struct {
     arena: std.heap.ArenaAllocator,
     items: []const SearchItem,
+    has_next_page: bool = false,
 
     pub fn deinit(self: *SearchResponse) void {
         self.arena.deinit();
@@ -44,6 +45,11 @@ pub const SubtitleResponse = struct {
 };
 
 pub const Scraper = struct {
+    pub const SearchOptions = struct {
+        page_start: usize = 1,
+        max_pages: usize = 1,
+    };
+
     allocator: Allocator,
     client: *std.http.Client,
 
@@ -54,36 +60,60 @@ pub const Scraper = struct {
     pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
+        return self.searchWithOptions(query, .{});
+    }
+
+    pub fn searchWithOptions(self: *Scraper, query: []const u8, options: SearchOptions) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        const page_start = if (options.page_start == 0) 1 else options.page_start;
+        const max_pages = if (options.max_pages == 0) 1 else options.max_pages;
+
         const encoded_query = try common.encodeUriComponent(a, query);
-        const url = try std.fmt.allocPrint(a, "{s}/?s={s}", .{ site, encoded_query });
-        const html_resp = try common.fetchBytes(self.client, a, url, .{ .accept = "text/html", .max_attempts = 2 });
-        var parsed = try common.parseHtmlStable(a, html_resp.body);
-        defer parsed.deinit();
-
         var items: std.ArrayListUnmanaged(SearchItem) = .empty;
-        var links = parsed.doc.queryAll("div.inside-article header h2 a");
-        while (links.next()) |link| {
-            const href = common.getAttributeValueSafe(link, "href") orelse continue;
-            const text = try common.innerTextTrimmedOwned(a, link);
-            const page_url = try common.resolveUrl(a, site, href);
-            try items.append(a, .{ .title = text, .page_url = page_url });
-        }
+        var has_next_page = false;
 
-        if (items.items.len == 0) {
-            var fallback = parsed.doc.queryAll("article h2 a");
-            while (fallback.next()) |link| {
+        var page: usize = page_start;
+        var fetched_pages: usize = 0;
+        while (fetched_pages < max_pages) : ({
+            fetched_pages += 1;
+            if (has_next_page) page += 1;
+        }) {
+            const url = try buildSearchUrl(a, encoded_query, page);
+            const html_resp = try common.fetchBytes(self.client, a, url, .{ .accept = "text/html", .max_attempts = 2 });
+            var parsed = try common.parseHtmlStable(a, html_resp.body);
+            defer parsed.deinit();
+
+            const len_before = items.items.len;
+            var links = parsed.doc.queryAll("div.inside-article header h2 a");
+            while (links.next()) |link| {
                 const href = common.getAttributeValueSafe(link, "href") orelse continue;
                 const text = try common.innerTextTrimmedOwned(a, link);
                 const page_url = try common.resolveUrl(a, site, href);
                 try items.append(a, .{ .title = text, .page_url = page_url });
             }
+
+            if (items.items.len == len_before) {
+                var fallback = parsed.doc.queryAll("article h2 a");
+                while (fallback.next()) |link| {
+                    const href = common.getAttributeValueSafe(link, "href") orelse continue;
+                    const text = try common.innerTextTrimmedOwned(a, link);
+                    const page_url = try common.resolveUrl(a, site, href);
+                    try items.append(a, .{ .title = text, .page_url = page_url });
+                }
+            }
+
+            has_next_page = hasNextSearchPage(&parsed.doc, page);
+            if (!has_next_page) break;
         }
 
-        return .{ .arena = arena, .items = try items.toOwnedSlice(a) };
+        return .{
+            .arena = arena,
+            .items = try items.toOwnedSlice(a),
+            .has_next_page = has_next_page,
+        };
     }
 
     pub fn fetchSubtitleByLink(self: *Scraper, page_url: []const u8) !SubtitleResponse {
@@ -189,9 +219,62 @@ fn hasDownloadHref(href: []const u8) bool {
     return std.mem.indexOf(u8, href, "download") != null;
 }
 
+fn buildSearchUrl(allocator: Allocator, encoded_query: []const u8, page: usize) ![]const u8 {
+    if (page <= 1) return std.fmt.allocPrint(allocator, "{s}/?s={s}", .{ site, encoded_query });
+    return std.fmt.allocPrint(allocator, "{s}/page/{d}/?s={s}", .{ site, page, encoded_query });
+}
+
+fn hasNextSearchPage(doc: *const html.Document, current_page: usize) bool {
+    if (doc.queryOne("link[rel='next'][href]")) |_| return true;
+    if (doc.queryOne("a.next.page-numbers[href]")) |_| return true;
+    if (doc.queryOne("a.page-numbers.next[href]")) |_| return true;
+    if (doc.queryOne(".nav-links a.next[href]")) |_| return true;
+    if (doc.queryOne("a[aria-label='Next'][href]")) |_| return true;
+    if (doc.queryOne("a[aria-label*='Next'][href]")) |_| return true;
+
+    var links = doc.queryAll("a[href*='/page/']");
+    while (links.next()) |link| {
+        const href = common.getAttributeValueSafe(link, "href") orelse continue;
+        const page_num = parsePageFromUrl(href) orelse continue;
+        if (page_num > current_page) return true;
+    }
+
+    return false;
+}
+
+fn parsePageFromUrl(url: []const u8) ?usize {
+    const marker = "/page/";
+    const idx = std.mem.indexOf(u8, url, marker) orelse return null;
+    const rest = url[idx + marker.len ..];
+    if (rest.len == 0) return null;
+
+    var end: usize = 0;
+    while (end < rest.len and std.ascii.isDigit(rest[end])) : (end += 1) {}
+    if (end == 0) return null;
+    return std.fmt.parseInt(usize, rest[0..end], 10) catch null;
+}
+
 test "moviesubtitlesrt parse key language" {
     const code = common.normalizeLanguageCode("English");
     try std.testing.expectEqualStrings("en", code.?);
+}
+
+test "moviesubtitlesrt parse page number from url" {
+    try std.testing.expectEqual(@as(?usize, 2), parsePageFromUrl("https://moviesubtitlesrt.com/page/2/?s=matrix"));
+    try std.testing.expectEqual(@as(?usize, 15), parsePageFromUrl("/foo/page/15/"));
+    try std.testing.expect(parsePageFromUrl("https://moviesubtitlesrt.com/?s=matrix") == null);
+}
+
+test "moviesubtitlesrt has next page detection" {
+    const allocator = std.testing.allocator;
+    const html_text =
+        \\<html><head><link rel="next" href="https://moviesubtitlesrt.com/page/3/?s=matrix"></head>
+        \\<body><a class="page-numbers" href="/page/2/?s=matrix">2</a></body></html>
+    ;
+
+    var parsed = try common.parseHtmlStable(allocator, html_text);
+    defer parsed.deinit();
+    try std.testing.expect(hasNextSearchPage(&parsed.doc, 2));
 }
 
 test "live moviesubtitlesrt search and details" {
