@@ -1,8 +1,23 @@
 const std = @import("std");
 const scrapers = @import("scrapers");
 const vaxis = @import("vaxis");
+const builtin = @import("builtin");
 
 const app = scrapers.providers_app;
+
+const hard_cancel_supported = std.Thread.use_pthreads and switch (builtin.os.tag) {
+    .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .openbsd, .netbsd, .dragonfly, .solaris, .illumos => true,
+    else => false,
+};
+
+const pthread = if (hard_cancel_supported) struct {
+    const PTHREAD_CANCEL_ENABLE: c_int = 0;
+    const PTHREAD_CANCEL_ASYNCHRONOUS: c_int = 1;
+
+    extern "c" fn pthread_cancel(thread: std.Thread.Handle) c_int;
+    extern "c" fn pthread_setcancelstate(state: c_int, old_state: ?*c_int) c_int;
+    extern "c" fn pthread_setcanceltype(cancel_type: c_int, old_type: ?*c_int) c_int;
+} else struct {};
 
 const Event = union(enum) {
     key_press: vaxis.Key,
@@ -146,11 +161,11 @@ const Ui = struct {
     }
 
     fn styleTitle(self: *Ui) vaxis.Style {
-        return .{ .fg = .{ .index = self.theme().title_fg } };
+        return .{ .fg = .{ .index = self.theme().title_fg }, .bold = true };
     }
 
     fn styleAccent(self: *Ui) vaxis.Style {
-        return .{ .fg = .{ .index = self.theme().accent_fg } };
+        return .{ .fg = .{ .index = self.theme().accent_fg }, .bold = true };
     }
 
     fn styleMuted(self: *Ui) vaxis.Style {
@@ -158,22 +173,23 @@ const Ui = struct {
     }
 
     fn styleWarn(self: *Ui) vaxis.Style {
-        return .{ .fg = .{ .index = self.theme().warning_fg } };
+        return .{ .fg = .{ .index = self.theme().warning_fg }, .bold = true };
     }
 
     fn styleError(self: *Ui) vaxis.Style {
-        return .{ .fg = .{ .index = self.theme().error_fg } };
+        return .{ .fg = .{ .index = self.theme().error_fg }, .bold = true };
     }
 
     fn styleSelected(self: *Ui) vaxis.Style {
         return .{
             .fg = .{ .index = self.theme().selected_fg },
             .bg = .{ .index = self.theme().selected_bg },
+            .bold = true,
         };
     }
 
     fn stylePaneTitle(self: *Ui) vaxis.Style {
-        return .{ .fg = .{ .index = self.theme().pane_title_fg } };
+        return .{ .fg = .{ .index = self.theme().pane_title_fg }, .bold = true };
     }
 };
 
@@ -216,6 +232,7 @@ pub fn main() !void {
 }
 
 fn searchTaskMain(task: *SearchTask) void {
+    configureWorkerHardCancel();
     var client: std.http.Client = .{ .allocator = std.heap.page_allocator };
     defer client.deinit();
 
@@ -228,6 +245,7 @@ fn searchTaskMain(task: *SearchTask) void {
 }
 
 fn subtitlesTaskMain(task: *SubtitlesTask) void {
+    configureWorkerHardCancel();
     var client: std.http.Client = .{ .allocator = std.heap.page_allocator };
     defer client.deinit();
 
@@ -240,6 +258,7 @@ fn subtitlesTaskMain(task: *SubtitlesTask) void {
 }
 
 fn downloadTaskMain(task: *DownloadTask) void {
+    configureWorkerHardCancel();
     var client: std.http.Client = .{ .allocator = std.heap.page_allocator };
     defer client.deinit();
 
@@ -254,17 +273,10 @@ fn downloadTaskMain(task: *DownloadTask) void {
 fn waitForFetch(ui: *Ui, done: *const std.atomic.Value(u8), title: []const u8, detail: []const u8) !FetchControl {
     const spinner = [_][]const u8{ "|", "/", "-", "\\" };
     var spinner_idx: usize = 0;
-    var cancel_requested = false;
-    var quit_requested = false;
 
     while (done.load(.acquire) == 0) {
         var msg_buf: [256]u8 = undefined;
-        const message = if (quit_requested)
-            "Quit requested. Waiting for current request to finish..."
-        else if (cancel_requested)
-            "Cancel requested. Waiting for current request to finish..."
-        else
-            std.fmt.bufPrint(&msg_buf, "Fetching... {s}", .{spinner[spinner_idx % spinner.len]}) catch "Fetching...";
+        const message = std.fmt.bufPrint(&msg_buf, "Fetching... {s}", .{spinner[spinner_idx % spinner.len]}) catch "Fetching...";
 
         try vaxisStatus(ui, title, message, detail);
 
@@ -281,11 +293,10 @@ fn waitForFetch(ui: *Ui, done: *const std.atomic.Value(u8), title: []const u8, d
                         continue;
                     }
                     if (key.matches('d', .{ .ctrl = true })) {
-                        quit_requested = true;
-                        continue;
+                        return .quit;
                     }
                     if (key.matches('c', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
-                        cancel_requested = true;
+                        return .canceled;
                     }
                 },
                 else => {},
@@ -295,13 +306,35 @@ fn waitForFetch(ui: *Ui, done: *const std.atomic.Value(u8), title: []const u8, d
         spinner_idx += 1;
         std.Thread.sleep(90 * std.time.ns_per_ms);
     }
-    if (quit_requested) return .quit;
-    if (cancel_requested) return .canceled;
     return .completed;
 }
 
 fn waitForTask(ui: *Ui, done: *const std.atomic.Value(u8), title: []const u8, detail: []const u8) !FetchControl {
     return waitForFetch(ui, done, title, detail);
+}
+
+fn configureWorkerHardCancel() void {
+    if (comptime !hard_cancel_supported) return;
+
+    var old_state: i32 = 0;
+    _ = pthread.pthread_setcancelstate(pthread.PTHREAD_CANCEL_ENABLE, &old_state);
+    var old_type: i32 = 0;
+    _ = pthread.pthread_setcanceltype(pthread.PTHREAD_CANCEL_ASYNCHRONOUS, &old_type);
+}
+
+fn requestHardThreadCancel(thread: std.Thread) bool {
+    if (comptime !hard_cancel_supported) return false;
+    return pthread.pthread_cancel(thread.getHandle()) == 0;
+}
+
+fn finalizeWorkerThread(thread: std.Thread, control: FetchControl) void {
+    switch (control) {
+        .completed => thread.join(),
+        .canceled, .quit => {
+            _ = requestHardThreadCancel(thread);
+            thread.join();
+        },
+    }
 }
 
 fn setContext(ui: *Ui, context_line: ?[]const u8) void {
@@ -413,7 +446,7 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
             };
             const search_thread = try std.Thread.spawn(.{}, searchTaskMain, .{&search_task});
             const search_control = try waitForTask(ui, &search_task.done, "Search", search_detail);
-            search_thread.join();
+            finalizeWorkerThread(search_thread, search_control);
 
             if (search_control == .quit) {
                 if (search_task.result) |*r| r.deinit();
@@ -503,7 +536,7 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
                 };
                 const subtitles_thread = try std.Thread.spawn(.{}, subtitlesTaskMain, .{&subtitles_task});
                 const subtitles_control = try waitForTask(ui, &subtitles_task.done, "Subtitles", subtitles_detail);
-                subtitles_thread.join();
+                finalizeWorkerThread(subtitles_thread, subtitles_control);
 
                 if (subtitles_control == .quit) {
                     if (subtitles_task.result) |*r| r.deinit();
@@ -632,7 +665,7 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
                     };
                     const download_thread = try std.Thread.spawn(.{}, downloadTaskMain, .{&download_task});
                     const download_control = try waitForTask(ui, &download_task.done, "Download", download_detail);
-                    download_thread.join();
+                    finalizeWorkerThread(download_thread, download_control);
 
                     if (download_control == .quit) {
                         if (download_task.result) |*r| r.deinit(std.heap.page_allocator);
@@ -801,7 +834,7 @@ fn vaxisInput(
             win.showCursor(@min(desired_col, max_col), 3);
         }
 
-        try renderGlobalFooter(ui, win, "Enter search | Esc back | Ctrl+D quit", null);
+        try renderGlobalFooter(ui, win, "Enter search | Esc back", null);
 
         if (error_text) |txt| {
             const err_segments = [_]vaxis.Segment{.{ .text = txt, .style = ui.styleError() }};
@@ -951,9 +984,9 @@ fn vaxisSelect(
         const filter_line = std.fmt.bufPrint(&filter_buf, "Filter: {s}  [{s}]", .{ filter.items, mode_text }) catch "Filter: (overflow)";
 
         const help_line = if (filter_mode)
-            "Type to filter | Enter/Esc done | Backspace delete | Ctrl+U clear"
+            "Type to filter | Enter done | Esc exit | Backspace delete"
         else
-            "Arrows/PgUp/PgDn/Space/b/j/k/g/G move | Enter select | / filter | Esc back";
+            "j/k or arrows move | Enter select | / filter | Esc back";
 
         var count_buf: [96]u8 = undefined;
         const count_line = std.fmt.bufPrint(&count_buf, "Visible: {d}/{d}", .{ matches.items.len, options.len }) catch "Visible: ?";
@@ -1164,9 +1197,9 @@ fn vaxisSelectSubtitle(
         ) catch "Sort/Filter: (overflow)";
 
         const help_line = if (filter_mode)
-            "Type to filter | Enter/Esc done | Backspace delete | Ctrl+U clear"
+            "Type to filter | Enter done | Esc exit | Backspace delete"
         else
-            "Arrows/PgUp/PgDn/Space/b/j/k/g/G move | Enter select | s sort | / filter | Esc back";
+            "j/k or arrows move | Enter select | s sort | / filter | Esc back";
 
         var count_buf: [96]u8 = undefined;
         const count_line = std.fmt.bufPrint(&count_buf, "Visible: {d}/{d}", .{ matches.items.len, subtitles.len }) catch "Visible: ?";
@@ -1368,17 +1401,18 @@ fn renderGlobalFooter(ui: *Ui, win: anytype, help_line: []const u8, extra_right:
     const help_segments = [_]vaxis.Segment{.{ .text = help_line, .style = ui.styleMuted() }};
     _ = win.print(&help_segments, .{ .row_offset = row_help, .col_offset = 1, .wrap = .none });
 
-    const confirm_text = if (ui.skip_confirm) "Confirm: off(F2)" else "Confirm: on(F2)";
+    const confirm_text = if (ui.skip_confirm) "F2 confirm:off" else "F2 confirm:on";
     const status_segments = [_]vaxis.Segment{
         .{ .text = confirm_text, .style = ui.styleMuted() },
-        .{ .text = " | Theme: ", .style = ui.styleMuted() },
+        .{ .text = "  ", .style = ui.styleMuted() },
+        .{ .text = "F3 theme:", .style = ui.styleMuted() },
         .{ .text = ui.theme().name, .style = ui.styleMuted() },
-        .{ .text = "(F3)", .style = ui.styleMuted() },
+        .{ .text = "  Ctrl+D quit", .style = ui.styleMuted() },
     };
     _ = win.print(&status_segments, .{ .row_offset = row_status, .col_offset = 1, .wrap = .none });
 
     if (extra_right) |text| {
-        const base_len = confirm_text.len + " | Theme: ".len + ui.theme().name.len + "(F3)".len + 2;
+        const base_len = confirm_text.len + "  F3 theme:".len + ui.theme().name.len + "  Ctrl+D quit".len + 2;
         const col: u16 = if (win.width > base_len + 1) @intCast(base_len) else 1;
         const right_segments = [_]vaxis.Segment{.{ .text = text, .style = ui.styleMuted() }};
         _ = win.print(&right_segments, .{ .row_offset = row_status, .col_offset = col, .wrap = .none });
