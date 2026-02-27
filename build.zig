@@ -2,8 +2,12 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
-    const strip = b.option(bool, "strip", "Strip debug symbols from binaries") orelse false;
+    const optimize_opt = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode");
+    const optimize = optimize_opt orelse .Debug;
+    const all_targets_optimize = optimize_opt orelse .ReleaseFast;
+    const strip_opt = b.option(bool, "strip", "Strip debug symbols from binaries");
+    const strip = strip_opt orelse false;
+    const all_targets_strip = strip_opt orelse true;
     const single_threaded = parseToggleBool("single-threaded", b.option([]const u8, "single-threaded", "Single-threaded mode: auto | on | off") orelse "auto");
     const omit_frame_pointer = parseToggleBool("omit-frame-pointer", b.option([]const u8, "omit-frame-pointer", "Frame pointer mode: auto | on | off") orelse "auto");
     const error_tracing = parseToggleBool("error-tracing", b.option([]const u8, "error-tracing", "Error tracing mode: auto | on | off") orelse "auto");
@@ -180,18 +184,18 @@ pub fn build(b: *std.Build) void {
     run_tui_step.dependOn(&run_tui_cmd.step);
     run_tui_cmd.step.dependOn(b.getInstallStep());
 
-    const cross_bin_step = b.step("cross-bin", "Build cross-platform scrapers_cli binaries into zig-out/bin");
+    const all_targets_step = b.step("build-all-targets", "Build scrapers_cli for all configured targets into zig-out/bin");
     for (cross_targets) |cross| {
         const cross_target = b.resolveTargetQuery(cross.query);
         const cross_htmlparser_dep = b.dependency("htmlparser", .{
             .target = cross_target,
-            .optimize = optimize,
+            .optimize = all_targets_optimize,
         });
         const cross_htmlparser_compat_mod = b.createModule(.{
             .root_source_file = b.path("src/deps/htmlparser_compat.zig"),
             .target = cross_target,
-            .optimize = optimize,
-            .strip = strip,
+            .optimize = all_targets_optimize,
+            .strip = all_targets_strip,
             .single_threaded = single_threaded,
             .omit_frame_pointer = omit_frame_pointer,
             .error_tracing = error_tracing,
@@ -202,18 +206,18 @@ pub fn build(b: *std.Build) void {
         });
         const cross_alldriver_dep = b.dependency("alldriver", .{
             .target = cross_target,
-            .optimize = optimize,
+            .optimize = all_targets_optimize,
         });
         const cross_unarr_dep = b.dependency("unarr", .{
             .target = cross_target,
-            .optimize = optimize,
+            .optimize = all_targets_optimize,
             .static_libc = true,
         });
         const cross_runtime_alloc_mod = b.createModule(.{
             .root_source_file = b.path("src/alloc/runtime_allocator.zig"),
             .target = cross_target,
-            .optimize = optimize,
-            .strip = strip,
+            .optimize = all_targets_optimize,
+            .strip = all_targets_strip,
             .single_threaded = single_threaded,
             .omit_frame_pointer = omit_frame_pointer,
             .error_tracing = error_tracing,
@@ -222,8 +226,8 @@ pub fn build(b: *std.Build) void {
         const cross_scrapers_mod = b.createModule(.{
             .root_source_file = b.path("src/lib.zig"),
             .target = cross_target,
-            .optimize = optimize,
-            .strip = strip,
+            .optimize = all_targets_optimize,
+            .strip = all_targets_strip,
             .single_threaded = single_threaded,
             .omit_frame_pointer = omit_frame_pointer,
             .error_tracing = error_tracing,
@@ -242,8 +246,8 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/cmd/cli.zig"),
                 .target = cross_target,
-                .optimize = optimize,
-                .strip = strip,
+                .optimize = all_targets_optimize,
+                .strip = all_targets_strip,
                 .single_threaded = single_threaded,
                 .omit_frame_pointer = omit_frame_pointer,
                 .error_tracing = error_tracing,
@@ -255,7 +259,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         const install_cross = b.addInstallArtifact(cross_exe, .{});
-        cross_bin_step.dependOn(&install_cross.step);
+        all_targets_step.dependOn(&install_cross.step);
     }
 
     const subdl_mod_tests = b.addTest(.{

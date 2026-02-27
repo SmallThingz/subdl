@@ -67,7 +67,8 @@ zig build install
 Build cross-target CLI binaries into `zig-out/bin`:
 
 ```bash
-zig build cross-bin -Doptimize=ReleaseFast -Dstrip=true
+zig build build-all-targets
+zig build build-all-targets -Doptimize=ReleaseFast -Dstrip=true
 ```
 
 Tunable build flags:
@@ -78,6 +79,10 @@ Tunable build flags:
 - `-Domit-frame-pointer=auto|on|off`
 - `-Derror-tracing=auto|on|off`
 - `-Dpic=auto|on|off`
+
+`build-all-targets` uses sane defaults when flags are omitted:
+- `-Doptimize` defaults to `ReleaseFast` for that step
+- `-Dstrip` defaults to `true` for that step
 
 ## Docs
 

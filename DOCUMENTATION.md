@@ -53,7 +53,8 @@ zig build run-tui
 Build cross-target CLI binaries (installed into `zig-out/bin`):
 
 ```bash
-zig build cross-bin -Doptimize=ReleaseFast -Dstrip=true
+zig build build-all-targets
+zig build build-all-targets -Doptimize=ReleaseFast -Dstrip=true
 ```
 
 ## Provider IDs
@@ -417,6 +418,11 @@ Build flags you can toggle from `zig build`:
 - `-Domit-frame-pointer=auto|on|off`
 - `-Derror-tracing=auto|on|off`
 - `-Dpic=auto|on|off`
+
+`build-all-targets` defaults when omitted:
+
+- `-Doptimize` -> `ReleaseFast`
+- `-Dstrip` -> `true`
 
 ## Troubleshooting
 
