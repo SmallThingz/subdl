@@ -4,6 +4,17 @@ const common = @import("common.zig");
 const Allocator = std.mem.Allocator;
 const site = "https://www.opensubtitles.org";
 const opensubtitles_host = "www.opensubtitles.org";
+const default_page_size: usize = 40;
+
+pub const SearchOptions = struct {
+    page_start: usize = 1,
+    max_pages: usize = 1,
+};
+
+pub const SubtitlesOptions = struct {
+    page_start: usize = 1,
+    max_pages: usize = 1,
+};
 
 pub const SearchItem = struct {
     title: []const u8,
@@ -29,6 +40,9 @@ pub const SubtitleItem = struct {
 pub const SearchResponse = struct {
     arena: std.heap.ArenaAllocator,
     items: []const SearchItem,
+    page: usize = 1,
+    has_prev_page: bool = false,
+    has_next_page: bool = false,
 
     pub fn deinit(self: *SearchResponse) void {
         self.arena.deinit();
@@ -40,6 +54,9 @@ pub const SubtitlesResponse = struct {
     arena: std.heap.ArenaAllocator,
     title: []const u8,
     subtitles: []const SubtitleItem,
+    page: usize = 1,
+    has_prev_page: bool = false,
+    has_next_page: bool = false,
 
     pub fn deinit(self: *SubtitlesResponse) void {
         self.arena.deinit();
@@ -67,107 +84,164 @@ pub const Scraper = struct {
     pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
+        return self.searchWithOptions(query, .{});
+    }
+
+    pub fn searchWithOptions(self: *Scraper, query: []const u8, options: SearchOptions) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
 
         const encoded = try common.encodeUriComponent(a, query);
         const language3 = languageToOpenSubtitles3(self.options.language_code) orelse "all";
-        const url = try std.fmt.allocPrint(a, "{s}/en/search2/moviename-{s}/sublanguageid-{s}", .{ site, encoded, language3 });
-
-        const response = try self.fetchHtmlWithDoh(a, url);
-        var parsed = try common.parseHtmlStable(a, response.body);
-        defer parsed.deinit();
-
+        const base_url = try std.fmt.allocPrint(a, "{s}/en/search2/moviename-{s}/sublanguageid-{s}", .{ site, encoded, language3 });
+        const max_pages = if (options.max_pages == 0) 1 else options.max_pages;
+        const page_start = if (options.page_start == 0) 1 else options.page_start;
+        var page = page_start;
+        var traversed: usize = 0;
+        var next_url: ?[]const u8 = if (page_start > 1) try addOrReplaceOffsetPage(a, base_url, page_start) else null;
+        var last_page = page_start;
+        var has_next_page = false;
         var items: std.ArrayListUnmanaged(SearchItem) = .empty;
-        var anchors = parsed.doc.queryAll("table#search_results td[id^='main'] strong a.bnone[href*='/search/'][href*='idmovie-']");
-        while (anchors.next()) |anchor| {
-            const href = anchor.getAttributeValue("href") orelse continue;
-            const title = try common.innerTextTrimmedOwned(a, anchor);
-            const page_url = try common.resolveUrl(a, site, href);
-            try items.append(a, .{ .title = title, .page_url = page_url });
-        }
 
-        if (items.items.len == 0) {
-            const has_subtitle_rows = parsed.doc.queryOne("table#search_results a[href*='/subtitleserve/sub/']") != null;
-            if (has_subtitle_rows) {
-                const inferred_title = blk: {
-                    if (parsed.doc.queryOne("h1")) |n| break :blk try common.innerTextTrimmedOwned(a, n);
-                    break :blk try a.dupe(u8, query);
-                };
-                try items.append(a, .{ .title = inferred_title, .page_url = try a.dupe(u8, url) });
+        while (traversed < max_pages) : (traversed += 1) {
+            last_page = page;
+            const page_url = if (next_url) |u| u else if (page == 1) base_url else try addOrReplaceOffsetPage(a, base_url, page);
+            const response = try self.fetchHtmlWithDoh(a, page_url);
+            var parsed = try common.parseHtmlStable(a, response.body);
+            defer parsed.deinit();
+
+            var anchors = parsed.doc.queryAll("table#search_results td[id^='main'] strong a.bnone[href*='/search/'][href*='idmovie-']");
+            while (anchors.next()) |anchor| {
+                const href = anchor.getAttributeValue("href") orelse continue;
+                const title = try common.innerTextTrimmedOwned(a, anchor);
+                const movie_page_url = try common.resolveUrl(a, site, href);
+                try items.append(a, .{ .title = title, .page_url = movie_page_url });
             }
+
+            if (items.items.len == 0) {
+                const has_subtitle_rows = parsed.doc.queryOne("table#search_results a[href*='/subtitleserve/sub/']") != null;
+                if (has_subtitle_rows) {
+                    const inferred_title = blk: {
+                        if (parsed.doc.queryOne("h1")) |n| break :blk try common.innerTextTrimmedOwned(a, n);
+                        break :blk try a.dupe(u8, query);
+                    };
+                    try items.append(a, .{ .title = inferred_title, .page_url = try a.dupe(u8, page_url) });
+                }
+            }
+
+            next_url = try extractNextPageUrl(a, &parsed.doc, page_url);
+            has_next_page = next_url != null;
+            page += 1;
+            if (next_url == null) break;
         }
 
-        return .{ .arena = arena, .items = try dedupeSearchItems(a, items.items) };
+        return .{
+            .arena = arena,
+            .items = try dedupeSearchItems(a, items.items),
+            .page = last_page,
+            .has_prev_page = last_page > 1,
+            .has_next_page = has_next_page,
+        };
     }
 
     pub fn fetchSubtitlesByMoviePage(self: *Scraper, page_url: []const u8) !SubtitlesResponse {
+        return self.fetchSubtitlesByMoviePageWithOptions(page_url, .{});
+    }
+
+    pub fn fetchSubtitlesByMoviePageWithOptions(self: *Scraper, page_url: []const u8, options: SubtitlesOptions) !SubtitlesResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        const response = try self.fetchHtmlWithDoh(a, page_url);
-        var parsed = try common.parseHtmlStable(a, response.body);
-        defer parsed.deinit();
-
-        const title = blk: {
-            if (parsed.doc.queryOne("h1")) |n| break :blk try common.innerTextTrimmedOwned(a, n);
-            if (parsed.doc.queryOne("title")) |n| break :blk try common.innerTextTrimmedOwned(a, n);
-            break :blk "";
-        };
-
+        const max_pages = if (options.max_pages == 0) 1 else options.max_pages;
+        const page_start = if (options.page_start == 0) 1 else options.page_start;
+        var page = page_start;
+        var traversed: usize = 0;
+        var next_url: ?[]const u8 = if (page_start > 1) try addOrReplaceOffsetPage(a, page_url, page_start) else null;
+        var last_page = page_start;
+        var has_next_page = false;
+        var title: []const u8 = "";
         var out: std.ArrayListUnmanaged(SubtitleItem) = .empty;
-        var rows = parsed.doc.queryAll("table#search_results tr[id^='name']");
-        while (rows.next()) |row| {
-            const subtitle_anchor = row.queryOne("td[id^='main'] strong a.bnone[href*='/subtitles/']") orelse continue;
-            const details_href = subtitle_anchor.getAttributeValue("href") orelse continue;
-            const details_url = try common.resolveUrl(a, site, details_href);
 
-            const subtitle_id = blk_id: {
-                const serve_anchor = row.queryOne("a[href*='/subtitleserve/sub/']") orelse break :blk_id null;
-                const href = serve_anchor.getAttributeValue("href") orelse break :blk_id null;
-                const marker = "/subtitleserve/sub/";
-                const start = std.mem.indexOf(u8, href, marker) orelse break :blk_id null;
-                const tail = href[start + marker.len ..];
-                const end = std.mem.indexOfAny(u8, tail, "/?#") orelse tail.len;
-                break :blk_id tail[0..end];
-            };
-            const direct_zip_url = if (subtitle_id) |sid|
-                try std.fmt.allocPrint(a, "https://dl.opensubtitles.org/en/download/sub/{s}", .{sid})
-            else
-                "";
+        while (traversed < max_pages) : (traversed += 1) {
+            last_page = page;
+            const url = if (next_url) |u| u else if (page == 1) page_url else try addOrReplaceOffsetPage(a, page_url, page);
+            const response = try self.fetchHtmlWithDoh(a, url);
+            var parsed = try common.parseHtmlStable(a, response.body);
+            defer parsed.deinit();
 
-            const language_code = extractFlagLanguage(row, a) catch null;
-            const filename = extractFilename(row, a) catch null;
-            const release = extractSubCellText(row, a, 1) catch null;
-            const fps = extractSubCellText(row, a, 5) catch null;
-            const cds = extractSubCellText(row, a, 4) catch null;
-            const rating = extractSubCellText(row, a, 8) catch null;
-            const downloads = extractSubCellText(row, a, 7) catch null;
-            const uploaded_at = extractSubCellText(row, a, 6) catch null;
+            if (title.len == 0) {
+                title = blk: {
+                    if (parsed.doc.queryOne("h1")) |n| break :blk try common.innerTextTrimmedOwned(a, n);
+                    if (parsed.doc.queryOne("title")) |n| break :blk try common.innerTextTrimmedOwned(a, n);
+                    break :blk "";
+                };
+            }
 
-            const row_text = try common.innerTextTrimmedOwned(a, row);
-            const lower_row = try lowerDup(a, row_text);
+            var rows = parsed.doc.queryAll("table#search_results tr[id^='name']");
+            while (rows.next()) |row| {
+                const subtitle_anchor = row.queryOne("td[id^='main'] strong a.bnone[href*='/subtitles/']") orelse continue;
+                const details_href = subtitle_anchor.getAttributeValue("href") orelse continue;
+                const details_url = try common.resolveUrl(a, site, details_href);
 
-            try out.append(a, .{
-                .language_code = language_code,
-                .filename = filename,
-                .release = release,
-                .fps = fps,
-                .cds = cds,
-                .rating = rating,
-                .downloads = downloads,
-                .uploaded_at = uploaded_at,
-                .hearing_impaired = std.mem.indexOf(u8, lower_row, "hearing") != null,
-                .trusted = std.mem.indexOf(u8, lower_row, "trusted") != null,
-                .hd = std.mem.indexOf(u8, lower_row, "hd") != null,
-                .details_url = details_url,
-                .direct_zip_url = direct_zip_url,
-            });
+                const subtitle_id = blk_id: {
+                    const serve_anchor = row.queryOne("a[href*='/subtitleserve/sub/']") orelse break :blk_id null;
+                    const href = serve_anchor.getAttributeValue("href") orelse break :blk_id null;
+                    const marker = "/subtitleserve/sub/";
+                    const start = std.mem.indexOf(u8, href, marker) orelse break :blk_id null;
+                    const tail = href[start + marker.len ..];
+                    const end = std.mem.indexOfAny(u8, tail, "/?#") orelse tail.len;
+                    break :blk_id tail[0..end];
+                };
+                const direct_zip_url = if (subtitle_id) |sid|
+                    try std.fmt.allocPrint(a, "https://dl.opensubtitles.org/en/download/sub/{s}", .{sid})
+                else
+                    "";
+
+                const language_code = extractFlagLanguage(row, a) catch null;
+                const filename = extractFilename(row, a) catch null;
+                const release = extractSubCellText(row, a, 1) catch null;
+                const fps = extractSubCellText(row, a, 5) catch null;
+                const cds = extractSubCellText(row, a, 4) catch null;
+                const rating = extractSubCellText(row, a, 8) catch null;
+                const downloads = extractSubCellText(row, a, 7) catch null;
+                const uploaded_at = extractSubCellText(row, a, 6) catch null;
+
+                const row_text = try common.innerTextTrimmedOwned(a, row);
+                const lower_row = try lowerDup(a, row_text);
+
+                try out.append(a, .{
+                    .language_code = language_code,
+                    .filename = filename,
+                    .release = release,
+                    .fps = fps,
+                    .cds = cds,
+                    .rating = rating,
+                    .downloads = downloads,
+                    .uploaded_at = uploaded_at,
+                    .hearing_impaired = std.mem.indexOf(u8, lower_row, "hearing") != null,
+                    .trusted = std.mem.indexOf(u8, lower_row, "trusted") != null,
+                    .hd = std.mem.indexOf(u8, lower_row, "hd") != null,
+                    .details_url = details_url,
+                    .direct_zip_url = direct_zip_url,
+                });
+            }
+
+            next_url = try extractNextPageUrl(a, &parsed.doc, url);
+            has_next_page = next_url != null;
+            page += 1;
+            if (next_url == null) break;
         }
 
-        return .{ .arena = arena, .title = title, .subtitles = try out.toOwnedSlice(a) };
+        return .{
+            .arena = arena,
+            .title = title,
+            .subtitles = try out.toOwnedSlice(a),
+            .page = last_page,
+            .has_prev_page = last_page > 1,
+            .has_next_page = has_next_page,
+        };
     }
 
     fn fetchHtmlWithDoh(self: *Scraper, allocator: Allocator, url: []const u8) !common.HttpResponse {
@@ -495,6 +569,50 @@ fn dedupeSearchItems(allocator: Allocator, items: []const SearchItem) ![]const S
     }
 
     return try out.toOwnedSlice(allocator);
+}
+
+fn addOrReplaceOffsetPage(allocator: Allocator, base_url: []const u8, page: usize) ![]const u8 {
+    const offset: usize = if (page <= 1) 0 else (page - 1) * default_page_size;
+    var normalized = base_url;
+
+    if (std.mem.indexOf(u8, normalized, "/offset-")) |idx| {
+        var end = idx + "/offset-".len;
+        while (end < normalized.len and std.ascii.isDigit(normalized[end])) : (end += 1) {}
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        try out.appendSlice(allocator, normalized[0..idx]);
+        try out.appendSlice(allocator, normalized[end..]);
+        normalized = try out.toOwnedSlice(allocator);
+    }
+
+    if (offset == 0) return try allocator.dupe(u8, normalized);
+
+    const suffix_pos = std.mem.indexOfAny(u8, normalized, "?#") orelse normalized.len;
+    const head = normalized[0..suffix_pos];
+    const tail = normalized[suffix_pos..];
+    const sep: []const u8 = if (head.len > 0 and head[head.len - 1] == '/') "" else "/";
+    return try std.fmt.allocPrint(allocator, "{s}{s}offset-{d}{s}", .{ head, sep, offset, tail });
+}
+
+fn extractNextPageUrl(allocator: Allocator, doc: *@import("htmlparser").Document, current_url: []const u8) !?[]const u8 {
+    if (doc.queryOne("link[rel='next'][href]")) |n| {
+        if (n.getAttributeValue("href")) |href| {
+            const resolved = try common.resolveUrl(allocator, site, href);
+            if (!std.mem.eql(u8, resolved, current_url)) return resolved;
+        }
+    }
+
+    if (doc.queryOne("#pager a[href*='/offset-']")) |anchor| {
+        const href = anchor.getAttributeValue("href") orelse return null;
+        const text = try common.innerTextTrimmedOwned(allocator, anchor);
+        if (std.mem.eql(u8, text, ">>") or std.mem.eql(u8, text, "›") or std.mem.eql(u8, text, ">")) {
+            const resolved = try common.resolveUrl(allocator, site, href);
+            if (!std.mem.eql(u8, resolved, current_url)) return resolved;
+        }
+    }
+
+    return null;
 }
 
 fn extractFlagLanguage(row: @import("htmlparser").Node, allocator: Allocator) !?[]const u8 {

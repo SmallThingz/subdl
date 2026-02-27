@@ -292,6 +292,7 @@ fn acquireSessionViaAllDriver(allocator: Allocator, domain: []const u8, challeng
 
         if (!headless) {
             std.log.info("cloudflare verification opened for {s}; complete challenge if prompted", .{challenge_url});
+            clearTerminalScreen();
         }
 
         const deadline = std.time.milliTimestamp() + challenge_timeout_ms;
@@ -320,6 +321,10 @@ fn acquireSessionViaAllDriver(allocator: Allocator, domain: []const u8, challeng
     }
 
     return error.CloudflareSessionUnavailable;
+}
+
+fn clearTerminalScreen() void {
+    std.debug.print("\x1b[2J\x1b[H", .{});
 }
 
 fn fetchUserAgent(allocator: Allocator, browser: *driver.modern.ModernSession) ![]const u8 {

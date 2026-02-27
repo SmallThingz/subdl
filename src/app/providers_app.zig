@@ -59,14 +59,14 @@ pub fn providerName(provider: Provider) []const u8 {
 
 pub fn providerSupportsSearchPagination(provider: Provider) bool {
     return switch (provider) {
-        .isubtitles_org, .my_subs_co, .tvsubtitles_net => true,
+        .opensubtitles_org, .isubtitles_org, .my_subs_co, .tvsubtitles_net => true,
         else => false,
     };
 }
 
 pub fn providerSupportsSubtitlesPagination(provider: Provider) bool {
     return switch (provider) {
-        .isubtitles_org, .my_subs_co, .tvsubtitles_net => true,
+        .opensubtitles_org, .isubtitles_org, .my_subs_co, .tvsubtitles_net => true,
         else => false,
     };
 }
@@ -528,6 +528,29 @@ pub fn searchPage(allocator: Allocator, client: *std.http.Client, provider: Prov
     var has_next_page = false;
 
     switch (provider) {
+        .opensubtitles_org => {
+            var scraper = subdl.opensubtitles_org.Scraper.init(a, client);
+            defer scraper.deinit();
+            var response = try scraper.searchWithOptions(query, .{
+                .page_start = requested_page,
+                .max_pages = 1,
+            });
+            defer response.deinit();
+            has_next_page = response.has_next_page;
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                const page_url = try a.dupe(u8, item.page_url);
+                try out.append(a, .{
+                    .title = title,
+                    .label = try a.dupe(u8, title),
+                    .ref = .{ .opensubtitles_org = .{
+                        .title = title,
+                        .page_url = page_url,
+                    } },
+                });
+            }
+        },
         .isubtitles_org => {
             var scraper = subdl.isubtitles_org.Scraper.init(a, client);
             defer scraper.deinit();
@@ -942,6 +965,29 @@ pub fn fetchSubtitlesPage(allocator: Allocator, client: *std.http.Client, ref: S
     var has_next_page = false;
 
     switch (ref) {
+        .opensubtitles_org => |item| {
+            var scraper = subdl.opensubtitles_org.Scraper.init(a, client);
+            defer scraper.deinit();
+            var subtitles = try scraper.fetchSubtitlesByMoviePageWithOptions(item.page_url, .{
+                .page_start = requested_page,
+                .max_pages = 1,
+            });
+            defer subtitles.deinit();
+            has_next_page = subtitles.has_next_page;
+            if (subtitles.title.len > 0) title = try a.dupe(u8, subtitles.title);
+
+            for (subtitles.subtitles) |subtitle| {
+                const download_url = if (subtitle.direct_zip_url.len > 0) subtitle.direct_zip_url else null;
+                const filename = subtitle.filename orelse subtitle.release;
+                const label = try subtitleLabel(a, subtitle.language_code, filename, download_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try dupOptional(a, subtitle.language_code),
+                    .filename = try dupOptional(a, filename),
+                    .download_url = try dupOptional(a, download_url),
+                });
+            }
+        },
         .isubtitles_org => |item| {
             var scraper = subdl.isubtitles_org.Scraper.init(a, client);
             defer scraper.deinit();
@@ -1697,12 +1743,14 @@ test "parseProvider accepts dotted/hyphenated js provider names" {
 }
 
 test "provider pagination support flags" {
+    try std.testing.expect(providerSupportsSearchPagination(.opensubtitles_org));
     try std.testing.expect(providerSupportsSearchPagination(.isubtitles_org));
     try std.testing.expect(providerSupportsSearchPagination(.my_subs_co));
     try std.testing.expect(providerSupportsSearchPagination(.tvsubtitles_net));
     try std.testing.expect(!providerSupportsSearchPagination(.subdl_com));
     try std.testing.expect(!providerSupportsSearchPagination(.podnapisi_net));
 
+    try std.testing.expect(providerSupportsSubtitlesPagination(.opensubtitles_org));
     try std.testing.expect(providerSupportsSubtitlesPagination(.isubtitles_org));
     try std.testing.expect(providerSupportsSubtitlesPagination(.my_subs_co));
     try std.testing.expect(providerSupportsSubtitlesPagination(.tvsubtitles_net));

@@ -424,6 +424,8 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
         provider_default = provider_idx;
         const provider = app.providers()[provider_idx];
         const provider_url = providerHomeUrl(provider);
+        const supports_search_pagination = app.providerSupportsSearchPagination(provider);
+        const supports_subtitles_pagination = app.providerSupportsSubtitlesPagination(provider);
 
         query_loop: while (true) {
             var hint_buf: [192]u8 = undefined;
@@ -455,18 +457,32 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
 
             title_loop: while (true) {
                 const search_idx = findSearchPageCacheIndex(search_pages.items, search_page_current) orelse blk_fetch: {
-                    const search_detail = try std.fmt.allocPrint(
-                        ui.allocator,
-                        "provider={s} query={s} page={d}",
-                        .{ app.providerName(provider), query, search_page_current },
-                    );
+                    const search_detail = if (supports_search_pagination)
+                        try std.fmt.allocPrint(
+                            ui.allocator,
+                            "provider={s} query={s} page={d}",
+                            .{ app.providerName(provider), query, search_page_current },
+                        )
+                    else
+                        try std.fmt.allocPrint(
+                            ui.allocator,
+                            "provider={s} query={s}",
+                            .{ app.providerName(provider), query },
+                        );
                     defer ui.allocator.free(search_detail);
 
-                    const search_context = try std.fmt.allocPrint(
-                        ui.allocator,
-                        "Search URL base: {s} | page={d}",
-                        .{ provider_url, search_page_current },
-                    );
+                    const search_context = if (supports_search_pagination)
+                        try std.fmt.allocPrint(
+                            ui.allocator,
+                            "Search URL base: {s} | page={d}",
+                            .{ provider_url, search_page_current },
+                        )
+                    else
+                        try std.fmt.allocPrint(
+                            ui.allocator,
+                            "Search URL base: {s}",
+                            .{provider_url},
+                        );
                     defer ui.allocator.free(search_context);
                     setContext(ui, search_context);
 
@@ -542,11 +558,18 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
                 const title_labels = try borrowSearchLabels(ui.allocator, search_result.items);
                 defer ui.allocator.free(title_labels);
 
-                const title_context = try std.fmt.allocPrint(
-                    ui.allocator,
-                    "Provider: {s} | Search base URL: {s} | page={d}",
-                    .{ app.providerName(provider), provider_url, search_page_current },
-                );
+                const title_context = if (supports_search_pagination)
+                    try std.fmt.allocPrint(
+                        ui.allocator,
+                        "Provider: {s} | Search base URL: {s} | page={d}",
+                        .{ app.providerName(provider), provider_url, search_page_current },
+                    )
+                else
+                    try std.fmt.allocPrint(
+                        ui.allocator,
+                        "Provider: {s} | Search base URL: {s}",
+                        .{ app.providerName(provider), provider_url },
+                    );
                 defer ui.allocator.free(title_context);
                 setContext(ui, title_context);
 
@@ -560,7 +583,10 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
                 const title_choice = try vaxisSelect(
                     ui,
                     "Select Title",
-                    "Use filter/sort keys. [ prev page, ] next page, Esc query.",
+                    if (supports_search_pagination)
+                        "Use filter/sort keys. [ prev page, ] next page, Esc query."
+                    else
+                        "Use filter/sort keys. Esc query.",
                     title_labels,
                     null,
                     null,
@@ -591,18 +617,32 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
 
                 subtitle_page_loop: while (true) {
                     const subtitles_idx = findSubtitlesPageCacheIndex(subtitle_pages.items, subtitle_page_current) orelse blk_fetch: {
-                        const subtitles_detail = try std.fmt.allocPrint(
-                            ui.allocator,
-                            "{s} | page={d}",
-                            .{ selected_title.label, subtitle_page_current },
-                        );
+                        const subtitles_detail = if (supports_subtitles_pagination)
+                            try std.fmt.allocPrint(
+                                ui.allocator,
+                                "{s} | page={d}",
+                                .{ selected_title.label, subtitle_page_current },
+                            )
+                        else
+                            try std.fmt.allocPrint(
+                                ui.allocator,
+                                "{s}",
+                                .{selected_title.label},
+                            );
                         defer ui.allocator.free(subtitles_detail);
 
-                        const subtitles_context = try std.fmt.allocPrint(
-                            ui.allocator,
-                            "Title URL: {s} | page={d}",
-                            .{ title_ref_url, subtitle_page_current },
-                        );
+                        const subtitles_context = if (supports_subtitles_pagination)
+                            try std.fmt.allocPrint(
+                                ui.allocator,
+                                "Title URL: {s} | page={d}",
+                                .{ title_ref_url, subtitle_page_current },
+                            )
+                        else
+                            try std.fmt.allocPrint(
+                                ui.allocator,
+                                "Title URL: {s}",
+                                .{title_ref_url},
+                            );
                         defer ui.allocator.free(subtitles_context);
                         setContext(ui, subtitles_context);
 
@@ -679,11 +719,18 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
                     const subtitle_enabled = try buildSubtitleEnabled(ui.allocator, subtitles.items);
                     defer ui.allocator.free(subtitle_enabled);
 
-                    const subtitle_context = try std.fmt.allocPrint(
-                        ui.allocator,
-                        "Title URL: {s} | page={d}",
-                        .{ title_ref_url, subtitle_page_current },
-                    );
+                    const subtitle_context = if (supports_subtitles_pagination)
+                        try std.fmt.allocPrint(
+                            ui.allocator,
+                            "Title URL: {s} | page={d}",
+                            .{ title_ref_url, subtitle_page_current },
+                        )
+                    else
+                        try std.fmt.allocPrint(
+                            ui.allocator,
+                            "Title URL: {s}",
+                            .{title_ref_url},
+                        );
                     defer ui.allocator.free(subtitle_context);
                     setContext(ui, subtitle_context);
 
@@ -697,7 +744,10 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
                     const subtitle_choice = try vaxisSelectSubtitle(
                         ui,
                         "Select Subtitle",
-                        "s sort, / filter, [ prev page, ] next page, Esc titles.",
+                        if (supports_subtitles_pagination)
+                            "s sort, / filter, [ prev page, ] next page, Esc titles."
+                        else
+                            "s sort, / filter, Esc titles.",
                         subtitles.items,
                         subtitle_enabled,
                         subtitle_page_nav_opt,
