@@ -102,7 +102,7 @@ pub const Scraper = struct {
                 u
             else
                 break;
-            const response = try self.fetchHtmlPreferCurl(a, page_url);
+            const response = try self.fetchHtml(a, page_url);
             if (response.body.len == 0) break;
 
             maybeDebugDumpFirstPage(response.status, page_url, response.body, traversed);
@@ -171,7 +171,7 @@ pub const Scraper = struct {
                 u
             else
                 break;
-            const response = try self.fetchHtmlPreferCurl(a, page_url);
+            const response = try self.fetchHtml(a, page_url);
             if (response.body.len == 0) break;
 
             var parsed = try common.parseHtmlStable(a, response.body);
@@ -234,10 +234,7 @@ pub const Scraper = struct {
         };
     }
 
-    fn fetchHtmlPreferCurl(self: *Scraper, allocator: Allocator, url: []const u8) !common.HttpResponse {
-        if (try fetchHtmlViaCurl(allocator, url)) |curl_response| {
-            return curl_response;
-        }
+    fn fetchHtml(self: *Scraper, allocator: Allocator, url: []const u8) !common.HttpResponse {
         return common.fetchBytes(self.client, allocator, url, .{
             .accept = "text/html",
             .max_attempts = 2,
@@ -419,52 +416,6 @@ fn maybeDebugDumpFirstPage(status: std.http.Status, page_url: []const u8, body: 
 
     std.debug.print("[isubtitles] status={d} body_len={d} url={s}\n", .{ @intFromEnum(status), body.len, page_url });
     std.fs.cwd().writeFile(.{ .sub_path = "/tmp/isubtitles_response_debug.html", .data = body }) catch {};
-}
-
-fn fetchHtmlViaCurl(allocator: Allocator, url: []const u8) !?common.HttpResponse {
-    const argv = [_][]const u8{
-        "curl",
-        "-sS",
-        "--location",
-        "--max-time",
-        "45",
-        "--compressed",
-        "-A",
-        common.default_user_agent,
-        "-H",
-        "Accept: text/html",
-        "-w",
-        "\n%{http_code}",
-        url,
-    };
-
-    const run_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &argv,
-        .max_output_bytes = 8 * 1024 * 1024,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer allocator.free(run_result.stdout);
-    defer allocator.free(run_result.stderr);
-
-    switch (run_result.term) {
-        .Exited => |code| {
-            if (code != 0) return null;
-        },
-        else => return null,
-    }
-
-    const sep = std.mem.lastIndexOfScalar(u8, run_result.stdout, '\n') orelse return null;
-    const status_raw = std.mem.trim(u8, run_result.stdout[sep + 1 ..], " \t\r\n");
-    const status_code = std.fmt.parseInt(u10, status_raw, 10) catch return null;
-    const body = run_result.stdout[0..sep];
-
-    return .{
-        .status = @enumFromInt(status_code),
-        .body = try allocator.dupe(u8, body),
-    };
 }
 
 fn isLikelyNextText(text: []const u8) bool {

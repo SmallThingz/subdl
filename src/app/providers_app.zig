@@ -665,48 +665,6 @@ pub fn searchPage(allocator: Allocator, client: *std.http.Client, provider: Prov
                 });
             }
         },
-        .my_subs_co => {
-            var scraper = subdl.my_subs_co.Scraper.init(a, client);
-            defer scraper.deinit();
-            var response = try scraper.search(query);
-            defer response.deinit();
-            has_next_page = response.has_next_page;
-
-            for (response.items) |item| {
-                const title = try a.dupe(u8, item.title);
-                const details_url = try a.dupe(u8, item.details_url);
-                const label = try std.fmt.allocPrint(a, "[{s}] {s}", .{ @tagName(item.media_kind), title });
-                try out.append(a, .{
-                    .title = title,
-                    .label = label,
-                    .ref = .{ .my_subs_co = .{
-                        .title = title,
-                        .details_url = details_url,
-                        .media_kind = item.media_kind,
-                    } },
-                });
-            }
-        },
-        .tvsubtitles_net => {
-            var scraper = subdl.tvsubtitles_net.Scraper.init(a, client);
-            defer scraper.deinit();
-            var response = try scraper.search(query);
-            defer response.deinit();
-            has_next_page = response.has_next_page;
-
-            for (response.items) |item| {
-                const title = try a.dupe(u8, item.title);
-                const show_url = try a.dupe(u8, item.show_url);
-                try out.append(a, .{
-                    .title = title,
-                    .label = try a.dupe(u8, title),
-                    .ref = .{ .tvsubtitles_net = .{
-                        .title = title,
-                        .show_url = show_url,
-                    } },
-                });
-            }
-        },
         else => return error.UnsupportedProvider,
     }
 
@@ -1215,46 +1173,6 @@ pub fn fetchSubtitlesPage(allocator: Allocator, client: *std.http.Client, ref: S
                 });
             }
         },
-        .my_subs_co => |item| {
-            var scraper = subdl.my_subs_co.Scraper.init(a, client);
-            defer scraper.deinit();
-            var subtitles = try scraper.fetchSubtitlesByDetailsLinkWithOptions(item.details_url, item.media_kind, .{
-                .include_seasons = false,
-                .resolve_download_links = false,
-            });
-            defer subtitles.deinit();
-            has_next_page = subtitles.has_next_page;
-
-            for (subtitles.subtitles) |subtitle| {
-                const label = try subtitleLabel(a, subtitle.language_code, subtitle.filename, subtitle.download_page_url);
-                try out.append(a, .{
-                    .label = label,
-                    .language = try dupOptional(a, subtitle.language_code),
-                    .filename = try a.dupe(u8, subtitle.filename),
-                    .download_url = try a.dupe(u8, subtitle.download_page_url),
-                });
-            }
-        },
-        .tvsubtitles_net => |item| {
-            var scraper = subdl.tvsubtitles_net.Scraper.init(a, client);
-            defer scraper.deinit();
-            var subtitles = try scraper.fetchSubtitlesByShowLinkWithOptions(item.show_url, .{
-                .include_all_seasons = false,
-                .resolve_download_links = false,
-            });
-            defer subtitles.deinit();
-            has_next_page = subtitles.has_next_page;
-
-            for (subtitles.subtitles) |subtitle| {
-                const label = try subtitleLabel(a, subtitle.language_code, subtitle.filename, subtitle.download_page_url);
-                try out.append(a, .{
-                    .label = label,
-                    .language = try dupOptional(a, subtitle.language_code),
-                    .filename = try a.dupe(u8, subtitle.filename),
-                    .download_url = try a.dupe(u8, subtitle.download_page_url),
-                });
-            }
-        },
         else => return error.UnsupportedProvider,
     }
 
@@ -1362,35 +1280,13 @@ pub fn downloadSubtitleWithProgress(
         };
     }
 
-    const stem = filenameStem(safe_name);
-    const extract_base = if (stem.len > 0)
-        try std.fmt.allocPrint(allocator, "{s}.files", .{stem})
-    else
-        try allocator.dupe(u8, "subtitle.files");
-    defer allocator.free(extract_base);
-
-    const extract_dir = try nextAvailableOutputPath(allocator, out_dir, extract_base);
-    defer allocator.free(extract_dir);
-    try std.fs.cwd().makePath(extract_dir);
-
     emitDownloadPhase(progress, .extracting_archive);
-    try extractArchive(allocator, archive_kind, output_path, extract_dir);
-    const extracted_files = try collectExtractedSubtitleFiles(allocator, extract_dir);
-    errdefer {
-        for (extracted_files) |p| allocator.free(p);
-        if (extracted_files.len > 0) allocator.free(extracted_files);
-    }
-
-    const primary_path = if (extracted_files.len > 0)
-        try allocator.dupe(u8, extracted_files[0])
-    else
-        try allocator.dupe(u8, output_path);
-    errdefer allocator.free(primary_path);
+    const archive_copy = try allocator.dupe(u8, output_path);
+    errdefer allocator.free(archive_copy);
 
     return .{
-        .file_path = primary_path,
-        .archive_path = output_path,
-        .extracted_files = extracted_files,
+        .file_path = output_path,
+        .archive_path = archive_copy,
         .bytes_written = response.body.len,
         .source_url = source_url,
     };
@@ -1864,17 +1760,12 @@ fn fetchDownloadBytes(client: *std.http.Client, allocator: Allocator, url: []con
     else
         &[_]std.http.Header{};
 
-    const primary = common.fetchBytes(client, allocator, url, .{
+    const primary = try common.fetchBytes(client, allocator, url, .{
         .accept = "*/*",
         .extra_headers = yify_headers,
         .allow_non_ok = true,
         .max_attempts = 2,
-    }) catch |err| {
-        if (try fetchBytesViaCurl(allocator, url, "*/*", yify_referer)) |fallback| {
-            return fallback;
-        }
-        return err;
-    };
+    });
 
     if (primary.status == .ok) return primary;
     const was_forbidden = primary.status == .forbidden;
@@ -1882,15 +1773,12 @@ fn fetchDownloadBytes(client: *std.http.Client, allocator: Allocator, url: []con
 
     if (was_forbidden) {
         if (cloudflareTargetForUrl(url)) |target| {
-            if (try fetchBytesViaCurlWithCloudflareSession(allocator, url, target.domain, target.challenge_url, "*/*")) |with_cf| {
-                return with_cf;
-            }
+            const with_cf = try fetchBytesWithCloudflareSession(client, allocator, url, target.domain, target.challenge_url, "*/*", yify_referer);
+            if (with_cf.status == .ok) return with_cf;
+            allocator.free(with_cf.body);
         }
     }
 
-    if (try fetchBytesViaCurl(allocator, url, "*/*", yify_referer)) |fallback| {
-        return fallback;
-    }
     return error.UnexpectedHttpStatus;
 }
 
@@ -1917,89 +1805,24 @@ fn yifyRefererForUrl(url: []const u8) ?[]const u8 {
     return null;
 }
 
-fn fetchBytesViaCurl(allocator: Allocator, url: []const u8, accept: []const u8, referer: ?[]const u8) !?common.HttpResponse {
-    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer argv.deinit(allocator);
-
-    var owned_args: std.ArrayListUnmanaged([]u8) = .empty;
-    defer {
-        for (owned_args.items) |arg| allocator.free(arg);
-        owned_args.deinit(allocator);
-    }
-
-    try argv.appendSlice(allocator, &.{
-        "curl",
-        "-sS",
-        "--location",
-        "--max-time",
-        "90",
-        "--compressed",
-        "-A",
-        common.default_user_agent,
-    });
-
-    const accept_header = try std.fmt.allocPrint(allocator, "Accept: {s}", .{accept});
-    try owned_args.append(allocator, accept_header);
-    try argv.appendSlice(allocator, &.{ "-H", accept_header });
-
-    if (referer) |value| {
-        const referer_header = try std.fmt.allocPrint(allocator, "Referer: {s}", .{value});
-        try owned_args.append(allocator, referer_header);
-        try argv.appendSlice(allocator, &.{ "-H", referer_header });
-    }
-
-    const normalized_url = try common.normalizeUrlForFetch(allocator, url);
-    defer allocator.free(normalized_url);
-    try argv.appendSlice(allocator, &.{ "-w", "\n%{http_code}", normalized_url });
-
-    const run_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv.items,
-        .max_output_bytes = 128 * 1024 * 1024,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer allocator.free(run_result.stdout);
-    defer allocator.free(run_result.stderr);
-
-    switch (run_result.term) {
-        .Exited => |code| {
-            if (code != 0) return null;
-        },
-        else => return null,
-    }
-
-    const sep = std.mem.lastIndexOfScalar(u8, run_result.stdout, '\n') orelse return null;
-    const status_raw = std.mem.trim(u8, run_result.stdout[sep + 1 ..], " \t\r\n");
-    const status_code = std.fmt.parseInt(u10, status_raw, 10) catch return null;
-    const body = run_result.stdout[0..sep];
-
-    return .{
-        .status = @enumFromInt(status_code),
-        .body = try allocator.dupe(u8, body),
-    };
-}
-
-fn fetchBytesViaCurlWithCloudflareSession(
+fn fetchBytesWithCloudflareSession(
+    client: *std.http.Client,
     allocator: Allocator,
     url: []const u8,
     domain: []const u8,
     challenge_url: []const u8,
     accept: []const u8,
-) !?common.HttpResponse {
+    referer: ?[]const u8,
+) !common.HttpResponse {
     var session = try cf.ensureDomainSession(allocator, .{
         .domain = domain,
         .challenge_url = challenge_url,
     });
     defer session.deinit(allocator);
 
-    if (try fetchBytesViaCurlUsingSession(allocator, url, accept, session)) |first| {
-        if (first.status != .forbidden) return first;
-        allocator.free(first.body);
-    } else {
-        return null;
-    }
+    const first = try fetchBytesUsingSession(client, allocator, url, accept, referer, session);
+    if (first.status != .forbidden) return first;
+    allocator.free(first.body);
 
     var refreshed = try cf.ensureDomainSession(allocator, .{
         .domain = domain,
@@ -2007,74 +1830,32 @@ fn fetchBytesViaCurlWithCloudflareSession(
         .force_refresh = true,
     });
     defer refreshed.deinit(allocator);
-    return fetchBytesViaCurlUsingSession(allocator, url, accept, refreshed);
+    return fetchBytesUsingSession(client, allocator, url, accept, referer, refreshed);
 }
 
-fn fetchBytesViaCurlUsingSession(
+fn fetchBytesUsingSession(
+    client: *std.http.Client,
     allocator: Allocator,
     url: []const u8,
     accept: []const u8,
+    referer: ?[]const u8,
     session: cf.Session,
-) !?common.HttpResponse {
-    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer argv.deinit(allocator);
+) !common.HttpResponse {
+    var headers = std.ArrayList(std.http.Header).empty;
+    defer headers.deinit(allocator);
 
-    var owned_args: std.ArrayListUnmanaged([]u8) = .empty;
-    defer {
-        for (owned_args.items) |arg| allocator.free(arg);
-        owned_args.deinit(allocator);
+    try headers.append(allocator, .{ .name = "cookie", .value = session.cookie_header });
+    try headers.append(allocator, .{ .name = "user-agent", .value = session.user_agent });
+    if (referer) |value| {
+        try headers.append(allocator, .{ .name = "referer", .value = value });
     }
 
-    try argv.appendSlice(allocator, &.{
-        "curl",
-        "-sS",
-        "--location",
-        "--max-time",
-        "90",
-        "--compressed",
-        "-A",
-        session.user_agent,
+    return common.fetchBytes(client, allocator, url, .{
+        .accept = accept,
+        .extra_headers = headers.items,
+        .allow_non_ok = true,
+        .max_attempts = 2,
     });
-
-    const cookie_header = try std.fmt.allocPrint(allocator, "Cookie: {s}", .{session.cookie_header});
-    try owned_args.append(allocator, cookie_header);
-    try argv.appendSlice(allocator, &.{ "-H", cookie_header });
-
-    const accept_header = try std.fmt.allocPrint(allocator, "Accept: {s}", .{accept});
-    try owned_args.append(allocator, accept_header);
-    try argv.appendSlice(allocator, &.{ "-H", accept_header });
-
-    const normalized_url = try common.normalizeUrlForFetch(allocator, url);
-    defer allocator.free(normalized_url);
-    try argv.appendSlice(allocator, &.{ "-w", "\n%{http_code}", normalized_url });
-
-    const run_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv.items,
-        .max_output_bytes = 128 * 1024 * 1024,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer allocator.free(run_result.stdout);
-    defer allocator.free(run_result.stderr);
-
-    switch (run_result.term) {
-        .Exited => |code| {
-            if (code != 0) return null;
-        },
-        else => return null,
-    }
-
-    const sep = std.mem.lastIndexOfScalar(u8, run_result.stdout, '\n') orelse return null;
-    const status_raw = std.mem.trim(u8, run_result.stdout[sep + 1 ..], " \t\r\n");
-    const status_code = std.fmt.parseInt(u10, status_raw, 10) catch return null;
-    const body = run_result.stdout[0..sep];
-
-    return .{
-        .status = @enumFromInt(status_code),
-        .body = try allocator.dupe(u8, body),
-    };
 }
 
 const ArchiveKind = enum {
@@ -2092,91 +1873,6 @@ fn detectArchiveKind(file_name: []const u8, url: []const u8, body: []const u8) A
     if (body.len >= 7 and std.mem.eql(u8, body[0..7], "Rar!\x1A\x07\x00")) return .rar;
     if (body.len >= 8 and std.mem.eql(u8, body[0..8], "Rar!\x1A\x07\x01\x00")) return .rar;
     return .none;
-}
-
-fn filenameStem(file_name: []const u8) []const u8 {
-    const dot = std.mem.lastIndexOfScalar(u8, file_name, '.') orelse return file_name;
-    if (dot == 0) return file_name;
-    return file_name[0..dot];
-}
-
-fn extractArchive(allocator: Allocator, kind: ArchiveKind, archive_path: []const u8, extract_dir: []const u8) !void {
-    if (try runExtractor(allocator, &.{ "bsdtar", "-xf", archive_path, "-C", extract_dir })) return;
-
-    switch (kind) {
-        .zip => {
-            if (try runExtractor(allocator, &.{ "unzip", "-o", archive_path, "-d", extract_dir })) return;
-            return error.ArchiveExtractionFailed;
-        },
-        .rar => {
-            if (try runExtractor(allocator, &.{ "unrar", "x", "-o+", archive_path, extract_dir })) return;
-            const seven_zip_out = try std.fmt.allocPrint(allocator, "-o{s}", .{extract_dir});
-            defer allocator.free(seven_zip_out);
-            if (try runExtractor(allocator, &.{ "7z", "x", "-y", seven_zip_out, archive_path })) return;
-            return error.ArchiveExtractionFailed;
-        },
-        .none => return,
-    }
-}
-
-fn runExtractor(allocator: Allocator, argv: []const []const u8) !bool {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv,
-        .max_output_bytes = 128 * 1024,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        else => return err,
-    };
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    return switch (result.term) {
-        .Exited => |code| code == 0,
-        else => false,
-    };
-}
-
-fn collectExtractedSubtitleFiles(allocator: Allocator, extract_dir: []const u8) ![]const []const u8 {
-    var dir = try std.fs.cwd().openDir(extract_dir, .{ .iterate = true });
-    defer dir.close();
-
-    var walker = try dir.walk(allocator);
-    defer walker.deinit();
-
-    var out: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer {
-        for (out.items) |p| allocator.free(p);
-        out.deinit(allocator);
-    }
-
-    while (try walker.next()) |entry| {
-        if (entry.kind != .file) continue;
-        if (!isSubtitleArchiveEntry(entry.path)) continue;
-        const full = try std.fs.path.join(allocator, &.{ extract_dir, entry.path });
-        try out.append(allocator, full);
-    }
-
-    if (out.items.len == 0) return &.{};
-    return try out.toOwnedSlice(allocator);
-}
-
-fn isSubtitleArchiveEntry(path: []const u8) bool {
-    const exts = [_][]const u8{
-        ".srt",
-        ".str",
-        ".sub",
-        ".ass",
-        ".ssa",
-        ".vtt",
-        ".smi",
-        ".idx",
-        ".txt",
-    };
-    for (exts) |ext| {
-        if (asciiEndsWithIgnoreCase(path, ext)) return true;
-    }
-    return false;
 }
 
 fn toAbsoluteSubdlLink(allocator: Allocator, link: []const u8) ![]const u8 {
@@ -2457,13 +2153,16 @@ test "searchPage returns empty page for unsupported provider page > 1" {
     var client: std.http.Client = .{ .allocator = std.testing.allocator };
     defer client.deinit();
 
-    var page = try searchPage(std.testing.allocator, &client, .subdl_com, "matrix", 2);
-    defer page.deinit();
+    const unsupported_providers = [_]Provider{ .subdl_com, .my_subs_co, .tvsubtitles_net };
+    for (unsupported_providers) |provider| {
+        var page = try searchPage(std.testing.allocator, &client, provider, "matrix", 2);
+        defer page.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), page.items.len);
-    try std.testing.expectEqual(@as(usize, 2), page.page);
-    try std.testing.expect(page.has_prev_page);
-    try std.testing.expect(!page.has_next_page);
+        try std.testing.expectEqual(@as(usize, 0), page.items.len);
+        try std.testing.expectEqual(@as(usize, 2), page.page);
+        try std.testing.expect(page.has_prev_page);
+        try std.testing.expect(!page.has_next_page);
+    }
 }
 
 test "fetchSubtitlesPage returns empty page for unsupported provider page > 1" {
@@ -2476,14 +2175,29 @@ test "fetchSubtitlesPage returns empty page for unsupported provider page > 1" {
         .link = "https://subdl.com/subtitle/the-matrix",
     } };
 
-    var page = try fetchSubtitlesPage(std.testing.allocator, &client, ref, 2);
-    defer page.deinit();
+    const refs = [_]SearchRef{
+        ref,
+        .{ .my_subs_co = .{
+            .title = "The Matrix",
+            .details_url = "https://my-subs.co/movie/the-matrix",
+            .media_kind = .movie,
+        } },
+        .{ .tvsubtitles_net = .{
+            .title = "Chernobyl",
+            .show_url = "https://www.tvsubtitles.net/tvshow-1234-1.html",
+        } },
+    };
 
-    try std.testing.expectEqual(@as(usize, 0), page.items.len);
-    try std.testing.expectEqual(@as(usize, 2), page.page);
-    try std.testing.expect(page.has_prev_page);
-    try std.testing.expect(!page.has_next_page);
-    try std.testing.expectEqualStrings("The Matrix", page.title);
+    for (refs) |item_ref| {
+        var page = try fetchSubtitlesPage(std.testing.allocator, &client, item_ref, 2);
+        defer page.deinit();
+
+        try std.testing.expectEqual(@as(usize, 0), page.items.len);
+        try std.testing.expectEqual(@as(usize, 2), page.page);
+        try std.testing.expect(page.has_prev_page);
+        try std.testing.expect(!page.has_next_page);
+        try std.testing.expectEqualStrings(titleFromRef(item_ref), page.title);
+    }
 }
 
 test "opensubtitles remote token helpers" {

@@ -267,7 +267,7 @@ pub const Scraper = struct {
             .{ .name = "accept", .value = "application/zip,application/octet-stream,*/*" },
         };
 
-        const verify_status = verifyDownloadHeadWithCurlSession(allocator, session.*, url, &verify_headers) catch null;
+        const verify_status = verifyDownloadHeadWithSession(self.client, allocator, session.*, url, &verify_headers) catch null;
         if (verify_status) |status| {
             if (status != .ok and status != .found and status != .moved_permanently and status != .see_other and status != .temporary_redirect and status != .permanent_redirect) {
                 // Some mirrors/challenge edges reject HEAD while the URL is still valid for GET.
@@ -286,29 +286,6 @@ const SessionFetchOptions = struct {
 };
 
 fn fetchWithSession(client: *std.http.Client, allocator: Allocator, session: *cf.Session, url: []const u8, options: SessionFetchOptions, refresh_on_403: bool) ![]u8 {
-    if (try fetchWithCurlSession(allocator, session.*, url, options)) |curl_response| {
-        if (curl_response.status == .forbidden and refresh_on_403) {
-            allocator.free(curl_response.body);
-            session.* = try cf.ensureSession(allocator, .{ .force_refresh = true });
-
-            if (try fetchWithCurlSession(allocator, session.*, url, options)) |refreshed| {
-                if (!options.allow_non_ok and refreshed.status != .ok) {
-                    allocator.free(refreshed.body);
-                    return error.UnexpectedHttpStatus;
-                }
-                return refreshed.body;
-            }
-            // Curl was available for the first attempt but not after refresh.
-            // Fall back to std.http below.
-        } else {
-            if (!options.allow_non_ok and curl_response.status != .ok) {
-                allocator.free(curl_response.body);
-                return error.UnexpectedHttpStatus;
-            }
-            return curl_response.body;
-        }
-    }
-
     const headers = try joinHeadersWithSession(allocator, session.*, options.extra_headers);
     defer allocator.free(headers);
 
@@ -367,81 +344,8 @@ fn joinHeadersWithSession(allocator: Allocator, session: cf.Session, headers: []
     return out;
 }
 
-fn fetchWithCurlSession(allocator: Allocator, session: cf.Session, url: []const u8, options: SessionFetchOptions) !?common.HttpResponse {
-    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer argv.deinit(allocator);
-
-    var owned_args: std.ArrayListUnmanaged([]u8) = .empty;
-    defer {
-        for (owned_args.items) |arg| allocator.free(arg);
-        owned_args.deinit(allocator);
-    }
-
-    try argv.appendSlice(allocator, &.{
-        "curl",
-        "-sS",
-        "--location",
-        "--max-time",
-        "45",
-        "--compressed",
-        "-X",
-        "GET",
-        "-A",
-        session.user_agent,
-    });
-
-    const cookie_header = try std.fmt.allocPrint(allocator, "Cookie: {s}", .{session.cookie_header});
-    try owned_args.append(allocator, cookie_header);
-    try argv.appendSlice(allocator, &.{ "-H", cookie_header });
-
-    if (options.accept) |accept| {
-        const accept_header = try std.fmt.allocPrint(allocator, "Accept: {s}", .{accept});
-        try owned_args.append(allocator, accept_header);
-        try argv.appendSlice(allocator, &.{ "-H", accept_header });
-    }
-
-    for (options.extra_headers) |h| {
-        if (std.ascii.eqlIgnoreCase(h.name, "cookie")) continue;
-        if (std.ascii.eqlIgnoreCase(h.name, "user-agent")) continue;
-        if (options.accept != null and std.ascii.eqlIgnoreCase(h.name, "accept")) continue;
-
-        const header_line = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ h.name, h.value });
-        try owned_args.append(allocator, header_line);
-        try argv.appendSlice(allocator, &.{ "-H", header_line });
-    }
-
-    try argv.appendSlice(allocator, &.{ "-w", "\n%{http_code}", url });
-
-    const run_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv.items,
-        .max_output_bytes = 8 * 1024 * 1024,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer allocator.free(run_result.stdout);
-    defer allocator.free(run_result.stderr);
-
-    switch (run_result.term) {
-        .Exited => |code| {
-            if (code != 0) return null;
-        },
-        else => return null,
-    }
-
-    const sep = std.mem.lastIndexOfScalar(u8, run_result.stdout, '\n') orelse return null;
-    const status_raw = std.mem.trim(u8, run_result.stdout[sep + 1 ..], " \t\r\n");
-    const status_code = std.fmt.parseInt(u10, status_raw, 10) catch return null;
-    const body = run_result.stdout[0..sep];
-
-    return .{
-        .status = @enumFromInt(status_code),
-        .body = try allocator.dupe(u8, body),
-    };
-}
-
-fn verifyDownloadHeadWithCurlSession(
+fn verifyDownloadHeadWithSession(
+    client: *std.http.Client,
     allocator: Allocator,
     session: cf.Session,
     url: []const u8,
@@ -451,63 +355,24 @@ fn verifyDownloadHeadWithCurlSession(
     phase.start();
     defer phase.finish();
 
-    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer argv.deinit(allocator);
-
-    var owned_args: std.ArrayListUnmanaged([]u8) = .empty;
-    defer {
-        for (owned_args.items) |arg| allocator.free(arg);
-        owned_args.deinit(allocator);
-    }
-
-    try argv.appendSlice(allocator, &.{
-        "curl",
-        "-sS",
-        "--location",
-        "--max-time",
-        "45",
-        "--compressed",
-        "-I",
-        "-A",
-        session.user_agent,
-    });
-
-    const cookie_header = try std.fmt.allocPrint(allocator, "Cookie: {s}", .{session.cookie_header});
-    try owned_args.append(allocator, cookie_header);
-    try argv.appendSlice(allocator, &.{ "-H", cookie_header });
-
+    var merged = std.ArrayList(std.http.Header).empty;
+    defer merged.deinit(allocator);
+    try merged.append(allocator, .{ .name = "cookie", .value = session.cookie_header });
+    try merged.append(allocator, .{ .name = "user-agent", .value = session.user_agent });
     for (headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "cookie")) continue;
         if (std.ascii.eqlIgnoreCase(h.name, "user-agent")) continue;
-        const header_line = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ h.name, h.value });
-        try owned_args.append(allocator, header_line);
-        try argv.appendSlice(allocator, &.{ "-H", header_line });
+        try merged.append(allocator, h);
     }
 
-    try argv.appendSlice(allocator, &.{ "-w", "\n%{http_code}", url });
-
-    const run_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv.items,
-        .max_output_bytes = 64 * 1024,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer allocator.free(run_result.stdout);
-    defer allocator.free(run_result.stderr);
-
-    switch (run_result.term) {
-        .Exited => |code| {
-            if (code != 0) return null;
-        },
-        else => return null,
-    }
-
-    const sep = std.mem.lastIndexOfScalar(u8, run_result.stdout, '\n') orelse return null;
-    const status_raw = std.mem.trim(u8, run_result.stdout[sep + 1 ..], " \t\r\n");
-    const status_code = std.fmt.parseInt(u10, status_raw, 10) catch return null;
-    return @enumFromInt(status_code);
+    const response = common.fetchBytes(client, allocator, url, .{
+        .method = .HEAD,
+        .extra_headers = merged.items,
+        .allow_non_ok = true,
+        .max_attempts = 1,
+    }) catch return null;
+    defer allocator.free(response.body);
+    return response.status;
 }
 
 fn parseLanguageFromCell(allocator: Allocator, cols: []const std.json.Value, idx: usize) !?[]const u8 {

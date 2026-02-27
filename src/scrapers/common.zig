@@ -103,7 +103,6 @@ fn selectorDebugEnabled() bool {
 }
 
 pub fn fetchBytes(client: *std.http.Client, allocator: Allocator, url: []const u8, opts: FetchOptions) !HttpResponse {
-    _ = client;
     var attempts: usize = 0;
     while (true) : (attempts += 1) {
         if (livePhaseLoggingEnabled()) {
@@ -113,8 +112,7 @@ pub fn fetchBytes(client: *std.http.Client, allocator: Allocator, url: []const u
             );
         }
 
-        const response = fetchBytesViaCurl(allocator, url, opts) catch |err| {
-            if (err == error.FileNotFound) return error.CurlUnavailable;
+        const response = fetchBytesViaHttp(client, allocator, url, opts) catch |err| {
             if (attempts + 1 < opts.max_attempts) {
                 sleepBackoff(opts.retry_initial_backoff_ms, attempts);
                 continue;
@@ -134,91 +132,50 @@ pub fn fetchBytes(client: *std.http.Client, allocator: Allocator, url: []const u
     }
 }
 
-fn fetchBytesViaCurl(allocator: Allocator, url: []const u8, opts: FetchOptions) !HttpResponse {
+fn fetchBytesViaHttp(client: *std.http.Client, allocator: Allocator, url: []const u8, opts: FetchOptions) !HttpResponse {
     var phase = LivePhase.init("http.fetch", url);
     phase.start();
     defer phase.finish();
 
-    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer argv.deinit(allocator);
-
-    var owned_args: std.ArrayListUnmanaged([]u8) = .empty;
-    defer {
-        for (owned_args.items) |arg| allocator.free(arg);
-        owned_args.deinit(allocator);
-    }
-
-    try argv.appendSlice(allocator, &.{
-        "curl",
-        "-sS",
-        "--location",
-        "--max-time",
-        "90",
-        "--compressed",
-        "--request",
-        methodToString(opts.method),
-    });
-
-    if (opts.payload) |payload| {
-        try argv.appendSlice(allocator, &.{ "--data-raw", payload });
-    }
+    var headers = std.ArrayList(std.http.Header).empty;
+    defer headers.deinit(allocator);
 
     if (opts.accept) |accept| {
         if (!hasHeader(opts.extra_headers, "accept")) {
-            const accept_header = try std.fmt.allocPrint(allocator, "accept: {s}", .{accept});
-            try owned_args.append(allocator, accept_header);
-            try argv.appendSlice(allocator, &.{ "-H", accept_header });
+            try headers.append(allocator, .{ .name = "accept", .value = accept });
         }
     }
 
     if (opts.content_type) |content_type| {
         if (!hasHeader(opts.extra_headers, "content-type")) {
-            const content_type_header = try std.fmt.allocPrint(allocator, "content-type: {s}", .{content_type});
-            try owned_args.append(allocator, content_type_header);
-            try argv.appendSlice(allocator, &.{ "-H", content_type_header });
+            try headers.append(allocator, .{ .name = "content-type", .value = content_type });
         }
     }
 
     if (!hasHeader(opts.extra_headers, "user-agent")) {
-        const user_agent_header = try std.fmt.allocPrint(allocator, "user-agent: {s}", .{default_user_agent});
-        try owned_args.append(allocator, user_agent_header);
-        try argv.appendSlice(allocator, &.{ "-H", user_agent_header });
+        try headers.append(allocator, .{ .name = "user-agent", .value = default_user_agent });
     }
 
-    for (opts.extra_headers) |h| {
-        const header_line = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ h.name, h.value });
-        try owned_args.append(allocator, header_line);
-        try argv.appendSlice(allocator, &.{ "-H", header_line });
-    }
+    try headers.appendSlice(allocator, opts.extra_headers);
 
     const normalized_url = try normalizeUrlForFetch(allocator, url);
     defer allocator.free(normalized_url);
 
-    try argv.appendSlice(allocator, &.{ "-w", "\n%{http_code}", normalized_url });
+    var body_writer = std.Io.Writer.Allocating.init(allocator);
+    defer body_writer.deinit();
 
-    const run_result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv.items,
-        .max_output_bytes = 128 * 1024 * 1024,
+    const fetched = try client.fetch(.{
+        .location = .{ .url = normalized_url },
+        .method = opts.method,
+        .payload = opts.payload,
+        .extra_headers = headers.items,
+        .response_writer = &body_writer.writer,
+        .redirect_behavior = std.http.Client.Request.RedirectBehavior.init(5),
     });
-    defer allocator.free(run_result.stdout);
-    defer allocator.free(run_result.stderr);
-
-    switch (run_result.term) {
-        .Exited => |code| {
-            if (code != 0) return error.ProcessTerminated;
-        },
-        else => return error.ProcessTerminated,
-    }
-
-    const sep = std.mem.lastIndexOfScalar(u8, run_result.stdout, '\n') orelse return error.InvalidField;
-    const status_raw = std.mem.trim(u8, run_result.stdout[sep + 1 ..], " \t\r\n");
-    const status_code = std.fmt.parseInt(u10, status_raw, 10) catch return error.InvalidField;
-    const body = run_result.stdout[0..sep];
 
     return .{
-        .status = @enumFromInt(status_code),
-        .body = try allocator.dupe(u8, body),
+        .status = fetched.status,
+        .body = try allocator.dupe(u8, body_writer.writer.buffered()),
     };
 }
 

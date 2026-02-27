@@ -334,10 +334,7 @@ fn appendSearchResults(
     options: SearchOptions,
     auth: *Auth,
 ) !void {
-    _ = options.include_seasons;
-    _ = options.limit_per_page;
-
-    const payload = try buildSearchPayload(allocator, query);
+    const payload = try buildSearchPayload(allocator, query, options.include_seasons, options.limit_per_page);
 
     var response = try postJson(client, allocator, api_base ++ "/movie/search", payload, auth.*, true);
     if (response.status == .forbidden and options.auto_cloudflare_session) {
@@ -404,12 +401,19 @@ fn appendSearchResults(
     }
 }
 
-fn buildSearchPayload(allocator: Allocator, query: []const u8) ![]const u8 {
+fn buildSearchPayload(allocator: Allocator, query: []const u8, include_seasons: bool, limit: usize) ![]const u8 {
+    const escaped_query = try escapeJson(allocator, query);
+    defer allocator.free(escaped_query);
+
+    const effective_limit = if (limit == 0) 5000 else limit;
+
     return std.fmt.allocPrint(
         allocator,
-        "{{\"query\":\"{s}\",\"signal\":{{}},\"includeSeasons\":false,\"limit\":9999}}",
+        "{{\"query\":\"{s}\",\"includeSeasons\":{s},\"limit\":{d}}}",
         .{
-            try escapeJson(allocator, query),
+            escaped_query,
+            if (include_seasons) "true" else "false",
+            effective_limit,
         },
     );
 }
@@ -603,10 +607,20 @@ test "subsource absolute site link normalization" {
 
 test "subsource search payload is fixed schema" {
     const allocator = std.testing.allocator;
-    const payload = try buildSearchPayload(allocator, "The Matrix");
+    const payload = try buildSearchPayload(allocator, "The Matrix", true, 5000);
     defer allocator.free(payload);
     try std.testing.expectEqualStrings(
-        "{\"query\":\"The Matrix\",\"signal\":{},\"includeSeasons\":false,\"limit\":9999}",
+        "{\"query\":\"The Matrix\",\"includeSeasons\":true,\"limit\":5000}",
+        payload,
+    );
+}
+
+test "subsource search payload defaults limit when zero" {
+    const allocator = std.testing.allocator;
+    const payload = try buildSearchPayload(allocator, "The Matrix", false, 0);
+    defer allocator.free(payload);
+    try std.testing.expectEqualStrings(
+        "{\"query\":\"The Matrix\",\"includeSeasons\":false,\"limit\":5000}",
         payload,
     );
 }
