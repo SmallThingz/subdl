@@ -1,5 +1,6 @@
 const std = @import("std");
 const scrapers = @import("scrapers");
+const runtime_alloc = @import("runtime_alloc");
 
 const app = scrapers.providers_app;
 
@@ -13,9 +14,9 @@ const Config = struct {
 };
 
 pub fn main() !void {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
+    var allocator_state = runtime_alloc.RuntimeAllocator.init();
+    defer allocator_state.deinit();
+    const allocator = allocator_state.allocator();
 
     var stdout_buf: [8192]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
@@ -25,7 +26,7 @@ pub fn main() !void {
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
     const stderr = &stderr_writer.interface;
 
-    const config = parseArgs(gpa, stderr) catch |err| {
+    const config = parseArgs(allocator, stderr) catch |err| {
         try stderr.print("argument error: {s}\n\n", .{@errorName(err)});
         try printUsage(stderr);
         try stderr.flush();
@@ -44,10 +45,10 @@ pub fn main() !void {
         std.process.exit(2);
     };
 
-    var client: std.http.Client = .{ .allocator = gpa };
+    var client: std.http.Client = .{ .allocator = allocator };
     defer client.deinit();
 
-    var search = app.search(gpa, &client, config.provider, query) catch |err| {
+    var search = app.search(allocator, &client, config.provider, query) catch |err| {
         try stderr.print("search failed: {s}\n", .{@errorName(err)});
         try stderr.flush();
         std.process.exit(1);
@@ -73,7 +74,7 @@ pub fn main() !void {
         std.process.exit(2);
     }
 
-    var subtitles = app.fetchSubtitles(gpa, &client, search.items[config.title_index].ref) catch |err| {
+    var subtitles = app.fetchSubtitles(allocator, &client, search.items[config.title_index].ref) catch |err| {
         try stderr.print("subtitle fetch failed: {s}\n", .{@errorName(err)});
         try stderr.flush();
         std.process.exit(1);
@@ -112,12 +113,12 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
-    var result = app.downloadSubtitle(gpa, &client, selected, config.out_dir) catch |err| {
+    var result = app.downloadSubtitle(allocator, &client, selected, config.out_dir) catch |err| {
         try stderr.print("download failed: {s}\n", .{@errorName(err)});
         try stderr.flush();
         std.process.exit(1);
     };
-    defer result.deinit(gpa);
+    defer result.deinit(allocator);
 
     try stdout.print("\nDownloaded:\n", .{});
     try stdout.print("  Provider: {s}\n", .{app.providerName(config.provider)});

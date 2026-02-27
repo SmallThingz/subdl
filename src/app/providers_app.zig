@@ -1,5 +1,6 @@
 const std = @import("std");
 const subdl = @import("../scrapers/subdl.zig");
+const runtime_alloc = @import("runtime_alloc");
 
 const Allocator = std.mem.Allocator;
 const common = subdl.common;
@@ -2366,9 +2367,9 @@ fn runProviderSmokeWorker(state: *ProviderSmokeState) void {
         }
     }
 
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa_state.deinit();
-    const allocator = gpa_state.allocator();
+    var allocator_state = runtime_alloc.RuntimeAllocator.init();
+    defer allocator_state.deinit();
+    const allocator = allocator_state.allocator();
 
     var client: std.http.Client = .{ .allocator = allocator };
     defer client.deinit();

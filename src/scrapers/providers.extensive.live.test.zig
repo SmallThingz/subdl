@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime_alloc = @import("runtime_alloc");
 
 const common = @import("common.zig");
 const suite = @import("test_suite.zig");
@@ -75,9 +76,9 @@ fn runExtensiveProbe(
         std.debug.print("[live][extensive][{s}] test_end elapsed_ms={d}\n", .{ provider_name, elapsed_ms });
     }
 
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa_state.deinit();
-    const allocator = gpa_state.allocator();
+    var allocator_state = runtime_alloc.RuntimeAllocator.init();
+    defer allocator_state.deinit();
+    const allocator = allocator_state.allocator();
 
     var client: std.http.Client = .{ .allocator = allocator };
     defer client.deinit();

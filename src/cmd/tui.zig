@@ -2,6 +2,7 @@ const std = @import("std");
 const scrapers = @import("scrapers");
 const vaxis = @import("vaxis");
 const builtin = @import("builtin");
+const runtime_alloc = @import("runtime_alloc");
 
 const app = scrapers.providers_app;
 
@@ -244,21 +245,21 @@ const Ui = struct {
 };
 
 pub fn main() !void {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
+    var allocator_state = runtime_alloc.RuntimeAllocator.init();
+    defer allocator_state.deinit();
+    const allocator = allocator_state.allocator();
 
-    var client: std.http.Client = .{ .allocator = gpa };
+    var client: std.http.Client = .{ .allocator = allocator };
     defer client.deinit();
 
     var tty_buffer: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(&tty_buffer);
     defer tty.deinit();
 
-    var vx = try vaxis.init(gpa, .{
+    var vx = try vaxis.init(allocator, .{
         .kitty_keyboard_flags = .{ .report_events = true },
     });
-    defer vx.deinit(gpa, tty.writer());
+    defer vx.deinit(allocator, tty.writer());
 
     var loop: vaxis.Loop(Event) = .{
         .vaxis = &vx,
@@ -272,11 +273,11 @@ pub fn main() !void {
     try vx.queryTerminal(tty.writer(), 1 * std.time.ns_per_s);
 
     var ui: Ui = .{
-        .allocator = gpa,
+        .allocator = allocator,
         .tty = &tty,
         .vx = &vx,
         .loop = &loop,
-        .frame_arena = std.heap.ArenaAllocator.init(gpa),
+        .frame_arena = std.heap.ArenaAllocator.init(allocator),
     };
     defer ui.frame_arena.deinit();
 

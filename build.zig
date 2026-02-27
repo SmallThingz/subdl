@@ -54,6 +54,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const runtime_alloc_mod = b.createModule(.{
+        .root_source_file = b.path("src/alloc/runtime_allocator.zig"),
+        .target = target,
+    });
     const subdl_mod = b.addModule("subdl", .{
         .root_source_file = b.path("src/scrapers/subdl.zig"),
         .target = target,
@@ -61,6 +65,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "htmlparser", .module = htmlparser_compat_mod },
             .{ .name = "alldriver", .module = alldriver_dep.module("alldriver") },
             .{ .name = "build_options", .module = build_options_mod },
+            .{ .name = "runtime_alloc", .module = runtime_alloc_mod },
         },
     });
     const scrapers_mod = b.addModule("scrapers", .{
@@ -70,6 +75,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "htmlparser", .module = htmlparser_compat_mod },
             .{ .name = "alldriver", .module = alldriver_dep.module("alldriver") },
             .{ .name = "build_options", .module = build_options_mod },
+            .{ .name = "runtime_alloc", .module = runtime_alloc_mod },
         },
     });
 
@@ -81,6 +87,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "scrapers", .module = scrapers_mod },
+                .{ .name = "runtime_alloc", .module = runtime_alloc_mod },
             },
         }),
     });
@@ -95,6 +102,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "scrapers", .module = scrapers_mod },
                 .{ .name = "vaxis", .module = libvaxis_dep.module("vaxis") },
+                .{ .name = "runtime_alloc", .module = runtime_alloc_mod },
             },
         }),
     });
