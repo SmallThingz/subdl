@@ -556,6 +556,7 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
                     .has_prev = search_result.has_prev_page,
                     .has_next = search_result.has_next_page,
                 };
+                const page_nav_opt: ?PageNav = if (page_nav.enabled) page_nav else null;
                 const title_choice = try vaxisSelect(
                     ui,
                     "Select Title",
@@ -563,7 +564,7 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
                     title_labels,
                     null,
                     null,
-                    page_nav,
+                    page_nav_opt,
                 );
 
                 const title_idx = switch (title_choice) {
@@ -692,13 +693,14 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
                         .has_prev = subtitles.has_prev_page,
                         .has_next = subtitles.has_next_page,
                     };
+                    const subtitle_page_nav_opt: ?PageNav = if (subtitle_page_nav.enabled) subtitle_page_nav else null;
                     const subtitle_choice = try vaxisSelectSubtitle(
                         ui,
                         "Select Subtitle",
                         "s sort, / filter, [ prev page, ] next page, Esc titles.",
                         subtitles.items,
                         subtitle_enabled,
-                        subtitle_page_nav,
+                        subtitle_page_nav_opt,
                     );
 
                     const subtitle_idx = switch (subtitle_choice) {
@@ -1123,8 +1125,8 @@ fn vaxisSelect(
             "j/k or arrows move | Enter select | / filter | Esc back";
 
         var count_buf: [96]u8 = undefined;
-        const count_line = if (page_nav) |pn|
-            std.fmt.bufPrint(&count_buf, "Visible: {d}/{d} | Page: {d}", .{ matches.items.len, options.len, pn.page }) catch "Visible: ?"
+        const count_line = if (can_page)
+            std.fmt.bufPrint(&count_buf, "Visible: {d}/{d} | Page: {d}", .{ matches.items.len, options.len, page_nav.?.page }) catch "Visible: ?"
         else
             std.fmt.bufPrint(&count_buf, "Visible: {d}/{d}", .{ matches.items.len, options.len }) catch "Visible: ?";
 
@@ -1345,8 +1347,8 @@ fn vaxisSelectSubtitle(
             "j/k or arrows move | Enter select | s sort | / filter | Esc back";
 
         var count_buf: [96]u8 = undefined;
-        const count_line = if (page_nav) |pn|
-            std.fmt.bufPrint(&count_buf, "Visible: {d}/{d} | Page: {d}", .{ matches.items.len, subtitles.len, pn.page }) catch "Visible: ?"
+        const count_line = if (can_page)
+            std.fmt.bufPrint(&count_buf, "Visible: {d}/{d} | Page: {d}", .{ matches.items.len, subtitles.len, page_nav.?.page }) catch "Visible: ?"
         else
             std.fmt.bufPrint(&count_buf, "Visible: {d}/{d}", .{ matches.items.len, subtitles.len }) catch "Visible: ?";
 
