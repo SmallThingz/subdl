@@ -100,31 +100,9 @@ fn selectorDebugEnabled() bool {
 }
 
 pub fn fetchBytes(client: *std.http.Client, allocator: Allocator, url: []const u8, opts: FetchOptions) !HttpResponse {
+    _ = client;
     var attempts: usize = 0;
     while (true) : (attempts += 1) {
-        var writer = std.Io.Writer.Allocating.init(allocator);
-        errdefer writer.deinit();
-
-        var header_buf: [16]std.http.Header = undefined;
-        var header_len: usize = 0;
-        if (opts.accept) |accept| {
-            header_buf[header_len] = .{ .name = "accept", .value = accept };
-            header_len += 1;
-        }
-        if (opts.content_type) |content_type| {
-            header_buf[header_len] = .{ .name = "content-type", .value = content_type };
-            header_len += 1;
-        }
-        if (!hasHeader(opts.extra_headers, "user-agent")) {
-            header_buf[header_len] = .{ .name = "user-agent", .value = default_user_agent };
-            header_len += 1;
-        }
-        for (opts.extra_headers) |h| {
-            if (header_len >= header_buf.len) return error.OutOfMemory;
-            header_buf[header_len] = h;
-            header_len += 1;
-        }
-
         if (livePhaseLoggingEnabled()) {
             std.debug.print(
                 "[live][phase][http.fetch] method={s} attempt={d}/{d} url={s}\n",
@@ -132,40 +110,124 @@ pub fn fetchBytes(client: *std.http.Client, allocator: Allocator, url: []const u
             );
         }
 
-        const result = blk: {
-            var phase = LivePhase.init("http.fetch", url);
-            phase.start();
-            defer phase.finish();
-
-            break :blk client.fetch(.{
-                .location = .{ .url = url },
-                .method = opts.method,
-                .payload = opts.payload,
-                .extra_headers = header_buf[0..header_len],
-                .response_writer = &writer.writer,
-            });
-        } catch |err| {
+        const response = fetchBytesViaCurl(allocator, url, opts) catch |err| {
+            if (err == error.FileNotFound) return error.CurlUnavailable;
             if (attempts + 1 < opts.max_attempts) {
                 sleepBackoff(opts.retry_initial_backoff_ms, attempts);
                 continue;
             }
             return err;
         };
-
-        const body = try writer.toOwnedSlice();
-        if (result.status == .too_many_requests and opts.retry_on_429 and attempts + 1 < opts.max_attempts) {
-            allocator.free(body);
+        if (response.status == .too_many_requests and opts.retry_on_429 and attempts + 1 < opts.max_attempts) {
+            allocator.free(response.body);
             sleepBackoff(opts.retry_initial_backoff_ms, attempts);
             continue;
         }
-
-        if (!opts.allow_non_ok and result.status != .ok) {
-            allocator.free(body);
+        if (!opts.allow_non_ok and response.status != .ok) {
+            allocator.free(response.body);
             return error.UnexpectedHttpStatus;
         }
-
-        return .{ .status = result.status, .body = body };
+        return response;
     }
+}
+
+fn fetchBytesViaCurl(allocator: Allocator, url: []const u8, opts: FetchOptions) !HttpResponse {
+    var phase = LivePhase.init("http.fetch", url);
+    phase.start();
+    defer phase.finish();
+
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv.deinit(allocator);
+
+    var owned_args: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (owned_args.items) |arg| allocator.free(arg);
+        owned_args.deinit(allocator);
+    }
+
+    try argv.appendSlice(allocator, &.{
+        "curl",
+        "-sS",
+        "--location",
+        "--max-time",
+        "90",
+        "--compressed",
+        "--request",
+        methodToString(opts.method),
+    });
+
+    if (opts.payload) |payload| {
+        try argv.appendSlice(allocator, &.{ "--data-raw", payload });
+    }
+
+    if (opts.accept) |accept| {
+        if (!hasHeader(opts.extra_headers, "accept")) {
+            const accept_header = try std.fmt.allocPrint(allocator, "accept: {s}", .{accept});
+            try owned_args.append(allocator, accept_header);
+            try argv.appendSlice(allocator, &.{ "-H", accept_header });
+        }
+    }
+
+    if (opts.content_type) |content_type| {
+        if (!hasHeader(opts.extra_headers, "content-type")) {
+            const content_type_header = try std.fmt.allocPrint(allocator, "content-type: {s}", .{content_type});
+            try owned_args.append(allocator, content_type_header);
+            try argv.appendSlice(allocator, &.{ "-H", content_type_header });
+        }
+    }
+
+    if (!hasHeader(opts.extra_headers, "user-agent")) {
+        const user_agent_header = try std.fmt.allocPrint(allocator, "user-agent: {s}", .{default_user_agent});
+        try owned_args.append(allocator, user_agent_header);
+        try argv.appendSlice(allocator, &.{ "-H", user_agent_header });
+    }
+
+    for (opts.extra_headers) |h| {
+        const header_line = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ h.name, h.value });
+        try owned_args.append(allocator, header_line);
+        try argv.appendSlice(allocator, &.{ "-H", header_line });
+    }
+
+    try argv.appendSlice(allocator, &.{ "-w", "\n%{http_code}", url });
+
+    const run_result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv.items,
+        .max_output_bytes = 128 * 1024 * 1024,
+    });
+    defer allocator.free(run_result.stdout);
+    defer allocator.free(run_result.stderr);
+
+    switch (run_result.term) {
+        .Exited => |code| {
+            if (code != 0) return error.ProcessTerminated;
+        },
+        else => return error.ProcessTerminated,
+    }
+
+    const sep = std.mem.lastIndexOfScalar(u8, run_result.stdout, '\n') orelse return error.InvalidField;
+    const status_raw = std.mem.trim(u8, run_result.stdout[sep + 1 ..], " \t\r\n");
+    const status_code = std.fmt.parseInt(u10, status_raw, 10) catch return error.InvalidField;
+    const body = run_result.stdout[0..sep];
+
+    return .{
+        .status = @enumFromInt(status_code),
+        .body = try allocator.dupe(u8, body),
+    };
+}
+
+fn methodToString(method: std.http.Method) []const u8 {
+    return switch (method) {
+        .GET => "GET",
+        .HEAD => "HEAD",
+        .POST => "POST",
+        .PUT => "PUT",
+        .DELETE => "DELETE",
+        .CONNECT => "CONNECT",
+        .OPTIONS => "OPTIONS",
+        .TRACE => "TRACE",
+        .PATCH => "PATCH",
+    };
 }
 
 fn hasHeader(headers: []const std.http.Header, wanted_name: []const u8) bool {

@@ -200,10 +200,12 @@ fn parseTranslateSpec(allocator: Allocator, onclick: []const u8) !TranslateSpec 
         if (folder == null and std.mem.startsWith(u8, arg, "/")) folder = arg;
     }
 
-    if (filename != null and folder != null) {
-        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ folder.?, filename.? });
-        defer allocator.free(path);
-        return .{ .source_url = try common.resolveUrl(allocator, site, path) };
+    if (filename) |filename_value| {
+        if (folder) |folder_value| {
+            const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ folder_value, filename_value });
+            defer allocator.free(path);
+            return .{ .source_url = try common.resolveUrl(allocator, site, path) };
+        }
     }
 
     if (filename) |f| return .{ .source_url = try common.resolveUrl(allocator, site, f) };

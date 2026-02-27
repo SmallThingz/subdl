@@ -74,7 +74,7 @@ pub fn ensureDomainSession(allocator: Allocator, options: EnsureDomainOptions) !
         url
     else blk: {
         owned_challenge_url = try std.fmt.allocPrint(allocator, "https://{s}/", .{normalized_domain});
-        break :blk owned_challenge_url.?;
+        break :blk owned_challenge_url orelse return error.OutOfMemory;
     };
 
     const now = std.time.timestamp();

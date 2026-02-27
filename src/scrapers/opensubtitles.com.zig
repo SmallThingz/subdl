@@ -258,7 +258,7 @@ pub const Scraper = struct {
         const parsed = parseFileDownload(body);
         if (parsed.url == null) return .{ .filename = null, .verified_url = null };
 
-        const url = parsed.url.?;
+        const url = parsed.url orelse return .{ .filename = parsed.filename, .verified_url = null };
         const verify_referer = try std.fmt.allocPrint(allocator, "{s}/{s}/", .{ site, language });
         const verify_headers = [_]std.http.Header{
             .{ .name = "cookie", .value = session.cookie_header },

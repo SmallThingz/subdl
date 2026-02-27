@@ -167,8 +167,9 @@ fn firstAndLastTd(row: html.Node) ?struct { first: html.Node, last: html.Node } 
         if (first == null) first = child;
         last = child;
     }
-    if (first == null or last == null) return null;
-    return .{ .first = first.?, .last = last.? };
+    const first_td = first orelse return null;
+    const last_td = last orelse return null;
+    return .{ .first = first_td, .last = last_td };
 }
 
 fn findFirstLinkByPredicate(doc: *const html.Document, predicate: fn ([]const u8) bool) ?html.Node {

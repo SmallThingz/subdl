@@ -355,12 +355,12 @@ pub const Scraper = struct {
             else => return .{ .download_token = null, .download_url = null },
         };
 
-        const token = objString(subtitle_obj, "download_token");
-        if (token == null or token.?.len == 0) return .{ .download_token = null, .download_url = null };
+        const token = objString(subtitle_obj, "download_token") orelse return .{ .download_token = null, .download_url = null };
+        if (token.len == 0) return .{ .download_token = null, .download_url = null };
 
         return .{
             .download_token = token,
-            .download_url = try std.fmt.allocPrint(allocator, "{s}/subtitle/download/{s}", .{ api_base, token.? }),
+            .download_url = try std.fmt.allocPrint(allocator, "{s}/subtitle/download/{s}", .{ api_base, token }),
         };
     }
 };
