@@ -17,6 +17,7 @@ pub const SearchOptions = struct {
 
 pub const SubtitlesOptions = struct {
     include_seasons: bool = true,
+    page_start_per_entry: usize = 1,
     max_pages_per_entry: usize = 1,
     resolve_download_links: bool = false,
 };
@@ -41,6 +42,9 @@ pub const SubtitleItem = struct {
 pub const SearchResponse = struct {
     arena: std.heap.ArenaAllocator,
     items: []const SearchItem,
+    page: usize = 1,
+    has_prev_page: bool = false,
+    has_next_page: bool = false,
 
     pub fn deinit(self: *SearchResponse) void {
         self.arena.deinit();
@@ -51,6 +55,9 @@ pub const SearchResponse = struct {
 pub const SubtitlesResponse = struct {
     arena: std.heap.ArenaAllocator,
     subtitles: []const SubtitleItem,
+    page: usize = 1,
+    has_prev_page: bool = false,
+    has_next_page: bool = false,
 
     pub fn deinit(self: *SubtitlesResponse) void {
         self.arena.deinit();
@@ -82,10 +89,14 @@ pub const Scraper = struct {
 
         const max_pages = if (options.max_pages == 0) 1 else options.max_pages;
         var page = if (options.page_start == 0) 1 else options.page_start;
+        const page_start = page;
         var next_url: ?[]const u8 = null;
+        var last_page = page_start;
+        var has_next_page = false;
 
         var traversed: usize = 0;
         while (traversed < max_pages) : (traversed += 1) {
+            last_page = page;
             const page_url = if (next_url) |u| u else try buildSearchUrl(a, query, page);
             const response = try common.fetchBytes(self.client, a, page_url, .{ .accept = "text/html", .max_attempts = 2, .allow_non_ok = true });
             if (response.body.len == 0) break;
@@ -118,12 +129,19 @@ pub const Scraper = struct {
             }
 
             next_url = try extractNextPageUrl(a, &parsed.doc, page_url);
+            has_next_page = next_url != null;
             page += 1;
             if (next_url == null and options.page_start > 1) break;
             if (next_url == null and page > 128) break;
         }
 
-        return .{ .arena = arena, .items = try out.toOwnedSlice(a) };
+        return .{
+            .arena = arena,
+            .items = try out.toOwnedSlice(a),
+            .page = last_page,
+            .has_prev_page = last_page > 1,
+            .has_next_page = has_next_page,
+        };
     }
 
     pub fn fetchSubtitlesByDetailsLink(self: *Scraper, details_url: []const u8, media_kind: MediaKind) !SubtitlesResponse {
@@ -157,16 +175,24 @@ pub const Scraper = struct {
         }
 
         var entry_seen = std.StringHashMapUnmanaged(void).empty;
+        var has_next_page = false;
+        var observed_page = if (options.page_start_per_entry == 0) 1 else options.page_start_per_entry;
 
         for (page_urls.items) |entry_url| {
             if (entry_seen.contains(entry_url)) continue;
             try entry_seen.put(a, entry_url, {});
 
-            var cursor_url: ?[]const u8 = entry_url;
+            const page_start = if (options.page_start_per_entry == 0) 1 else options.page_start_per_entry;
+            var page_number = page_start;
+            var cursor_url: ?[]const u8 = if (page_start <= 1)
+                entry_url
+            else
+                try addOrReplacePageQuery(a, entry_url, page_start);
             var traversed: usize = 0;
             const max_pages = if (options.max_pages_per_entry == 0) 1 else options.max_pages_per_entry;
             while (cursor_url) |page_url| : (traversed += 1) {
                 if (traversed >= max_pages) break;
+                observed_page = page_number;
 
                 const response = try common.fetchBytes(self.client, a, page_url, .{ .accept = "text/html", .max_attempts = 2, .allow_non_ok = true });
                 if (response.body.len == 0) break;
@@ -221,16 +247,24 @@ pub const Scraper = struct {
                 }
 
                 const next = try extractNextPageUrl(a, &parsed.doc, page_url);
+                has_next_page = next != null;
                 if (next) |next_page| {
                     if (std.mem.eql(u8, next_page, page_url)) break;
                     cursor_url = next_page;
+                    page_number += 1;
                 } else {
                     cursor_url = null;
                 }
             }
         }
 
-        return .{ .arena = arena, .subtitles = try subtitles.toOwnedSlice(a) };
+        return .{
+            .arena = arena,
+            .subtitles = try subtitles.toOwnedSlice(a),
+            .page = observed_page,
+            .has_prev_page = observed_page > 1,
+            .has_next_page = has_next_page,
+        };
     }
 
     pub fn resolveDownloadPageUrl(self: *Scraper, allocator: Allocator, download_page_url: []const u8) ![]const u8 {
@@ -252,6 +286,23 @@ fn buildSearchUrl(allocator: Allocator, query: []const u8, page: usize) ![]const
     const encoded = try common.encodeUriComponent(allocator, query);
     if (page <= 1) return std.fmt.allocPrint(allocator, "{s}/search.php?key={s}", .{ site, encoded });
     return std.fmt.allocPrint(allocator, "{s}/search.php?key={s}&page={d}", .{ site, encoded, page });
+}
+
+fn addOrReplacePageQuery(allocator: Allocator, base_url: []const u8, page: usize) ![]const u8 {
+    if (page <= 1) return try allocator.dupe(u8, base_url);
+
+    if (std.mem.indexOf(u8, base_url, "page=")) |idx| {
+        const end = std.mem.indexOfAnyPos(u8, base_url, idx, "&?#") orelse base_url.len;
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        try out.appendSlice(allocator, base_url[0..idx]);
+        try out.writer(allocator).print("page={d}", .{page});
+        try out.appendSlice(allocator, base_url[end..]);
+        return try out.toOwnedSlice(allocator);
+    }
+
+    const sep: u8 = if (std.mem.indexOfScalar(u8, base_url, '?') == null) '?' else '&';
+    return try std.fmt.allocPrint(allocator, "{s}{c}page={d}", .{ base_url, sep, page });
 }
 
 fn extractNextPageUrl(allocator: Allocator, doc: *const html.Document, current_url: []const u8) !?[]const u8 {

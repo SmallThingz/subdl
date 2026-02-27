@@ -37,6 +37,9 @@ pub const SubtitleItem = struct {
 pub const SearchResponse = struct {
     arena: std.heap.ArenaAllocator,
     items: []const SearchItem,
+    page: usize = 1,
+    has_prev_page: bool = false,
+    has_next_page: bool = false,
 
     pub fn deinit(self: *SearchResponse) void {
         self.arena.deinit();
@@ -48,6 +51,9 @@ pub const SubtitlesResponse = struct {
     arena: std.heap.ArenaAllocator,
     title: []const u8,
     subtitles: []const SubtitleItem,
+    page: usize = 1,
+    has_prev_page: bool = false,
+    has_next_page: bool = false,
 
     pub fn deinit(self: *SubtitlesResponse) void {
         self.arena.deinit();
@@ -79,10 +85,14 @@ pub const Scraper = struct {
 
         const max_pages = if (options.max_pages == 0) 1 else options.max_pages;
         var page = if (options.page_start == 0) 1 else options.page_start;
+        const page_start = page;
         var next_url: ?[]const u8 = null;
         var traversed: usize = 0;
+        var last_page = page_start;
+        var has_next_page = false;
 
         while (traversed < max_pages) : (traversed += 1) {
+            last_page = page;
             const page_url = if (next_url) |u| u else try buildSearchUrl(a, query, page);
             const response = try self.fetchHtmlPreferCurl(a, page_url);
             if (response.body.len == 0) break;
@@ -104,10 +114,13 @@ pub const Scraper = struct {
                 try collectSearchItemsFromRawHtml(a, response.body, &seen, &out);
             }
 
+            const extracted_next = try extractNextPageUrl(a, &parsed.doc, page_url);
+            has_next_page = extracted_next != null;
+
             if (next_url != null) {
-                next_url = try extractNextPageUrl(a, &parsed.doc, page_url);
+                next_url = extracted_next;
             } else {
-                next_url = try extractNextPageUrl(a, &parsed.doc, page_url);
+                next_url = extracted_next;
                 page += 1;
             }
 
@@ -118,7 +131,13 @@ pub const Scraper = struct {
             }
         }
 
-        return .{ .arena = arena, .items = try out.toOwnedSlice(a) };
+        return .{
+            .arena = arena,
+            .items = try out.toOwnedSlice(a),
+            .page = last_page,
+            .has_prev_page = last_page > 1,
+            .has_next_page = has_next_page,
+        };
     }
 
     pub fn fetchSubtitlesByMovieLink(self: *Scraper, details_url: []const u8) !SubtitlesResponse {
@@ -137,10 +156,14 @@ pub const Scraper = struct {
 
         const max_pages = if (options.max_pages == 0) 1 else options.max_pages;
         var page = if (options.page_start == 0) 1 else options.page_start;
+        const page_start = page;
         var next_url: ?[]const u8 = if (options.page_start > 1) try addOrReplacePageQuery(a, details_url, page) else null;
+        var last_page = page_start;
+        var has_next_page = false;
 
         var traversed: usize = 0;
         while (traversed < max_pages) : (traversed += 1) {
+            last_page = page;
             const page_url = if (next_url) |u| u else if (page == 1) details_url else try addOrReplacePageQuery(a, details_url, page);
             const response = try self.fetchHtmlPreferCurl(a, page_url);
             if (response.body.len == 0) break;
@@ -188,12 +211,20 @@ pub const Scraper = struct {
             }
 
             next_url = try extractNextPageUrl(a, &parsed.doc, page_url);
+            has_next_page = next_url != null;
             page += 1;
             if (next_url == null and page > 128) break;
             if (next_url == null and options.page_start > 1) break;
         }
 
-        return .{ .arena = arena, .title = title, .subtitles = try out.toOwnedSlice(a) };
+        return .{
+            .arena = arena,
+            .title = title,
+            .subtitles = try out.toOwnedSlice(a),
+            .page = last_page,
+            .has_prev_page = last_page > 1,
+            .has_next_page = has_next_page,
+        };
     }
 
     fn fetchHtmlPreferCurl(self: *Scraper, allocator: Allocator, url: []const u8) !common.HttpResponse {

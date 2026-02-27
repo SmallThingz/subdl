@@ -56,6 +56,9 @@ pub const SearchResponse = struct {
     arena: std.heap.ArenaAllocator,
     query_used: []const u8,
     items: []const SearchItem,
+    page: usize = 1,
+    has_prev_page: bool = false,
+    has_next_page: bool = false,
 
     pub fn deinit(self: *SearchResponse) void {
         self.arena.deinit();
@@ -67,6 +70,9 @@ pub const SubtitlesResponse = struct {
     arena: std.heap.ArenaAllocator,
     title: []const u8,
     subtitles: []const SubtitleItem,
+    page: usize = 1,
+    has_prev_page: bool = false,
+    has_next_page: bool = false,
 
     pub fn deinit(self: *SubtitlesResponse) void {
         self.arena.deinit();
@@ -106,9 +112,13 @@ pub const Scraper = struct {
 
         const max_pages = if (options.max_pages == 0) 1 else options.max_pages;
         var page = if (options.page_start == 0) 1 else options.page_start;
+        const page_start = page;
         var traversed: usize = 0;
+        var last_page = page_start;
+        var has_next_page = false;
 
         while (traversed < max_pages) : (traversed += 1) {
+            last_page = page;
             const payload = try std.fmt.allocPrint(
                 a,
                 "{{\"query\":\"{s}\",\"includeSeasons\":{s},\"limit\":{d},\"page\":{d},\"offset\":{d}}}",
@@ -140,6 +150,7 @@ pub const Scraper = struct {
                 .array => |arr| arr,
                 else => break,
             };
+            has_next_page = false;
 
             var new_count: usize = 0;
             for (results.items) |entry| {
@@ -191,7 +202,14 @@ pub const Scraper = struct {
             page += 1;
         }
 
-        return .{ .arena = arena, .query_used = query_used, .items = try out.toOwnedSlice(a) };
+        return .{
+            .arena = arena,
+            .query_used = query_used,
+            .items = try out.toOwnedSlice(a),
+            .page = last_page,
+            .has_prev_page = last_page > 1,
+            .has_next_page = has_next_page,
+        };
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
@@ -300,7 +318,15 @@ pub const Scraper = struct {
             }
         }
 
-        return .{ .arena = arena, .title = item.title, .subtitles = try out.toOwnedSlice(a) };
+        const current_page = if (options.page_start == 0) 1 else options.page_start;
+        return .{
+            .arena = arena,
+            .title = item.title,
+            .subtitles = try out.toOwnedSlice(a),
+            .page = current_page,
+            .has_prev_page = current_page > 1,
+            .has_next_page = false,
+        };
     }
 
     const SubtitleDetails = struct {

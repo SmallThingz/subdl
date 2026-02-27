@@ -57,6 +57,20 @@ pub fn providerName(provider: Provider) []const u8 {
     };
 }
 
+pub fn providerSupportsSearchPagination(provider: Provider) bool {
+    return switch (provider) {
+        .isubtitles_org, .my_subs_co, .tvsubtitles_net => true,
+        else => false,
+    };
+}
+
+pub fn providerSupportsSubtitlesPagination(provider: Provider) bool {
+    return switch (provider) {
+        .isubtitles_org, .my_subs_co, .tvsubtitles_net => true,
+        else => false,
+    };
+}
+
 pub fn parseProvider(value: []const u8) ?Provider {
     if (matchesProvider(value, "subdl") or matchesProvider(value, "subdl_com")) return .subdl_com;
     if (matchesProvider(value, "opensubtitles_com")) return .opensubtitles_com;
@@ -162,6 +176,9 @@ pub const SearchResponse = struct {
     arena: std.heap.ArenaAllocator,
     provider: Provider,
     items: []const SearchChoice,
+    page: usize = 1,
+    has_prev_page: bool = false,
+    has_next_page: bool = false,
 
     pub fn deinit(self: *SearchResponse) void {
         self.arena.deinit();
@@ -181,6 +198,9 @@ pub const SubtitlesResponse = struct {
     provider: Provider,
     title: []const u8,
     items: []const SubtitleChoice,
+    page: usize = 1,
+    has_prev_page: bool = false,
+    has_next_page: bool = false,
 
     pub fn deinit(self: *SubtitlesResponse) void {
         self.arena.deinit();
@@ -487,6 +507,116 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
     };
 }
 
+pub fn searchPage(allocator: Allocator, client: *std.http.Client, provider: Provider, query: []const u8, page: usize) !SearchResponse {
+    const requested_page = if (page == 0) 1 else page;
+    if (!providerSupportsSearchPagination(provider)) {
+        if (requested_page == 1) {
+            var first = try search(allocator, client, provider, query);
+            first.page = 1;
+            first.has_prev_page = false;
+            first.has_next_page = false;
+            return first;
+        }
+        return emptySearchPage(allocator, provider, requested_page);
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    var out: std.ArrayListUnmanaged(SearchChoice) = .empty;
+    var has_next_page = false;
+
+    switch (provider) {
+        .isubtitles_org => {
+            var scraper = subdl.isubtitles_org.Scraper.init(a, client);
+            defer scraper.deinit();
+            var response = try scraper.searchWithOptions(query, .{
+                .page_start = requested_page,
+                .max_pages = 1,
+            });
+            defer response.deinit();
+            has_next_page = response.has_next_page;
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                const details_url = try a.dupe(u8, item.details_url);
+                const label = if (item.year) |y|
+                    try std.fmt.allocPrint(a, "{s} ({s})", .{ title, y })
+                else
+                    try a.dupe(u8, title);
+
+                try out.append(a, .{
+                    .title = title,
+                    .label = label,
+                    .ref = .{ .isubtitles_org = .{
+                        .title = title,
+                        .details_url = details_url,
+                    } },
+                });
+            }
+        },
+        .my_subs_co => {
+            var scraper = subdl.my_subs_co.Scraper.init(a, client);
+            defer scraper.deinit();
+            var response = try scraper.searchWithOptions(query, .{
+                .page_start = requested_page,
+                .max_pages = 1,
+            });
+            defer response.deinit();
+            has_next_page = response.has_next_page;
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                const details_url = try a.dupe(u8, item.details_url);
+                const label = try std.fmt.allocPrint(a, "[{s}] {s}", .{ @tagName(item.media_kind), title });
+                try out.append(a, .{
+                    .title = title,
+                    .label = label,
+                    .ref = .{ .my_subs_co = .{
+                        .title = title,
+                        .details_url = details_url,
+                        .media_kind = item.media_kind,
+                    } },
+                });
+            }
+        },
+        .tvsubtitles_net => {
+            var scraper = subdl.tvsubtitles_net.Scraper.init(a, client);
+            defer scraper.deinit();
+            var response = try scraper.searchWithOptions(query, .{
+                .page_start = requested_page,
+                .max_pages = 1,
+            });
+            defer response.deinit();
+            has_next_page = response.has_next_page;
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                const show_url = try a.dupe(u8, item.show_url);
+                try out.append(a, .{
+                    .title = title,
+                    .label = try a.dupe(u8, title),
+                    .ref = .{ .tvsubtitles_net = .{
+                        .title = title,
+                        .show_url = show_url,
+                    } },
+                });
+            }
+        },
+        else => unreachable,
+    }
+
+    return .{
+        .arena = arena,
+        .provider = provider,
+        .items = try out.toOwnedSlice(a),
+        .page = requested_page,
+        .has_prev_page = requested_page > 1,
+        .has_next_page = has_next_page,
+    };
+}
+
 pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: SearchRef) !SubtitlesResponse {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -786,6 +916,153 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
         .provider = std.meta.activeTag(ref),
         .title = title,
         .items = try out.toOwnedSlice(a),
+    };
+}
+
+pub fn fetchSubtitlesPage(allocator: Allocator, client: *std.http.Client, ref: SearchRef, page: usize) !SubtitlesResponse {
+    const requested_page = if (page == 0) 1 else page;
+    const provider = std.meta.activeTag(ref);
+    if (!providerSupportsSubtitlesPagination(provider)) {
+        if (requested_page == 1) {
+            var first = try fetchSubtitles(allocator, client, ref);
+            first.page = 1;
+            first.has_prev_page = false;
+            first.has_next_page = false;
+            return first;
+        }
+        return emptySubtitlesPage(allocator, ref, requested_page);
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    var out: std.ArrayListUnmanaged(SubtitleChoice) = .empty;
+    var title = titleFromRef(ref);
+    var has_next_page = false;
+
+    switch (ref) {
+        .isubtitles_org => |item| {
+            var scraper = subdl.isubtitles_org.Scraper.init(a, client);
+            defer scraper.deinit();
+            var subtitles = try scraper.fetchSubtitlesByMovieLinkWithOptions(item.details_url, .{
+                .page_start = requested_page,
+                .max_pages = 1,
+            });
+            defer subtitles.deinit();
+            has_next_page = subtitles.has_next_page;
+            if (subtitles.title.len > 0) title = try a.dupe(u8, subtitles.title);
+
+            for (subtitles.subtitles) |subtitle| {
+                const label = try subtitleLabel(a, subtitle.language_code, subtitle.filename, subtitle.download_page_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try dupOptional(a, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_page_url),
+                });
+            }
+        },
+        .my_subs_co => |item| {
+            var scraper = subdl.my_subs_co.Scraper.init(a, client);
+            defer scraper.deinit();
+            var subtitles = try scraper.fetchSubtitlesByDetailsLinkWithOptions(item.details_url, item.media_kind, .{
+                .include_seasons = false,
+                .page_start_per_entry = requested_page,
+                .max_pages_per_entry = 1,
+                .resolve_download_links = false,
+            });
+            defer subtitles.deinit();
+            has_next_page = subtitles.has_next_page;
+
+            for (subtitles.subtitles) |subtitle| {
+                const label = try subtitleLabel(a, subtitle.language_code, subtitle.filename, subtitle.download_page_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try dupOptional(a, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_page_url),
+                });
+            }
+        },
+        .tvsubtitles_net => |item| {
+            var scraper = subdl.tvsubtitles_net.Scraper.init(a, client);
+            defer scraper.deinit();
+            var subtitles = try scraper.fetchSubtitlesByShowLinkWithOptions(item.show_url, .{
+                .include_all_seasons = false,
+                .page_start_per_season = requested_page,
+                .max_pages_per_season = 1,
+                .resolve_download_links = false,
+            });
+            defer subtitles.deinit();
+            has_next_page = subtitles.has_next_page;
+
+            for (subtitles.subtitles) |subtitle| {
+                const label = try subtitleLabel(a, subtitle.language_code, subtitle.filename, subtitle.download_page_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try dupOptional(a, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_page_url),
+                });
+            }
+        },
+        else => unreachable,
+    }
+
+    return .{
+        .arena = arena,
+        .provider = provider,
+        .title = title,
+        .items = try out.toOwnedSlice(a),
+        .page = requested_page,
+        .has_prev_page = requested_page > 1,
+        .has_next_page = has_next_page,
+    };
+}
+
+fn emptySearchPage(allocator: Allocator, provider: Provider, page: usize) !SearchResponse {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    return .{
+        .arena = arena,
+        .provider = provider,
+        .items = &.{},
+        .page = if (page == 0) 1 else page,
+        .has_prev_page = page > 1,
+        .has_next_page = false,
+    };
+}
+
+fn emptySubtitlesPage(allocator: Allocator, ref: SearchRef, page: usize) !SubtitlesResponse {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const p = if (page == 0) 1 else page;
+    return .{
+        .arena = arena,
+        .provider = std.meta.activeTag(ref),
+        .title = titleFromRef(ref),
+        .items = &.{},
+        .page = p,
+        .has_prev_page = p > 1,
+        .has_next_page = false,
+    };
+}
+
+fn titleFromRef(ref: SearchRef) []const u8 {
+    return switch (ref) {
+        .subdl_com => |item| item.title,
+        .opensubtitles_com => |item| item.title,
+        .opensubtitles_org => |item| item.title,
+        .moviesubtitles_org => |item| item.title,
+        .moviesubtitlesrt_com => |item| item.title,
+        .podnapisi_net => |item| item.title,
+        .yifysubtitles_ch => |item| item.title,
+        .subtitlecat_com => |item| item.title,
+        .isubtitles_org => |item| item.title,
+        .my_subs_co => |item| item.title,
+        .subsource_net => |item| item.title,
+        .tvsubtitles_net => |item| item.title,
     };
 }
 
@@ -1417,6 +1694,53 @@ test "parseProvider accepts dotted/hyphenated js provider names" {
     try std.testing.expect(parseProvider("my-subs.co") == .my_subs_co);
     try std.testing.expect(parseProvider("subsource.net") == .subsource_net);
     try std.testing.expect(parseProvider("tvsubtitles.net") == .tvsubtitles_net);
+}
+
+test "provider pagination support flags" {
+    try std.testing.expect(providerSupportsSearchPagination(.isubtitles_org));
+    try std.testing.expect(providerSupportsSearchPagination(.my_subs_co));
+    try std.testing.expect(providerSupportsSearchPagination(.tvsubtitles_net));
+    try std.testing.expect(!providerSupportsSearchPagination(.subdl_com));
+    try std.testing.expect(!providerSupportsSearchPagination(.podnapisi_net));
+
+    try std.testing.expect(providerSupportsSubtitlesPagination(.isubtitles_org));
+    try std.testing.expect(providerSupportsSubtitlesPagination(.my_subs_co));
+    try std.testing.expect(providerSupportsSubtitlesPagination(.tvsubtitles_net));
+    try std.testing.expect(!providerSupportsSubtitlesPagination(.subdl_com));
+    try std.testing.expect(!providerSupportsSubtitlesPagination(.opensubtitles_com));
+}
+
+test "searchPage returns empty page for unsupported provider page > 1" {
+    var client: std.http.Client = .{ .allocator = std.testing.allocator };
+    defer client.deinit();
+
+    var page = try searchPage(std.testing.allocator, &client, .subdl_com, "matrix", 2);
+    defer page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), page.items.len);
+    try std.testing.expectEqual(@as(usize, 2), page.page);
+    try std.testing.expect(page.has_prev_page);
+    try std.testing.expect(!page.has_next_page);
+}
+
+test "fetchSubtitlesPage returns empty page for unsupported provider page > 1" {
+    var client: std.http.Client = .{ .allocator = std.testing.allocator };
+    defer client.deinit();
+
+    const ref: SearchRef = .{ .subdl_com = .{
+        .title = "The Matrix",
+        .media_type = .movie,
+        .link = "https://subdl.com/subtitle/the-matrix",
+    } };
+
+    var page = try fetchSubtitlesPage(std.testing.allocator, &client, ref, 2);
+    defer page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), page.items.len);
+    try std.testing.expectEqual(@as(usize, 2), page.page);
+    try std.testing.expect(page.has_prev_page);
+    try std.testing.expect(!page.has_next_page);
+    try std.testing.expectEqualStrings("The Matrix", page.title);
 }
 
 test "opensubtitles remote token helpers" {

@@ -36,6 +36,8 @@ const SelectResult = union(enum) {
     selected: usize,
     back,
     to_query,
+    page_prev,
+    page_next,
     quit,
 };
 
@@ -103,9 +105,27 @@ const FetchControl = enum {
     quit,
 };
 
+const PageNav = struct {
+    enabled: bool = false,
+    page: usize = 1,
+    has_prev: bool = false,
+    has_next: bool = false,
+};
+
+const SearchPageCacheEntry = struct {
+    page: usize,
+    response: app.SearchResponse,
+};
+
+const SubtitlesPageCacheEntry = struct {
+    page: usize,
+    response: app.SubtitlesResponse,
+};
+
 const SearchTask = struct {
     provider: app.Provider,
     query: []const u8,
+    page: usize = 1,
     done: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     err: ?anyerror = null,
     result: ?app.SearchResponse = null,
@@ -113,6 +133,7 @@ const SearchTask = struct {
 
 const SubtitlesTask = struct {
     ref: app.SearchRef,
+    page: usize = 1,
     done: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     err: ?anyerror = null,
     result: ?app.SubtitlesResponse = null,
@@ -236,7 +257,7 @@ fn searchTaskMain(task: *SearchTask) void {
     var client: std.http.Client = .{ .allocator = std.heap.page_allocator };
     defer client.deinit();
 
-    task.result = app.search(std.heap.page_allocator, &client, task.provider, task.query) catch |err| {
+    task.result = app.searchPage(std.heap.page_allocator, &client, task.provider, task.query, task.page) catch |err| {
         task.err = err;
         task.done.store(1, .release);
         return;
@@ -249,7 +270,7 @@ fn subtitlesTaskMain(task: *SubtitlesTask) void {
     var client: std.http.Client = .{ .allocator = std.heap.page_allocator };
     defer client.deinit();
 
-    task.result = app.fetchSubtitles(std.heap.page_allocator, &client, task.ref) catch |err| {
+    task.result = app.fetchSubtitlesPage(std.heap.page_allocator, &client, task.ref, task.page) catch |err| {
         task.err = err;
         task.done.store(1, .release);
         return;
@@ -391,11 +412,13 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
             provider_names,
             provider_default,
             null,
+            null,
         );
 
         const provider_idx = switch (provider_choice) {
             .selected => |idx| idx,
             .back, .to_query, .quit => return,
+            .page_prev, .page_next => continue :provider_loop,
         };
 
         provider_default = provider_idx;
@@ -426,188 +449,271 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
             };
             defer ui.allocator.free(query);
 
-            const search_detail = try std.fmt.allocPrint(
-                ui.allocator,
-                "provider={s} query={s}",
-                .{ app.providerName(provider), query },
-            );
-            defer ui.allocator.free(search_detail);
-            const search_context = try std.fmt.allocPrint(
-                ui.allocator,
-                "Search URL base: {s}",
-                .{provider_url},
-            );
-            defer ui.allocator.free(search_context);
-            setContext(ui, search_context);
-
-            var search_task: SearchTask = .{
-                .provider = provider,
-                .query = query,
-            };
-            const search_thread = try std.Thread.spawn(.{}, searchTaskMain, .{&search_task});
-            const search_control = try waitForTask(ui, &search_task.done, "Search", search_detail);
-            finalizeWorkerThread(search_thread, search_control);
-
-            if (search_control == .quit) {
-                if (search_task.result) |*r| r.deinit();
-                return;
-            }
-            if (search_control == .canceled) {
-                if (search_task.result) |*r| r.deinit();
-                const msg_result = try vaxisMessage(
-                    ui,
-                    "Search Canceled",
-                    "Canceled current fetch.",
-                    "Press any key to continue.",
-                    ui.styleWarn(),
-                );
-                switch (msg_result) {
-                    .ok, .to_query => continue :query_loop,
-                    .quit => return,
-                }
-            }
-
-            if (search_task.err) |err| {
-                const msg_result = try showFriendlyError(ui, "Search failed", err);
-                switch (msg_result) {
-                    .ok, .to_query => continue :query_loop,
-                    .quit => return,
-                }
-            }
-            var search_result = search_task.result orelse return error.UnexpectedHttpStatus;
-            defer search_result.deinit();
-
-            if (search_result.items.len == 0) {
-                const msg_result = try vaxisMessage(
-                    ui,
-                    "No Results",
-                    "No titles matched your query.",
-                    "Press any key to try another query.",
-                    ui.styleWarn(),
-                );
-                switch (msg_result) {
-                    .ok, .to_query => continue :query_loop,
-                    .quit => return,
-                }
-            }
-
-            const title_labels = try borrowSearchLabels(ui.allocator, search_result.items);
-            defer ui.allocator.free(title_labels);
+            var search_pages: std.ArrayListUnmanaged(SearchPageCacheEntry) = .empty;
+            defer deinitSearchPageCache(ui.allocator, &search_pages);
+            var search_page_current: usize = 1;
 
             title_loop: while (true) {
+                const search_idx = findSearchPageCacheIndex(search_pages.items, search_page_current) orelse blk_fetch: {
+                    const search_detail = try std.fmt.allocPrint(
+                        ui.allocator,
+                        "provider={s} query={s} page={d}",
+                        .{ app.providerName(provider), query, search_page_current },
+                    );
+                    defer ui.allocator.free(search_detail);
+
+                    const search_context = try std.fmt.allocPrint(
+                        ui.allocator,
+                        "Search URL base: {s} | page={d}",
+                        .{ provider_url, search_page_current },
+                    );
+                    defer ui.allocator.free(search_context);
+                    setContext(ui, search_context);
+
+                    var search_task: SearchTask = .{
+                        .provider = provider,
+                        .query = query,
+                        .page = search_page_current,
+                    };
+                    const search_thread = try std.Thread.spawn(.{}, searchTaskMain, .{&search_task});
+                    const search_control = try waitForTask(ui, &search_task.done, "Search", search_detail);
+                    finalizeWorkerThread(search_thread, search_control);
+
+                    if (search_control == .quit) {
+                        if (search_task.result) |*r| r.deinit();
+                        return;
+                    }
+                    if (search_control == .canceled) {
+                        if (search_task.result) |*r| r.deinit();
+                        const msg_result = try vaxisMessage(
+                            ui,
+                            "Search Canceled",
+                            "Canceled current fetch.",
+                            "Press any key to continue.",
+                            ui.styleWarn(),
+                        );
+                        switch (msg_result) {
+                            .ok, .to_query => continue :query_loop,
+                            .quit => return,
+                        }
+                    }
+
+                    if (search_task.err) |err| {
+                        const msg_result = try showFriendlyError(ui, "Search failed", err);
+                        switch (msg_result) {
+                            .ok, .to_query => continue :query_loop,
+                            .quit => return,
+                        }
+                    }
+
+                    const search_result = search_task.result orelse return error.UnexpectedHttpStatus;
+                    try search_pages.append(ui.allocator, .{
+                        .page = search_page_current,
+                        .response = search_result,
+                    });
+                    break :blk_fetch search_pages.items.len - 1;
+                };
+
+                const search_result = &search_pages.items[search_idx].response;
+                if (search_result.items.len == 0) {
+                    const msg_result = try vaxisMessage(
+                        ui,
+                        "No Results",
+                        if (search_page_current == 1)
+                            "No titles matched your query."
+                        else
+                            "No titles were found on this page.",
+                        "Press any key to continue.",
+                        ui.styleWarn(),
+                    );
+                    switch (msg_result) {
+                        .ok => {
+                            if (search_page_current > 1) {
+                                search_page_current -= 1;
+                                continue :title_loop;
+                            }
+                            continue :query_loop;
+                        },
+                        .to_query => continue :query_loop,
+                        .quit => return,
+                    }
+                }
+
+                const title_labels = try borrowSearchLabels(ui.allocator, search_result.items);
+                defer ui.allocator.free(title_labels);
+
                 const title_context = try std.fmt.allocPrint(
                     ui.allocator,
-                    "Provider: {s} | Search base URL: {s}",
-                    .{ app.providerName(provider), provider_url },
+                    "Provider: {s} | Search base URL: {s} | page={d}",
+                    .{ app.providerName(provider), provider_url, search_page_current },
                 );
                 defer ui.allocator.free(title_context);
                 setContext(ui, title_context);
 
+                const page_nav = PageNav{
+                    .enabled = app.providerSupportsSearchPagination(provider),
+                    .page = search_page_current,
+                    .has_prev = search_result.has_prev_page,
+                    .has_next = search_result.has_next_page,
+                };
                 const title_choice = try vaxisSelect(
                     ui,
                     "Select Title",
-                    "Use filter/sort navigation keys. Esc goes back.",
+                    "Use filter/sort keys. [ prev page, ] next page, Esc query.",
                     title_labels,
                     null,
                     null,
+                    page_nav,
                 );
 
                 const title_idx = switch (title_choice) {
                     .selected => |idx| idx,
                     .back, .to_query => continue :query_loop,
+                    .page_prev => {
+                        if (page_nav.enabled and search_page_current > 1) search_page_current -= 1;
+                        continue :title_loop;
+                    },
+                    .page_next => {
+                        if (!page_nav.enabled or !search_result.has_next_page) continue :title_loop;
+                        search_page_current += 1;
+                        continue :title_loop;
+                    },
                     .quit => return,
                 };
 
                 const selected_title = search_result.items[title_idx];
                 const title_ref_url = searchRefUrl(selected_title.ref);
 
-                const subtitles_detail = try std.fmt.allocPrint(ui.allocator, "{s}", .{selected_title.label});
-                defer ui.allocator.free(subtitles_detail);
-                const subtitles_context = try std.fmt.allocPrint(
-                    ui.allocator,
-                    "Title URL: {s}",
-                    .{title_ref_url},
-                );
-                defer ui.allocator.free(subtitles_context);
-                setContext(ui, subtitles_context);
+                var subtitle_pages: std.ArrayListUnmanaged(SubtitlesPageCacheEntry) = .empty;
+                defer deinitSubtitlesPageCache(ui.allocator, &subtitle_pages);
+                var subtitle_page_current: usize = 1;
 
-                var subtitles_task: SubtitlesTask = .{
-                    .ref = selected_title.ref,
-                };
-                const subtitles_thread = try std.Thread.spawn(.{}, subtitlesTaskMain, .{&subtitles_task});
-                const subtitles_control = try waitForTask(ui, &subtitles_task.done, "Subtitles", subtitles_detail);
-                finalizeWorkerThread(subtitles_thread, subtitles_control);
+                subtitle_page_loop: while (true) {
+                    const subtitles_idx = findSubtitlesPageCacheIndex(subtitle_pages.items, subtitle_page_current) orelse blk_fetch: {
+                        const subtitles_detail = try std.fmt.allocPrint(
+                            ui.allocator,
+                            "{s} | page={d}",
+                            .{ selected_title.label, subtitle_page_current },
+                        );
+                        defer ui.allocator.free(subtitles_detail);
 
-                if (subtitles_control == .quit) {
-                    if (subtitles_task.result) |*r| r.deinit();
-                    return;
-                }
-                if (subtitles_control == .canceled) {
-                    if (subtitles_task.result) |*r| r.deinit();
-                    const msg_result = try vaxisMessage(
-                        ui,
-                        "Fetch Canceled",
-                        "Canceled subtitle list fetch.",
-                        "Press any key to continue.",
-                        ui.styleWarn(),
-                    );
-                    switch (msg_result) {
-                        .ok => continue :title_loop,
-                        .to_query => continue :query_loop,
-                        .quit => return,
+                        const subtitles_context = try std.fmt.allocPrint(
+                            ui.allocator,
+                            "Title URL: {s} | page={d}",
+                            .{ title_ref_url, subtitle_page_current },
+                        );
+                        defer ui.allocator.free(subtitles_context);
+                        setContext(ui, subtitles_context);
+
+                        var subtitles_task: SubtitlesTask = .{
+                            .ref = selected_title.ref,
+                            .page = subtitle_page_current,
+                        };
+                        const subtitles_thread = try std.Thread.spawn(.{}, subtitlesTaskMain, .{&subtitles_task});
+                        const subtitles_control = try waitForTask(ui, &subtitles_task.done, "Subtitles", subtitles_detail);
+                        finalizeWorkerThread(subtitles_thread, subtitles_control);
+
+                        if (subtitles_control == .quit) {
+                            if (subtitles_task.result) |*r| r.deinit();
+                            return;
+                        }
+                        if (subtitles_control == .canceled) {
+                            if (subtitles_task.result) |*r| r.deinit();
+                            const msg_result = try vaxisMessage(
+                                ui,
+                                "Fetch Canceled",
+                                "Canceled subtitle list fetch.",
+                                "Press any key to continue.",
+                                ui.styleWarn(),
+                            );
+                            switch (msg_result) {
+                                .ok => continue :title_loop,
+                                .to_query => continue :query_loop,
+                                .quit => return,
+                            }
+                        }
+
+                        if (subtitles_task.err) |err| {
+                            const msg_result = try showFriendlyError(ui, "Could not load subtitles", err);
+                            switch (msg_result) {
+                                .ok => continue :title_loop,
+                                .to_query => continue :query_loop,
+                                .quit => return,
+                            }
+                        }
+
+                        const subtitles = subtitles_task.result orelse return error.UnexpectedHttpStatus;
+                        try subtitle_pages.append(ui.allocator, .{
+                            .page = subtitle_page_current,
+                            .response = subtitles,
+                        });
+                        break :blk_fetch subtitle_pages.items.len - 1;
+                    };
+
+                    const subtitles = &subtitle_pages.items[subtitles_idx].response;
+                    if (subtitles.items.len == 0) {
+                        const msg_result = try vaxisMessage(
+                            ui,
+                            "No Subtitles",
+                            if (subtitle_page_current == 1)
+                                "No subtitle rows were returned."
+                            else
+                                "No subtitle rows were returned on this page.",
+                            "Press any key to continue.",
+                            ui.styleWarn(),
+                        );
+                        switch (msg_result) {
+                            .ok => {
+                                if (subtitle_page_current > 1) {
+                                    subtitle_page_current -= 1;
+                                    continue :subtitle_page_loop;
+                                }
+                                continue :title_loop;
+                            },
+                            .to_query => continue :query_loop,
+                            .quit => return,
+                        }
                     }
-                }
 
-                if (subtitles_task.err) |err| {
-                    const msg_result = try showFriendlyError(ui, "Could not load subtitles", err);
-                    switch (msg_result) {
-                        .ok => continue :title_loop,
-                        .to_query => continue :query_loop,
-                        .quit => return,
-                    }
-                }
-                var subtitles = subtitles_task.result orelse return error.UnexpectedHttpStatus;
-                defer subtitles.deinit();
+                    const subtitle_enabled = try buildSubtitleEnabled(ui.allocator, subtitles.items);
+                    defer ui.allocator.free(subtitle_enabled);
 
-                if (subtitles.items.len == 0) {
-                    const msg_result = try vaxisMessage(
-                        ui,
-                        "No Subtitles",
-                        "No subtitle rows were returned.",
-                        "Press any key to return to titles.",
-                        ui.styleWarn(),
-                    );
-                    switch (msg_result) {
-                        .ok => continue :title_loop,
-                        .to_query => continue :query_loop,
-                        .quit => return,
-                    }
-                }
-
-                const subtitle_enabled = try buildSubtitleEnabled(ui.allocator, subtitles.items);
-                defer ui.allocator.free(subtitle_enabled);
-
-                subtitle_loop: while (true) {
                     const subtitle_context = try std.fmt.allocPrint(
                         ui.allocator,
-                        "Title URL: {s}",
-                        .{title_ref_url},
+                        "Title URL: {s} | page={d}",
+                        .{ title_ref_url, subtitle_page_current },
                     );
                     defer ui.allocator.free(subtitle_context);
                     setContext(ui, subtitle_context);
 
+                    const subtitle_page_nav = PageNav{
+                        .enabled = app.providerSupportsSubtitlesPagination(provider),
+                        .page = subtitle_page_current,
+                        .has_prev = subtitles.has_prev_page,
+                        .has_next = subtitles.has_next_page,
+                    };
                     const subtitle_choice = try vaxisSelectSubtitle(
                         ui,
                         "Select Subtitle",
-                        "s cycles sort, / enters filter mode, Esc goes back.",
+                        "s sort, / filter, [ prev page, ] next page, Esc titles.",
                         subtitles.items,
                         subtitle_enabled,
+                        subtitle_page_nav,
                     );
 
                     const subtitle_idx = switch (subtitle_choice) {
                         .selected => |idx| idx,
                         .back => continue :title_loop,
                         .to_query => continue :query_loop,
+                        .page_prev => {
+                            if (subtitle_page_nav.enabled and subtitle_page_current > 1) subtitle_page_current -= 1;
+                            continue :subtitle_page_loop;
+                        },
+                        .page_next => {
+                            if (!subtitle_page_nav.enabled or !subtitles.has_next_page) continue :subtitle_page_loop;
+                            subtitle_page_current += 1;
+                            continue :subtitle_page_loop;
+                        },
                         .quit => return,
                     };
 
@@ -639,7 +745,7 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
                         const confirm_result = try vaxisConfirm(ui, "Confirm Selection", &confirm_lines);
                         switch (confirm_result) {
                             .confirm => {},
-                            .back => continue :subtitle_loop,
+                            .back => continue :subtitle_page_loop,
                             .to_query => continue :query_loop,
                             .quit => return,
                         }
@@ -681,7 +787,7 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
                             ui.styleWarn(),
                         );
                         switch (msg_result) {
-                            .ok => continue :subtitle_loop,
+                            .ok => continue :subtitle_page_loop,
                             .to_query => continue :query_loop,
                             .quit => return,
                         }
@@ -690,7 +796,7 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
                     if (download_task.err) |err| {
                         const msg_result = try showFriendlyError(ui, "Download failed", err);
                         switch (msg_result) {
-                            .ok => continue :subtitle_loop,
+                            .ok => continue :subtitle_page_loop,
                             .to_query => continue :query_loop,
                             .quit => return,
                         }
@@ -714,7 +820,7 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
                         ui.styleAccent(),
                     );
                     switch (msg_result) {
-                        .ok => continue :subtitle_loop,
+                        .ok => continue :subtitle_page_loop,
                         .to_query => continue :query_loop,
                         .quit => return,
                     }
@@ -722,6 +828,30 @@ fn runTui(ui: *Ui, client: *std.http.Client) !void {
             }
         }
     }
+}
+
+fn findSearchPageCacheIndex(pages: []const SearchPageCacheEntry, page: usize) ?usize {
+    for (pages, 0..) |entry, idx| {
+        if (entry.page == page) return idx;
+    }
+    return null;
+}
+
+fn findSubtitlesPageCacheIndex(pages: []const SubtitlesPageCacheEntry, page: usize) ?usize {
+    for (pages, 0..) |entry, idx| {
+        if (entry.page == page) return idx;
+    }
+    return null;
+}
+
+fn deinitSearchPageCache(allocator: std.mem.Allocator, pages: *std.ArrayListUnmanaged(SearchPageCacheEntry)) void {
+    for (pages.items) |*entry| entry.response.deinit();
+    pages.deinit(allocator);
+}
+
+fn deinitSubtitlesPageCache(allocator: std.mem.Allocator, pages: *std.ArrayListUnmanaged(SubtitlesPageCacheEntry)) void {
+    for (pages.items) |*entry| entry.response.deinit();
+    pages.deinit(allocator);
 }
 
 fn buildProviderNames(allocator: std.mem.Allocator) ![][]u8 {
@@ -902,6 +1032,7 @@ fn vaxisSelect(
     options: []const []const u8,
     default_idx: ?usize,
     enabled: ?[]const bool,
+    page_nav: ?PageNav,
 ) !SelectResult {
     if (options.len == 0) return error.NoData;
     if (enabled) |flags| {
@@ -983,13 +1114,19 @@ fn vaxisSelect(
         var filter_buf: [384]u8 = undefined;
         const filter_line = std.fmt.bufPrint(&filter_buf, "Filter: {s}  [{s}]", .{ filter.items, mode_text }) catch "Filter: (overflow)";
 
+        const can_page = if (page_nav) |pn| pn.enabled else false;
         const help_line = if (filter_mode)
             "Type to filter | Enter done | Esc exit | Backspace delete"
+        else if (can_page)
+            "j/k move | Enter select | [ prev page | ] next page | / filter | Esc back"
         else
             "j/k or arrows move | Enter select | / filter | Esc back";
 
         var count_buf: [96]u8 = undefined;
-        const count_line = std.fmt.bufPrint(&count_buf, "Visible: {d}/{d}", .{ matches.items.len, options.len }) catch "Visible: ?";
+        const count_line = if (page_nav) |pn|
+            std.fmt.bufPrint(&count_buf, "Visible: {d}/{d} | Page: {d}", .{ matches.items.len, options.len, pn.page }) catch "Visible: ?"
+        else
+            std.fmt.bufPrint(&count_buf, "Visible: {d}/{d}", .{ matches.items.len, options.len }) catch "Visible: ?";
 
         try renderGlobalFooter(ui, win, help_line, count_line);
 
@@ -1039,6 +1176,8 @@ fn vaxisSelect(
                 }
 
                 if (key.matches(vaxis.Key.escape, .{})) return .back;
+                if (can_page and key.matches('[', .{})) return .page_prev;
+                if (can_page and key.matches(']', .{})) return .page_next;
                 if (key.matches('/', .{})) {
                     filter_mode = true;
                     continue;
@@ -1097,6 +1236,7 @@ fn vaxisSelectSubtitle(
     hint: []const u8,
     subtitles: []const app.SubtitleChoice,
     enabled: []const bool,
+    page_nav: ?PageNav,
 ) !SelectResult {
     if (subtitles.len == 0) return error.NoData;
     if (enabled.len != subtitles.len) return error.InvalidFieldType;
@@ -1196,13 +1336,19 @@ fn vaxisSelectSubtitle(
             .{ subtitleSortName(sort_mode), filter.items, mode_text },
         ) catch "Sort/Filter: (overflow)";
 
+        const can_page = if (page_nav) |pn| pn.enabled else false;
         const help_line = if (filter_mode)
             "Type to filter | Enter done | Esc exit | Backspace delete"
+        else if (can_page)
+            "j/k move | Enter select | s sort | [ prev page | ] next page | / filter | Esc back"
         else
             "j/k or arrows move | Enter select | s sort | / filter | Esc back";
 
         var count_buf: [96]u8 = undefined;
-        const count_line = std.fmt.bufPrint(&count_buf, "Visible: {d}/{d}", .{ matches.items.len, subtitles.len }) catch "Visible: ?";
+        const count_line = if (page_nav) |pn|
+            std.fmt.bufPrint(&count_buf, "Visible: {d}/{d} | Page: {d}", .{ matches.items.len, subtitles.len, pn.page }) catch "Visible: ?"
+        else
+            std.fmt.bufPrint(&count_buf, "Visible: {d}/{d}", .{ matches.items.len, subtitles.len }) catch "Visible: ?";
 
         try renderGlobalFooter(ui, win, help_line, count_line);
 
@@ -1252,6 +1398,8 @@ fn vaxisSelectSubtitle(
                 }
 
                 if (key.matches(vaxis.Key.escape, .{})) return .back;
+                if (can_page and key.matches('[', .{})) return .page_prev;
+                if (can_page and key.matches(']', .{})) return .page_next;
                 if (key.matches('/', .{})) {
                     filter_mode = true;
                     continue;
