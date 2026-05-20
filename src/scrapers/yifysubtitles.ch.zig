@@ -200,7 +200,7 @@ test "live yify search and subtitle extraction" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
     if (!common.shouldRunNamedLiveTest(std.testing.allocator, "YIFY")) return error.SkipZigTest;
 
-    var client: std.http.Client = .{ .allocator = std.testing.allocator };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer client.deinit();
 
     var scraper = Scraper.init(std.testing.allocator, &client);

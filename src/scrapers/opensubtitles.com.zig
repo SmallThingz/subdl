@@ -301,7 +301,7 @@ fn fetchWithSession(client: *std.http.Client, allocator: Allocator, session: *cf
 
         // Cloudflare cookies can appear before the challenge flow has fully settled.
         // Retry once with the same session before forcing a fresh browser run.
-        std.Thread.sleep(1200 * std.time.ns_per_ms);
+        common.sleepMilliseconds(1200);
         response = try common.fetchBytes(client, allocator, url, .{
             .accept = options.accept,
             .extra_headers = headers,
@@ -492,7 +492,7 @@ test "live opensubtitles.com search and resolve" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
     if (!common.shouldRunNamedLiveTest(std.testing.allocator, "OPENSUBTITLES_COM")) return error.SkipZigTest;
 
-    var client: std.http.Client = .{ .allocator = std.testing.allocator };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer client.deinit();
 
     var scraper = Scraper.init(std.testing.allocator, &client);

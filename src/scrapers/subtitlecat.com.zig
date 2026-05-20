@@ -101,8 +101,8 @@ pub const Scraper = struct {
         while (blocks.next()) |block| {
             var spans: [3]?HtmlNode = .{ null, null, null };
             var span_count: usize = 0;
-            for (block.children()) |child_idx| {
-                const child = block.doc.nodeAt(child_idx) orelse continue;
+            var children = block.children();
+            while (children.next()) |child| {
                 if (!std.mem.eql(u8, child.tagName(), "span")) continue;
                 if (span_count < spans.len) spans[span_count] = child;
                 span_count += 1;
@@ -170,7 +170,7 @@ fn parseTranslatedFrom(raw: []const u8) ?[]const u8 {
     const start = std.ascii.indexOfIgnoreCase(raw, marker) orelse return null;
     const tail = raw[start + marker.len ..];
     const end = std.mem.indexOfScalar(u8, tail, ')') orelse tail.len;
-    return common.trimAscii(tail[0..end]);
+    return std.mem.trim(u8, tail[0..end], " \t\r\n");
 }
 
 fn parseTranslateSpec(allocator: Allocator, onclick: []const u8) !TranslateSpec {
@@ -199,7 +199,7 @@ fn parseTranslateSpec(allocator: Allocator, onclick: []const u8) !TranslateSpec 
     var filename: ?[]const u8 = null;
     var folder: ?[]const u8 = null;
     for (args) |arg| {
-        if (filename == null and asciiEndsWithIgnoreCase(arg, ".srt")) filename = arg;
+        if (filename == null and std.ascii.endsWithIgnoreCase(arg, ".srt")) filename = arg;
         if (folder == null and std.mem.startsWith(u8, arg, "/")) folder = arg;
     }
 
@@ -250,18 +250,9 @@ fn inferTranslatedFilename(allocator: Allocator, source: ?[]const u8, lang_code:
     return try std.fmt.allocPrint(allocator, "subtitle-{s}.srt", .{lang});
 }
 
-fn asciiEndsWithIgnoreCase(input: []const u8, suffix: []const u8) bool {
-    if (suffix.len > input.len) return false;
-    const tail = input[input.len - suffix.len ..];
-    for (tail, suffix) |a, b| {
-        if (std.ascii.toLower(a) != std.ascii.toLower(b)) return false;
-    }
-    return true;
-}
-
 fn findDescendantByTag(node: HtmlNode, tag_name: []const u8) ?HtmlNode {
-    for (node.children()) |child_idx| {
-        const child = node.doc.nodeAt(child_idx) orelse continue;
+    var children = node.children();
+    while (children.next()) |child| {
         if (std.mem.eql(u8, child.tagName(), tag_name)) return child;
         if (findDescendantByTag(child, tag_name)) |nested| return nested;
     }
@@ -269,8 +260,8 @@ fn findDescendantByTag(node: HtmlNode, tag_name: []const u8) ?HtmlNode {
 }
 
 fn findDescendantByTagWithAttr(node: HtmlNode, tag_name: []const u8, attr_name: []const u8) ?HtmlNode {
-    for (node.children()) |child_idx| {
-        const child = node.doc.nodeAt(child_idx) orelse continue;
+    var children = node.children();
+    while (children.next()) |child| {
         if (std.mem.eql(u8, child.tagName(), tag_name) and common.getAttributeValueSafe(child, attr_name) != null) return child;
         if (findDescendantByTagWithAttr(child, tag_name, attr_name)) |nested| return nested;
     }
@@ -289,7 +280,7 @@ test "live subtitlecat search and subtitles" {
     if (!common.shouldRunNamedLiveTest(std.testing.allocator, "SUBTITLECAT")) return error.SkipZigTest;
     if (suite.shouldRunExtensiveLiveSuite(std.testing.allocator)) return error.SkipZigTest;
 
-    var client: std.http.Client = .{ .allocator = std.testing.allocator };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer client.deinit();
 
     var scraper = Scraper.init(std.testing.allocator, &client);

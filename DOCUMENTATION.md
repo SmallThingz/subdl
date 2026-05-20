@@ -2,20 +2,29 @@
 
 ## Overview
 
-This project provides subtitle scraping and download workflows across multiple providers using:
+This project provides subtitle search, subtitle listing, and subtitle download flows across multiple subtitle sites through one Zig API.
 
-- A shared app layer in `src/app/providers_app.zig`
-- A single user-facing binary: `scrapers` (`CLI` by default, `TUI` via `--tui`)
-- A library surface exported from `src/lib.zig`
+Primary entry points:
 
-The runtime HTTP path uses Zig `std.http.Client`.
+- Binary: `scrapers`
+- Library: `src/lib.zig`
+- App layer: `src/app/providers_app.zig`
+
+Default behavior:
+
+- CLI is enabled by default
+- TUI is enabled by default and can be disabled with `-Denable-tui=false`
+- Archive extraction is compiled out by default
+- Browser automation support is compiled out by default
+
+Those features are opt-in because some upstream projects are not fully settled on the current Zig dev toolchain. See [ISSUES.md](./ISSUES.md).
 
 ## Requirements
 
-- Zig `0.15.2+` (as defined in `build.zig.zon`)
-- Network access for provider queries/downloads
+- Zig `0.16.0-dev.2905+`
+- Network access for normal provider use
 
-## Build, Test, and Run
+## Build Commands
 
 Build:
 
@@ -23,40 +32,39 @@ Build:
 zig build
 ```
 
-Install binaries:
-
-```bash
-zig build install
-ls -l zig-out/bin/
-```
-
-Run all unit/integration tests configured in `build.zig`:
+Run tests:
 
 ```bash
 zig build test
+```
+
+Install:
+
+```bash
+zig build install
 ```
 
 Run CLI:
 
 ```bash
 zig build run -- --list-providers
-zig build run -- --provider subsource_net --query "The Matrix"
+zig build run -- --query "The Matrix"
 ```
 
 Run TUI:
 
 ```bash
-zig build run-tui
+zig build run -- --tui
 ```
 
-Build cross-target binaries (installed into `zig-out/bin`):
+Build all target binaries into `zig-out/bin`:
 
 ```bash
 zig build build-all-targets
 zig build build-all-targets -Doptimize=ReleaseFast -Dstrip=true
 ```
 
-`build-all-targets` currently emits:
+Outputs:
 
 - `scrapers-x86_64-linux-gnu`
 - `scrapers-aarch64-linux-gnu`
@@ -64,9 +72,34 @@ zig build build-all-targets -Doptimize=ReleaseFast -Dstrip=true
 - `scrapers-aarch64-macos-none`
 - `scrapers-x86_64-windows-gnu.exe`
 
+## Optional Build Flags
+
+General:
+
+- `-Doptimize=Debug|ReleaseSafe|ReleaseFast|ReleaseSmall`
+- `-Dstrip=true|false`
+- `-Dsingle-threaded=true|false`
+- `-Domit-frame-pointer=true|false`
+- `-Derror-tracing=true|false`
+- `-Dpic=true|false`
+- `-Dllvm=true|false`
+
+Feature gates:
+
+- `-Denable-tui=true|false`
+- `-Denable-alldriver=true|false`
+- `-Denable-unarr=true|false`
+
+Notes:
+
+- `build-all-targets` defaults to `-Doptimize=ReleaseFast`
+- `build-all-targets` defaults to `-Dstrip=true`
+- `-Dllvm=true` works around native GNU host CRT `.sframe` relocation failures seen with Zig self-hosted codegen/linking
+- default host builds keep archive extraction and browser automation off unless you opt in
+
 ## Provider IDs
 
-The canonical provider IDs accepted by the app layer and CLI are:
+Supported canonical provider IDs:
 
 - `subdl_com`
 - `opensubtitles_com`
@@ -81,11 +114,78 @@ The canonical provider IDs accepted by the app layer and CLI are:
 - `subsource_net`
 - `tvsubtitles_net`
 
-Only canonical provider IDs (and dotted/hyphenated site forms like `subsource.net`) are accepted.
+The parser also accepts dotted or hyphenated site forms such as `subsource.net`.
 
-## Pagination Support Matrix
+## CLI Reference
 
-Pagination is provider-specific in `providers_app`.
+Usage:
+
+```text
+scrapers --query <text> [--providers a,b] [-p provider] [--title-index N] [--subtitle-index N] [--out-dir DIR] [--extract]
+scrapers --list-providers
+scrapers --tui
+```
+
+Options:
+
+- `--providers <list>`: comma-separated provider IDs or unique prefixes; defaults to all providers
+- `--providers none`, `--providers=none`, `-p none`, `-p=none`, and `-pnone`: start with no providers selected
+- `-p <provider>`: repeatable provider selector; values may also be comma-separated
+- `--provider <name>`: compatibility alias for selecting one provider
+- `--query <text>`: search query
+- `--title-index <N>`: selected search result, default `0`
+- `--subtitle-index <N>`: selected subtitle row, default first downloadable row
+- `--out-dir <DIR>`: download destination, default `downloads`
+- `--extract`: extract archives after download
+- `--list-providers`: print available providers
+- `--help`, `-h`: print help
+- `--tui`: launch the TUI instead of the CLI
+
+Important:
+
+- `--extract` requires a build with `-Denable-unarr=true`
+
+Examples:
+
+```bash
+zig build run -- --query "The Matrix"
+zig build run -- --providers podnapisi_net,subsource_net --query "Inception" --title-index 1 --subtitle-index 0
+zig build run -- -p subdl --query "Breaking Bad" --out-dir /tmp/subtitles
+zig build run -- -pnone --query "The Matrix"
+zig build -Denable-unarr=true run -- --providers subsource --query "The Matrix" --extract
+./zig-out/bin/scrapers --providers isubtitles_org --query "Interstellar"
+```
+
+## TUI Reference
+
+The TUI is built around the same provider app layer as the CLI and is enabled by default.
+
+Build and run it with:
+
+```bash
+zig build run -- --tui
+```
+
+Flow:
+
+1. Select providers with `Space`, or leave all providers unselected
+2. Enter query
+3. Select title
+4. Select subtitle row
+5. Confirm download if confirmation is enabled
+
+Key behaviors:
+
+- Provider selection starts empty when there is no saved history.
+- `Space` toggles the highlighted provider on the home screen.
+- `Enter` with zero selected providers opens the highlighted provider.
+- `Enter` with one selected provider opens that provider, even if a different provider is highlighted.
+- `Enter` with multiple selected providers opens a combined search tab across the selected providers.
+- `my_subs_co` does not expose pagination in the TUI
+- `tvsubtitles_net` does not expose pagination in the TUI
+- `[` and `]` only navigate pages for providers that actually support pagination
+
+## Pagination Behavior
 
 Search pagination supported:
 
@@ -103,125 +203,22 @@ No pagination:
 
 - `my_subs_co`
 - `tvsubtitles_net`
-- Others not listed in the pagination-supported sets above
+- providers not listed above
 
-For non-paginated providers, page `1` returns data and page `>1` returns empty page results.
+For non-paginated providers:
 
-## CLI Reference (`scrapers`)
-
-Usage:
-
-```text
-scrapers --provider <name> --query <text> [--title-index N] [--subtitle-index N] [--out-dir DIR] [--extract]
-scrapers --list-providers
-```
-
-Options:
-
-- `--provider <name>`: provider ID
-- `--query <text>`: search query
-- `--title-index <N>`: selected title from search results (default `0`)
-- `--subtitle-index <N>`: selected subtitle row (default: first downloadable row)
-- `--out-dir <DIR>`: destination directory (default `downloads`)
-- `--extract`: extract downloaded archive contents into `out-dir` (disabled by default)
-- `--list-providers`: print all provider IDs
-- `--help`, `-h`: print usage
-
-Exit behavior:
-
-- `0`: success
-- `1`: runtime/provider failure (search/subtitle fetch/download)
-- `2`: argument/validation failure (invalid provider, missing value, index out of range)
-
-### CLI Usage Examples
-
-List providers:
-
-```bash
-zig build run -- --list-providers
-```
-
-Basic query and download (defaults to first title and first downloadable subtitle):
-
-```bash
-zig build run -- --provider subsource_net --query "The Matrix"
-```
-
-Query, download, and extract archive contents:
-
-```bash
-zig build run -- --provider subsource_net --query "The Matrix" --extract
-```
-
-Select explicit search and subtitle rows:
-
-```bash
-zig build run -- \
-  --provider podnapisi_net \
-  --query "Inception" \
-  --title-index 1 \
-  --subtitle-index 0
-```
-
-Download into a custom directory:
-
-```bash
-zig build run -- \
-  --provider subdl_com \
-  --query "Breaking Bad" \
-  --out-dir /tmp/subtitles
-```
-
-Use the installed binary directly:
-
-```bash
-./zig-out/bin/scrapers --provider isubtitles_org --query "Interstellar"
-```
-
-## TUI Reference (`scrapers --tui`)
-
-Launch:
-
-```bash
-zig build run-tui
-# or:
-zig build run -- --tui
-```
-
-Flow:
-
-1. Select provider
-2. Enter query
-3. Select title
-4. Select subtitle row
-5. Confirm download (unless confirm is toggled off)
-
-Global keys:
-
-- `Esc` or `q`: back/quit depending on screen
-- `Ctrl+C`: cancel current fetch/download
-- `F2`: toggle download confirmation screen
-- `F3`: toggle theme
-
-List/navigation keys:
-
-- `j` / `k` or arrow keys: move selection
-- `Enter`: select
-- `/`: filter mode
-- `s`: cycle subtitle sort mode (subtitle list)
-- `[` and `]`: previous/next page only for providers with pagination support
-
-`my_subs_co` and `tvsubtitles_net` do not expose pagination in the TUI.
+- page `1` returns normal data
+- page `>1` returns an empty page result
 
 ## Library API
 
-`src/lib.zig` exports the app layer and provider modules:
+Import:
 
 ```zig
 const scrapers = @import("scrapers");
 ```
 
-Common app-layer entry points:
+Common app-layer functions:
 
 - `providers_app.providers()`
 - `providers_app.parseProvider()`
@@ -232,22 +229,21 @@ Common app-layer entry points:
 - `providers_app.downloadSubtitleWithOptions()`
 - `providers_app.downloadSubtitleWithProgressAndOptions()`
 
-### Library Example: Search -> Subtitle Rows -> Download
+## Library Example: Search Then Download
 
 ```zig
 const std = @import("std");
 const scrapers = @import("scrapers");
 
-pub fn main() !void {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa_state.deinit();
-    const allocator = gpa_state.allocator();
-
-    var client: std.http.Client = .{ .allocator = allocator };
+pub fn main(init: std.process.Init) !void {
+    var client: std.http.Client = .{
+        .allocator = init.gpa,
+        .io = init.io,
+    };
     defer client.deinit();
 
     var search = try scrapers.providers_app.search(
-        allocator,
+        init.gpa,
         &client,
         .subsource_net,
         "The Matrix",
@@ -257,46 +253,41 @@ pub fn main() !void {
     if (search.items.len == 0) return;
 
     var subtitles = try scrapers.providers_app.fetchSubtitles(
-        allocator,
+        init.gpa,
         &client,
         search.items[0].ref,
     );
     defer subtitles.deinit();
 
     if (subtitles.items.len == 0) return;
-
-    const selected = subtitles.items[0];
-    if (selected.download_url == null) return;
+    if (subtitles.items[0].download_url == null) return;
 
     var result = try scrapers.providers_app.downloadSubtitleWithOptions(
-        allocator,
+        init.gpa,
         &client,
-        selected,
+        subtitles.items[0],
         "downloads",
         .{ .extract_archive = false },
     );
-    defer result.deinit(allocator);
-
-    std.debug.print("saved to: {s}\n", .{result.file_path});
+    defer result.deinit(init.gpa);
 }
 ```
 
-### Library Example: Paginated Search
+## Library Example: Paginated Search
 
 ```zig
 const std = @import("std");
 const scrapers = @import("scrapers");
 
-pub fn main() !void {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa_state.deinit();
-    const allocator = gpa_state.allocator();
-
-    var client: std.http.Client = .{ .allocator = allocator };
+pub fn main(init: std.process.Init) !void {
+    var client: std.http.Client = .{
+        .allocator = init.gpa,
+        .io = init.io,
+    };
     defer client.deinit();
 
     var page1 = try scrapers.providers_app.searchPage(
-        allocator,
+        init.gpa,
         &client,
         .opensubtitles_org,
         "The Office",
@@ -304,21 +295,20 @@ pub fn main() !void {
     );
     defer page1.deinit();
 
-    if (page1.has_next_page) {
-        var page2 = try scrapers.providers_app.searchPage(
-            allocator,
-            &client,
-            .opensubtitles_org,
-            "The Office",
-            2,
-        );
-        defer page2.deinit();
-        _ = page2;
-    }
+    if (!page1.has_next_page) return;
+
+    var page2 = try scrapers.providers_app.searchPage(
+        init.gpa,
+        &client,
+        .opensubtitles_org,
+        "The Office",
+        2,
+    );
+    defer page2.deinit();
 }
 ```
 
-### Library Example: Download Progress Hook
+## Library Example: Download Progress
 
 ```zig
 const std = @import("std");
@@ -332,19 +322,18 @@ fn onUnits(_: ?*anyopaque, done: usize, total: usize) void {
     std.debug.print("progress: {d}/{d}\n", .{ done, total });
 }
 
-pub fn main() !void {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa_state.deinit();
-    const allocator = gpa_state.allocator();
-
-    var client: std.http.Client = .{ .allocator = allocator };
+pub fn main(init: std.process.Init) !void {
+    var client: std.http.Client = .{
+        .allocator = init.gpa,
+        .io = init.io,
+    };
     defer client.deinit();
 
-    var search = try scrapers.providers_app.search(allocator, &client, .subsource_net, "The Matrix");
+    var search = try scrapers.providers_app.search(init.gpa, &client, .subsource_net, "The Matrix");
     defer search.deinit();
     if (search.items.len == 0) return;
 
-    var subs = try scrapers.providers_app.fetchSubtitles(allocator, &client, search.items[0].ref);
+    var subs = try scrapers.providers_app.fetchSubtitles(init.gpa, &client, search.items[0].ref);
     defer subs.deinit();
     if (subs.items.len == 0 or subs.items[0].download_url == null) return;
 
@@ -354,37 +343,37 @@ pub fn main() !void {
     };
 
     var result = try scrapers.providers_app.downloadSubtitleWithProgressAndOptions(
-        allocator,
+        init.gpa,
         &client,
         subs.items[0],
         "downloads",
         &progress,
         .{ .extract_archive = false },
     );
-    defer result.deinit(allocator);
+    defer result.deinit(init.gpa);
 }
 ```
 
-## Output Files and Extensions
+## Downloaded Files
 
-- Downloaded filenames retain extensions where available.
-- If needed, extension fallback is inferred from URL/content.
-- For archive formats (`.zip`/`.rar`/other recognized archive patterns), the saved file is preserved as an archive artifact and surfaced via `DownloadResult.archive_path`.
+- Downloaded filenames retain file extensions where available
+- Extension fallback is inferred from URL or response data when needed
+- When archive extraction is enabled, the original archive path is still tracked in `DownloadResult.archive_path`
 
 ## Environment Variables
 
-Runtime/provider controls:
+Runtime and provider controls:
 
-- `SUBSOURCE_CF_CLEARANCE`: optional Cloudflare clearance token for `subsource.net`
-- `SUBSOURCE_USER_AGENT`: override User-Agent for `subsource.net` requests
-- `SUBDL_CF_HEADLESS`: toggles headless browser behavior in Cloudflare handling paths
+- `SUBSOURCE_CF_CLEARANCE`
+- `SUBSOURCE_USER_AGENT`
+- `SUBDL_CF_HEADLESS`
 
 Live test controls:
 
-- `SCRAPERS_LIVE_PROVIDER_FILTER`: provider filter for live test runs
-- `SCRAPERS_LIVE_PROVIDERS`: alternative provider filter variable used by common test helpers
-- `SCRAPERS_LIVE_INCLUDE_CAPTCHA`: include captcha/cloudflare providers in live runs
-- `SCRAPERS_LIVE_BATCH`: enables batch mode behavior in live app tests
+- `SCRAPERS_LIVE_PROVIDER_FILTER`
+- `SCRAPERS_LIVE_PROVIDERS`
+- `SCRAPERS_LIVE_INCLUDE_CAPTCHA`
+- `SCRAPERS_LIVE_BATCH`
 
 Debug flags:
 
@@ -395,71 +384,48 @@ Debug flags:
 
 ## Live Testing
 
-Run smoke live suite:
+Smoke suite:
 
 ```bash
 zig build test-live -Dlive=smoke -Dlive-providers=* -Dlive-include-captcha=false
 ```
 
-Run extensive live suite for one provider:
+Extensive suite for one provider:
 
 ```bash
 zig build test-live-single -Dlive=extensive -Dlive-providers=subsource.net
 ```
 
-Run all live providers (including captcha/cloudflare targets):
+All live providers:
 
 ```bash
 zig build test-live-all
 ```
 
-Run parallel provider fan-out when supported:
+Parallel fan-out mode:
 
 ```bash
 zig build test-live -Dlive=all -Dlive-providers=* -Dlive-include-captcha=true -Dlive-parallel-on-all=true
 ```
 
-## Build Flags
+## Upstream Dependencies
 
-Build flags you can toggle from `zig build`:
+Current upstream selections:
 
-- `-Doptimize=Debug|ReleaseSafe|ReleaseFast|ReleaseSmall`
-- `-Dstrip=true|false`
-- `-Dsingle-threaded=auto|on|off`
-- `-Domit-frame-pointer=auto|on|off`
-- `-Derror-tracing=auto|on|off`
-- `-Dpic=auto|on|off`
+- `libvaxis`: `main`
+- `htmlparser`: `main` from renamed repo `SmallThingz/htmlparser`
+- `alldriver`: `main`
+- `unarr`: `main`
 
-`build-all-targets` defaults when omitted:
-
-- `-Doptimize` -> `ReleaseFast`
-- `-Dstrip` -> `true`
-
-## Troubleshooting
-
-No results:
-
-- Validate provider and query.
-- Retry with another provider to isolate provider-side issues.
-- For paginated providers, test page `1` first.
-
-Cloudflare/session errors:
-
-- Set `SUBSOURCE_CF_CLEARANCE` and `SUBSOURCE_USER_AGENT` when required by `subsource.net`.
-- For captcha-heavy providers, use `-Dlive-include-captcha=true` only when you intend to test those paths.
-
-Download has no direct URL:
-
-- Some rows are listing entries without direct links.
-- Choose another subtitle row where `download_url` is present.
+If any of those upstreams cause integration issues on current Zig, they should be recorded in [ISSUES.md](./ISSUES.md).
 
 ## Project Structure
 
-Key paths:
-
 - `src/lib.zig`: public library exports
-- `src/app/providers_app.zig`: unified provider app layer
-- `src/cmd/cli.zig`: CLI entrypoint
-- `src/cmd/tui.zig`: TUI entrypoint
+- `src/app/providers_app.zig`: unified provider API
+- `src/cmd/main.zig`: single-binary entrypoint
+- `src/cmd/cli.zig`: CLI flow
+- `src/cmd/tui_backend.zig`: TUI feature-gated wrapper
 - `src/scrapers/*.zig`: provider implementations
-- `build.zig`: build graph, binaries, and test steps
+- `src/deps/*_compat.zig`: upstream compatibility wrappers
+- `build.zig`: build graph, test steps, target builds

@@ -69,10 +69,10 @@ fn runExtensiveProbe(
     provider_name: []const u8,
     run: *const fn (allocator: std.mem.Allocator, client: *std.http.Client) anyerror!void,
 ) !void {
-    const started_ms = std.time.milliTimestamp();
+    const started_ms = common.compatMilliTimestamp();
     std.debug.print("[live][extensive][{s}] test_start\n", .{provider_name});
     defer {
-        const elapsed_ms = std.time.milliTimestamp() - started_ms;
+        const elapsed_ms = common.compatMilliTimestamp() - started_ms;
         std.debug.print("[live][extensive][{s}] test_end elapsed_ms={d}\n", .{ provider_name, elapsed_ms });
     }
 
@@ -80,20 +80,20 @@ fn runExtensiveProbe(
     defer allocator_state.deinit();
     const allocator = allocator_state.allocator();
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = std.testing.io };
     defer client.deinit();
 
     try run(allocator, &client);
 }
 
 fn phaseStart(provider: []const u8, phase: []const u8) i64 {
-    const started_ms = std.time.milliTimestamp();
+    const started_ms = common.compatMilliTimestamp();
     std.debug.print("[live][phase][{s}] start {s}\n", .{ provider, phase });
     return started_ms;
 }
 
 fn phaseDone(provider: []const u8, phase: []const u8, started_ms: i64) void {
-    const elapsed_ms = std.time.milliTimestamp() - started_ms;
+    const elapsed_ms = common.compatMilliTimestamp() - started_ms;
     std.debug.print("[live][phase][{s}] done {s} elapsed_ms={d}\n", .{
         provider,
         phase,

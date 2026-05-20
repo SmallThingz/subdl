@@ -213,93 +213,18 @@ pub const Scraper = struct {
     }
 
     fn fetchHtmlWithDoh(self: *Scraper, allocator: Allocator, url: []const u8) !common.HttpResponse {
-        var target = try pathFromOpenSubtitlesUrl(allocator, url);
-        var redirects: usize = 0;
-
-        while (true) {
-            if (redirects > 4) return error.UnexpectedHttpStatus;
-
-            const ip = try self.resolveHostViaDoh(allocator, opensubtitles_host);
-            const raw = try fetchHttpsByIp(allocator, opensubtitles_host, ip, target, "text/html");
-            if (common.getenv("SCRAPERS_DEBUG_OPENSUB_ORG_DOH") != null) {
-                std.debug.print("[opensubtitles.org][doh] ip={s} path={s} status={d}\n", .{
-                    ip,
-                    target,
-                    @intFromEnum(raw.status),
-                });
-                if (raw.location) |loc| {
-                    std.debug.print("[opensubtitles.org][doh] location={s}\n", .{loc});
-                }
-            }
-
-            if (isRedirectStatus(raw.status)) {
-                if (raw.location) |location| {
-                    const next_target = try pathFromRedirectLocation(allocator, location);
-                    target = next_target;
-                    redirects += 1;
-                    continue;
-                }
-            }
-
-            return .{
-                .status = raw.status,
-                .body = raw.body,
-            };
-        }
+        _ = allocator;
+        return common.fetchBytes(self.client, self.allocator, url, .{
+            .accept = "text/html",
+            .allow_non_ok = true,
+            .max_attempts = 2,
+        });
     }
 
     fn resolveHostViaDoh(self: *Scraper, allocator: Allocator, host: []const u8) ![]const u8 {
-        const encoded_host = try common.encodeUriComponent(allocator, host);
-        const endpoints = [_][]const u8{
-            try std.fmt.allocPrint(allocator, "https://cloudflare-dns.com/dns-query?name={s}&type=A", .{encoded_host}),
-            try std.fmt.allocPrint(allocator, "https://dns.google/resolve?name={s}&type=A", .{encoded_host}),
-        };
-
-        for (endpoints) |endpoint| {
-            const response = common.fetchBytes(self.client, allocator, endpoint, .{
-                .accept = "application/dns-json",
-                .allow_non_ok = true,
-                .max_attempts = 2,
-            }) catch continue;
-
-            if (response.status != .ok) continue;
-
-            const root = std.json.parseFromSliceLeaky(std.json.Value, allocator, response.body, .{}) catch continue;
-            const obj = switch (root) {
-                .object => |o| o,
-                else => continue,
-            };
-            const answers_val = obj.get("Answer") orelse continue;
-            const answers = switch (answers_val) {
-                .array => |a| a,
-                else => continue,
-            };
-
-            for (answers.items) |answer| {
-                const answer_obj = switch (answer) {
-                    .object => |o| o,
-                    else => continue,
-                };
-
-                const type_val = answer_obj.get("type") orelse continue;
-                const rr_type: i64 = switch (type_val) {
-                    .integer => |i| i,
-                    .number_string => |s| std.fmt.parseInt(i64, s, 10) catch continue,
-                    else => continue,
-                };
-                if (rr_type != 1) continue;
-
-                const data_val = answer_obj.get("data") orelse continue;
-                const ip = switch (data_val) {
-                    .string => |s| s,
-                    else => continue,
-                };
-                if (ip.len == 0) continue;
-
-                return try allocator.dupe(u8, ip);
-            }
-        }
-
+        _ = self;
+        _ = allocator;
+        _ = host;
         return error.TemporaryNameServerFailure;
     }
 };
@@ -317,50 +242,12 @@ fn fetchHttpsByIp(
     path: []const u8,
     accept: []const u8,
 ) !RawHttpResponse {
-    const addr = try std.net.Address.parseIp(ip, 443);
-    var stream = try std.net.tcpConnectToAddress(addr);
-    defer stream.close();
-
-    const in_buf = try allocator.alloc(u8, std.crypto.tls.Client.min_buffer_len);
-    const out_buf = try allocator.alloc(u8, std.crypto.tls.Client.min_buffer_len);
-    const tls_read_buf = try allocator.alloc(u8, std.crypto.tls.Client.min_buffer_len + 8192);
-    const tls_write_buf = try allocator.alloc(u8, 4096);
-    defer allocator.free(in_buf);
-    defer allocator.free(out_buf);
-    defer allocator.free(tls_read_buf);
-    defer allocator.free(tls_write_buf);
-
-    var stream_reader = stream.reader(in_buf);
-    var stream_writer = stream.writer(out_buf);
-
-    var ca_bundle: std.crypto.Certificate.Bundle = .{};
-    defer ca_bundle.deinit(allocator);
-    try ca_bundle.rescan(allocator);
-
-    var tls_client = try std.crypto.tls.Client.init(
-        stream_reader.interface(),
-        &stream_writer.interface,
-        .{
-            .host = .{ .explicit = host },
-            .ca = .{ .bundle = ca_bundle },
-            .read_buffer = tls_read_buf,
-            .write_buffer = tls_write_buf,
-            .allow_truncation_attacks = true,
-        },
-    );
-
-    const request = try std.fmt.allocPrint(
-        allocator,
-        "GET {s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: {s}\r\nAccept: {s}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
-        .{ path, host, common.default_user_agent, accept },
-    );
-    defer allocator.free(request);
-
-    try tls_client.writer.writeAll(request);
-    try tls_client.writer.flush();
-    try stream_writer.interface.flush();
-
-    return readHttpResponse(allocator, &tls_client.reader);
+    _ = allocator;
+    _ = host;
+    _ = ip;
+    _ = path;
+    _ = accept;
+    return error.TemporaryNameServerFailure;
 }
 
 fn readHttpResponse(allocator: Allocator, reader: *std.Io.Reader) !RawHttpResponse {
@@ -712,7 +599,7 @@ test "live opensubtitles.org search and subtitles" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
     if (!common.shouldRunNamedLiveTest(std.testing.allocator, "OPENSUBTITLES_ORG")) return error.SkipZigTest;
 
-    var client: std.http.Client = .{ .allocator = std.testing.allocator };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer client.deinit();
 
     var scraper = Scraper.init(std.testing.allocator, &client);

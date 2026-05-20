@@ -1,6 +1,7 @@
 const std = @import("std");
 const subdl = @import("../scrapers/subdl.zig");
 const runtime_alloc = @import("runtime_alloc");
+const runtime_io = @import("runtime_io");
 const unarr = @import("unarr");
 
 const Allocator = std.mem.Allocator;
@@ -64,6 +65,17 @@ pub fn providers() []const Provider {
     return &provider_values;
 }
 
+pub fn providerCount() usize {
+    return provider_values.len;
+}
+
+pub fn providerIndex(provider: Provider) usize {
+    for (provider_values, 0..) |value, idx| {
+        if (value == provider) return idx;
+    }
+    unreachable;
+}
+
 pub fn providerName(provider: Provider) []const u8 {
     return switch (provider) {
         .subdl_com => "subdl_com",
@@ -78,6 +90,88 @@ pub fn providerName(provider: Provider) []const u8 {
         .my_subs_co => "my_subs_co",
         .subsource_net => "subsource_net",
         .tvsubtitles_net => "tvsubtitles_net",
+    };
+}
+
+pub const ProviderInfo = struct {
+    id: []const u8,
+    display_name: []const u8,
+    site_url: []const u8,
+    supports_search_pagination: bool,
+    supports_subtitles_pagination: bool,
+    protected: bool,
+    supports_movies: bool,
+    supports_tv: bool,
+};
+
+/// User-facing provider metadata is derived from the enum, not copied into
+/// scraper-specific structs. This keeps CLI/TUI provider lists consistent with
+/// the actual dispatch table below.
+pub fn providerInfo(provider: Provider) ProviderInfo {
+    return .{
+        .id = providerName(provider),
+        .display_name = providerDisplayName(provider),
+        .site_url = providerSiteUrl(provider),
+        .supports_search_pagination = providerSupportsSearchPagination(provider),
+        .supports_subtitles_pagination = providerSupportsSubtitlesPagination(provider),
+        .protected = providerRequiresBrowserSession(provider),
+        .supports_movies = providerSupportsMovies(provider),
+        .supports_tv = providerSupportsTv(provider),
+    };
+}
+
+pub fn providerDisplayName(provider: Provider) []const u8 {
+    return switch (provider) {
+        .subdl_com => "SubDL",
+        .opensubtitles_com => "OpenSubtitles.com",
+        .opensubtitles_org => "OpenSubtitles.org",
+        .moviesubtitles_org => "MovieSubtitles.org",
+        .moviesubtitlesrt_com => "MovieSubtitlesRT",
+        .podnapisi_net => "Podnapisi",
+        .yifysubtitles_ch => "YIFY Subtitles",
+        .subtitlecat_com => "Subtitle Cat",
+        .isubtitles_org => "iSubtitles",
+        .my_subs_co => "My Subs",
+        .subsource_net => "SubSource",
+        .tvsubtitles_net => "TVSubtitles",
+    };
+}
+
+pub fn providerSiteUrl(provider: Provider) []const u8 {
+    return switch (provider) {
+        .subdl_com => "https://subdl.com",
+        .opensubtitles_com => "https://www.opensubtitles.com",
+        .opensubtitles_org => "https://www.opensubtitles.org",
+        .moviesubtitles_org => "https://www.moviesubtitles.org",
+        .moviesubtitlesrt_com => "https://moviesubtitlesrt.com",
+        .podnapisi_net => "https://www.podnapisi.net",
+        .yifysubtitles_ch => "https://yifysubtitles.ch",
+        .subtitlecat_com => "https://www.subtitlecat.com",
+        .isubtitles_org => "https://isubtitles.org",
+        .my_subs_co => "https://my-subs.co",
+        .subsource_net => "https://subsource.net",
+        .tvsubtitles_net => "https://www.tvsubtitles.net",
+    };
+}
+
+pub fn providerRequiresBrowserSession(provider: Provider) bool {
+    return switch (provider) {
+        .opensubtitles_com => true,
+        else => false,
+    };
+}
+
+pub fn providerSupportsMovies(provider: Provider) bool {
+    return switch (provider) {
+        .tvsubtitles_net => false,
+        else => true,
+    };
+}
+
+pub fn providerSupportsTv(provider: Provider) bool {
+    return switch (provider) {
+        .moviesubtitles_org, .moviesubtitlesrt_com, .yifysubtitles_ch => false,
+        else => true,
     };
 }
 
@@ -96,33 +190,46 @@ pub fn providerSupportsSubtitlesPagination(provider: Provider) bool {
 }
 
 pub fn parseProvider(value: []const u8) ?Provider {
-    if (matchesProvider(value, "subdl_com")) return .subdl_com;
-    if (matchesProvider(value, "opensubtitles_com")) return .opensubtitles_com;
-    if (matchesProvider(value, "opensubtitles_org")) return .opensubtitles_org;
-    if (matchesProvider(value, "moviesubtitles_org")) return .moviesubtitles_org;
-    if (matchesProvider(value, "moviesubtitlesrt_com")) return .moviesubtitlesrt_com;
-    if (matchesProvider(value, "podnapisi_net")) return .podnapisi_net;
-    if (matchesProvider(value, "yifysubtitles_ch")) return .yifysubtitles_ch;
-    if (matchesProvider(value, "subtitlecat_com")) return .subtitlecat_com;
-    if (matchesProvider(value, "isubtitles_org")) return .isubtitles_org;
-    if (matchesProvider(value, "my_subs_co")) return .my_subs_co;
-    if (matchesProvider(value, "subsource_net")) return .subsource_net;
-    if (matchesProvider(value, "tvsubtitles_net")) return .tvsubtitles_net;
-    return null;
+    return resolveProvider(value) catch null;
+}
+
+pub const ResolveProviderError = error{
+    UnknownProvider,
+    AmbiguousProvider,
+};
+
+pub fn resolveProvider(value: []const u8) ResolveProviderError!Provider {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return error.UnknownProvider;
+
+    var candidate: ?Provider = null;
+    for (provider_values) |provider| {
+        const name = providerName(provider);
+        if (!matchesProviderPrefix(trimmed, name)) continue;
+        if (matchesProvider(trimmed, name)) return provider;
+        if (candidate != null) return error.AmbiguousProvider;
+        candidate = provider;
+    }
+
+    return candidate orelse error.UnknownProvider;
+}
+
+fn matchesProviderPrefix(input: []const u8, canonical: []const u8) bool {
+    if (input.len == 0 or input.len > canonical.len) return false;
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        if (normalizeProviderChar(input[i]) != normalizeProviderChar(canonical[i])) return false;
+    }
+    return true;
 }
 
 fn matchesProvider(input: []const u8, canonical: []const u8) bool {
-    if (input.len == 0) return false;
+    if (input.len != canonical.len) return false;
     var i: usize = 0;
-    var j: usize = 0;
-    while (i < input.len and j < canonical.len) {
-        const a = normalizeProviderChar(input[i]);
-        const b = normalizeProviderChar(canonical[j]);
-        if (a != b) return false;
-        i += 1;
-        j += 1;
+    while (i < input.len) : (i += 1) {
+        if (normalizeProviderChar(input[i]) != normalizeProviderChar(canonical[i])) return false;
     }
-    return i == input.len and j == canonical.len;
+    return true;
 }
 
 fn normalizeProviderChar(c: u8) u8 {
@@ -132,6 +239,17 @@ fn normalizeProviderChar(c: u8) u8 {
     };
 }
 
+pub fn providerSelectionAll() [provider_values.len]bool {
+    return [_]bool{true} ** provider_values.len;
+}
+
+pub fn providerSelectionNone() [provider_values.len]bool {
+    return [_]bool{false} ** provider_values.len;
+}
+
+/// SearchRef is the durable provider-specific handle returned by search and
+/// consumed by subtitle fetch. It intentionally keeps only fields needed for the
+/// follow-up request plus a title fallback for empty/error pages.
 pub const SearchRef = union(Provider) {
     subdl_com: struct {
         title: []const u8,
@@ -192,12 +310,16 @@ pub const SearchRef = union(Provider) {
 };
 
 pub const SearchChoice = struct {
-    title: []const u8,
+    /// Human-readable row text. The canonical title is available through
+    /// titleFromRef(ref), so this field can include extra context such as year
+    /// or media type without duplicating durable data.
     label: []const u8,
     ref: SearchRef,
 };
 
 pub const SearchResponse = struct {
+    /// All strings and items in the response live in this arena. Call deinit()
+    /// once after consumers are done borrowing response slices.
     arena: std.heap.ArenaAllocator,
     provider: Provider,
     items: []const SearchChoice,
@@ -214,7 +336,6 @@ pub const SearchResponse = struct {
 pub const SubdlSeasonChoice = struct {
     label: []const u8,
     season_slug: []const u8,
-    season_name: []const u8,
 };
 
 pub const SubdlSeasonsResponse = struct {
@@ -236,6 +357,7 @@ pub const SubtitleChoice = struct {
 };
 
 pub const SubtitlesResponse = struct {
+    /// Mirrors SearchResponse ownership: subtitle rows borrow from this arena.
     arena: std.heap.ArenaAllocator,
     provider: Provider,
     title: []const u8,
@@ -287,7 +409,6 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
                 const link = try toAbsoluteSubdlLink(a, item.link);
                 const label = try std.fmt.allocPrint(a, "[{s}] {s} ({d})", .{ @tagName(item.media_type), title, item.year });
                 try out.append(a, .{
-                    .title = title,
                     .label = label,
                     .ref = .{ .subdl_com = .{
                         .title = title,
@@ -315,7 +436,6 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
                     try a.dupe(u8, title);
 
                 try out.append(a, .{
-                    .title = title,
                     .label = label,
                     .ref = .{ .opensubtitles_com = .{
                         .title = title,
@@ -338,7 +458,6 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
                 const title = try a.dupe(u8, item.title);
                 const page_url = try a.dupe(u8, item.page_url);
                 try out.append(a, .{
-                    .title = title,
                     .label = try a.dupe(u8, title),
                     .ref = .{ .opensubtitles_org = .{
                         .title = title,
@@ -357,7 +476,6 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
                 const title = try a.dupe(u8, item.title);
                 const link = try a.dupe(u8, item.link);
                 try out.append(a, .{
-                    .title = title,
                     .label = try a.dupe(u8, title),
                     .ref = .{ .moviesubtitles_org = .{
                         .title = title,
@@ -376,7 +494,6 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
                 const title = try a.dupe(u8, item.title);
                 const page_url = try a.dupe(u8, item.page_url);
                 try out.append(a, .{
-                    .title = title,
                     .label = try a.dupe(u8, title),
                     .ref = .{ .moviesubtitlesrt_com = .{
                         .title = title,
@@ -400,7 +517,6 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
                     try a.dupe(u8, title);
 
                 try out.append(a, .{
-                    .title = title,
                     .label = label,
                     .ref = .{ .podnapisi_net = .{
                         .title = title,
@@ -419,7 +535,6 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
                 const title = try a.dupe(u8, item.movie);
                 const movie_page_url = try a.dupe(u8, item.movie_page_url);
                 try out.append(a, .{
-                    .title = title,
                     .label = try a.dupe(u8, title),
                     .ref = .{ .yifysubtitles_ch = .{
                         .title = title,
@@ -438,7 +553,6 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
                 const title = try a.dupe(u8, item.title);
                 const details_url = try a.dupe(u8, item.details_url);
                 try out.append(a, .{
-                    .title = title,
                     .label = try a.dupe(u8, title),
                     .ref = .{ .subtitlecat_com = .{
                         .title = title,
@@ -462,7 +576,6 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
                     try a.dupe(u8, title);
 
                 try out.append(a, .{
-                    .title = title,
                     .label = label,
                     .ref = .{ .isubtitles_org = .{
                         .title = title,
@@ -482,7 +595,6 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
                 const details_url = try a.dupe(u8, item.details_url);
                 const label = try std.fmt.allocPrint(a, "[{s}] {s}", .{ @tagName(item.media_kind), title });
                 try out.append(a, .{
-                    .title = title,
                     .label = label,
                     .ref = .{ .my_subs_co = .{
                         .title = title,
@@ -518,7 +630,6 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
                     try a.dupe(u8, title);
 
                 try out.append(a, .{
-                    .title = title,
                     .label = label,
                     .ref = .{ .subsource_net = .{
                         .title = title,
@@ -539,7 +650,6 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
                 const title = try a.dupe(u8, item.title);
                 const show_url = try a.dupe(u8, item.show_url);
                 try out.append(a, .{
-                    .title = title,
                     .label = try a.dupe(u8, title),
                     .ref = .{ .tvsubtitles_net = .{
                         .title = title,
@@ -557,6 +667,9 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
     };
 }
 
+/// Page-aware search wrapper. Providers without real pagination expose page 1
+/// as normal data and every later page as an empty, non-network response so the
+/// UI never invents fake pagination for those providers.
 pub fn searchPage(allocator: Allocator, client: *std.http.Client, provider: Provider, query: []const u8, page: usize) !SearchResponse {
     const requested_page = if (page == 0) 1 else page;
     if (!providerSupportsSearchPagination(provider)) {
@@ -592,7 +705,6 @@ pub fn searchPage(allocator: Allocator, client: *std.http.Client, provider: Prov
                 const title = try a.dupe(u8, item.title);
                 const page_url = try a.dupe(u8, item.page_url);
                 try out.append(a, .{
-                    .title = title,
                     .label = try a.dupe(u8, title),
                     .ref = .{ .opensubtitles_org = .{
                         .title = title,
@@ -615,7 +727,6 @@ pub fn searchPage(allocator: Allocator, client: *std.http.Client, provider: Prov
                 const title = try a.dupe(u8, item.title);
                 const page_url = try a.dupe(u8, item.page_url);
                 try out.append(a, .{
-                    .title = title,
                     .label = try a.dupe(u8, title),
                     .ref = .{ .moviesubtitlesrt_com = .{
                         .title = title,
@@ -643,7 +754,6 @@ pub fn searchPage(allocator: Allocator, client: *std.http.Client, provider: Prov
                     try a.dupe(u8, title);
 
                 try out.append(a, .{
-                    .title = title,
                     .label = label,
                     .ref = .{ .podnapisi_net = .{
                         .title = title,
@@ -671,7 +781,6 @@ pub fn searchPage(allocator: Allocator, client: *std.http.Client, provider: Prov
                     try a.dupe(u8, title);
 
                 try out.append(a, .{
-                    .title = title,
                     .label = label,
                     .ref = .{ .isubtitles_org = .{
                         .title = title,
@@ -713,7 +822,6 @@ pub fn fetchSubdlSeasons(allocator: Allocator, client: *std.http.Client, ref: Se
 
             for (seasons.seasons) |season| {
                 const season_slug = try a.dupe(u8, season.number);
-                const season_name = try a.dupe(u8, season.name);
                 const label = if (season.name.len == 0 or std.mem.eql(u8, season.name, season.number))
                     try a.dupe(u8, season.number)
                 else
@@ -721,7 +829,6 @@ pub fn fetchSubdlSeasons(allocator: Allocator, client: *std.http.Client, ref: Se
                 try out.append(a, .{
                     .label = label,
                     .season_slug = season_slug,
-                    .season_name = season_name,
                 });
             }
         },
@@ -1121,6 +1228,9 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
     };
 }
 
+/// Same pagination contract as searchPage: unsupported providers return an
+/// empty page after page 1. This keeps scraper modules simple and moves TUI
+/// pagination policy into the app layer.
 pub fn fetchSubtitlesPage(allocator: Allocator, client: *std.http.Client, ref: SearchRef, page: usize) !SubtitlesResponse {
     const requested_page = if (page == 0) 1 else page;
     const provider = std.meta.activeTag(ref);
@@ -1230,7 +1340,7 @@ fn emptySubtitlesPage(allocator: Allocator, ref: SearchRef, page: usize) !Subtit
     };
 }
 
-fn titleFromRef(ref: SearchRef) []const u8 {
+pub fn titleFromRef(ref: SearchRef) []const u8 {
     return switch (ref) {
         .subdl_com => |item| item.title,
         .opensubtitles_com => |item| item.title,
@@ -1287,15 +1397,13 @@ pub fn downloadSubtitleWithProgressAndOptions(
     defer allocator.free(raw_name);
 
     emitDownloadPhase(progress, .writing_output);
-    try std.fs.cwd().makePath(out_dir);
+    try std.Io.Dir.cwd().createDirPath(runtime_io.get(), out_dir);
     const safe_name = try sanitizeFilename(allocator, raw_name);
     defer allocator.free(safe_name);
 
     const output_path = try nextAvailableOutputPath(allocator, out_dir, safe_name);
     errdefer allocator.free(output_path);
-    var file = try std.fs.cwd().createFile(output_path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(response.body);
+    try std.Io.Dir.cwd().writeFile(runtime_io.get(), .{ .sub_path = output_path, .data = response.body });
 
     if (archive_kind == .none) {
         return .{
@@ -1316,6 +1424,8 @@ pub fn downloadSubtitleWithProgressAndOptions(
             .source_url = source_url,
         };
     }
+
+    if (!unarr.enabled) return error.ArchiveExtractionUnavailable;
 
     emitDownloadPhase(progress, .extracting_archive);
     const extracted_files = try extractArchiveFiles(allocator, response.body, archive_kind, out_dir);
@@ -1355,6 +1465,9 @@ const SubtitlecatTranslateToken = struct {
     }
 };
 
+/// Subtitlecat can expose translated subtitles without a direct file URL. The
+/// token is an internal pseudo-URL that carries enough data for the download
+/// step to fetch the source subtitle and translate it before writing a file.
 fn makeSubtitlecatTranslateToken(
     allocator: Allocator,
     source_url: []const u8,
@@ -1490,7 +1603,7 @@ fn downloadSubtitlecatTranslated(
     defer allocator.free(translated_text);
 
     emitDownloadPhase(progress, .writing_output);
-    try std.fs.cwd().makePath(out_dir);
+    try std.Io.Dir.cwd().createDirPath(runtime_io.get(), out_dir);
     const preferred_name = if (subtitle.filename) |name| name else token.filename;
     const raw_name = try ensureFilenameExtension(allocator, preferred_name, token.source_url, .none, ".srt");
     defer allocator.free(raw_name);
@@ -1499,9 +1612,7 @@ fn downloadSubtitlecatTranslated(
 
     const output_path = try nextAvailableOutputPath(allocator, out_dir, safe_name);
     errdefer allocator.free(output_path);
-    var file = try std.fs.cwd().createFile(output_path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(translated_text);
+    try std.Io.Dir.cwd().writeFile(runtime_io.get(), .{ .sub_path = output_path, .data = translated_text });
 
     return .{
         .file_path = output_path,
@@ -1511,7 +1622,7 @@ fn downloadSubtitlecatTranslated(
 }
 
 fn languageToGoogleCode(input: []const u8) ?[]const u8 {
-    const trimmed = common.trimAscii(input);
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
     if (trimmed.len == 0) return null;
 
     if (common.normalizeLanguageCode(trimmed)) |normalized| {
@@ -1694,13 +1805,13 @@ fn sanitizeSubtitlecatTranslateLine(allocator: Allocator, line: []const u8) ![]u
 
     var i: usize = 0;
     while (i < line.len) {
-        if (asciiStartsWithIgnoreCase(line[i..], "<font")) {
+        if (std.ascii.startsWithIgnoreCase(line[i..], "<font")) {
             if (std.mem.indexOfScalarPos(u8, line, i, '>')) |end_idx| {
                 i = end_idx + 1;
                 continue;
             }
         }
-        if (asciiStartsWithIgnoreCase(line[i..], "</font>")) {
+        if (std.ascii.startsWithIgnoreCase(line[i..], "</font>")) {
             i += "</font>".len;
             continue;
         }
@@ -1713,14 +1824,6 @@ fn sanitizeSubtitlecatTranslateLine(allocator: Allocator, line: []const u8) ![]u
     }
 
     return try out.toOwnedSlice(allocator);
-}
-
-fn asciiStartsWithIgnoreCase(input: []const u8, prefix: []const u8) bool {
-    if (prefix.len > input.len) return false;
-    for (input[0..prefix.len], prefix) |a, b| {
-        if (std.ascii.toLower(a) != std.ascii.toLower(b)) return false;
-    }
-    return true;
 }
 
 fn translateViaGoogle(
@@ -1773,6 +1876,9 @@ fn googleTranslateResultToString(allocator: Allocator, value: std.json.Value) ![
     return try out.toOwnedSlice(allocator);
 }
 
+/// Some providers publish an intermediate download page instead of the final
+/// archive URL. Resolve only the known cases here; all other URLs are treated
+/// as already-downloadable.
 fn resolveDownloadUrlIfNeeded(allocator: Allocator, client: *std.http.Client, download_url: []const u8) ![]const u8 {
     if (parseOpenSubtitlesRemoteToken(download_url)) |remote_endpoint| {
         var scraper = subdl.opensubtitles_com.Scraper.init(allocator, client);
@@ -1796,6 +1902,8 @@ fn resolveDownloadUrlIfNeeded(allocator: Allocator, client: *std.http.Client, do
     return allocator.dupe(u8, download_url);
 }
 
+/// Download fetch has provider-specific recovery hooks because several sites
+/// accept normal search requests but protect binary/archive endpoints.
 fn fetchDownloadBytes(client: *std.http.Client, allocator: Allocator, url: []const u8) !common.HttpResponse {
     const yify_referer = yifyRefererForUrl(url);
     const yify_headers = if (yify_referer) |referer|
@@ -1908,10 +2016,12 @@ const ArchiveKind = enum {
     seven_z,
 };
 
+/// Prefer filename/URL extensions but fall back to magic bytes because many
+/// subtitle providers serve archives from extensionless download endpoints.
 fn detectArchiveKind(file_name: []const u8, url: []const u8, body: []const u8) ArchiveKind {
-    if (asciiEndsWithIgnoreCase(file_name, ".zip") or asciiEndsWithIgnoreCase(url, ".zip")) return .zip;
-    if (asciiEndsWithIgnoreCase(file_name, ".rar") or asciiEndsWithIgnoreCase(url, ".rar")) return .rar;
-    if (asciiEndsWithIgnoreCase(file_name, ".7z") or asciiEndsWithIgnoreCase(url, ".7z")) return .seven_z;
+    if (std.ascii.endsWithIgnoreCase(file_name, ".zip") or std.ascii.endsWithIgnoreCase(url, ".zip")) return .zip;
+    if (std.ascii.endsWithIgnoreCase(file_name, ".rar") or std.ascii.endsWithIgnoreCase(url, ".rar")) return .rar;
+    if (std.ascii.endsWithIgnoreCase(file_name, ".7z") or std.ascii.endsWithIgnoreCase(url, ".7z")) return .seven_z;
     if (body.len >= 4 and std.mem.eql(u8, body[0..4], "PK\x03\x04")) return .zip;
     if (body.len >= 4 and std.mem.eql(u8, body[0..4], "PK\x05\x06")) return .zip;
     if (body.len >= 4 and std.mem.eql(u8, body[0..4], "PK\x07\x08")) return .zip;
@@ -1968,9 +2078,7 @@ fn extractArchiveFiles(
         const output_path = try nextAvailableOutputPath(allocator, out_dir, entry_base_name);
         errdefer allocator.free(output_path);
 
-        var out_file = std.fs.cwd().createFile(output_path, .{ .truncate = true }) catch return error.ArchiveExtractionFailed;
-        defer out_file.close();
-        out_file.writeAll(entry_data) catch return error.ArchiveExtractionFailed;
+        std.Io.Dir.cwd().writeFile(runtime_io.get(), .{ .sub_path = output_path, .data = entry_data }) catch return error.ArchiveExtractionFailed;
 
         try extracted.append(allocator, output_path);
     }
@@ -2124,7 +2232,7 @@ fn nextAvailableOutputPath(allocator: Allocator, out_dir: []const u8, base_name:
 
         const full_path = try std.fs.path.join(allocator, &.{ out_dir, file_name });
         errdefer allocator.free(full_path);
-        std.fs.cwd().access(full_path, .{}) catch |err| switch (err) {
+        std.Io.Dir.cwd().access(runtime_io.get(), full_path, .{}) catch |err| switch (err) {
             error.FileNotFound => return full_path,
             else => return err,
         };
@@ -2141,15 +2249,6 @@ fn appendNumericSuffix(allocator: Allocator, base_name: []const u8, suffix: usiz
         return std.fmt.allocPrint(allocator, "{s}-{d}{s}", .{ stem, suffix, ext });
     }
     return std.fmt.allocPrint(allocator, "{s}-{d}", .{ base_name, suffix });
-}
-
-fn asciiEndsWithIgnoreCase(input: []const u8, suffix: []const u8) bool {
-    if (suffix.len > input.len) return false;
-    const tail = input[input.len - suffix.len ..];
-    for (tail, suffix) |a, b| {
-        if (std.ascii.toLower(a) != std.ascii.toLower(b)) return false;
-    }
-    return true;
 }
 
 fn shouldRunTuiLiveSmoke(allocator: Allocator) bool {
@@ -2177,7 +2276,9 @@ fn liveQueryForProvider(provider: Provider) []const u8 {
     };
 }
 
-fn searchRefLogUrl(ref: SearchRef) []const u8 {
+/// URL shown in logs/UI for a search result. It is not always the exact request
+/// URL used later, but it is the best provider-specific page to show the user.
+pub fn searchRefUrl(ref: SearchRef) []const u8 {
     return switch (ref) {
         .subdl_com => |item| item.link,
         .opensubtitles_com => |item| item.subtitles_list_url,
@@ -2219,10 +2320,10 @@ fn iterDownloadCandidates(subtitles: []const SubtitleChoice, prefer_archive: boo
 }
 
 fn likelyArchiveSource(url: []const u8, filename: ?[]const u8) bool {
-    if (asciiEndsWithIgnoreCase(url, ".zip") or asciiEndsWithIgnoreCase(url, ".rar") or asciiEndsWithIgnoreCase(url, ".7z")) return true;
+    if (std.ascii.endsWithIgnoreCase(url, ".zip") or std.ascii.endsWithIgnoreCase(url, ".rar") or std.ascii.endsWithIgnoreCase(url, ".7z")) return true;
     if (std.mem.indexOf(u8, url, ".zip?") != null or std.mem.indexOf(u8, url, ".rar?") != null or std.mem.indexOf(u8, url, ".7z?") != null) return true;
     if (filename) |name| {
-        if (asciiEndsWithIgnoreCase(name, ".zip") or asciiEndsWithIgnoreCase(name, ".rar") or asciiEndsWithIgnoreCase(name, ".7z")) return true;
+        if (std.ascii.endsWithIgnoreCase(name, ".zip") or std.ascii.endsWithIgnoreCase(name, ".rar") or std.ascii.endsWithIgnoreCase(name, ".7z")) return true;
     }
     return false;
 }
@@ -2233,11 +2334,11 @@ fn isSubtitlecatTranslateTokenUrl(download_url: ?[]const u8) bool {
 }
 
 fn prepareDownloadOutDir(path: []const u8) !void {
-    try std.fs.cwd().makePath(path);
+    try std.Io.Dir.cwd().createDirPath(runtime_io.get(), path);
 }
 
 fn cleanupDownloadOutDir(path: []const u8) void {
-    std.fs.cwd().deleteTree(path) catch {};
+    std.Io.Dir.cwd().deleteTree(runtime_io.get(), path) catch {};
 }
 
 test "provider registry covers all subdl_js providers" {
@@ -2286,14 +2387,16 @@ test "parseProvider accepts dotted/hyphenated js provider names" {
     try std.testing.expect(parseProvider("tvsubtitles.net") == .tvsubtitles_net);
 }
 
-test "parseProvider rejects deprecated short aliases" {
-    try std.testing.expect(parseProvider("subdl") == null);
-    try std.testing.expect(parseProvider("yify") == null);
-    try std.testing.expect(parseProvider("subtitlecat") == null);
-    try std.testing.expect(parseProvider("isubtitles") == null);
-    try std.testing.expect(parseProvider("my_subs") == null);
-    try std.testing.expect(parseProvider("subsource") == null);
-    try std.testing.expect(parseProvider("tvsubtitles") == null);
+test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
+    try std.testing.expect(try resolveProvider("subdl") == .subdl_com);
+    try std.testing.expect(try resolveProvider("yify") == .yifysubtitles_ch);
+    try std.testing.expect(try resolveProvider("subtitlecat") == .subtitlecat_com);
+    try std.testing.expect(try resolveProvider("isubtitles") == .isubtitles_org);
+    try std.testing.expect(try resolveProvider("my_subs") == .my_subs_co);
+    try std.testing.expect(try resolveProvider("subsource") == .subsource_net);
+    try std.testing.expect(try resolveProvider("tvsubtitles") == .tvsubtitles_net);
+    try std.testing.expectError(error.AmbiguousProvider, resolveProvider("open"));
+    try std.testing.expectError(error.UnknownProvider, resolveProvider("missing"));
 }
 
 test "provider pagination support flags" {
@@ -2315,7 +2418,7 @@ test "provider pagination support flags" {
 }
 
 test "searchPage returns empty page for unsupported provider page > 1" {
-    var client: std.http.Client = .{ .allocator = std.testing.allocator };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer client.deinit();
 
     const unsupported_providers = [_]Provider{ .subdl_com, .my_subs_co, .tvsubtitles_net };
@@ -2331,7 +2434,7 @@ test "searchPage returns empty page for unsupported provider page > 1" {
 }
 
 test "fetchSubtitlesPage returns empty page for unsupported provider page > 1" {
-    var client: std.http.Client = .{ .allocator = std.testing.allocator };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer client.deinit();
 
     const ref: SearchRef = .{ .subdl_com = .{
@@ -2475,13 +2578,13 @@ const ProviderSmokeState = struct {
 };
 
 fn runProviderSmokeWorker(state: *ProviderSmokeState) void {
-    const start_ms = std.time.milliTimestamp();
+    const start_ms = common.compatMilliTimestamp();
     std.debug.print("[live][providers_app][{s}] worker_start state=0x{x}\n", .{
         providerName(state.provider),
         @intFromPtr(state),
     });
     defer {
-        const elapsed_ms = std.time.milliTimestamp() - start_ms;
+        const elapsed_ms = common.compatMilliTimestamp() - start_ms;
         if (state.err) |err| {
             std.debug.print("[live][providers_app][{s}] worker_end status=err err={s} elapsed_ms={d}\n", .{
                 providerName(state.provider),
@@ -2500,7 +2603,7 @@ fn runProviderSmokeWorker(state: *ProviderSmokeState) void {
     defer allocator_state.deinit();
     const allocator = allocator_state.allocator();
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = std.testing.io };
     defer client.deinit();
 
     var phase = common.LivePhase.init(providerName(state.provider), "providers_app_tui_smoke");
@@ -2531,14 +2634,15 @@ fn runProviderTuiSmoke(allocator: std.mem.Allocator, client: *std.http.Client, p
     const chosen_idx: usize = 0;
     const picked_search = search_response.items[chosen_idx];
     std.debug.print("[live][providers_app][{s}][search][0]\n", .{providerName(provider)});
-    try validateUtfNoReplacement(picked_search.title);
+    const picked_title = titleFromRef(picked_search.ref);
+    try validateUtfNoReplacement(picked_title);
     try validateUtfNoReplacement(picked_search.label);
-    try common.livePrintField(allocator, "title", picked_search.title);
+    try common.livePrintField(allocator, "title", picked_title);
     try common.livePrintField(allocator, "label", picked_search.label);
-    try common.livePrintField(allocator, "url", searchRefLogUrl(picked_search.ref));
+    try common.livePrintField(allocator, "url", searchRefUrl(picked_search.ref));
     std.debug.print("[live][providers_app][{s}] chosen_search={d}\n", .{ providerName(provider), chosen_idx });
-    try common.livePrintField(allocator, "chosen_search_title", picked_search.title);
-    try common.livePrintField(allocator, "chosen_search_url", searchRefLogUrl(picked_search.ref));
+    try common.livePrintField(allocator, "chosen_search_title", picked_title);
+    try common.livePrintField(allocator, "chosen_search_url", searchRefUrl(picked_search.ref));
 
     std.debug.print("[live][providers_app][{s}] phase=fetch_chosen_subtitles_start idx={d}\n", .{
         providerName(provider),
@@ -2567,7 +2671,7 @@ fn runProviderTuiSmoke(allocator: std.mem.Allocator, client: *std.http.Client, p
     if (chosen_subtitle.filename) |v| try validateUtfNoReplacement(v);
     if (chosen_subtitle.download_url) |v| try validateUtfNoReplacement(v);
 
-    const unique = std.time.nanoTimestamp();
+    const unique = common.compatNanoTimestamp();
     const out_dir = try std.fmt.allocPrint(allocator, ".zig-cache/live-downloads/{s}-{d}-{d}", .{ providerName(provider), chosen_idx, unique });
     defer allocator.free(out_dir);
     try prepareDownloadOutDir(out_dir);
@@ -2584,7 +2688,7 @@ fn runProviderTuiSmoke(allocator: std.mem.Allocator, client: *std.http.Client, p
     if (download.archive_path) |p| try common.livePrintField(allocator, "download_archive_path", p);
     for (download.extracted_files) |path| {
         try common.livePrintField(allocator, "extracted_file", path);
-        try std.fs.cwd().access(path, .{});
+        try std.Io.Dir.cwd().access(runtime_io.get(), path, .{});
     }
 
     if (download.bytes_written == 0) return error.TestUnexpectedResult;
@@ -2651,7 +2755,7 @@ fn runSubtitlecatTranslateDownloadLive(allocator: std.mem.Allocator, client: *st
     try common.livePrintField(allocator, "subtitle_label", chosen_subtitle.?.label);
     try common.livePrintOptionalField(allocator, "download_url", chosen_subtitle.?.download_url);
 
-    const unique = std.time.nanoTimestamp();
+    const unique = common.compatNanoTimestamp();
     const out_dir = try std.fmt.allocPrint(allocator, ".zig-cache/live-downloads/subtitlecat-translate-{d}", .{unique});
     defer allocator.free(out_dir);
     try prepareDownloadOutDir(out_dir);
@@ -2663,7 +2767,7 @@ fn runSubtitlecatTranslateDownloadLive(allocator: std.mem.Allocator, client: *st
     defer download.deinit(allocator);
     std.debug.print("[live][providers_app][subtitlecat_com][translate] download_ok bytes={d}\n", .{download.bytes_written});
     try common.livePrintField(allocator, "download_file_path", download.file_path);
-    try std.fs.cwd().access(download.file_path, .{});
+    try std.Io.Dir.cwd().access(runtime_io.get(), download.file_path, .{});
     if (download.bytes_written == 0) return error.TestUnexpectedResult;
 }
 
@@ -2803,7 +2907,7 @@ test "live providers_app subtitlecat translated download path" {
     if (!shouldRunTuiLiveSmoke(std.testing.allocator)) return error.SkipZigTest;
     if (!common.providerMatchesLiveFilter(common.liveProviderFilter(), "subtitlecat_com")) return error.SkipZigTest;
 
-    var client: std.http.Client = .{ .allocator = std.testing.allocator };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer client.deinit();
     try runSubtitlecatTranslateDownloadLive(std.testing.allocator, &client);
 }

@@ -144,7 +144,7 @@ pub const Scraper = struct {
             const label_node = pair.first;
             const value_node = pair.last;
             const label_raw = try common.innerTextTrimmedOwned(a, label_node);
-            const label = try asciiLowerDup(a, label_raw);
+            const label = try std.ascii.allocLowerString(a, label_raw);
             const value = try common.innerTextTrimmedOwned(a, value_node);
 
             if (std.mem.indexOf(u8, label, "language") != null) language_raw = value;
@@ -184,18 +184,11 @@ pub const Scraper = struct {
     }
 };
 
-fn asciiLowerDup(allocator: Allocator, input: []const u8) ![]u8 {
-    const out = try allocator.dupe(u8, input);
-    for (out) |*c| c.* = std.ascii.toLower(c.*);
-    return out;
-}
-
 fn firstAndLastTd(row: HtmlNode) ?struct { first: HtmlNode, last: HtmlNode } {
-    const children = row.children();
+    var children = row.children();
     var first: ?HtmlNode = null;
     var last: ?HtmlNode = null;
-    for (children) |child_idx| {
-        const child = row.doc.nodeAt(child_idx) orelse continue;
+    while (children.next()) |child| {
         if (!std.mem.eql(u8, child.tagName(), "td")) continue;
         if (first == null) first = child;
         last = child;
@@ -285,7 +278,7 @@ test "live moviesubtitlesrt search and details" {
     if (!common.shouldRunNamedLiveTest(std.testing.allocator, "MOVIESUBTITLESRT_COM")) return error.SkipZigTest;
     if (suite.shouldRunExtensiveLiveSuite(std.testing.allocator)) return error.SkipZigTest;
 
-    var client: std.http.Client = .{ .allocator = std.testing.allocator };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer client.deinit();
 
     var scraper = Scraper.init(std.testing.allocator, &client);

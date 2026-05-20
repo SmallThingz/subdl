@@ -1,29 +1,30 @@
 const std = @import("std");
 const cli = @import("cli.zig");
-const tui = @import("tui.zig");
+const tui = @import("tui_backend");
+const runtime_io = @import("runtime_io");
 
-pub fn main() !void {
-    var args = try std.process.argsWithAllocator(std.heap.page_allocator);
+pub fn main(init: std.process.Init) !void {
+    runtime_io.set(init.io);
+    var args = try init.minimal.args.iterateAllocator(init.gpa);
     defer args.deinit();
-
     _ = args.next();
     if (args.next()) |mode| {
         if (std.mem.eql(u8, mode, "tui") or std.mem.eql(u8, mode, "--tui")) {
-            try tui.main();
+            try tui.main(init);
             return;
         }
         if (std.mem.eql(u8, mode, "help") or std.mem.eql(u8, mode, "--help") or std.mem.eql(u8, mode, "-h")) {
-            try printUsage();
+            try printUsage(init.io);
             return;
         }
     }
 
-    try cli.main();
+    try cli.main(init);
 }
 
-fn printUsage() !void {
+fn printUsage(io: std.Io) !void {
     var stdout_buf: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
     const stdout = &stdout_writer.interface;
 
     try stdout.print(
@@ -32,7 +33,10 @@ fn printUsage() !void {
         \\  scrapers [cli args...]
         \\
         \\Examples:
-        \\  scrapers --provider subsource_net --query "The Matrix"
+        \\  scrapers --query "The Matrix"
+        \\  scrapers --providers subdl_com,podnapisi_net --query "The Matrix"
+        \\  scrapers --providers=none --query "The Matrix"
+        \\  scrapers -p subsource --query "The Matrix" --extract
         \\  scrapers --tui
         \\
     ,

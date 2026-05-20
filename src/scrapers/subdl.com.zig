@@ -790,7 +790,7 @@ test "movie scraping works for The Thing" {
     if (!common.shouldRunNamedLiveTest(std.testing.allocator, "SUBDL_COM")) return error.SkipZigTest;
     if (suite.shouldRunExtensiveLiveSuite(std.testing.allocator)) return error.SkipZigTest;
 
-    var client: std.http.Client = .{ .allocator = std.testing.allocator };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer client.deinit();
 
     var scraper = Scraper.init(std.testing.allocator, &client);
@@ -809,7 +809,7 @@ test "tv scraping works for Shadowhunters seasons and season subtitles" {
     if (!common.shouldRunNamedLiveTest(std.testing.allocator, "SUBDL_COM")) return error.SkipZigTest;
     if (suite.shouldRunExtensiveLiveSuite(std.testing.allocator)) return error.SkipZigTest;
 
-    var client: std.http.Client = .{ .allocator = std.testing.allocator };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer client.deinit();
 
     var scraper = Scraper.init(std.testing.allocator, &client);
@@ -833,7 +833,7 @@ test "tv scraping works for Shadowhunters seasons and season subtitles" {
 }
 
 test "scraper options default and opt-in include-empty-subtitle-groups" {
-    var client: std.http.Client = .{ .allocator = std.testing.allocator };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer client.deinit();
 
     var default_scraper = Scraper.init(std.testing.allocator, &client);
@@ -852,9 +852,9 @@ test "grouped subtitle parsing excludes empty groups by default and includes wit
     defer arena.deinit();
     const a = arena.allocator();
 
-    var grouped = std.json.ObjectMap.init(a);
-    try grouped.put("english", .{ .array = std.json.Array.init(a) });
-    try grouped.put("spanish", .{ .array = std.json.Array.init(a) });
+    var grouped = try std.json.ObjectMap.init(a, &.{}, &.{});
+    try grouped.put(a, "english", .{ .array = std.json.Array.init(a) });
+    try grouped.put(a, "spanish", .{ .array = std.json.Array.init(a) });
 
     const filtered = try parseGroupedSubtitles(grouped, a, false);
     try std.testing.expectEqual(@as(usize, 0), filtered.len);

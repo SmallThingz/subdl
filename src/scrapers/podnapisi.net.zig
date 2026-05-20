@@ -240,7 +240,7 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
         const debug_timing = debugTimingEnabled();
-        const started_ns = if (debug_timing) std.time.nanoTimestamp() else 0;
+        const started_ns = if (debug_timing) common.compatNanoTimestamp() else 0;
         if (debug_timing) std.debug.print("[podnapisi.net] subtitles start url={s}\n", .{subtitles_page_url});
 
         const response = try common.fetchBytes(self.client, a, subtitles_page_url, .{
@@ -303,7 +303,7 @@ pub const Scraper = struct {
         }
 
         if (debug_timing) {
-            const elapsed_ns = std.time.nanoTimestamp() - started_ns;
+            const elapsed_ns = common.compatNanoTimestamp() - started_ns;
             std.debug.print("[podnapisi.net] subtitles done status={s} rows={d} out={d} in {d} ms\n", .{
                 @tagName(response.status),
                 row_count,
@@ -320,7 +320,7 @@ fn parseIdFromSubtitlesSearchUrl(url: []const u8) ?[]const u8 {
     const marker = "/subtitles/search/";
     const start = std.mem.indexOf(u8, url, marker) orelse return null;
     const remainder_raw = url[start + marker.len ..];
-    const remainder = std.mem.trimLeft(u8, remainder_raw, "/");
+    const remainder = std.mem.trimStart(u8, remainder_raw, "/");
     const end = std.mem.indexOfAny(u8, remainder, "?#/") orelse remainder.len;
     if (end == 0) return null;
     return remainder[0..end];
@@ -330,13 +330,13 @@ fn parseTitleFromSubtitlesSearchUrl(allocator: Allocator, url: []const u8) !?[]c
     const marker = "/subtitles/search/";
     const start = std.mem.indexOf(u8, url, marker) orelse return null;
     var remainder = url[start + marker.len ..];
-    remainder = std.mem.trimLeft(u8, remainder, "/");
+    remainder = std.mem.trimStart(u8, remainder, "/");
 
     const id_end = std.mem.indexOfAny(u8, remainder, "?#/") orelse remainder.len;
     if (id_end >= remainder.len) return null;
 
     var tail = remainder[id_end..];
-    tail = std.mem.trimLeft(u8, tail, "/");
+    tail = std.mem.trimStart(u8, tail, "/");
     const title_end = std.mem.indexOfAny(u8, tail, "?#/") orelse tail.len;
     if (title_end == 0) return null;
 
@@ -477,8 +477,8 @@ fn debugTimingEnabled() bool {
 }
 
 fn findDescendantByTag(node: HtmlNode, tag_name: []const u8) ?HtmlNode {
-    for (node.children()) |child_idx| {
-        const child = node.doc.nodeAt(child_idx) orelse continue;
+    var children = node.children();
+    while (children.next()) |child| {
         if (std.mem.eql(u8, child.tagName(), tag_name)) return child;
         if (findDescendantByTag(child, tag_name)) |nested| return nested;
     }
@@ -486,8 +486,8 @@ fn findDescendantByTag(node: HtmlNode, tag_name: []const u8) ?HtmlNode {
 }
 
 fn findDescendantAnchorByRelNoFollow(node: HtmlNode) ?HtmlNode {
-    for (node.children()) |child_idx| {
-        const child = node.doc.nodeAt(child_idx) orelse continue;
+    var children = node.children();
+    while (children.next()) |child| {
         if (std.mem.eql(u8, child.tagName(), "a")) {
             const rel = common.getAttributeValueSafe(child, "rel") orelse "";
             if (std.mem.indexOf(u8, rel, "nofollow") != null) return child;
@@ -498,8 +498,8 @@ fn findDescendantAnchorByRelNoFollow(node: HtmlNode) ?HtmlNode {
 }
 
 fn findDescendantSpanWithClass(node: HtmlNode, class_fragment: []const u8) ?HtmlNode {
-    for (node.children()) |child_idx| {
-        const child = node.doc.nodeAt(child_idx) orelse continue;
+    var children = node.children();
+    while (children.next()) |child| {
         if (std.mem.eql(u8, child.tagName(), "span")) {
             const class = common.getAttributeValueSafe(child, "class") orelse "";
             if (std.mem.indexOf(u8, class, class_fragment) != null) return child;
@@ -526,7 +526,7 @@ test "live podnapisi search and subtitles" {
     if (!common.shouldRunNamedLiveTest(std.testing.allocator, "PODNAPISI")) return error.SkipZigTest;
     if (suite.shouldRunExtensiveLiveSuite(std.testing.allocator)) return error.SkipZigTest;
 
-    var client: std.http.Client = .{ .allocator = std.testing.allocator };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer client.deinit();
 
     var scraper = Scraper.init(std.testing.allocator, &client);

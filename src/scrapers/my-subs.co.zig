@@ -103,7 +103,7 @@ pub const Scraper = struct {
 
                 const title = blk: {
                     if (common.getAttributeValueSafe(anchor, "title")) |title_attr| {
-                        const clean = common.trimAscii(title_attr);
+                        const clean = std.mem.trim(u8, title_attr, " \t\r\n");
                         if (clean.len > 0) break :blk try a.dupe(u8, clean);
                     }
                     const txt = try common.innerTextTrimmedOwned(a, anchor);
@@ -253,7 +253,7 @@ fn extractLanguage(anchor: HtmlNode) struct { raw: ?[]const u8, code: ?[]const u
 
         const raw = blk: {
             const title = common.getAttributeValueSafe(flag, "title") orelse break :blk null;
-            const clean = common.trimAscii(title);
+            const clean = std.mem.trim(u8, title, " \t\r\n");
             if (clean.len == 0) break :blk null;
             break :blk clean;
         };

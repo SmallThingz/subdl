@@ -299,7 +299,7 @@ fn parseSubtitleId(subtitle_page_url: []const u8) ?[]const u8 {
 fn languageFromSubtitleAnchor(anchor: HtmlNode, href: []const u8) ?[]const u8 {
     if (anchor.queryOne("img")) |img| {
         if (common.getAttributeValueSafe(img, "alt")) |alt| {
-            const code = common.trimAscii(alt);
+            const code = std.mem.trim(u8, alt, " \t\r\n");
             if (code.len == 2) return mapLanguageCode(code);
         }
     }
@@ -386,14 +386,14 @@ fn parseDocumentLocationFromScript(allocator: Allocator, html_body: []const u8) 
     const after = html_body[idx + marker.len ..];
     const eq_idx = std.mem.indexOfScalar(u8, after, '=') orelse return null;
     const semicolon_idx = std.mem.indexOfScalarPos(u8, after, eq_idx + 1, ';') orelse return null;
-    const expr = common.trimAscii(after[eq_idx + 1 .. semicolon_idx]);
+    const expr = std.mem.trim(u8, after[eq_idx + 1 .. semicolon_idx], " \t\r\n");
     if (expr.len == 0) return null;
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     var it = std.mem.tokenizeScalar(u8, expr, '+');
     while (it.next()) |part_raw| {
-        const part = common.trimAscii(part_raw);
+        const part = std.mem.trim(u8, part_raw, " \t\r\n");
         if (part.len == 0) continue;
 
         if ((part[0] == '\'' and part[part.len - 1] == '\'') or (part[0] == '"' and part[part.len - 1] == '"')) {

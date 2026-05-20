@@ -1,11 +1,13 @@
 const std = @import("std");
 const scrapers = @import("scrapers");
 const runtime_alloc = @import("runtime_alloc");
+const runtime_io = @import("runtime_io");
 
 const app = scrapers.providers_app;
 
 const Config = struct {
-    provider: app.Provider = .subdl_com,
+    providers_enabled: [app.providerCount()]bool = app.providerSelectionAll(),
+    provider_filter_seen: bool = false,
     query: ?[]const u8 = null,
     title_index: usize = 0,
     subtitle_index: ?usize = null,
@@ -14,20 +16,27 @@ const Config = struct {
     list_providers: bool = false,
 };
 
-pub fn main() !void {
+const SearchHit = struct {
+    provider: app.Provider,
+    response_index: usize,
+    item_index: usize,
+};
+
+pub fn main(init: std.process.Init) !void {
+    runtime_io.set(init.io);
     var allocator_state = runtime_alloc.RuntimeAllocator.init();
     defer allocator_state.deinit();
     const allocator = allocator_state.allocator();
 
     var stdout_buf: [8192]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buf);
     const stdout = &stdout_writer.interface;
 
     var stderr_buf: [8192]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buf);
     const stderr = &stderr_writer.interface;
 
-    const config = parseArgs(allocator, stderr) catch |err| {
+    const config = parseArgs(init, stderr) catch |err| {
         try stderr.print("argument error: {s}\n\n", .{@errorName(err)});
         try printUsage(stderr);
         try stderr.flush();
@@ -45,37 +54,77 @@ pub fn main() !void {
         try stderr.flush();
         std.process.exit(2);
     };
-
-    var client: std.http.Client = .{ .allocator = allocator };
-    defer client.deinit();
-
-    var search = app.search(allocator, &client, config.provider, query) catch |err| {
-        try stderr.print("search failed: {s}\n", .{@errorName(err)});
-        try stderr.flush();
-        std.process.exit(1);
-    };
-    defer search.deinit();
-
-    if (search.items.len == 0) {
-        try stderr.print("no search results for provider {s}\n", .{app.providerName(config.provider)});
-        try stderr.flush();
-        std.process.exit(1);
-    }
-
-    try stdout.print("Provider: {s}\n", .{app.providerName(config.provider)});
-    try stdout.print("Query: {s}\n", .{query});
-    try stdout.print("Search Results ({d}):\n", .{search.items.len});
-    for (search.items, 0..) |item, idx| {
-        try stdout.print("  [{d}] {s}\n", .{ idx, item.label });
-    }
-
-    if (config.title_index >= search.items.len) {
-        try stderr.print("title-index out of range: {d} (max {d})\n", .{ config.title_index, search.items.len - 1 });
+    if (countEnabledProviders(&config.providers_enabled) == 0) {
+        try stderr.print("no providers selected\n", .{});
         try stderr.flush();
         std.process.exit(2);
     }
 
-    var subtitles = app.fetchSubtitles(allocator, &client, search.items[config.title_index].ref) catch |err| {
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = init.io,
+    };
+    defer client.deinit();
+
+    var searches: std.ArrayListUnmanaged(app.SearchResponse) = .empty;
+    defer {
+        for (searches.items) |*search| search.deinit();
+        searches.deinit(allocator);
+    }
+
+    var hits: std.ArrayListUnmanaged(SearchHit) = .empty;
+    defer hits.deinit(allocator);
+
+    var failed_count: usize = 0;
+    for (app.providers()) |provider| {
+        if (!config.providers_enabled[app.providerIndex(provider)]) continue;
+
+        var search_result = app.search(allocator, &client, provider, query) catch |err| {
+            failed_count += 1;
+            try stderr.print("warning: search failed for {s}: {s}\n", .{ app.providerName(provider), @errorName(err) });
+            continue;
+        };
+        errdefer search_result.deinit();
+
+        const response_index = searches.items.len;
+        try searches.append(allocator, search_result);
+        for (searches.items[response_index].items, 0..) |_, item_index| {
+            try hits.append(allocator, .{
+                .provider = provider,
+                .response_index = response_index,
+                .item_index = item_index,
+            });
+        }
+    }
+
+    if (hits.items.len == 0) {
+        if (failed_count > 0) {
+            try stderr.print("no search results; {d} provider(s) failed\n", .{failed_count});
+        } else {
+            try stderr.print("no search results\n", .{});
+        }
+        try stderr.flush();
+        std.process.exit(1);
+    }
+
+    try stdout.print("Query: {s}\n", .{query});
+    try stdout.print("Search Results ({d}):\n", .{hits.items.len});
+    for (hits.items, 0..) |hit, idx| {
+        const item = searches.items[hit.response_index].items[hit.item_index];
+        try stdout.print("  [{d}] [{s}] {s}\n", .{ idx, app.providerName(hit.provider), item.label });
+    }
+
+    if (config.title_index >= hits.items.len) {
+        try stderr.print("title-index out of range: {d} (max {d})\n", .{ config.title_index, hits.items.len - 1 });
+        try stderr.flush();
+        std.process.exit(2);
+    }
+
+    const hit = hits.items[config.title_index];
+    const selected_title = searches.items[hit.response_index].items[hit.item_index];
+    const selected_provider = hit.provider;
+
+    var subtitles = app.fetchSubtitles(allocator, &client, selected_title.ref) catch |err| {
         try stderr.print("subtitle fetch failed: {s}\n", .{@errorName(err)});
         try stderr.flush();
         std.process.exit(1);
@@ -88,7 +137,8 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
-    try stdout.print("\nTitle: {s}\n", .{subtitles.title});
+    try stdout.print("\nProvider: {s}\n", .{app.providerName(selected_provider)});
+    try stdout.print("Title: {s}\n", .{subtitles.title});
     try stdout.print("Subtitle Rows ({d}):\n", .{subtitles.items.len});
     for (subtitles.items, 0..) |item, idx| {
         const status = if (item.download_url != null) "downloadable" else "no-direct-url";
@@ -124,7 +174,7 @@ pub fn main() !void {
     defer result.deinit(allocator);
 
     try stdout.print("\nDownloaded:\n", .{});
-    try stdout.print("  Provider: {s}\n", .{app.providerName(config.provider)});
+    try stdout.print("  Provider: {s}\n", .{app.providerName(selected_provider)});
     try stdout.print("  File: {s}\n", .{result.file_path});
     if (result.archive_path) |archive_path| {
         try stdout.print("  Archive: {s}\n", .{archive_path});
@@ -140,17 +190,33 @@ pub fn main() !void {
     try stdout.flush();
 }
 
-fn parseArgs(allocator: std.mem.Allocator, stderr: *std.Io.Writer) !Config {
+fn parseArgs(init: std.process.Init, stderr: *std.Io.Writer) !Config {
     var cfg: Config = .{};
 
-    var args = try std.process.argsWithAllocator(allocator);
+    var args = try init.minimal.args.iterateAllocator(init.gpa);
     defer args.deinit();
-
     _ = args.next();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--provider")) {
             const value = args.next() orelse return error.MissingArgumentValue;
-            cfg.provider = app.parseProvider(value) orelse return error.InvalidProvider;
+            try addProviderFilter(&cfg, value);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--providers") or std.mem.eql(u8, arg, "-p")) {
+            const value = args.next() orelse return error.MissingArgumentValue;
+            try addProviderFilter(&cfg, value);
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--providers=")) {
+            try addProviderFilter(&cfg, arg["--providers=".len..]);
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "-p=")) {
+            try addProviderFilter(&cfg, arg["-p=".len..]);
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "-p") and arg.len > 2) {
+            try addProviderFilter(&cfg, arg["-p".len..]);
             continue;
         }
         if (std.mem.eql(u8, arg, "--query")) {
@@ -190,6 +256,44 @@ fn parseArgs(allocator: std.mem.Allocator, stderr: *std.Io.Writer) !Config {
     return cfg;
 }
 
+fn addProviderFilter(cfg: *Config, value: []const u8) !void {
+    if (!cfg.provider_filter_seen) {
+        cfg.providers_enabled = [_]bool{false} ** app.providerCount();
+        cfg.provider_filter_seen = true;
+    }
+
+    var it = std.mem.splitScalar(u8, value, ',');
+    var added = false;
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        if (isNoneProviderSelector(trimmed)) {
+            cfg.providers_enabled = [_]bool{false} ** app.providerCount();
+            added = true;
+            continue;
+        }
+        const provider = app.resolveProvider(trimmed) catch |err| switch (err) {
+            error.UnknownProvider => return error.InvalidProvider,
+            error.AmbiguousProvider => return error.AmbiguousProvider,
+        };
+        cfg.providers_enabled[app.providerIndex(provider)] = true;
+        added = true;
+    }
+    if (!added) return error.InvalidProvider;
+}
+
+fn isNoneProviderSelector(value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(value, "none");
+}
+
+fn countEnabledProviders(flags: []const bool) usize {
+    var count: usize = 0;
+    for (flags) |enabled| {
+        if (enabled) count += 1;
+    }
+    return count;
+}
+
 fn findFirstDownloadable(items: []const app.SubtitleChoice) ?usize {
     for (items, 0..) |item, idx| {
         if (item.download_url != null) return idx;
@@ -200,20 +304,35 @@ fn findFirstDownloadable(items: []const app.SubtitleChoice) ?usize {
 fn printProviders(writer: *std.Io.Writer) !void {
     try writer.print("Available providers:\n", .{});
     for (app.providers()) |provider| {
-        try writer.print("  {s}\n", .{app.providerName(provider)});
+        const info = app.providerInfo(provider);
+        try writer.print(
+            "  {s} - {s} ({s}) movies={any} tv={any} search_pages={any} subtitle_pages={any} protected={any}\n",
+            .{
+                info.id,
+                info.display_name,
+                info.site_url,
+                info.supports_movies,
+                info.supports_tv,
+                info.supports_search_pagination,
+                info.supports_subtitles_pagination,
+                info.protected,
+            },
+        );
     }
 }
 
 fn printUsage(writer: *std.Io.Writer) !void {
     try writer.print(
         \\Usage:
-        \\  scrapers --provider <name> --query <text> [--title-index N] [--subtitle-index N] [--out-dir DIR] [--extract]
+        \\  scrapers --query <text> [--providers a,b] [-p provider] [--title-index N] [--subtitle-index N] [--out-dir DIR] [--extract]
         \\  scrapers --list-providers
         \\
         \\Examples:
-        \\  scrapers --provider subdl_com --query "The Matrix"
-        \\  scrapers --provider podnapisi_net --query "The Matrix" --title-index 0 --subtitle-index 1 --out-dir downloads
-        \\  scrapers --provider subsource_net --query "The Matrix" --extract
+        \\  scrapers --query "The Matrix"
+        \\  scrapers --providers subdl_com,podnapisi_net --query "The Matrix" --title-index 0
+        \\  scrapers --providers=none --query "The Matrix"
+        \\  scrapers -pnone --query "The Matrix"
+        \\  scrapers -p subsource --query "The Matrix" --extract
         \\
     ,
         .{},

@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 
 pub const RuntimeAllocator = if (builtin.mode == .Debug)
     struct {
-        gpa: std.heap.GeneralPurposeAllocator(.{}) = .{},
+        gpa: std.heap.DebugAllocator(.{}) = .{},
 
         pub fn init() @This() {
             return .{};

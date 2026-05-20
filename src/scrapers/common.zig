@@ -1,6 +1,7 @@
 const std = @import("std");
 const html = @import("htmlparser");
 const builtin = @import("builtin");
+const runtime_io = @import("runtime_io");
 const HtmlParseOptions: html.ParseOptions = .{};
 const HtmlDocument = HtmlParseOptions.GetDocument();
 const HtmlNode = HtmlParseOptions.GetNode();
@@ -44,8 +45,28 @@ fn debugTimingEnabled() bool {
     return value.len > 0 and !std.mem.eql(u8, value, "0");
 }
 
+// Live tests can look stuck when a provider throttles or changes markup.
+// This switch keeps periodic phase logging out of normal CLI/library runs.
 fn livePhaseLoggingEnabled() bool {
     return build_options.live_tests_enabled;
+}
+
+pub fn compatMilliTimestamp() i64 {
+    const ns = std.Io.Timestamp.now(runtime_io.get(), .awake).nanoseconds;
+    return @intCast(@divTrunc(ns, std.time.ns_per_ms));
+}
+
+pub fn compatNanoTimestamp() i64 {
+    return @intCast(std.Io.Timestamp.now(runtime_io.get(), .awake).nanoseconds);
+}
+
+pub fn compatUnixTimestamp() i64 {
+    const ns = std.Io.Timestamp.now(runtime_io.get(), .real).nanoseconds;
+    return @intCast(@divTrunc(ns, std.time.ns_per_s));
+}
+
+pub fn sleepMilliseconds(ms: u64) void {
+    runtime_io.get().sleep(.fromMilliseconds(@intCast(ms)), .awake) catch {};
 }
 
 pub const LivePhase = struct {
@@ -67,7 +88,7 @@ pub const LivePhase = struct {
 
     pub fn start(self: *LivePhase) void {
         if (!self.enabled) return;
-        self.start_ms = std.time.milliTimestamp();
+        self.start_ms = compatMilliTimestamp();
         std.debug.print("[live][phase][{s}] start {s}\n", .{ self.scope, self.phase });
         self.thread = std.Thread.spawn(.{}, run, .{self}) catch null;
     }
@@ -76,7 +97,7 @@ pub const LivePhase = struct {
         if (!self.enabled) return;
         self.stopped.store(true, .release);
         if (self.thread) |thread| thread.join();
-        const elapsed_ms = std.time.milliTimestamp() - self.start_ms;
+        const elapsed_ms = compatMilliTimestamp() - self.start_ms;
         std.debug.print("[live][phase][{s}] done {s} elapsed_ms={d}\n", .{
             self.scope,
             self.phase,
@@ -86,9 +107,9 @@ pub const LivePhase = struct {
 
     fn run(self: *LivePhase) void {
         while (!self.stopped.load(.acquire)) {
-            std.Thread.sleep(self.tick_ms * std.time.ns_per_ms);
+            sleepMilliseconds(self.tick_ms);
             if (self.stopped.load(.acquire)) break;
-            const elapsed_ms = std.time.milliTimestamp() - self.start_ms;
+            const elapsed_ms = compatMilliTimestamp() - self.start_ms;
             std.debug.print("[live][phase][{s}] running {s} elapsed_ms={d}\n", .{
                 self.scope,
                 self.phase,
@@ -162,6 +183,8 @@ fn fetchBytesViaHttp(client: *std.http.Client, allocator: Allocator, url: []cons
     const normalized_url = try normalizeUrlForFetch(allocator, url);
     defer allocator.free(normalized_url);
 
+    // std.http writes into this buffer once; HttpResponse.body is then an owned
+    // copy so every caller has the same allocator/free contract.
     var body_writer = std.Io.Writer.Allocating.init(allocator);
     defer body_writer.deinit();
 
@@ -188,6 +211,8 @@ pub fn normalizeUrlForFetch(allocator: Allocator, url: []const u8) ![]u8 {
     while (i < url.len) {
         const c = url[i];
 
+        // Preserve existing escapes. Double-escaping provider URLs breaks
+        // already-encoded search terms and path components.
         if (c == '%' and i + 2 < url.len and isHex(url[i + 1]) and isHex(url[i + 2])) {
             try out.appendSlice(allocator, url[i .. i + 3]);
             i += 3;
@@ -225,20 +250,6 @@ fn isSafeUrlByte(c: u8) bool {
         c == ',' or c == ';' or c == '=' or c == '%';
 }
 
-fn methodToString(method: std.http.Method) []const u8 {
-    return switch (method) {
-        .GET => "GET",
-        .HEAD => "HEAD",
-        .POST => "POST",
-        .PUT => "PUT",
-        .DELETE => "DELETE",
-        .CONNECT => "CONNECT",
-        .OPTIONS => "OPTIONS",
-        .TRACE => "TRACE",
-        .PATCH => "PATCH",
-    };
-}
-
 fn hasHeader(headers: []const std.http.Header, wanted_name: []const u8) bool {
     for (headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, wanted_name)) return true;
@@ -248,7 +259,7 @@ fn hasHeader(headers: []const std.http.Header, wanted_name: []const u8) bool {
 
 pub fn parseHtmlTurbo(allocator: Allocator, source: []const u8) !ParsedHtml {
     const debug_timing = debugTimingEnabled();
-    const started_ns = if (debug_timing) std.time.nanoTimestamp() else 0;
+    const started_ns = if (debug_timing) compatNanoTimestamp() else 0;
     if (debug_timing) std.debug.print("[parseHtmlTurbo] start len={d}\n", .{source.len});
 
     const html_bytes = try allocator.dupe(u8, source);
@@ -262,13 +273,12 @@ pub fn parseHtmlTurbo(allocator: Allocator, source: []const u8) !ParsedHtml {
         phase.start();
         defer phase.finish();
         try doc.parse(html_bytes, .{
-            .eager_child_views = false,
             .drop_whitespace_text_nodes = true,
         });
     }
 
     if (debug_timing) {
-        const elapsed_ns = std.time.nanoTimestamp() - started_ns;
+        const elapsed_ns = compatNanoTimestamp() - started_ns;
         std.debug.print("[parseHtmlTurbo] done in {d} ms\n", .{@divTrunc(elapsed_ns, std.time.ns_per_ms)});
     }
 
@@ -277,7 +287,7 @@ pub fn parseHtmlTurbo(allocator: Allocator, source: []const u8) !ParsedHtml {
 
 pub fn parseHtmlStable(allocator: Allocator, source: []const u8) !ParsedHtml {
     const debug_timing = debugTimingEnabled();
-    const started_ns = if (debug_timing) std.time.nanoTimestamp() else 0;
+    const started_ns = if (debug_timing) compatNanoTimestamp() else 0;
     if (debug_timing) std.debug.print("[parseHtmlStable] start len={d}\n", .{source.len});
 
     const html_bytes = try allocator.dupe(u8, source);
@@ -290,20 +300,15 @@ pub fn parseHtmlStable(allocator: Allocator, source: []const u8) !ParsedHtml {
         phase.start();
         defer phase.finish();
         try doc.parse(html_bytes, .{
-            .eager_child_views = true,
             .drop_whitespace_text_nodes = false,
         });
     }
 
     if (debug_timing) {
-        const elapsed_ns = std.time.nanoTimestamp() - started_ns;
+        const elapsed_ns = compatNanoTimestamp() - started_ns;
         std.debug.print("[parseHtmlStable] done in {d} ms\n", .{@divTrunc(elapsed_ns, std.time.ns_per_ms)});
     }
     return .{ .allocator = allocator, .source = html_bytes, .doc = doc };
-}
-
-pub fn trimAscii(input: []const u8) []const u8 {
-    return std.mem.trim(u8, input, " \t\r\n");
 }
 
 // Pass the request-local arena allocator (`const a = arena.allocator()`).
@@ -338,7 +343,7 @@ pub fn collapseWhitespace(allocator: Allocator, input: []const u8) ![]const u8 {
 }
 
 pub fn normalizeLanguageCode(language_or_code: []const u8) ?[]const u8 {
-    const s = trimAscii(language_or_code);
+    const s = std.mem.trim(u8, language_or_code, " \t\r\n");
     if (s.len == 0) return null;
 
     if (eqlCode(s, "en") or std.ascii.eqlIgnoreCase(s, "english")) return "en";
@@ -440,23 +445,23 @@ pub fn liveIncludeCaptchaEnabled() bool {
 
 pub fn liveProviderFilter() ?[]const u8 {
     if (getenv("SCRAPERS_LIVE_PROVIDER_FILTER")) |value| {
-        const trimmed_env = trimAscii(value);
+        const trimmed_env = std.mem.trim(u8, value, " \t\r\n");
         if (trimmed_env.len == 0) return null;
         return trimmed_env;
     }
     if (getenv("SCRAPERS_LIVE_PROVIDERS")) |value| {
-        const trimmed_env = trimAscii(value);
+        const trimmed_env = std.mem.trim(u8, value, " \t\r\n");
         if (trimmed_env.len == 0) return null;
         return trimmed_env;
     }
-    const trimmed = trimAscii(build_options.live_provider_filter);
+    const trimmed = std.mem.trim(u8, build_options.live_provider_filter, " \t\r\n");
     if (trimmed.len == 0) return null;
     return trimmed;
 }
 
 fn envBool(name: []const u8) ?bool {
     const raw = getenv(name) orelse return null;
-    const value = trimAscii(raw);
+    const value = std.mem.trim(u8, raw, " \t\r\n");
     if (value.len == 0) return null;
     if (std.mem.eql(u8, value, "1")) return true;
     if (std.mem.eql(u8, value, "0")) return false;
@@ -470,17 +475,18 @@ fn envBool(name: []const u8) ?bool {
 }
 
 pub fn getenv(name: []const u8) ?[]const u8 {
+    _ = name;
     if (builtin.os.tag == .windows) {
         return null;
     }
-    return std.posix.getenv(name);
+    return null;
 }
 
 pub fn providerMatchesLiveFilter(filter: ?[]const u8, provider_name: []const u8) bool {
     const f = filter orelse return true;
     var it = std.mem.splitScalar(u8, f, ',');
     while (it.next()) |entry_raw| {
-        const entry = trimAscii(entry_raw);
+        const entry = std.mem.trim(u8, entry_raw, " \t\r\n");
         if (entry.len == 0) continue;
         if (std.mem.eql(u8, entry, "*")) return true;
         if (std.ascii.eqlIgnoreCase(entry, "all")) return true;
@@ -572,21 +578,21 @@ pub fn getAttributeValueSafe(node: anytype, attr_name: []const u8) ?[]const u8 {
 
 pub fn parseAttrInt(node: anytype, attr_name: []const u8, comptime T: type) ?T {
     const raw = getAttributeValueSafe(node, attr_name) orelse return null;
-    const trimmed = trimAscii(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return null;
     return std.fmt.parseInt(T, trimmed, 10) catch null;
 }
 
 pub fn parseAttrFloat(node: anytype, attr_name: []const u8) ?f64 {
     const raw = getAttributeValueSafe(node, attr_name) orelse return null;
-    const trimmed = trimAscii(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return null;
     return std.fmt.parseFloat(f64, trimmed) catch null;
 }
 
 pub fn parseAttrBool(node: anytype, attr_name: []const u8) ?bool {
     const raw = getAttributeValueSafe(node, attr_name) orelse return null;
-    const trimmed = trimAscii(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return true;
     return parseBoolLike(attr_name, trimmed);
 }
@@ -604,24 +610,23 @@ pub fn queryOneWithOptionalDebug(
 ) ?@TypeOf(scope.queryOne(selector).?) {
     if (!selectorDebugEnabled()) return scope.queryOne(selector);
 
-    var report: html.QueryDebugReport = .{};
-    const node = scope.queryOneDebug(selector, &report);
-    if (node != null) return node;
+    const debug_result = scope.queryOneDebug(selector);
+    if (debug_result.node) |node| return node;
 
     std.debug.print(
         "[selector-debug] context={s} selector={s} visited={d} groups={d} parse_error={any}\n",
         .{
             context,
             selector,
-            report.visited_elements,
-            report.group_count,
-            report.runtime_parse_error,
+            debug_result.report.visited_elements,
+            debug_result.report.group_count,
+            debug_result.report.runtime_parse_error,
         },
     );
 
     var i: usize = 0;
-    while (i < report.near_miss_len) : (i += 1) {
-        const miss = report.near_misses[i];
+    while (i < debug_result.report.near_miss_len) : (i += 1) {
+        const miss = debug_result.report.near_misses[i];
         std.debug.print(
             "[selector-debug] near_miss[{d}] node={d} kind={s} group={d} compound={d} predicate={d}\n",
             .{
@@ -642,8 +647,8 @@ pub fn findTableColumnIndexByAliases(allocator: Allocator, header_row: anytype, 
     if (aliases.len == 0) return null;
 
     var col: usize = 0;
-    for (header_row.children()) |child_idx| {
-        const cell = header_row.doc.nodeAt(child_idx) orelse continue;
+    var children = header_row.children();
+    while (children.next()) |cell| {
         if (!isTableCellTag(cell.tagName())) continue;
 
         const raw = try innerTextTrimmedOwned(allocator, cell);
@@ -666,8 +671,8 @@ pub fn tableCellTextByColumnIndex(allocator: Allocator, row: anytype, maybe_col:
     const col = maybe_col orelse return null;
 
     var cell_index: usize = 0;
-    for (row.children()) |child_idx| {
-        const cell = row.doc.nodeAt(child_idx) orelse continue;
+    var children = row.children();
+    while (children.next()) |cell| {
         if (!isTableCellTag(cell.tagName())) continue;
         if (cell_index == col) {
             const text = try innerTextTrimmedOwned(allocator, cell);
@@ -693,7 +698,7 @@ pub fn tableCellTextByHeaderAliases(
 fn sleepBackoff(initial_ms: u64, attempt: usize) void {
     const shift: u6 = @intCast(@min(attempt, 6));
     const multiplier = (@as(u64, 1) << shift);
-    std.Thread.sleep(initial_ms * multiplier * std.time.ns_per_ms);
+    sleepMilliseconds(initial_ms * multiplier);
 }
 
 fn appendHexEscape(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), value: u8) !void {

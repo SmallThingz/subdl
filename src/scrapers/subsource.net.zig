@@ -8,6 +8,9 @@ const site = "https://subsource.net";
 const default_subsource_user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 
 pub const SearchOptions = struct {
+    /// The SubSource search endpoint returns movies and tvseries together. When
+    /// enabled, tvseries rows include season links so callers can fetch one
+    /// season-specific subtitle page instead of scraping the generic series URL.
     include_seasons: bool = true,
     page_start: usize = 1,
     max_pages: usize = 1,
@@ -105,7 +108,7 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        const query_trimmed = common.trimAscii(query);
+        const query_trimmed = std.mem.trim(u8, query, " \t\r\n");
         var auth = try resolveAuth(a, options.cf_clearance, options.user_agent, false, options.auto_cloudflare_session);
 
         var out: std.ArrayListUnmanaged(SearchItem) = .empty;
@@ -115,7 +118,9 @@ pub const Scraper = struct {
         else
             try a.dupe(u8, query);
 
-        // Keep broad queries broad. Only try the suggestion endpoint as fallback.
+        // Keep broad queries broad. The browser uses movie/search directly and
+        // that endpoint returns both movie and tvseries results; the suggestion
+        // endpoint is only a fallback for empty exact searches.
         try appendSearchResults(self.client, a, &out, &seen, query_used, options, &auth);
         if (out.items.len == 0 and query_trimmed.len > 0) {
             const suggested = try resolveSearchQuery(self.client, a, query_trimmed);
@@ -261,7 +266,7 @@ pub const Scraper = struct {
     };
 
     fn fetchSubtitleDetails(self: *Scraper, allocator: Allocator, details_path: []const u8, auth: Auth) !SubtitleDetails {
-        const trimmed = std.mem.trimLeft(u8, details_path, "/");
+        const trimmed = std.mem.trimStart(u8, details_path, "/");
         const url = try std.fmt.allocPrint(allocator, "{s}/subtitle/{s}", .{ api_base, trimmed });
 
         const response = try getJson(self.client, allocator, url, auth, true);
@@ -296,7 +301,7 @@ pub const Scraper = struct {
 };
 
 fn resolveSearchQuery(client: *std.http.Client, allocator: Allocator, query: []const u8) ![]const u8 {
-    const trimmed = common.trimAscii(query);
+    const trimmed = std.mem.trim(u8, query, " \t\r\n");
     if (trimmed.len == 0) return try allocator.dupe(u8, query);
 
     const encoded = try common.encodeUriComponent(allocator, trimmed);
@@ -510,7 +515,7 @@ fn normalizeSubsourceLanguage(raw: ?[]const u8) ?[]const u8 {
 }
 
 fn pathToSubtitles(allocator: Allocator, link: []const u8) !?[]const u8 {
-    var normalized = common.trimAscii(link);
+    var normalized = std.mem.trim(u8, link, " \t\r\n");
     if (normalized.len == 0) return null;
 
     if (std.mem.startsWith(u8, normalized, "http://") or std.mem.startsWith(u8, normalized, "https://")) {
@@ -554,7 +559,7 @@ fn pathToSubtitles(allocator: Allocator, link: []const u8) !?[]const u8 {
 }
 
 fn toAbsoluteSiteLink(allocator: Allocator, link: []const u8) ![]const u8 {
-    const trimmed = common.trimAscii(link);
+    const trimmed = std.mem.trim(u8, link, " \t\r\n");
     if (trimmed.len == 0) return try allocator.dupe(u8, trimmed);
     if (std.mem.startsWith(u8, trimmed, "http://") or std.mem.startsWith(u8, trimmed, "https://")) {
         return try allocator.dupe(u8, trimmed);
@@ -575,7 +580,7 @@ fn objString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 
 fn firstNonEmptyObjString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = objString(obj, key) orelse return null;
-    const trimmed = common.trimAscii(value);
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
     if (trimmed.len == 0) return null;
     return trimmed;
 }
@@ -599,7 +604,7 @@ fn objFirstArrayString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     for (arr.items) |entry| {
         switch (entry) {
             .string => |s| {
-                const trimmed = common.trimAscii(s);
+                const trimmed = std.mem.trim(u8, s, " \t\r\n");
                 if (trimmed.len > 0) return trimmed;
             },
             else => {},

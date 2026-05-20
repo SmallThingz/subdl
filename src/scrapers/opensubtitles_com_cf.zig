@@ -1,6 +1,8 @@
 const std = @import("std");
 const driver = @import("alldriver");
 const builtin = @import("builtin");
+const common = @import("common.zig");
+const runtime_io = @import("runtime_io");
 
 const Allocator = std.mem.Allocator;
 const opensubtitles_domain = "www.opensubtitles.com";
@@ -78,7 +80,7 @@ pub fn ensureDomainSession(allocator: Allocator, options: EnsureDomainOptions) !
         break :blk owned_challenge_url orelse return error.OutOfMemory;
     };
 
-    const now = std.time.timestamp();
+    const now = common.compatUnixTimestamp();
     if (!options.force_refresh) {
         if (try loadSessionForDomain(allocator, normalized_domain)) |cached| {
             if (!cached.isLikelyExpired(now) and isUsableSession(cached)) return cached;
@@ -175,11 +177,12 @@ fn freeRecordFields(allocator: Allocator, record: CacheRecord) void {
 fn readCacheRecords(allocator: Allocator) !std.ArrayListUnmanaged(CacheRecord) {
     var records: std.ArrayListUnmanaged(CacheRecord) = .empty;
     errdefer freeCacheRecords(allocator, &records);
+    if (!driver.enabled) return records;
 
     const path = try cachePath(allocator);
     defer allocator.free(path);
 
-    const data = std.fs.cwd().readFileAlloc(allocator, path, 2 * 1024 * 1024) catch |err| switch (err) {
+    const data = std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), path, allocator, .limited(2 * 1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return records,
         else => return err,
     };
@@ -238,11 +241,12 @@ fn readCacheRecords(allocator: Allocator) !std.ArrayListUnmanaged(CacheRecord) {
 }
 
 fn writeCacheRecords(allocator: Allocator, records: []const CacheRecord) !void {
+    if (!driver.enabled) return;
     const path = try cachePath(allocator);
     defer allocator.free(path);
 
     if (std.fs.path.dirname(path)) |dir_path| {
-        try std.fs.cwd().makePath(dir_path);
+        try std.Io.Dir.cwd().createDirPath(runtime_io.get(), dir_path);
     }
 
     const json_data = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(.{
@@ -251,7 +255,7 @@ fn writeCacheRecords(allocator: Allocator, records: []const CacheRecord) !void {
     }, .{ .whitespace = .indent_2 })});
     defer allocator.free(json_data);
 
-    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = json_data });
+    try std.Io.Dir.cwd().writeFile(runtime_io.get(), .{ .sub_path = path, .data = json_data });
 }
 
 fn freeCacheRecords(allocator: Allocator, records: *std.ArrayListUnmanaged(CacheRecord)) void {
@@ -263,6 +267,7 @@ fn freeCacheRecords(allocator: Allocator, records: *std.ArrayListUnmanaged(Cache
 }
 
 fn cachePath(allocator: Allocator) ![]u8 {
+    if (!driver.enabled) return error.CloudflareSessionUnavailable;
     const home = getenv("HOME") orelse return error.EnvironmentVariableNotFound;
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, shared_cache_relpath });
 }
@@ -296,14 +301,14 @@ fn acquireSessionViaAllDriver(allocator: Allocator, domain: []const u8, challeng
             clearTerminalScreen();
         }
 
-        const deadline = std.time.milliTimestamp() + challenge_timeout_ms;
+        const deadline = common.compatMilliTimestamp() + challenge_timeout_ms;
         var storage = browser.storage();
-        while (std.time.milliTimestamp() < deadline) {
+        while (common.compatMilliTimestamp() < deadline) {
             const cookies = storage.getCookies(allocator) catch break;
             defer storage.freeCookies(allocator, cookies);
 
             const cf_value = findCookieValueForDomain(cookies, domain, "cf_clearance") orelse {
-                std.Thread.sleep(@as(u64, @intCast(challenge_poll_interval_ms)) * std.time.ns_per_ms);
+                common.sleepMilliseconds(@intCast(challenge_poll_interval_ms));
                 continue;
             };
 
@@ -316,7 +321,7 @@ fn acquireSessionViaAllDriver(allocator: Allocator, domain: []const u8, challeng
                 .cf_clearance = try allocator.dupe(u8, cf_value),
                 .user_agent = user_agent,
                 .csrf_token = csrf_token,
-                .acquired_at_unix = std.time.timestamp(),
+                .acquired_at_unix = common.compatUnixTimestamp(),
             };
         }
     }
@@ -488,10 +493,12 @@ fn shouldLaunchHeadless() bool {
 }
 
 fn getenv(name: []const u8) ?[]const u8 {
+    _ = name;
+    if (!driver.enabled) return null;
     if (builtin.os.tag == .windows) {
         return null;
     }
-    return std.posix.getenv(name);
+    return null;
 }
 
 fn getString(obj: std.json.ObjectMap, field: []const u8) ![]const u8 {

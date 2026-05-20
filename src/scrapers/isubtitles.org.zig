@@ -288,7 +288,7 @@ fn collectSearchItemsFromRawHtml(
 
         const tag_end = std.mem.indexOfScalarPos(u8, body, href_end, '>') orelse continue;
         const text_end = std.mem.indexOfPos(u8, body, tag_end + 1, "</a>") orelse continue;
-        const raw_title = common.trimAscii(body[tag_end + 1 .. text_end]);
+        const raw_title = std.mem.trim(u8, body[tag_end + 1 .. text_end], " \t\r\n");
         if (raw_title.len == 0) continue;
 
         const details_url = try common.resolveUrl(allocator, site, href);
@@ -351,7 +351,7 @@ fn addOrReplacePageQuery(allocator: Allocator, base_url: []const u8, page: usize
         wrote_any = true;
 
         if (is_page_key) {
-            try out.writer(allocator).print("p={d}", .{page});
+            try out.print(allocator, "p={d}", .{page});
             replaced = true;
         } else {
             try out.appendSlice(allocator, pair);
@@ -360,7 +360,7 @@ fn addOrReplacePageQuery(allocator: Allocator, base_url: []const u8, page: usize
 
     if (!replaced) {
         if (wrote_any) try out.append(allocator, '&');
-        try out.writer(allocator).print("p={d}", .{page});
+        try out.print(allocator, "p={d}", .{page});
     }
 
     try out.appendSlice(allocator, fragment);
@@ -415,7 +415,6 @@ fn maybeDebugDumpFirstPage(status: std.http.Status, page_url: []const u8, body: 
     if (common.getenv("SCRAPERS_DEBUG_ISUB") == null) return;
 
     std.debug.print("[isubtitles] status={d} body_len={d} url={s}\n", .{ @intFromEnum(status), body.len, page_url });
-    std.fs.cwd().writeFile(.{ .sub_path = "/tmp/isubtitles_response_debug.html", .data = body }) catch {};
 }
 
 fn isLikelyNextText(text: []const u8) bool {
@@ -447,7 +446,7 @@ fn pageFromUrl(url: []const u8) ?usize {
 }
 
 fn splitTitleAndYear(raw_title: []const u8) struct { title: []const u8, year: ?[]const u8 } {
-    const trimmed = common.trimAscii(raw_title);
+    const trimmed = std.mem.trim(u8, raw_title, " \t\r\n");
     if (trimmed.len < 7) return .{ .title = trimmed, .year = null };
 
     if (trimmed[trimmed.len - 1] != ')') return .{ .title = trimmed, .year = null };
@@ -459,9 +458,9 @@ fn splitTitleAndYear(raw_title: []const u8) struct { title: []const u8, year: ?[
         if (c < '0' or c > '9') return .{ .title = trimmed, .year = null };
     }
 
-    var title = common.trimAscii(trimmed[0..open_idx]);
+    var title = std.mem.trim(u8, trimmed[0..open_idx], " \t\r\n");
     if (std.mem.endsWith(u8, title, "-")) {
-        title = common.trimAscii(title[0 .. title.len - 1]);
+        title = std.mem.trim(u8, title[0 .. title.len - 1], " \t\r\n");
     }
 
     return .{ .title = title, .year = year };

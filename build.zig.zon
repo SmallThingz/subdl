@@ -25,7 +25,7 @@
     .fingerprint = 0x2a77a132140119e1, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0-dev.2905",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
@@ -33,20 +33,23 @@
     // internet connectivity.
     .dependencies = .{
         .libvaxis = .{
-            .url = "git+https://github.com/rockorager/libvaxis.git#67bbc1ee072aa390838c66caf4ed47edee282dc4",
-            .hash = "vaxis-0.5.1-BWNV_IxJCQC5OGNaXQfNnqgn9_Vku0PMgey-dplubcQK",
+            .url = "git+https://github.com/rockorager/libvaxis.git#60a507c25b5335e222eb12320aa7514db684d4a4",
+            .hash = "vaxis-0.6.0-BWNV_HHwCQCy33z_jb0RHLjoinqQ8tgQVZI9z2e5Yqdd",
         },
         .htmlparser = .{
-            .url = "git+https://github.com/SmallThingz/html_parser.git#525668fb19441e8d78e2666f6da510420a96314a",
-            .hash = "htmlparser-0.0.0-80cNI7K_BQB8xzOMGwy89UQZ8-yBx_gq5xjyrCt2oCVu",
+            .url = "git+https://github.com/SmallThingz/htmlparser.git#a93e57647d08c864fdec25a8e18a287c7b07a050",
+            .hash = "html-0.0.0-dtdpOuMWBQC9s6xzSwlNzRXufohcB4o3RQbohJ1rz6AR",
         },
         .alldriver = .{
-            .url = "git+https://github.com/SmallThingz/alldriver.git#78131f163677d527f4a49b84ea3e760fa8ef0346",
-            .hash = "alldriver-0.0.0-IXnEoU1GCgBd5-w2beaQcat38MXJvU2f0UfHswJyT3EQ",
+            .url = "git+https://github.com/SmallThingz/alldriver.git#ef2abd24e22f912b1c4afee5b268bbe35fe07529",
+            .hash = "alldriver-0.0.0-IXnEoV_pDABwfz2WJjLon1CqMN_ktTgQkDoQkpThvT1n",
         },
         .unarr = .{
-            .url = "git+https://github.com/SmallThingz/unarr.git#8f0d9d47122a923a94d6c6db9b09be478238aa04",
-            .hash = "unarr-0.0.0-9UpXAweIAAAtzJuOufOaFMr3OfE1RuZ9zwIwkNsqIwbn",
+            .url = "git+https://github.com/SmallThingz/unarr.git#07311af273079e0f4fd95c8936d559e1a5c72010",
+            .hash = "unarr-0.0.0-9UpXAyjIAAAFFVhPGhpoLcdgKJgyUYhdcdi0Jhjkes3k",
+        },
+        .oneserial = .{
+            .path = "src/deps/oneserial_upstream",
         },
     },
     .paths = .{

@@ -8,10 +8,14 @@ pub fn build(b: *std.Build) void {
     const strip_opt = b.option(bool, "strip", "Strip debug symbols from binaries");
     const strip = strip_opt orelse false;
     const all_targets_strip = strip_opt orelse true;
-    const single_threaded = parseToggleBool("single-threaded", b.option([]const u8, "single-threaded", "Single-threaded mode: auto | on | off") orelse "auto");
-    const omit_frame_pointer = parseToggleBool("omit-frame-pointer", b.option([]const u8, "omit-frame-pointer", "Frame pointer mode: auto | on | off") orelse "auto");
-    const error_tracing = parseToggleBool("error-tracing", b.option([]const u8, "error-tracing", "Error tracing mode: auto | on | off") orelse "auto");
-    const pic = parseToggleBool("pic", b.option([]const u8, "pic", "PIC mode: auto | on | off") orelse "auto");
+    const single_threaded = b.option(bool, "single-threaded", "Force single-threaded mode");
+    const omit_frame_pointer = b.option(bool, "omit-frame-pointer", "Force frame pointer omission mode");
+    const error_tracing = b.option(bool, "error-tracing", "Force error tracing mode");
+    const pic = b.option(bool, "pic", "Force PIC mode");
+    const llvm = b.option(bool, "llvm", "Use LLVM codegen backend");
+    const enable_tui = b.option(bool, "enable-tui", "Enable TUI support via libvaxis") orelse true;
+    const enable_alldriver = b.option(bool, "enable-alldriver", "Enable browser automation support via alldriver") orelse false;
+    const enable_unarr = b.option(bool, "enable-unarr", "Enable archive extraction support via unarr") orelse false;
     const live_mode = b.option([]const u8, "live", "Live test mode: off | smoke | named | extensive | all") orelse "off";
     const live_providers = b.option([]const u8, "live-providers", "Comma-separated provider filter for live tests, or '*' for all") orelse "*";
     const live_include_captcha = b.option(bool, "live-include-captcha", "Include captcha/cloudflare providers in live test runs") orelse false;
@@ -40,13 +44,11 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "live_tui_suite", live_tui_suite);
     build_options.addOption(bool, "live_named_tests_enabled", live_named_tests_enabled);
     build_options.addOption(bool, "live_include_captcha", live_include_captcha);
+    build_options.addOption(bool, "enable_tui", enable_tui);
+    build_options.addOption(bool, "enable_alldriver", enable_alldriver);
+    build_options.addOption(bool, "enable_unarr", enable_unarr);
     build_options.addOption([]const u8, "live_provider_filter", if (live_tests_enabled) live_providers else "");
     const build_options_mod = build_options.createModule();
-
-    const libvaxis_dep = b.dependency("libvaxis", .{
-        .target = target,
-        .optimize = optimize,
-    });
     const host_modules = createTargetModuleSet(
         b,
         target,
@@ -58,6 +60,9 @@ pub fn build(b: *std.Build) void {
         pic,
         build_options_mod,
         true,
+        enable_tui,
+        enable_alldriver,
+        enable_unarr,
     );
     const subdl_mod = b.addModule("subdl", .{
         .root_source_file = b.path("src/scrapers/subdl.zig"),
@@ -73,28 +78,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "alldriver", .module = host_modules.alldriver },
             .{ .name = "build_options", .module = build_options_mod },
             .{ .name = "runtime_alloc", .module = host_modules.runtime_alloc },
+            .{ .name = "runtime_io", .module = host_modules.runtime_io },
         },
     });
-    const scrapers_mod = b.addModule("scrapers", .{
-        .root_source_file = b.path("src/lib.zig"),
-        .target = target,
-        .optimize = optimize,
-        .strip = strip,
-        .single_threaded = single_threaded,
-        .omit_frame_pointer = omit_frame_pointer,
-        .error_tracing = error_tracing,
-        .pic = pic,
-        .imports = &.{
-            .{ .name = "htmlparser", .module = host_modules.htmlparser_compat },
-            .{ .name = "alldriver", .module = host_modules.alldriver },
-            .{ .name = "build_options", .module = build_options_mod },
-            .{ .name = "runtime_alloc", .module = host_modules.runtime_alloc },
-            .{ .name = "unarr", .module = host_modules.unarr },
-        },
-    });
+    const scrapers_mod = host_modules.scrapers;
 
     const app_exe = b.addExecutable(.{
         .name = "scrapers",
+        .use_llvm = llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/cmd/main.zig"),
             .target = target,
@@ -107,8 +98,9 @@ pub fn build(b: *std.Build) void {
             .pic = pic,
             .imports = &.{
                 .{ .name = "scrapers", .module = scrapers_mod },
-                .{ .name = "vaxis", .module = libvaxis_dep.module("vaxis") },
                 .{ .name = "runtime_alloc", .module = host_modules.runtime_alloc },
+                .{ .name = "runtime_io", .module = host_modules.runtime_io },
+                .{ .name = "tui_backend", .module = host_modules.tui_backend },
             },
         }),
     });
@@ -163,10 +155,6 @@ pub fn build(b: *std.Build) void {
     const all_targets_step = b.step("build-all-targets", "Build scrapers for all configured targets into zig-out/bin");
     for (cross_targets) |cross| {
         const cross_target = b.resolveTargetQuery(cross.query);
-        const cross_libvaxis_dep = b.dependency("libvaxis", .{
-            .target = cross_target,
-            .optimize = all_targets_optimize,
-        });
         const cross_modules = createTargetModuleSet(
             b,
             cross_target,
@@ -178,10 +166,14 @@ pub fn build(b: *std.Build) void {
             pic,
             build_options_mod,
             cross.static_libc,
+            enable_tui,
+            enable_alldriver,
+            enable_unarr,
         );
 
         const cross_exe = b.addExecutable(.{
             .name = b.fmt("scrapers-{s}", .{cross.suffix}),
+            .use_llvm = llvm,
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/cmd/main.zig"),
                 .target = cross_target,
@@ -194,8 +186,9 @@ pub fn build(b: *std.Build) void {
                 .pic = pic,
                 .imports = &.{
                     .{ .name = "scrapers", .module = cross_modules.scrapers },
-                    .{ .name = "vaxis", .module = cross_libvaxis_dep.module("vaxis") },
                     .{ .name = "runtime_alloc", .module = cross_modules.runtime_alloc },
+                    .{ .name = "runtime_io", .module = cross_modules.runtime_io },
+                    .{ .name = "tui_backend", .module = cross_modules.tui_backend },
                 },
             }),
         });
@@ -205,11 +198,13 @@ pub fn build(b: *std.Build) void {
 
     const subdl_mod_tests = b.addTest(.{
         .root_module = subdl_mod,
+        .use_llvm = llvm,
     });
     const run_subdl_mod_tests = b.addRunArtifact(subdl_mod_tests);
 
     const scrapers_mod_tests = b.addTest(.{
         .root_module = scrapers_mod,
+        .use_llvm = llvm,
     });
     const run_scrapers_mod_tests = b.addRunArtifact(scrapers_mod_tests);
     const run_scrapers_mod_tests_live = b.addSystemCommand(&.{ "bash", "-lc", "exec \"$1\"", "_" });
@@ -218,6 +213,7 @@ pub fn build(b: *std.Build) void {
 
     const app_tests = b.addTest(.{
         .root_module = app_exe.root_module,
+        .use_llvm = llvm,
     });
     const run_app_tests = b.addRunArtifact(app_tests);
 
@@ -288,9 +284,7 @@ fn makeParallelLiveRunScript(
 ) []const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(b.allocator);
-    const w = out.writer(b.allocator);
-
-    w.writeAll(
+    out.appendSlice(b.allocator,
         \\set -euo pipefail
         \\test_bin="$1"
         \\tmpdir="$(mktemp -d)"
@@ -303,7 +297,7 @@ fn makeParallelLiveRunScript(
 
     for (live_provider_targets) |target_info| {
         if (target_info.captcha and !std.mem.eql(u8, include_captcha_arg, "true")) continue;
-        w.print(
+        out.print(b.allocator,
             \\echo "[live][runner] START {s}"
             \\
             \\(
@@ -328,7 +322,7 @@ fn makeParallelLiveRunScript(
         }) catch @panic("oom");
     }
 
-    w.writeAll(
+    out.appendSlice(b.allocator,
         \\(
         \\  while true; do
         \\    active_names=""
@@ -381,19 +375,15 @@ fn makeParallelLiveRunScript(
     return out.toOwnedSlice(b.allocator) catch @panic("oom");
 }
 
-fn parseToggleBool(option_name: []const u8, raw: []const u8) ?bool {
-    if (std.ascii.eqlIgnoreCase(raw, "auto")) return null;
-    if (std.ascii.eqlIgnoreCase(raw, "on") or std.ascii.eqlIgnoreCase(raw, "true")) return true;
-    if (std.ascii.eqlIgnoreCase(raw, "off") or std.ascii.eqlIgnoreCase(raw, "false")) return false;
-    std.debug.panic("invalid -D{s} value '{s}', expected: auto|on|off", .{ option_name, raw });
-}
-
 const TargetModuleSet = struct {
     htmlparser_compat: *std.Build.Module,
     alldriver: *std.Build.Module,
+    oneserial: *std.Build.Module,
     runtime_alloc: *std.Build.Module,
+    runtime_io: *std.Build.Module,
     unarr: *std.Build.Module,
     scrapers: *std.Build.Module,
+    tui_backend: *std.Build.Module,
 };
 
 fn createTargetModuleSet(
@@ -407,8 +397,15 @@ fn createTargetModuleSet(
     pic: ?bool,
     build_options_mod: *std.Build.Module,
     static_libc: bool,
+    enable_tui: bool,
+    enable_alldriver: bool,
+    enable_unarr: bool,
 ) TargetModuleSet {
     const htmlparser_dep = b.dependency("htmlparser", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const oneserial_dep = b.dependency("oneserial", .{
         .target = target,
         .optimize = optimize,
     });
@@ -422,17 +419,73 @@ fn createTargetModuleSet(
         .error_tracing = error_tracing,
         .pic = pic,
         .imports = &.{
-            .{ .name = "htmlparser_upstream", .module = htmlparser_dep.module("htmlparser") },
+            .{ .name = "htmlparser_upstream", .module = htmlparser_dep.module("html") },
         },
     });
-    const alldriver_dep = b.dependency("alldriver", .{
+    const alldriver_mod = if (enable_alldriver) blk: {
+        const alldriver_dep = b.lazyDependency("alldriver", .{
+            .target = target,
+            .optimize = optimize,
+        }) orelse @panic("enable-alldriver requested but alldriver dependency is unavailable");
+        break :blk b.createModule(.{
+            .root_source_file = b.path("src/deps/alldriver_compat.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = strip,
+            .single_threaded = single_threaded,
+            .omit_frame_pointer = omit_frame_pointer,
+            .error_tracing = error_tracing,
+            .pic = pic,
+            .imports = &.{
+                .{ .name = "build_options", .module = build_options_mod },
+                .{ .name = "alldriver_upstream", .module = alldriver_dep.module("alldriver") },
+            },
+        });
+    } else b.createModule(.{
+        .root_source_file = b.path("src/deps/alldriver_compat.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
+        .single_threaded = single_threaded,
+        .omit_frame_pointer = omit_frame_pointer,
+        .error_tracing = error_tracing,
+        .pic = pic,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options_mod },
+        },
     });
-    const unarr_dep = b.dependency("unarr", .{
+    const unarr_mod = if (enable_unarr) blk: {
+        const unarr_dep = b.lazyDependency("unarr", .{
+            .target = target,
+            .optimize = optimize,
+            .static_libc = static_libc,
+        }) orelse @panic("enable-unarr requested but unarr dependency is unavailable");
+        break :blk b.createModule(.{
+            .root_source_file = b.path("src/deps/unarr_compat.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = strip,
+            .single_threaded = single_threaded,
+            .omit_frame_pointer = omit_frame_pointer,
+            .error_tracing = error_tracing,
+            .pic = pic,
+            .imports = &.{
+                .{ .name = "build_options", .module = build_options_mod },
+                .{ .name = "unarr_upstream", .module = unarr_dep.module("unarr") },
+            },
+        });
+    } else b.createModule(.{
+        .root_source_file = b.path("src/deps/unarr_compat.zig"),
         .target = target,
         .optimize = optimize,
-        .static_libc = static_libc,
+        .strip = strip,
+        .single_threaded = single_threaded,
+        .omit_frame_pointer = omit_frame_pointer,
+        .error_tracing = error_tracing,
+        .pic = pic,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options_mod },
+        },
     });
     const runtime_alloc_mod = b.createModule(.{
         .root_source_file = b.path("src/alloc/runtime_allocator.zig"),
@@ -444,8 +497,16 @@ fn createTargetModuleSet(
         .error_tracing = error_tracing,
         .pic = pic,
     });
-    const alldriver_mod = alldriver_dep.module("alldriver");
-    const unarr_mod = unarr_dep.module("unarr");
+    const runtime_io_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime_io.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .single_threaded = single_threaded,
+        .omit_frame_pointer = omit_frame_pointer,
+        .error_tracing = error_tracing,
+        .pic = pic,
+    });
     const scrapers_mod = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
@@ -460,15 +521,69 @@ fn createTargetModuleSet(
             .{ .name = "alldriver", .module = alldriver_mod },
             .{ .name = "build_options", .module = build_options_mod },
             .{ .name = "runtime_alloc", .module = runtime_alloc_mod },
+            .{ .name = "runtime_io", .module = runtime_io_mod },
             .{ .name = "unarr", .module = unarr_mod },
+        },
+    });
+    const tui_backend_mod = if (enable_tui) blk: {
+        const libvaxis_dep = b.lazyDependency("libvaxis", .{
+            .target = target,
+            .optimize = optimize,
+        }) orelse @panic("enable-tui requested but libvaxis dependency is unavailable");
+        const tui_impl_mod = b.createModule(.{
+            .root_source_file = b.path("src/cmd/tui.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = strip,
+            .single_threaded = single_threaded,
+            .omit_frame_pointer = omit_frame_pointer,
+            .error_tracing = error_tracing,
+            .pic = pic,
+            .imports = &.{
+                .{ .name = "scrapers", .module = scrapers_mod },
+                .{ .name = "vaxis", .module = libvaxis_dep.module("vaxis") },
+                .{ .name = "runtime_alloc", .module = runtime_alloc_mod },
+                .{ .name = "runtime_io", .module = runtime_io_mod },
+                .{ .name = "build_options", .module = build_options_mod },
+                .{ .name = "oneserial", .module = oneserial_dep.module("oneserial") },
+            },
+        });
+        break :blk b.createModule(.{
+            .root_source_file = b.path("src/cmd/tui_backend.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = strip,
+            .single_threaded = single_threaded,
+            .omit_frame_pointer = omit_frame_pointer,
+            .error_tracing = error_tracing,
+            .pic = pic,
+            .imports = &.{
+                .{ .name = "build_options", .module = build_options_mod },
+                .{ .name = "tui_impl", .module = tui_impl_mod },
+            },
+        });
+    } else b.createModule(.{
+        .root_source_file = b.path("src/cmd/tui_backend.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .single_threaded = single_threaded,
+        .omit_frame_pointer = omit_frame_pointer,
+        .error_tracing = error_tracing,
+        .pic = pic,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options_mod },
         },
     });
 
     return .{
         .htmlparser_compat = htmlparser_compat_mod,
         .alldriver = alldriver_mod,
+        .oneserial = oneserial_dep.module("oneserial"),
         .runtime_alloc = runtime_alloc_mod,
+        .runtime_io = runtime_io_mod,
         .unarr = unarr_mod,
         .scrapers = scrapers_mod,
+        .tui_backend = tui_backend_mod,
     };
 }

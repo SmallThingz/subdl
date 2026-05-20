@@ -59,7 +59,7 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
         const debug_timing = debugTimingEnabled();
-        const started_ns = if (debug_timing) std.time.nanoTimestamp() else 0;
+        const started_ns = if (debug_timing) common.compatNanoTimestamp() else 0;
         if (debug_timing) std.debug.print("[moviesubtitles.org] search start query='{s}'\n", .{query});
 
         const encoded = try common.encodeUriComponent(a, query);
@@ -100,7 +100,7 @@ pub const Scraper = struct {
         }
 
         if (debug_timing) {
-            const elapsed_ns = std.time.nanoTimestamp() - started_ns;
+            const elapsed_ns = common.compatNanoTimestamp() - started_ns;
             std.debug.print("[moviesubtitles.org] search done status={s} anchors={d} items={d} in {d} ms\n", .{
                 @tagName(response.status),
                 raw_anchor_count,
@@ -121,7 +121,7 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
         const debug_timing = debugTimingEnabled();
-        const started_ns = if (debug_timing) std.time.nanoTimestamp() else 0;
+        const started_ns = if (debug_timing) common.compatNanoTimestamp() else 0;
         if (debug_timing) std.debug.print("[moviesubtitles.org] subtitles start url={s}\n", .{movie_link});
 
         const response = try common.fetchBytes(self.client, a, movie_link, .{ .accept = "text/html", .max_attempts = 2 });
@@ -193,7 +193,7 @@ pub const Scraper = struct {
         }
 
         if (debug_timing) {
-            const elapsed_ns = std.time.nanoTimestamp() - started_ns;
+            const elapsed_ns = common.compatNanoTimestamp() - started_ns;
             std.debug.print("[moviesubtitles.org] subtitles done status={s} anchors={d} unique={d} in {d} ms\n", .{
                 @tagName(response.status),
                 total_detail_anchors,
@@ -217,7 +217,7 @@ fn appendSearchItemsFromRawHtml(allocator: Allocator, html_body: []const u8, ite
         const text_start_marker = std.mem.indexOfScalarPos(u8, html_body, href_value_end, '>') orelse break;
         const text_start = text_start_marker + 1;
         const text_end = std.mem.indexOfScalarPos(u8, html_body, text_start, '<') orelse break;
-        const title = common.trimAscii(html_body[text_start..text_end]);
+        const title = std.mem.trim(u8, html_body[text_start..text_end], " \t\r\n");
 
         const link = try common.resolveUrl(allocator, site, href);
         if (seen.contains(link)) {
@@ -242,8 +242,8 @@ fn findAncestorWithStyleFragment(node: HtmlNode, style_fragment: []const u8) ?Ht
 }
 
 fn findDescendantImgWithSrcFragment(node: HtmlNode, src_fragment: []const u8) ?HtmlNode {
-    for (node.children()) |child_idx| {
-        const child = node.doc.nodeAt(child_idx) orelse continue;
+    var children = node.children();
+    while (children.next()) |child| {
         if (std.mem.eql(u8, child.tagName(), "img")) {
             const src = common.getAttributeValueSafe(child, "src") orelse "";
             if (std.mem.indexOf(u8, src, src_fragment) != null) return child;
@@ -278,7 +278,7 @@ test "live moviesubtitles.org search and subtitles" {
     if (!common.shouldRunNamedLiveTest(std.testing.allocator, "MOVIESUBTITLES_ORG")) return error.SkipZigTest;
     if (suite.shouldRunExtensiveLiveSuite(std.testing.allocator)) return error.SkipZigTest;
 
-    var client: std.http.Client = .{ .allocator = std.testing.allocator };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer client.deinit();
 
     var scraper = Scraper.init(std.testing.allocator, &client);

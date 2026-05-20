@@ -1,18 +1,24 @@
 # SubDL Zig Scrapers
 
-Subtitle scrapers in Zig with a shared provider API, a CLI, and a Vaxis TUI.
+Subtitle scrapers in Zig with a shared provider API and a single `scrapers` binary.
 
-![Zig](https://img.shields.io/badge/Zig-0.15.2%2B-f7a41d)
+![Zig](https://img.shields.io/badge/Zig-0.16.0--dev-f7a41d)
 ![Providers](https://img.shields.io/badge/Providers-12-2ea44f)
 ![Runtime](https://img.shields.io/badge/HTTP-std.http%20(Client)-0366d6)
 
-## What This Project Provides
+## Overview
 
-- 12 provider integrations behind one unified app layer (`providers_app`).
-- One binary:
-  - `scrapers` (CLI mode by default, TUI mode via `--tui` or `tui`).
-- Library API exported from `src/lib.zig`.
-- Runtime networking through Zig `std.http.Client` (no `curl` dependency in runtime flows).
+- 12 provider integrations behind one app layer: `providers_app`
+- One binary: `scrapers`
+- CLI mode by default
+- TUI mode available with `--tui` in the default build
+- Runtime HTTP implemented with Zig `std.http.Client`
+- No runtime `curl` dependency
+
+## Requirements
+
+- Zig `0.16.0-dev.2905+`
+- Network access for provider queries and downloads
 
 ## Providers
 
@@ -33,6 +39,8 @@ Subtitle scrapers in Zig with a shared provider API, a CLI, and a Vaxis TUI.
 
 ## Quick Start
 
+Build and test:
+
 ```bash
 zig build
 zig build test
@@ -44,26 +52,21 @@ List providers:
 zig build run -- --list-providers
 ```
 
-Run CLI:
+Run the CLI:
 
 ```bash
-zig build run -- --provider subsource_net --query "The Matrix"
-zig build run -- --provider subsource_net --query "The Matrix" --extract
+zig build run -- --query "The Matrix"
 ```
 
-Run TUI:
-
-```bash
-zig build run-tui
-```
-
-Install binaries:
+Install the binary:
 
 ```bash
 zig build install
+./zig-out/bin/scrapers --providers subdl_com,podnapisi_net --query "Inception"
+./zig-out/bin/scrapers -pnone --query "Inception"
 ```
 
-Build cross-target binaries into `zig-out/bin`:
+Build all supported targets into `zig-out/bin`:
 
 ```bash
 zig build build-all-targets
@@ -78,22 +81,54 @@ Targets produced by `build-all-targets`:
 - `scrapers-aarch64-macos-none`
 - `scrapers-x86_64-windows-gnu.exe`
 
-Tunable build flags:
+## Optional Features
+
+The default build is intentionally conservative because some upstream integrations are still moving on Zig `0.16-dev`.
+
+Run the TUI:
+
+```bash
+zig build run -- --tui
+```
+
+Enable archive extraction for `--extract`:
+
+```bash
+zig build -Denable-unarr=true run -- --providers subsource_net --query "The Matrix" --extract
+```
+
+Enable browser automation support:
+
+```bash
+zig build -Denable-alldriver=true
+```
+
+Tracked upstream issues are documented in [ISSUES.md](./ISSUES.md).
+
+## Build Flags
 
 - `-Doptimize=Debug|ReleaseSafe|ReleaseFast|ReleaseSmall`
 - `-Dstrip=true|false`
-- `-Dsingle-threaded=auto|on|off`
-- `-Domit-frame-pointer=auto|on|off`
-- `-Derror-tracing=auto|on|off`
-- `-Dpic=auto|on|off`
+- `-Dsingle-threaded=true|false`
+- `-Domit-frame-pointer=true|false`
+- `-Derror-tracing=true|false`
+- `-Dpic=true|false`
+- `-Dllvm=true|false`
+- `-Denable-tui=true|false`
+- `-Denable-alldriver=true|false`
+- `-Denable-unarr=true|false`
 
-`build-all-targets` uses sane defaults when flags are omitted:
-- `-Doptimize` defaults to `ReleaseFast` for that step
-- `-Dstrip` defaults to `true` for that step
+`build-all-targets` defaults:
+
+- `-Doptimize=ReleaseFast`
+- `-Dstrip=true`
+
+Use `-Dllvm=true` if the native GNU build hits host CRT `.sframe` relocation errors.
 
 ## Docs
 
 - [DOCUMENTATION.md](./DOCUMENTATION.md)
+- [ISSUES.md](./ISSUES.md)
 - [CONTRIBUTIONS.md](./CONTRIBUTIONS.md)
 - [SECURITY.md](./SECURITY.md)
 - [LICENCE](./LICENCE)
