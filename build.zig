@@ -269,7 +269,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "tvsubtitles.net" },
     .{ .name = "opensubtitles.org", .captcha = true },
     .{ .name = "opensubtitles.com", .captcha = true },
-    .{ .name = "yifysubtitles.ch", .captcha = true },
+    .{ .name = "yifysubtitles.ch", .captcha = false },
 };
 
 fn isAllLiveProviderSelection(raw_filter: []const u8) bool {

@@ -1597,6 +1597,8 @@ const SubtitlecatBatch = struct {
     indices: []usize,
 };
 
+const subtitlecat_batch_separator = "\n__SUBDL_LINE_BREAK_9F3A__\n";
+
 fn downloadSubtitlecatTranslated(
     allocator: Allocator,
     client: *std.http.Client,
@@ -1703,7 +1705,9 @@ fn translateSubtitlecatSrt(
     defer batch_text.deinit(allocator);
     var batch_indices: std.ArrayListUnmanaged(usize) = .empty;
     defer batch_indices.deinit(allocator);
-    const batch_limit: usize = 500;
+    // Keep requests below common URL limits while avoiding hundreds of tiny
+    // requests for a feature-length subtitle file.
+    const batch_limit: usize = 4000;
 
     for (lines.items, 0..) |line, idx| {
         if (!shouldTranslateSubtitleLine(line)) {
@@ -1714,7 +1718,7 @@ fn translateSubtitlecatSrt(
         const sanitized = try sanitizeSubtitlecatTranslateLine(allocator, line);
         defer allocator.free(sanitized);
 
-        const extra_len = sanitized.len + @as(usize, if (batch_indices.items.len > 0) 1 else 0);
+        const extra_len = sanitized.len + @as(usize, if (batch_indices.items.len > 0) subtitlecat_batch_separator.len else 0);
         if (batch_indices.items.len > 0 and batch_text.items.len + extra_len > batch_limit) {
             const batch = SubtitlecatBatch{
                 .text = try batch_text.toOwnedSlice(allocator),
@@ -1727,7 +1731,7 @@ fn translateSubtitlecatSrt(
             try applySubtitlecatBatch(allocator, client, lines.items, translated.items, batch, target_lang, progress, &done_units, total_units);
         }
 
-        if (batch_indices.items.len > 0) try batch_text.append(allocator, '\n');
+        if (batch_indices.items.len > 0) try batch_text.appendSlice(allocator, subtitlecat_batch_separator);
         try batch_text.appendSlice(allocator, sanitized);
         try batch_indices.append(allocator, idx);
     }
@@ -1772,7 +1776,7 @@ fn applySubtitlecatBatch(
         var out_lines: std.ArrayListUnmanaged([]const u8) = .empty;
         defer out_lines.deinit(allocator);
 
-        var line_it = std.mem.splitScalar(u8, batch_text, '\n');
+        var line_it = std.mem.splitSequence(u8, batch_text, subtitlecat_batch_separator);
         while (line_it.next()) |line| try out_lines.append(allocator, line);
 
         if (out_lines.items.len == batch.indices.len) {
@@ -1785,12 +1789,12 @@ fn applySubtitlecatBatch(
         }
     }
 
+    // A provider response can normalize separators. Do not turn that into one
+    // network request per subtitle line; preserve the source batch instead.
     emitDownloadPhase(progress, .translating_fallback);
     for (batch.indices) |line_idx| {
         const source_line = source_lines[line_idx];
-        const translated_line = translateViaGoogle(allocator, client, source_line, target_lang) catch
-            try allocator.dupe(u8, source_line);
-        translated_lines[line_idx] = translated_line;
+        translated_lines[line_idx] = try allocator.dupe(u8, source_line);
         done_units.* += 1;
         emitDownloadUnits(progress, done_units.*, total_units);
     }
@@ -1861,14 +1865,17 @@ fn translateViaGoogle(
     const encoded_tl = try common.encodeUriComponent(allocator, target_lang);
     defer allocator.free(encoded_tl);
 
-    const url = try std.fmt.allocPrint(
+    const payload = try std.fmt.allocPrint(
         allocator,
-        "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={s}&dt=t&q={s}",
+        "client=gtx&sl=auto&tl={s}&dt=t&q={s}",
         .{ encoded_tl, encoded_q },
     );
-    defer allocator.free(url);
+    defer allocator.free(payload);
 
-    const response = try common.fetchBytes(client, allocator, url, .{
+    const response = try common.fetchBytes(client, allocator, "https://translate.googleapis.com/translate_a/single", .{
+        .method = .POST,
+        .payload = payload,
+        .content_type = "application/x-www-form-urlencoded",
         .accept = "application/json,text/plain,*/*",
         .allow_non_ok = true,
         .max_attempts = 2,
@@ -2459,6 +2466,10 @@ fn firstDownloadCandidate(subtitles: []const SubtitleChoice) ?usize {
         if (likelyArchiveSource(url, sub.filename)) return idx;
     }
     for (subtitles, 0..) |sub, idx| {
+        const url = sub.download_url orelse continue;
+        if (!isSubtitlecatTranslateTokenUrl(url)) return idx;
+    }
+    for (subtitles, 0..) |sub, idx| {
         if (sub.download_url != null) return idx;
     }
     return null;
@@ -2989,7 +3000,7 @@ fn liveBatchEnabled() bool {
 
 fn isCaptchaProvider(provider: Provider) bool {
     return switch (provider) {
-        .opensubtitles_com, .opensubtitles_org, .yifysubtitles_ch => true,
+        .opensubtitles_com, .opensubtitles_org => true,
         else => false,
     };
 }
@@ -3062,7 +3073,7 @@ test "live providers_app tui-path smoke provider: subtitlecat.com" {
 }
 
 test "live providers_app subtitlecat translated download path" {
-    if (!shouldRunTuiLiveSmoke(std.testing.allocator)) return error.SkipZigTest;
+    if (!common.shouldRunNamedLiveTest(std.testing.allocator, "SUBTITLECAT_COM")) return error.SkipZigTest;
     if (!common.providerMatchesLiveFilter(common.liveProviderFilter(), "subtitlecat_com")) return error.SkipZigTest;
 
     var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
