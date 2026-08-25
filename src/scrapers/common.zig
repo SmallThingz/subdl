@@ -61,6 +61,8 @@ pub const ParsedHtml = struct {
     source: []u8,
     doc: HtmlDocument,
 
+    /// Release only when no extracted attribute or source-backed slice escapes.
+    /// Response parsers intentionally let their owning arena reclaim this data.
     pub fn deinit(self: *ParsedHtml) void {
         self.doc.deinit();
         self.allocator.free(self.source);
