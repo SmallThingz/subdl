@@ -44,6 +44,7 @@ pub const Provider = enum {
     isubtitles_org,
     my_subs_co,
     subsource_net,
+    sub_scene_com,
     tvsubtitles_net,
 };
 
@@ -56,6 +57,7 @@ const provider_values = [_]Provider{
     .isubtitles_org,
     .my_subs_co,
     .subsource_net,
+    .sub_scene_com,
     .tvsubtitles_net,
 };
 
@@ -87,6 +89,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .isubtitles_org => "isubtitles_org",
         .my_subs_co => "my_subs_co",
         .subsource_net => "subsource_net",
+        .sub_scene_com => "sub_scene_com",
         .tvsubtitles_net => "tvsubtitles_net",
     };
 }
@@ -131,6 +134,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .isubtitles_org => "iSubtitles",
         .my_subs_co => "My Subs",
         .subsource_net => "SubSource",
+        .sub_scene_com => "Sub-Scene",
         .tvsubtitles_net => "TVSubtitles",
     };
 }
@@ -148,13 +152,14 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .isubtitles_org => "https://isubtitles.org",
         .my_subs_co => "https://my-subs.co",
         .subsource_net => "https://subsource.net",
+        .sub_scene_com => "https://sub-scene.com",
         .tvsubtitles_net => "https://www.tvsubtitles.net",
     };
 }
 
 pub fn providerRequiresBrowserSession(provider: Provider) bool {
     return switch (provider) {
-        .opensubtitles_com => true,
+        .opensubtitles_com, .sub_scene_com => true,
         else => false,
     };
 }
@@ -300,6 +305,10 @@ pub const SearchRef = union(Provider) {
         link: []const u8,
         media_type: []const u8,
         seasons: []const subdl.subsource_net.SeasonItem,
+    },
+    sub_scene_com: struct {
+        title: []const u8,
+        page_url: []const u8,
     },
     tvsubtitles_net: struct {
         title: []const u8,
@@ -651,6 +660,23 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                         .link = link,
                         .media_type = media_type,
                         .seasons = try seasons.toOwnedSlice(a),
+                    } },
+                });
+            }
+        },
+        .sub_scene_com => {
+            var scraper = subdl.sub_scene_com.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                try out.append(a, .{
+                    .label = try a.dupe(u8, title),
+                    .ref = .{ .sub_scene_com = .{
+                        .title = title,
+                        .page_url = try a.dupe(u8, item.page_url),
                     } },
                 });
             }
@@ -1219,6 +1245,25 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .sub_scene_com => |item| {
+            title = try a.dupe(u8, item.title);
+            var scraper = subdl.sub_scene_com.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var subtitles = try scraper.fetchSubtitles(item.page_url);
+            defer subtitles.deinit();
+            if (subtitles.title.len > 0) title = try a.dupe(u8, subtitles.title);
+
+            for (subtitles.subtitles) |subtitle| {
+                const filename = subtitle.release orelse "Without release";
+                const label = try subtitleLabel(a, subtitle.language_code orelse subtitle.language, filename, subtitle.download_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try dupOptional(a, subtitle.language_code orelse subtitle.language),
+                    .filename = try a.dupe(u8, filename),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
         .tvsubtitles_net => |item| {
             title = try a.dupe(u8, item.title);
             var scraper = subdl.tvsubtitles_net.Scraper.init(allocator, client);
@@ -1375,6 +1420,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .isubtitles_org => |item| item.title,
         .my_subs_co => |item| item.title,
         .subsource_net => |item| item.title,
+        .sub_scene_com => |item| item.title,
         .tvsubtitles_net => |item| item.title,
     };
 }
@@ -2470,6 +2516,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .isubtitles_org => |item| item.details_url,
         .my_subs_co => |item| item.details_url,
         .subsource_net => |item| item.link,
+        .sub_scene_com => |item| item.page_url,
         .tvsubtitles_net => |item| item.show_url,
     };
 }
@@ -2534,6 +2581,7 @@ test "active provider registry excludes retired providers" {
         "isubtitles_org",
         "my_subs_co",
         "subsource_net",
+        "sub_scene_com",
         "tvsubtitles_net",
     };
 
@@ -2564,6 +2612,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("isubtitles.org") == .isubtitles_org);
     try std.testing.expect(parseProvider("my-subs.co") == .my_subs_co);
     try std.testing.expect(parseProvider("subsource.net") == .subsource_net);
+    try std.testing.expect(parseProvider("sub-scene.com") == .sub_scene_com);
     try std.testing.expect(parseProvider("tvsubtitles.net") == .tvsubtitles_net);
 }
 
@@ -2574,6 +2623,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("isubtitles") == .isubtitles_org);
     try std.testing.expect(try resolveProvider("my_subs") == .my_subs_co);
     try std.testing.expect(try resolveProvider("subsource") == .subsource_net);
+    try std.testing.expect(try resolveProvider("sub_scene") == .sub_scene_com);
     try std.testing.expect(try resolveProvider("tvsubtitles") == .tvsubtitles_net);
     try std.testing.expectError(error.AmbiguousProvider, resolveProvider("open"));
     try std.testing.expectError(error.UnknownProvider, resolveProvider("missing"));
@@ -3047,7 +3097,7 @@ fn liveBatchEnabled() bool {
 
 fn isCaptchaProvider(provider: Provider) bool {
     return switch (provider) {
-        .opensubtitles_com, .opensubtitles_org => true,
+        .opensubtitles_com, .opensubtitles_org, .sub_scene_com => true,
         else => false,
     };
 }

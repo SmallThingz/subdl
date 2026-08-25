@@ -14,6 +14,7 @@ pub const subtitlecat_com = @import("subtitlecat.com.zig");
 pub const isubtitles_org = @import("isubtitles.org.zig");
 pub const my_subs_co = @import("my-subs.co.zig");
 pub const subsource_net = @import("subsource.net.zig");
+pub const sub_scene_com = @import("sub-scene.com.zig");
 pub const tvsubtitles_net = @import("tvsubtitles.net.zig");
 pub const opensubtitles_com_cf = @import("opensubtitles_com_cf.zig");
 
@@ -49,6 +50,7 @@ test {
     _ = @import("isubtitles.org.zig");
     _ = @import("my-subs.co.zig");
     _ = @import("subsource.net.zig");
+    _ = @import("sub-scene.com.zig");
     _ = @import("tvsubtitles.net.zig");
     _ = @import("opensubtitles_com_cf.zig");
     _ = @import("provider_union.zig");

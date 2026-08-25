@@ -792,6 +792,7 @@ fn providerHomeUrl(provider: app.Provider) []const u8 {
         .isubtitles_org => "https://isubtitles.org",
         .my_subs_co => "https://my-subs.co",
         .subsource_net => "https://subsource.net",
+        .sub_scene_com => "https://sub-scene.com",
         .tvsubtitles_net => "https://www.tvsubtitles.net",
     };
 }
@@ -1750,7 +1751,7 @@ fn deinitSubtitlesPageCache(allocator: std.mem.Allocator, pages: *std.ArrayListU
     pages.deinit(allocator);
 }
 
-const persistent_version = 9;
+const persistent_version = 10;
 const default_cache_ttl_seconds: i64 = 12 * 60 * 60;
 const search_state_magic = "subdl-tui-search-state-v1\n";
 const keyword_state_magic = "subdl-tui-keywords-v1\n";
@@ -2007,6 +2008,10 @@ fn cloneSearchRef(allocator: std.mem.Allocator, ref: app.SearchRef) !app.SearchR
                 .seasons = seasons,
             } };
         },
+        .sub_scene_com => |item| .{ .sub_scene_com = .{
+            .title = try allocator.dupe(u8, item.title),
+            .page_url = try allocator.dupe(u8, item.page_url),
+        } },
         .tvsubtitles_net => |item| .{ .tvsubtitles_net = .{ .title = try allocator.dupe(u8, item.title), .show_url = try allocator.dupe(u8, item.show_url) } },
     };
 }

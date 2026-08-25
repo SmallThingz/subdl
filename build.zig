@@ -264,6 +264,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "my-subs.co" },
     .{ .name = "subtitlecat.com" },
     .{ .name = "subsource.net" },
+    .{ .name = "sub-scene.com", .captcha = true },
     .{ .name = "tvsubtitles.net" },
     .{ .name = "opensubtitles.org", .captcha = true },
     .{ .name = "opensubtitles.com", .captcha = true },

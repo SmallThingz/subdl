@@ -12,6 +12,7 @@ const my_subs_co = @import("my-subs.co.zig");
 const podnapisi_net = @import("podnapisi.net.zig");
 const subtitlecat_com = @import("subtitlecat.com.zig");
 const subsource_net = @import("subsource.net.zig");
+const sub_scene_com = @import("sub-scene.com.zig");
 const tvsubtitles_net = @import("tvsubtitles.net.zig");
 
 test "extensive live suite provider: subdl.com" {
@@ -52,6 +53,11 @@ test "extensive live suite provider: subtitlecat.com" {
 test "extensive live suite provider: subsource.net" {
     if (!extensiveProbeEnabled("subsource.net")) return error.SkipZigTest;
     try runExtensiveProbe("subsource.net", runSubsource);
+}
+
+test "extensive live suite provider: sub-scene.com" {
+    if (!extensiveProbeEnabled("sub-scene.com")) return error.SkipZigTest;
+    try runExtensiveProbe("sub-scene.com", runSubScene);
 }
 
 test "extensive live suite provider: tvsubtitles.net" {
@@ -484,6 +490,38 @@ fn runSubsource(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     try common.livePrintOptionalField(allocator, "download_token", first.download_token);
     try common.livePrintOptionalField(allocator, "download_url", first.download_url);
     try suite.expectNonEmpty(first.details_path);
+}
+
+fn runSubScene(allocator: std.mem.Allocator, client: *std.http.Client) !void {
+    var scraper = sub_scene_com.Scraper.init(allocator, client);
+
+    const subtitles_started_ms = phaseStart("sub-scene.com", "fetch_subtitles");
+    var subtitles = try scraper.fetchSubtitles("https://sub-scene.com/subscene/159141");
+    defer subtitles.deinit();
+    phaseDone("sub-scene.com", "fetch_subtitles", subtitles_started_ms);
+    try suite.expectPositive(subtitles.subtitles.len);
+    try common.livePrintField(allocator, "title", subtitles.title);
+
+    const first = subtitles.subtitles[0];
+    try common.livePrintOptionalField(allocator, "language", first.language);
+    try common.livePrintOptionalField(allocator, "language_code", first.language_code);
+    try common.livePrintOptionalField(allocator, "release", first.release);
+    try common.livePrintOptionalField(allocator, "files", first.files);
+    std.debug.print("[live] hearing_impaired={any}\n", .{first.hearing_impaired});
+    try common.livePrintOptionalField(allocator, "uploader", first.uploader);
+    try common.livePrintOptionalField(allocator, "comment", first.comment);
+    try common.livePrintField(allocator, "details_url", first.details_url);
+    try common.livePrintField(allocator, "download_url", first.download_url);
+
+    const download_started_ms = phaseStart("sub-scene.com", "download");
+    const download = try common.fetchBytes(client, allocator, first.download_url, .{
+        .accept = "application/zip,application/octet-stream,*/*",
+        .cache = false,
+    });
+    defer allocator.free(download.body);
+    phaseDone("sub-scene.com", "download", download_started_ms);
+    if (download.body.len < 4 or !std.mem.eql(u8, download.body[0..2], "PK")) return error.TestUnexpectedResult;
+    std.debug.print("[live] archive_bytes={d}\n", .{download.body.len});
 }
 
 fn runTvSubtitles(allocator: std.mem.Allocator, client: *std.http.Client) !void {
