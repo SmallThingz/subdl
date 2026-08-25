@@ -81,12 +81,6 @@ pub const Scraper = struct {
             if (movie != .string or imdb != .string) continue;
 
             const link = try std.fmt.allocPrint(a, "{s}/movie-imdb/{s}", .{ site, imdb.string });
-            const detail = common.fetchBytes(self.client, a, link, .{
-                .accept = "text/html",
-                .allow_non_ok = true,
-                .max_attempts = 1,
-            }) catch continue;
-            if (!usableDetailResponse(detail.status, detail.body)) continue;
             try items.append(a, .{
                 .movie = movie.string,
                 .imdb_id = imdb.string,
@@ -194,21 +188,11 @@ pub const Scraper = struct {
     }
 };
 
-fn usableDetailResponse(status: std.http.Status, body: []const u8) bool {
-    return status == .ok and body.len > 0;
-}
-
 test "yify zip url" {
     const allocator = std.testing.allocator;
     const url = try Scraper.subtitleToZipUrl(allocator, "https://yifysubtitles.ch/subtitles/the-matrix-english-yify-100");
     defer allocator.free(url);
     try std.testing.expectEqualStrings("https://yifysubtitles.ch/subtitle/the-matrix-english-yify-100.zip", url);
-}
-
-test "yify search excludes blank detail pages" {
-    try std.testing.expect(!usableDetailResponse(.ok, ""));
-    try std.testing.expect(!usableDetailResponse(.not_found, "html"));
-    try std.testing.expect(usableDetailResponse(.ok, "html"));
 }
 
 test "live yify search and subtitle extraction" {

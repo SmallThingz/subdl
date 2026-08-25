@@ -16,22 +16,13 @@ fn tuiPanic(msg: []const u8, ret_addr: ?usize) noreturn {
 }
 
 fn restoreTerminalOnPanic() void {
-    vaxis.recover();
+    if (comptime builtin.os.tag == .windows) return vaxis.recover();
+    if (vaxis.tty.global_tty) |tty| {
+        std.posix.tcsetattr(tty.fd.handle, .FLUSH, tty.termios) catch {};
+        const reset = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b[?1049l";
+        _ = std.c.write(tty.fd.handle, reset.ptr, reset.len);
+    }
 }
-
-const hard_cancel_supported = std.Thread.use_pthreads and switch (builtin.os.tag) {
-    .linux, .macos, .ios, .watchos, .tvos, .visionos, .freebsd, .openbsd, .netbsd, .dragonfly, .illumos => true,
-    else => false,
-};
-
-const pthread = if (hard_cancel_supported) struct {
-    const PTHREAD_CANCEL_ENABLE: c_int = 0;
-    const PTHREAD_CANCEL_ASYNCHRONOUS: c_int = 1;
-
-    extern "c" fn pthread_cancel(thread: std.Thread.Handle) c_int;
-    extern "c" fn pthread_setcancelstate(state: c_int, old_state: ?*c_int) c_int;
-    extern "c" fn pthread_setcanceltype(cancel_type: c_int, old_type: ?*c_int) c_int;
-} else struct {};
 
 const Event = union(enum) {
     key_press: vaxis.Key,
@@ -454,6 +445,11 @@ const Ui = struct {
         return .{ .fg = .{ .index = self.theme().pane_title_fg }, .bold = true };
     }
 
+    fn styleMenuBackground(self: *Ui) vaxis.Style {
+        _ = self;
+        return .{};
+    }
+
     fn providerPanelVisible(_: *Ui, width: u16) bool {
         return width >= 92;
     }
@@ -495,34 +491,32 @@ pub fn main(init: std.process.Init) !void {
     try runTui(&ui);
 }
 
-fn searchTaskMain(task: *SearchTask) void {
-    configureWorkerHardCancel();
+fn searchTaskMain(task: *SearchTask) std.Io.Cancelable!void {
+    defer task.done.store(1, .release);
     var client: std.http.Client = .{ .allocator = std.heap.page_allocator, .io = runtime_io.get() };
     defer client.deinit();
 
     task.result = app.searchPageWithOptions(std.heap.page_allocator, &client, task.provider, task.query, task.page, .{
         .language_code = task.language_code,
     }) catch |err| {
+        if (err == error.Canceled) return error.Canceled;
         task.err = err;
-        task.done.store(1, .release);
         return;
     };
-    task.done.store(1, .release);
 }
 
-fn providerSearchTaskMain(task: *ProviderSearchTask) void {
-    configureWorkerHardCancel();
+fn providerSearchTaskMain(task: *ProviderSearchTask) std.Io.Cancelable!void {
+    defer task.done.store(1, .release);
     var client: std.http.Client = .{ .allocator = std.heap.page_allocator, .io = runtime_io.get() };
     defer client.deinit();
 
     task.result = app.searchPageWithOptions(std.heap.page_allocator, &client, task.provider, task.query, task.page, .{
         .language_code = task.language_code,
     }) catch |err| {
+        if (err == error.Canceled) return error.Canceled;
         task.err = err;
-        task.done.store(1, .release);
         return;
     };
-    task.done.store(1, .release);
 }
 
 fn isRemoteSearchFailure(err: anyerror) bool {
@@ -552,8 +546,8 @@ fn isRemoteSearchFailure(err: anyerror) bool {
     };
 }
 
-fn subtitlesTaskMain(task: *SubtitlesTask) void {
-    configureWorkerHardCancel();
+fn subtitlesTaskMain(task: *SubtitlesTask) std.Io.Cancelable!void {
+    defer task.done.store(1, .release);
     var client: std.http.Client = .{ .allocator = std.heap.page_allocator, .io = runtime_io.get() };
     defer client.deinit();
 
@@ -563,28 +557,26 @@ fn subtitlesTaskMain(task: *SubtitlesTask) void {
         app.fetchSubtitlesPage(std.heap.page_allocator, &client, task.ref, task.page);
 
     task.result = fetch_result catch |err| {
+        if (err == error.Canceled) return error.Canceled;
         task.err = err;
-        task.done.store(1, .release);
         return;
     };
-    task.done.store(1, .release);
 }
 
-fn subdlSeasonsTaskMain(task: *SubdlSeasonsTask) void {
-    configureWorkerHardCancel();
+fn subdlSeasonsTaskMain(task: *SubdlSeasonsTask) std.Io.Cancelable!void {
+    defer task.done.store(1, .release);
     var client: std.http.Client = .{ .allocator = std.heap.page_allocator, .io = runtime_io.get() };
     defer client.deinit();
 
     task.result = app.fetchSubdlSeasons(std.heap.page_allocator, &client, task.ref) catch |err| {
+        if (err == error.Canceled) return error.Canceled;
         task.err = err;
-        task.done.store(1, .release);
         return;
     };
-    task.done.store(1, .release);
 }
 
-fn downloadTaskMain(task: *DownloadTask) void {
-    configureWorkerHardCancel();
+fn downloadTaskMain(task: *DownloadTask) std.Io.Cancelable!void {
+    defer task.done.store(1, .release);
     var client: std.http.Client = .{ .allocator = std.heap.page_allocator, .io = runtime_io.get() };
     defer client.deinit();
 
@@ -597,11 +589,10 @@ fn downloadTaskMain(task: *DownloadTask) void {
     task.result = app.downloadSubtitleWithProgressAndOptions(std.heap.page_allocator, &client, task.subtitle, task.out_dir, &progress, .{
         .extract_archive = task.extract_archive,
     }) catch |err| {
+        if (err == error.Canceled) return error.Canceled;
         task.err = err;
-        task.done.store(1, .release);
         return;
     };
-    task.done.store(1, .release);
 }
 
 fn onDownloadProgressPhase(user_data: ?*anyopaque, phase: app.DownloadPhase) void {
@@ -768,27 +759,10 @@ fn formatDownloadProgressBar(buf: *[20]u8, done: u32, total: u32) []const u8 {
     return buf[0 .. width + 2];
 }
 
-fn configureWorkerHardCancel() void {
-    if (comptime !hard_cancel_supported) return;
-
-    var old_state: i32 = 0;
-    _ = pthread.pthread_setcancelstate(pthread.PTHREAD_CANCEL_ENABLE, &old_state);
-    var old_type: i32 = 0;
-    _ = pthread.pthread_setcanceltype(pthread.PTHREAD_CANCEL_ASYNCHRONOUS, &old_type);
-}
-
-fn requestHardThreadCancel(thread: std.Thread) bool {
-    if (comptime !hard_cancel_supported) return false;
-    return pthread.pthread_cancel(thread.getHandle()) == 0;
-}
-
-fn finalizeWorkerThread(thread: std.Thread, control: FetchControl) void {
+fn finalizeWorkerGroup(group: *std.Io.Group, control: FetchControl) void {
     switch (control) {
-        .completed => thread.join(),
-        .canceled, .quit => {
-            _ = requestHardThreadCancel(thread);
-            thread.join();
-        },
+        .completed => group.await(runtime_io.get()) catch {},
+        .canceled, .quit => group.cancel(runtime_io.get()),
     }
 }
 
@@ -1219,9 +1193,11 @@ fn runProviderFirstTui(ui: *Ui) !void {
                         .query = query,
                         .page = search_page_current,
                     };
-                    const search_thread = try std.Thread.spawn(.{}, searchTaskMain, .{&search_task});
+                    var search_group: std.Io.Group = .init;
+                    defer search_group.cancel(runtime_io.get());
+                    try search_group.concurrent(runtime_io.get(), searchTaskMain, .{&search_task});
                     const search_control = try waitForTask(ui, &search_task.done, "Search", search_detail);
-                    finalizeWorkerThread(search_thread, search_control);
+                    finalizeWorkerGroup(&search_group, search_control);
 
                     if (search_control == .quit) {
                         if (search_task.result) |*r| r.deinit();
@@ -1362,9 +1338,11 @@ fn runProviderFirstTui(ui: *Ui) !void {
                     var seasons_task: SubdlSeasonsTask = .{
                         .ref = selected_title.ref,
                     };
-                    const seasons_thread = try std.Thread.spawn(.{}, subdlSeasonsTaskMain, .{&seasons_task});
+                    var seasons_group: std.Io.Group = .init;
+                    defer seasons_group.cancel(runtime_io.get());
+                    try seasons_group.concurrent(runtime_io.get(), subdlSeasonsTaskMain, .{&seasons_task});
                     const seasons_control = try waitForTask(ui, &seasons_task.done, "Seasons", seasons_detail);
-                    finalizeWorkerThread(seasons_thread, seasons_control);
+                    finalizeWorkerGroup(&seasons_group, seasons_control);
 
                     if (seasons_control == .quit) {
                         if (seasons_task.result) |*r| r.deinit();
@@ -1501,9 +1479,11 @@ fn runProviderFirstTui(ui: *Ui) !void {
                             .page = subtitle_page_current,
                             .subdl_season_slug = selected_subdl_season_slug,
                         };
-                        const subtitles_thread = try std.Thread.spawn(.{}, subtitlesTaskMain, .{&subtitles_task});
+                        var subtitles_group: std.Io.Group = .init;
+                        defer subtitles_group.cancel(runtime_io.get());
+                        try subtitles_group.concurrent(runtime_io.get(), subtitlesTaskMain, .{&subtitles_task});
                         const subtitles_control = try waitForTask(ui, &subtitles_task.done, "Subtitles", subtitles_detail);
-                        finalizeWorkerThread(subtitles_thread, subtitles_control);
+                        finalizeWorkerGroup(&subtitles_group, subtitles_control);
 
                         if (subtitles_control == .quit) {
                             if (subtitles_task.result) |*r| r.deinit();
@@ -1683,9 +1663,11 @@ fn runProviderFirstTui(ui: *Ui) !void {
                         .out_dir = download_out_dir,
                         .extract_archive = true,
                     };
-                    const download_thread = try std.Thread.spawn(.{}, downloadTaskMain, .{&download_task});
+                    var download_group: std.Io.Group = .init;
+                    defer download_group.cancel(runtime_io.get());
+                    try download_group.concurrent(runtime_io.get(), downloadTaskMain, .{&download_task});
                     const download_control = try waitForDownloadTask(ui, &download_task, "Download", download_detail);
-                    finalizeWorkerThread(download_thread, download_control);
+                    finalizeWorkerGroup(&download_group, download_control);
 
                     if (download_control == .quit) {
                         if (download_task.result) |*r| r.deinit(std.heap.page_allocator);
@@ -1768,7 +1750,7 @@ fn deinitSubtitlesPageCache(allocator: std.mem.Allocator, pages: *std.ArrayListU
     pages.deinit(allocator);
 }
 
-const persistent_version = 6;
+const persistent_version = 8;
 const default_cache_ttl_seconds: i64 = 12 * 60 * 60;
 const search_state_magic = "subdl-tui-search-state-v1\n";
 const keyword_state_magic = "subdl-tui-keywords-v1\n";
@@ -2065,9 +2047,11 @@ fn executeQuerySearch(ui: *Ui, state: *TuiRuntimeState, query_norm: []const u8) 
             .language_code = primaryLanguageCode(state.settings),
             .page = 1,
         };
-        const search_thread = try std.Thread.spawn(.{}, searchTaskMain, .{&search_task});
+        var search_group: std.Io.Group = .init;
+        defer search_group.cancel(runtime_io.get());
+        try search_group.concurrent(runtime_io.get(), searchTaskMain, .{&search_task});
         const search_control = try waitForTask(ui, &search_task.done, "Searching", detail);
-        finalizeWorkerThread(search_thread, search_control);
+        finalizeWorkerGroup(&search_group, search_control);
 
         if (search_control == .quit) {
             if (search_task.result) |*r| r.deinit();
@@ -2120,8 +2104,9 @@ fn executeQuerySearchIncremental(
     var consumed = try ui.allocator.alloc(bool, app.providerCount());
     defer ui.allocator.free(consumed);
     @memset(consumed, false);
-    var threads: std.ArrayListUnmanaged(std.Thread) = .empty;
-    defer threads.deinit(ui.allocator);
+    var search_group: std.Io.Group = .init;
+
+    defer search_group.cancel(runtime_io.get());
 
     var task_count: usize = 0;
     const language_code = primaryLanguageCode(state.settings);
@@ -2133,8 +2118,7 @@ fn executeQuerySearchIncremental(
             .language_code = language_code,
             .page = 1,
         };
-        const thread = try std.Thread.spawn(.{}, providerSearchTaskMain, .{&tasks[task_count]});
-        try threads.append(ui.allocator, thread);
+        try search_group.concurrent(runtime_io.get(), providerSearchTaskMain, .{&tasks[task_count]});
         task_count += 1;
         bundle.pending_count += 1;
     }
@@ -2187,12 +2171,12 @@ fn executeQuerySearchIncremental(
                 .key_press => |key| {
                     if (key.isModifier()) continue;
                     if (key.matches('d', .{ .ctrl = true })) {
-                        cancelSearchThreads(threads.items);
+                        search_group.cancel(runtime_io.get());
                         cleanupUnconsumedProviderTasks(tasks[0..task_count], consumed[0..task_count]);
                         return error.TuiQuit;
                     }
                     if (key.matches('c', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
-                        cancelSearchThreads(threads.items);
+                        search_group.cancel(runtime_io.get());
                         cleanupUnconsumedProviderTasks(tasks[0..task_count], consumed[0..task_count]);
                         return bundle;
                     }
@@ -2231,7 +2215,7 @@ fn executeQuerySearchIncremental(
                         switch (try openSearchResult(ui, &bundle, visible_order[selected_result.*], state.settings, state.cache_root_path)) {
                             .back, .to_query => {},
                             .quit => {
-                                cancelSearchThreads(threads.items);
+                                search_group.cancel(runtime_io.get());
                                 cleanupUnconsumedProviderTasks(tasks[0..task_count], consumed[0..task_count]);
                                 return error.TuiQuit;
                             },
@@ -2246,15 +2230,10 @@ fn executeQuerySearchIncremental(
         try runtime_io.get().sleep(.fromMilliseconds(search_poll_interval_ms), .awake);
     }
 
-    for (threads.items) |thread| thread.join();
+    try search_group.await(runtime_io.get());
     bundle.searching = false;
     try renderQueryHome(ui, state, query_display, cursor_pos, if (bundle.hits.items.len > 0) .results else .query, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
     return bundle;
-}
-
-fn cancelSearchThreads(threads: []const std.Thread) void {
-    for (threads) |thread| _ = requestHardThreadCancel(thread);
-    for (threads) |thread| thread.join();
 }
 
 fn cleanupUnconsumedProviderTasks(tasks: []ProviderSearchTask, consumed: []const bool) void {
@@ -2744,6 +2723,7 @@ fn renderSettingsPopup(
     const height = metrics.height;
     const x = metrics.x;
     const y = metrics.y;
+    try fillBoxBackground(ui, win, x, y, width, height);
     try renderBox(ui, win, x, y, width, height, ui.styleAccent());
     try printFitted(ui, win, y + 1, x + 2, "Settings", ui.stylePaneTitle(), width -| 4);
 
@@ -3010,6 +2990,17 @@ fn renderBox(ui: *Ui, win: anytype, x: u16, y: u16, width: u16, height: u16, sty
     _ = win.print(&[_]vaxis.Segment{ .{ .text = "╰", .style = style }, .{ .text = h, .style = style }, .{ .text = "╯", .style = style } }, .{ .row_offset = y + height - 1, .col_offset = x, .wrap = .none });
 }
 
+fn fillBoxBackground(ui: *Ui, win: anytype, x: u16, y: u16, width: u16, height: u16) !void {
+    const spaces = try frameRepeatByte(ui, ' ', width);
+    for (0..height) |offset| {
+        _ = win.print(&[_]vaxis.Segment{.{ .text = spaces, .style = ui.styleMenuBackground() }}, .{
+            .row_offset = y + @as(u16, @intCast(offset)),
+            .col_offset = x,
+            .wrap = .none,
+        });
+    }
+}
+
 fn frameRepeatText(ui: *Ui, text: []const u8, count: usize) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try out.ensureTotalCapacity(ui.frameAllocator(), text.len * count);
@@ -3071,9 +3062,11 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, settings: Tu
                 .ref = selected_title.ref,
                 .page = subtitle_page_current,
             };
-            const subtitles_thread = try std.Thread.spawn(.{}, subtitlesTaskMain, .{&subtitles_task});
+            var subtitles_group: std.Io.Group = .init;
+            defer subtitles_group.cancel(runtime_io.get());
+            try subtitles_group.concurrent(runtime_io.get(), subtitlesTaskMain, .{&subtitles_task});
             const subtitles_control = try waitForTask(ui, &subtitles_task.done, "Subtitles", detail);
-            finalizeWorkerThread(subtitles_thread, subtitles_control);
+            finalizeWorkerGroup(&subtitles_group, subtitles_control);
             if (subtitles_control == .quit) {
                 if (subtitles_task.result) |*r| r.deinit();
                 return .quit;
@@ -3176,9 +3169,11 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, settings: Tu
             .out_dir = download_out_dir,
             .extract_archive = true,
         };
-        const download_thread = try std.Thread.spawn(.{}, downloadTaskMain, .{&download_task});
+        var download_group: std.Io.Group = .init;
+        defer download_group.cancel(runtime_io.get());
+        try download_group.concurrent(runtime_io.get(), downloadTaskMain, .{&download_task});
         const download_control = try waitForDownloadTask(ui, &download_task, "Download", download_detail);
-        finalizeWorkerThread(download_thread, download_control);
+        finalizeWorkerGroup(&download_group, download_control);
         if (download_control == .quit) {
             if (download_task.result) |*r| r.deinit(std.heap.page_allocator);
             return .quit;
@@ -3257,9 +3252,11 @@ fn runCombinedSearch(ui: *Ui, provider_enabled: []const bool) !SelectResult {
                 .query = query,
                 .page = 1,
             };
-            const search_thread = try std.Thread.spawn(.{}, searchTaskMain, .{&search_task});
+            var search_group: std.Io.Group = .init;
+            defer search_group.cancel(runtime_io.get());
+            try search_group.concurrent(runtime_io.get(), searchTaskMain, .{&search_task});
             const search_control = try waitForTask(ui, &search_task.done, "Combined Search", detail);
-            finalizeWorkerThread(search_thread, search_control);
+            finalizeWorkerGroup(&search_group, search_control);
 
             if (search_control == .quit) {
                 if (search_task.result) |*r| r.deinit();
@@ -3336,9 +3333,11 @@ fn runCombinedSearch(ui: *Ui, provider_enabled: []const bool) !SelectResult {
                 .ref = selected_title.ref,
                 .page = 1,
             };
-            const subtitles_thread = try std.Thread.spawn(.{}, subtitlesTaskMain, .{&subtitles_task});
+            var subtitles_group: std.Io.Group = .init;
+            defer subtitles_group.cancel(runtime_io.get());
+            try subtitles_group.concurrent(runtime_io.get(), subtitlesTaskMain, .{&subtitles_task});
             const subtitles_control = try waitForTask(ui, &subtitles_task.done, "Subtitles", detail);
-            finalizeWorkerThread(subtitles_thread, subtitles_control);
+            finalizeWorkerGroup(&subtitles_group, subtitles_control);
 
             if (subtitles_control == .quit) {
                 if (subtitles_task.result) |*r| r.deinit();
@@ -3445,9 +3444,11 @@ fn runCombinedSearch(ui: *Ui, provider_enabled: []const bool) !SelectResult {
                     .subtitle = selected_subtitle,
                     .out_dir = "downloads",
                 };
-                const download_thread = try std.Thread.spawn(.{}, downloadTaskMain, .{&download_task});
+                var download_group: std.Io.Group = .init;
+                defer download_group.cancel(runtime_io.get());
+                try download_group.concurrent(runtime_io.get(), downloadTaskMain, .{&download_task});
                 const download_control = try waitForDownloadTask(ui, &download_task, "Download", download_detail);
-                finalizeWorkerThread(download_thread, download_control);
+                finalizeWorkerGroup(&download_group, download_control);
 
                 if (download_control == .quit) {
                     if (download_task.result) |*r| r.deinit(std.heap.page_allocator);
@@ -4699,6 +4700,7 @@ fn renderOverlayMenu(ui: *Ui, win: anytype, title: []const u8, lines: []const []
     const y0: u16 = (win.height - box_h) / 2;
     const inner_w: usize = @intCast(max_box_w - 2);
 
+    try fillBoxBackground(ui, win, x0, y0, max_box_w, box_h);
     try renderBox(ui, win, x0, y0, max_box_w, box_h, ui.stylePaneTitle());
 
     try printFitted(ui, win, y0 + 1, x0 + 1, title, ui.styleAccent(), inner_w);

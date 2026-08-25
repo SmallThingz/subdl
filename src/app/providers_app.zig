@@ -52,8 +52,6 @@ const provider_values = [_]Provider{
     .opensubtitles_com,
     .opensubtitles_org,
     .moviesubtitles_org,
-    .moviesubtitlesrt_com,
-    .podnapisi_net,
     .yifysubtitles_ch,
     .subtitlecat_com,
     .isubtitles_org,
@@ -2527,14 +2525,12 @@ fn cleanupDownloadOutDir(path: []const u8) void {
     std.Io.Dir.cwd().deleteTree(runtime_io.get(), path) catch {};
 }
 
-test "provider registry covers all subdl_js providers" {
+test "active provider registry excludes retired providers" {
     const expected = [_][]const u8{
         "subdl_com",
         "opensubtitles_com",
         "opensubtitles_org",
         "moviesubtitles_org",
-        "moviesubtitlesrt_com",
-        "podnapisi_net",
         "yifysubtitles_ch",
         "subtitlecat_com",
         "isubtitles_org",
@@ -2558,13 +2554,13 @@ test "provider registry covers all subdl_js providers" {
     }
 }
 
-test "parseProvider accepts dotted/hyphenated js provider names" {
+test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("subdl.com") == .subdl_com);
     try std.testing.expect(parseProvider("opensubtitles.com") == .opensubtitles_com);
     try std.testing.expect(parseProvider("opensubtitles.org") == .opensubtitles_org);
     try std.testing.expect(parseProvider("moviesubtitles.org") == .moviesubtitles_org);
-    try std.testing.expect(parseProvider("moviesubtitlesrt.com") == .moviesubtitlesrt_com);
-    try std.testing.expect(parseProvider("podnapisi.net") == .podnapisi_net);
+    try std.testing.expect(parseProvider("moviesubtitlesrt.com") == null);
+    try std.testing.expect(parseProvider("podnapisi.net") == null);
     try std.testing.expect(parseProvider("yifysubtitles.ch") == .yifysubtitles_ch);
     try std.testing.expect(parseProvider("subtitlecat.com") == .subtitlecat_com);
     try std.testing.expect(parseProvider("isubtitles.org") == .isubtitles_org);
@@ -2999,9 +2995,7 @@ const tui_smoke_providers = [_]Provider{
     .subdl_com,
     .isubtitles_org,
     .moviesubtitles_org,
-    .moviesubtitlesrt_com,
     .my_subs_co,
-    .podnapisi_net,
     .subtitlecat_com,
     .subsource_net,
     .tvsubtitles_net,
