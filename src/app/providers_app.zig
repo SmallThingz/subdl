@@ -2569,7 +2569,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
 
 test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("subdl") == .subdl_com);
-    try std.testing.expect(try resolveProvider("yify") == .yifysubtitles_ch);
+    try std.testing.expectError(error.UnknownProvider, resolveProvider("yify"));
     try std.testing.expect(try resolveProvider("subtitlecat") == .subtitlecat_com);
     try std.testing.expect(try resolveProvider("isubtitles") == .isubtitles_org);
     try std.testing.expect(try resolveProvider("my_subs") == .my_subs_co);
