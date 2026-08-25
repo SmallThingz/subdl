@@ -52,7 +52,6 @@ const provider_values = [_]Provider{
     .opensubtitles_com,
     .opensubtitles_org,
     .moviesubtitles_org,
-    .yifysubtitles_ch,
     .subtitlecat_com,
     .isubtitles_org,
     .my_subs_co,
@@ -2531,7 +2530,6 @@ test "active provider registry excludes retired providers" {
         "opensubtitles_com",
         "opensubtitles_org",
         "moviesubtitles_org",
-        "yifysubtitles_ch",
         "subtitlecat_com",
         "isubtitles_org",
         "my_subs_co",
@@ -2561,7 +2559,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("moviesubtitles.org") == .moviesubtitles_org);
     try std.testing.expect(parseProvider("moviesubtitlesrt.com") == null);
     try std.testing.expect(parseProvider("podnapisi.net") == null);
-    try std.testing.expect(parseProvider("yifysubtitles.ch") == .yifysubtitles_ch);
+    try std.testing.expect(parseProvider("yifysubtitles.ch") == null);
     try std.testing.expect(parseProvider("subtitlecat.com") == .subtitlecat_com);
     try std.testing.expect(parseProvider("isubtitles.org") == .isubtitles_org);
     try std.testing.expect(parseProvider("my-subs.co") == .my_subs_co);

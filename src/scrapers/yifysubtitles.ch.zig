@@ -96,7 +96,12 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        const response = try common.fetchBytes(self.client, a, movie_page_url, .{ .accept = "text/html", .max_attempts = 2 });
+        const response = try common.fetchBytes(self.client, a, movie_page_url, .{
+            .accept = "text/html",
+            .max_attempts = 2,
+            .cache = false,
+        });
+        if (response.body.len == 0) return error.UnexpectedHttpStatus;
         var parsed = try common.parseHtmlStable(a, response.body);
 
         const title_node = parsed.doc.queryOne("title");

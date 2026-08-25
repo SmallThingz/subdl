@@ -1750,7 +1750,7 @@ fn deinitSubtitlesPageCache(allocator: std.mem.Allocator, pages: *std.ArrayListU
     pages.deinit(allocator);
 }
 
-const persistent_version = 8;
+const persistent_version = 9;
 const default_cache_ttl_seconds: i64 = 12 * 60 * 60;
 const search_state_magic = "subdl-tui-search-state-v1\n";
 const keyword_state_magic = "subdl-tui-keywords-v1\n";
@@ -2175,10 +2175,27 @@ fn executeQuerySearchIncremental(
                         cleanupUnconsumedProviderTasks(tasks[0..task_count], consumed[0..task_count]);
                         return error.TuiQuit;
                     }
-                    if (key.matches('c', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                    if (key.matches('c', .{ .ctrl = true })) {
                         search_group.cancel(runtime_io.get());
                         cleanupUnconsumedProviderTasks(tasks[0..task_count], consumed[0..task_count]);
                         return bundle;
+                    }
+                    if (key.matches(vaxis.Key.escape, .{})) {
+                        try editSettingsPopup(
+                            ui,
+                            state,
+                            query_display,
+                            cursor_pos,
+                            if (bundle.hits.items.len > 0) .results else .query,
+                            false,
+                            &bundle,
+                            selected_result,
+                            result_scroll,
+                            &selected_download,
+                            &download_scroll,
+                            info_open,
+                        );
+                        continue;
                     }
                     if (key.matches(vaxis.Key.f1, .{})) {
                         info_open.* = !info_open.*;
