@@ -1,3 +1,4 @@
+const std = @import("std");
 const build_options = @import("build_options");
 
 const impl = if (build_options.enable_tui)
@@ -12,6 +13,11 @@ else
     };
 
 pub const available = impl.available;
+pub const panic = if (build_options.enable_tui) impl.panic else std.debug.FullPanic(defaultPanic);
+
+fn defaultPanic(msg: []const u8, ret_addr: ?usize) noreturn {
+    std.debug.defaultPanic(msg, ret_addr);
+}
 
 pub fn main(init: anytype) !void {
     return impl.main(init);

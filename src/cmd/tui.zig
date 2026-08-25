@@ -525,6 +525,33 @@ fn providerSearchTaskMain(task: *ProviderSearchTask) void {
     task.done.store(1, .release);
 }
 
+fn isRemoteSearchFailure(err: anyerror) bool {
+    return switch (err) {
+        error.UnexpectedHttpStatus,
+        error.HttpRequestFailed,
+        error.RateLimited,
+        error.ParseFailed,
+        error.MissingField,
+        error.InvalidField,
+        error.InvalidFieldType,
+        error.CloudflareChallenge,
+        error.CloudflareSessionUnavailable,
+        error.BrowserAutomationFailed,
+        error.SessionExpired,
+        error.InvalidDownloadUrl,
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.ConnectionTimedOut,
+        error.NetworkUnreachable,
+        error.TemporaryNameServerFailure,
+        error.UnknownHostName,
+        error.EndOfStream,
+        error.ReadFailed,
+        => true,
+        else => false,
+    };
+}
+
 fn subtitlesTaskMain(task: *SubtitlesTask) void {
     configureWorkerHardCancel();
     var client: std.http.Client = .{ .allocator = std.heap.page_allocator, .io = runtime_io.get() };
@@ -1741,7 +1768,7 @@ fn deinitSubtitlesPageCache(allocator: std.mem.Allocator, pages: *std.ArrayListU
     pages.deinit(allocator);
 }
 
-const persistent_version = 5;
+const persistent_version = 6;
 const default_cache_ttl_seconds: i64 = 12 * 60 * 60;
 const search_state_magic = "subdl-tui-search-state-v1\n";
 const keyword_state_magic = "subdl-tui-keywords-v1\n";
@@ -2119,8 +2146,8 @@ fn executeQuerySearchIncremental(
             if (tasks[idx].done.load(.acquire) == 0) continue;
             consumed[idx] = true;
             bundle.pending_count -= 1;
-            if (tasks[idx].err) |_| {
-                bundle.failed_count += 1;
+            if (tasks[idx].err) |err| {
+                if (!isRemoteSearchFailure(err)) bundle.failed_count += 1;
                 continue;
             }
             const search_result = tasks[idx].result orelse {
@@ -2128,6 +2155,7 @@ fn executeQuerySearchIncremental(
                 continue;
             };
             const response_index = bundle.searches.items.len;
+            try upsertCacheEntry(ui.allocator, state, tasks[idx].provider, query_norm, 1, scrapers.common.compatUnixTimestamp(), search_result);
             try bundle.searches.append(ui.allocator, search_result);
             for (bundle.searches.items[response_index].items, 0..) |_, item_index| {
                 try bundle.hits.append(ui.allocator, .{ .provider = tasks[idx].provider, .response_index = response_index, .item_index = item_index, .source = .live });
@@ -2194,6 +2222,20 @@ fn executeQuerySearchIncremental(
                     }
                     if (key.matches(vaxis.Key.home, .{})) {
                         selected_result.* = 0;
+                        continue;
+                    }
+                    if (bundle.hits.items.len > 0 and key.matches(vaxis.Key.enter, .{})) {
+                        const visible_order = try buildQueryHitOrder(ui.allocator, &bundle, normalizeQueryView(query_display));
+                        defer ui.allocator.free(visible_order);
+                        if (selected_result.* >= visible_order.len) continue;
+                        switch (try openSearchResult(ui, &bundle, visible_order[selected_result.*], state.settings, state.cache_root_path)) {
+                            .back, .to_query => {},
+                            .quit => {
+                                cancelSearchThreads(threads.items);
+                                cleanupUnconsumedProviderTasks(tasks[0..task_count], consumed[0..task_count]);
+                                return error.TuiQuit;
+                            },
+                        }
                         continue;
                     }
                 },
@@ -2694,6 +2736,9 @@ fn renderSettingsPopup(
     ttl_cursor: usize,
     ttl_error: ?[]const u8,
 ) !void {
+    std.debug.assert(main_selected < 7);
+    std.debug.assert(provider_selected < app.providerCount());
+    std.debug.assert(language_selected <= languageCount());
     const metrics = settingsPopupMetrics(win.width, win.height);
     const width = metrics.width;
     const height = metrics.height;
@@ -3540,7 +3585,8 @@ fn exportCachedDownload(ui: *Ui, result: app.DownloadResult) !MessageResult {
             .to_query => return .to_query,
             .quit => return .quit,
         };
-        const exported = try exportCachedFile(ui.allocator, files[idx], "downloads");
+        const source = selectedCachedFile(files, idx) catch |err| return showFriendlyError(ui, "Could not export subtitle", err);
+        const exported = exportCachedFile(ui.allocator, source, "downloads") catch |err| return showFriendlyError(ui, "Could not export subtitle", err);
         defer ui.allocator.free(exported);
         const msg = try vaxisMessage(ui, "Exported", exported, "Press any key to continue.", ui.styleAccent());
         switch (msg) {
@@ -3549,6 +3595,11 @@ fn exportCachedDownload(ui: *Ui, result: app.DownloadResult) !MessageResult {
             .quit => return .quit,
         }
     }
+}
+
+fn selectedCachedFile(files: []const []const u8, idx: usize) ![]const u8 {
+    if (idx >= files.len) return error.InvalidSelection;
+    return files[idx];
 }
 
 fn exportCachedFile(allocator: std.mem.Allocator, source_path: []const u8, out_dir: []const u8) ![]u8 {
@@ -4964,29 +5015,27 @@ fn printFitted(
 ) !void {
     if (max_width == 0) return;
 
-    if (isSimpleAsciiDisplay(text)) {
-        if (text.len <= max_width) {
-            const segs = [_]vaxis.Segment{.{ .text = text, .style = style }};
+    var display_text = try ui.frameAllocator().dupe(u8, text);
+    if (needsUtfSanitizeForDisplay(display_text)) display_text = try sanitizeUtf8ForDisplay(ui.frameAllocator(), display_text);
+    std.debug.assert(std.unicode.utf8ValidateSlice(display_text));
+
+    if (isSimpleAsciiDisplay(display_text)) {
+        if (display_text.len <= max_width) {
+            const segs = [_]vaxis.Segment{.{ .text = display_text, .style = style }};
             _ = win.print(&segs, .{ .row_offset = row, .col_offset = col, .wrap = .none });
             return;
         }
         if (max_width <= 3) {
-            const segs = [_]vaxis.Segment{.{ .text = text[0..max_width], .style = style }};
+            const segs = [_]vaxis.Segment{.{ .text = display_text[0..max_width], .style = style }};
             _ = win.print(&segs, .{ .row_offset = row, .col_offset = col, .wrap = .none });
             return;
         }
         const segs = [_]vaxis.Segment{
-            .{ .text = text[0 .. max_width - 3], .style = style },
+            .{ .text = display_text[0 .. max_width - 3], .style = style },
             .{ .text = "...", .style = style },
         };
         _ = win.print(&segs, .{ .row_offset = row, .col_offset = col, .wrap = .none });
         return;
-    }
-
-    var display_text = try ui.frameAllocator().dupe(u8, text);
-
-    if (needsUtfSanitizeForDisplay(display_text)) {
-        display_text = try sanitizeUtf8ForDisplay(ui.frameAllocator(), display_text);
     }
 
     // Never call gwidth on the full string: vaxis currently accumulates into u16
@@ -5125,6 +5174,19 @@ test "sanitizeUtf8ForDisplay escapes invalid bytes" {
 
     try std.testing.expectEqualStrings("A\\xAAB\\xFF", safe);
     try std.testing.expect(std.unicode.utf8ValidateSlice(safe));
+}
+
+test "remote search failures do not count as application failures" {
+    try std.testing.expect(isRemoteSearchFailure(error.UnexpectedHttpStatus));
+    try std.testing.expect(isRemoteSearchFailure(error.InvalidFieldType));
+    try std.testing.expect(isRemoteSearchFailure(error.CloudflareSessionUnavailable));
+    try std.testing.expect(!isRemoteSearchFailure(error.OutOfMemory));
+}
+
+test "cached export rejects stale selection index" {
+    const files = [_][]const u8{"subtitle.srt"};
+    try std.testing.expectEqualStrings("subtitle.srt", try selectedCachedFile(&files, 0));
+    try std.testing.expectError(error.InvalidSelection, selectedCachedFile(&files, 1));
 }
 
 test "subtitleFilenameForDisplay uses Without release fallback" {

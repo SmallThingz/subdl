@@ -296,6 +296,14 @@ pub const Scraper = struct {
             .download_url = try std.fmt.allocPrint(allocator, "{s}/subtitle/download/{s}", .{ api_base, token }),
         };
     }
+
+    pub fn resolveDownloadUrl(self: *Scraper, allocator: Allocator, details_path: []const u8) !?[]u8 {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const details = try self.fetchSubtitleDetails(a, details_path, try resolveAuth(a, null, null, false, false));
+        return if (details.download_url) |url| try allocator.dupe(u8, url) else null;
+    }
 };
 
 fn resolveSearchQuery(client: *std.http.Client, allocator: Allocator, query: []const u8) ![]const u8 {
@@ -526,7 +534,7 @@ fn pathToSubtitles(allocator: Allocator, link: []const u8) !?[]const u8 {
         if (std.mem.indexOf(u8, normalized, marker)) |idx| {
             const season = normalized[idx + marker.len ..];
             if (season.len > 0) {
-                return try std.fmt.allocPrint(allocator, "{s}?season={s}", .{ normalized[0..idx], season });
+                return try std.fmt.allocPrint(allocator, "{s}/season-{s}", .{ normalized[0..idx], season });
             }
         }
         return try allocator.dupe(u8, normalized);
@@ -539,7 +547,7 @@ fn pathToSubtitles(allocator: Allocator, link: []const u8) !?[]const u8 {
         if (std.mem.indexOf(u8, normalized, marker)) |idx| {
             const season = normalized[idx + marker.len ..];
             if (season.len > 0) {
-                return try std.fmt.allocPrint(allocator, "/subtitles/{s}?season={s}", .{ normalized[0..idx], season });
+                return try std.fmt.allocPrint(allocator, "/subtitles/{s}/season-{s}", .{ normalized[0..idx], season });
             }
         }
         return try std.fmt.allocPrint(allocator, "/subtitles/{s}", .{normalized});
@@ -548,7 +556,7 @@ fn pathToSubtitles(allocator: Allocator, link: []const u8) !?[]const u8 {
     if (std.mem.indexOf(u8, normalized, marker)) |idx| {
         const season = normalized[idx + marker.len ..];
         if (season.len > 0) {
-            return try std.fmt.allocPrint(allocator, "/subtitles{s}?season={s}", .{ normalized[0..idx], season });
+            return try std.fmt.allocPrint(allocator, "/subtitles{s}/season-{s}", .{ normalized[0..idx], season });
         }
     }
     return try std.fmt.allocPrint(allocator, "/subtitles{s}", .{normalized});
@@ -639,11 +647,11 @@ test "subsource path to subtitles" {
 
     const c = (try pathToSubtitles(allocator, "/subtitles/friends/season=1")).?;
     defer allocator.free(c);
-    try std.testing.expectEqualStrings("/subtitles/friends?season=1", c);
+    try std.testing.expectEqualStrings("/subtitles/friends/season-1", c);
 
     const d = (try pathToSubtitles(allocator, "https://subsource.net/subtitles/friends/season=10")).?;
     defer allocator.free(d);
-    try std.testing.expectEqualStrings("/subtitles/friends?season=10", d);
+    try std.testing.expectEqualStrings("/subtitles/friends/season-10", d);
 
     try std.testing.expect((try pathToSubtitles(allocator, "")) == null);
 }

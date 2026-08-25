@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 const common = subdl.common;
 const cf = subdl.opensubtitles_com_cf;
 const opensubtitles_remote_prefix = "oscom-remote:";
+const subsource_remote_prefix = "subsource-remote:";
 const subtitlecat_translate_prefix = "subtitlecat-translate:";
 
 pub const DownloadPhase = enum(u8) {
@@ -1204,20 +1205,20 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
             var subtitles = try scraper.fetchSubtitlesBySearchItemWithOptions(fake_item, .{
                 .include_seasons = true,
                 .max_pages = 1,
-                .resolve_download_tokens = true,
-                .auto_cloudflare_session = true,
+                .resolve_download_tokens = false,
             });
             defer subtitles.deinit();
             if (subtitles.title.len > 0) title = try a.dupe(u8, subtitles.title);
 
             for (subtitles.subtitles) |subtitle| {
                 const filename = subtitle.release_info orelse subtitle.release_type;
-                const label = try subtitleLabel(a, subtitle.language_code, filename, subtitle.download_url);
+                const download_url = try makeSubsourceRemoteToken(a, subtitle.details_path);
+                const label = try subtitleLabel(a, subtitle.language_code, filename, download_url);
                 try out.append(a, .{
                     .label = label,
                     .language = try dupOptional(a, subtitle.language_code),
                     .filename = try dupOptional(a, filename),
-                    .download_url = try dupOptional(a, subtitle.download_url),
+                    .download_url = download_url,
                 });
             }
         },
@@ -1918,6 +1919,12 @@ fn resolveDownloadUrlIfNeeded(allocator: Allocator, client: *std.http.Client, do
         return error.InvalidDownloadUrl;
     }
 
+    if (parseSubsourceRemoteToken(download_url)) |details_path| {
+        var scraper = subdl.subsource_net.Scraper.init(allocator, client);
+        defer scraper.deinit();
+        return try scraper.resolveDownloadUrl(allocator, details_path) orelse error.InvalidDownloadUrl;
+    }
+
     if (std.mem.indexOf(u8, download_url, "my-subs.co/downloads/") != null) {
         var scraper = subdl.my_subs_co.Scraper.init(allocator, client);
         defer scraper.deinit();
@@ -2257,6 +2264,16 @@ fn nonEmptyTrimmed(value: ?[]const u8) ?[]const u8 {
 
 fn makeOpenSubtitlesRemoteToken(allocator: Allocator, remote_endpoint: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}{s}", .{ opensubtitles_remote_prefix, remote_endpoint });
+}
+
+fn makeSubsourceRemoteToken(allocator: Allocator, details_path: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ subsource_remote_prefix, details_path });
+}
+
+fn parseSubsourceRemoteToken(download_url: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, download_url, subsource_remote_prefix)) return null;
+    const path = download_url[subsource_remote_prefix.len..];
+    return if (path.len > 0) path else null;
 }
 
 fn parseOpenSubtitlesRemoteToken(download_url: []const u8) ?[]const u8 {
@@ -2647,6 +2664,14 @@ test "opensubtitles remote token helpers" {
     try std.testing.expect(parseOpenSubtitlesRemoteToken("https://example.com/file.zip") == null);
 }
 
+test "subsource remote token helpers" {
+    const allocator = std.testing.allocator;
+    const token = try makeSubsourceRemoteToken(allocator, "malcolm-in-the-middle-season-1/english/123");
+    defer allocator.free(token);
+    try std.testing.expectEqualStrings("malcolm-in-the-middle-season-1/english/123", parseSubsourceRemoteToken(token).?);
+    try std.testing.expect(parseSubsourceRemoteToken("https://api.subsource.net/file.zip") == null);
+}
+
 test "subtitlecat translate token helpers" {
     const allocator = std.testing.allocator;
 
@@ -2787,6 +2812,10 @@ fn runProviderSmokeWorker(state: *ProviderSmokeState) void {
 
 fn runProviderTuiSmoke(allocator: std.mem.Allocator, client: *std.http.Client, provider: Provider) !void {
     const query = liveQueryForProvider(provider);
+    return runProviderTuiSmokeQuery(allocator, client, provider, query);
+}
+
+fn runProviderTuiSmokeQuery(allocator: std.mem.Allocator, client: *std.http.Client, provider: Provider, query: []const u8) !void {
     std.debug.print("[live][providers_app][{s}] query={s}\n", .{ providerName(provider), query });
 
     std.debug.print("[live][providers_app][{s}] phase=search_start\n", .{providerName(provider)});
@@ -2800,9 +2829,26 @@ fn runProviderTuiSmoke(allocator: std.mem.Allocator, client: *std.http.Client, p
     if (search_response.items.len == 0) return error.TestUnexpectedResult;
     std.debug.print("[live][providers_app][{s}] search_items={d}\n", .{ providerName(provider), search_response.items.len });
 
-    const chosen_idx: usize = 0;
+    var chosen_idx: usize = 0;
+    var subtitles_opt: ?SubtitlesResponse = null;
+    defer if (subtitles_opt) |*subtitles| subtitles.deinit();
+    for (search_response.items, 0..) |candidate, idx| {
+        var candidate_subtitles = fetchSubtitles(allocator, client, candidate.ref) catch |err| {
+            std.debug.print("[live][providers_app][{s}] skip_search={d} err={s}\n", .{ providerName(provider), idx, @errorName(err) });
+            continue;
+        };
+        if (candidate_subtitles.items.len == 0 or firstDownloadCandidate(candidate_subtitles.items) == null) {
+            std.debug.print("[live][providers_app][{s}] skip_search={d} reason=no_downloadable_subtitles\n", .{ providerName(provider), idx });
+            candidate_subtitles.deinit();
+            continue;
+        }
+        chosen_idx = idx;
+        subtitles_opt = candidate_subtitles;
+        break;
+    }
+    const subtitles = if (subtitles_opt) |*value| value else return error.TestUnexpectedResult;
     const picked_search = search_response.items[chosen_idx];
-    std.debug.print("[live][providers_app][{s}][search][0]\n", .{providerName(provider)});
+    std.debug.print("[live][providers_app][{s}][search][{d}]\n", .{ providerName(provider), chosen_idx });
     const picked_title = titleFromRef(picked_search.ref);
     try validateUtfNoReplacement(picked_title);
     try validateUtfNoReplacement(picked_search.label);
@@ -2813,18 +2859,11 @@ fn runProviderTuiSmoke(allocator: std.mem.Allocator, client: *std.http.Client, p
     try common.livePrintField(allocator, "chosen_search_title", picked_title);
     try common.livePrintField(allocator, "chosen_search_url", searchRefUrl(picked_search.ref));
 
-    std.debug.print("[live][providers_app][{s}] phase=fetch_chosen_subtitles_start idx={d}\n", .{
-        providerName(provider),
-        chosen_idx,
-    });
-    var subtitles = try fetchSubtitles(allocator, client, picked_search.ref);
-    defer subtitles.deinit();
     std.debug.print("[live][providers_app][{s}] phase=fetch_chosen_subtitles_done items={d}\n", .{
         providerName(provider),
         subtitles.items.len,
     });
 
-    if (subtitles.items.len == 0) return error.TestUnexpectedResult;
     try validateUtfNoReplacement(subtitles.title);
     try common.livePrintField(allocator, "subtitles_title", subtitles.title);
     std.debug.print("[live][providers_app][{s}] subtitles_items={d}\n", .{ providerName(provider), subtitles.items.len });
@@ -2874,6 +2913,22 @@ fn runProviderTuiSmoke(allocator: std.mem.Allocator, client: *std.http.Client, p
             download_idx,
         });
     }
+}
+
+fn seriesQueryForProvider(provider: Provider) []const u8 {
+    return switch (provider) {
+        .subdl_com, .subsource_net, .subtitlecat_com => "Malcolm in the Middle",
+        else => "Chernobyl",
+    };
+}
+
+fn runSingleProviderSeriesTest(provider: Provider) !void {
+    if (!providerSupportsTv(provider) or !shouldRunSingleProviderSmoke(provider)) return error.SkipZigTest;
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    std.debug.print("[live][providers_app][{s}][series] test_start\n", .{providerName(provider)});
+    defer std.debug.print("[live][providers_app][{s}][series] test_end\n", .{providerName(provider)});
+    try runProviderTuiSmokeQuery(std.testing.allocator, &client, provider, seriesQueryForProvider(provider));
 }
 
 fn runSubtitlecatTranslateDownloadLive(allocator: std.mem.Allocator, client: *std.http.Client) !void {
@@ -3099,4 +3154,40 @@ test "live providers_app tui-path smoke provider: opensubtitles.org" {
 
 test "live providers_app tui-path smoke provider: yifysubtitles.ch" {
     try runSingleProviderSmokeTest(.yifysubtitles_ch);
+}
+
+test "live series download path provider: subdl.com" {
+    try runSingleProviderSeriesTest(.subdl_com);
+}
+
+test "live series download path provider: opensubtitles.com" {
+    try runSingleProviderSeriesTest(.opensubtitles_com);
+}
+
+test "live series download path provider: opensubtitles.org" {
+    try runSingleProviderSeriesTest(.opensubtitles_org);
+}
+
+test "live series download path provider: podnapisi.net" {
+    try runSingleProviderSeriesTest(.podnapisi_net);
+}
+
+test "live series download path provider: subtitlecat.com" {
+    try runSingleProviderSeriesTest(.subtitlecat_com);
+}
+
+test "live series download path provider: isubtitles.org" {
+    try runSingleProviderSeriesTest(.isubtitles_org);
+}
+
+test "live series download path provider: my-subs.co" {
+    try runSingleProviderSeriesTest(.my_subs_co);
+}
+
+test "live series download path provider: subsource.net" {
+    try runSingleProviderSeriesTest(.subsource_net);
+}
+
+test "live series download path provider: tvsubtitles.net" {
+    try runSingleProviderSeriesTest(.tvsubtitles_net);
 }

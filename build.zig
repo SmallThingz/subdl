@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
     const omit_frame_pointer = b.option(bool, "omit-frame-pointer", "Force frame pointer omission mode");
     const error_tracing = b.option(bool, "error-tracing", "Force error tracing mode");
     const pic = b.option(bool, "pic", "Force PIC mode");
-    const llvm = b.option(bool, "llvm", "Use LLVM codegen backend");
+    const llvm = b.option(bool, "llvm", "Use LLVM codegen backend") orelse true;
     const enable_tui = b.option(bool, "enable-tui", "Enable TUI support via libvaxis") orelse true;
     const enable_alldriver = b.option(bool, "enable-alldriver", "Enable browser automation support via alldriver") orelse false;
     const enable_unarr = b.option(bool, "enable-unarr", "Enable archive extraction support via unarr") orelse true;

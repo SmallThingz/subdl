@@ -3,6 +3,8 @@ const cli = @import("cli.zig");
 const tui = @import("tui_backend");
 const runtime_io = @import("runtime_io");
 
+pub const panic = tui.panic;
+
 pub fn main(init: std.process.Init) !void {
     runtime_io.set(init.io);
     var args = try init.minimal.args.iterateAllocator(init.gpa);
