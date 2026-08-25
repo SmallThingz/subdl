@@ -113,7 +113,6 @@ pub const Scraper = struct {
             const page_url = if (next_url) |u| u else if (page == 1) base_url else try addOrReplaceOffsetPage(a, base_url, page);
             const response = try self.fetchHtmlWithDoh(a, page_url);
             var parsed = try common.parseHtmlStable(a, response.body);
-            defer parsed.deinit();
 
             var anchors = parsed.doc.queryAll("table#search_results td[id^='main'] strong a.bnone[href*='/search/'][href*='idmovie-']");
             while (anchors.next()) |anchor| {
@@ -174,7 +173,6 @@ pub const Scraper = struct {
             const url = if (next_url) |u| u else if (page == 1) page_url else try addOrReplaceOffsetPage(a, page_url, page);
             const response = try self.fetchHtmlWithDoh(a, url);
             var parsed = try common.parseHtmlStable(a, response.body);
-            defer parsed.deinit();
 
             if (title.len == 0) {
                 title = blk: {

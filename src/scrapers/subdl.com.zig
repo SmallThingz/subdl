@@ -1,15 +1,16 @@
 const std = @import("std");
 const common = @import("common.zig");
+const html = @import("htmlparser");
 const suite = @import("test_suite.zig");
 
 const Allocator = std.mem.Allocator;
 
 const user_agent = "scrape-subdl.com/0.1 (+https://subdl.com)";
-const build_id_source_url = "https://subdl.com/api-doc";
+const api_base = "https://api3.subdl.com";
+const site = "https://subdl.com";
 
 pub const Error = error{
     UnexpectedHttpStatus,
-    BuildIdNotFound,
     InvalidSubtitleLink,
     MissingField,
     InvalidFieldType,
@@ -216,7 +217,6 @@ pub const Scraper = struct {
 
     allocator: Allocator,
     client: *std.http.Client,
-    build_id: ?[]u8 = null,
     options: Options = .{},
 
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
@@ -231,12 +231,7 @@ pub const Scraper = struct {
         };
     }
 
-    pub fn deinit(self: *Scraper) void {
-        if (self.build_id) |build_id| {
-            self.allocator.free(build_id);
-            self.build_id = null;
-        }
-    }
+    pub fn deinit(_: *Scraper) void {}
 
     pub fn parseSubtitleLink(link: []const u8) Error!SubtitlePath {
         const marker = "/subtitle/";
@@ -272,52 +267,29 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        const language_code = resolveProjectSearchLanguageCode(language) orelse return error.UnsupportedSearchLanguage;
-        const build_id = try self.ensureBuildId();
-        const encoded_query = try encodePathSegment(a, query);
-        const url = try std.fmt.allocPrint(
-            a,
-            "https://subdl.com/_next/data/{s}/{s}/search/{s}.json",
-            .{ build_id, language_code, encoded_query },
-        );
-
-        const body = self.fetchBytes(a, url, "application/json") catch |err| switch (err) {
-            error.UnexpectedHttpStatus => blk: {
-                self.clearBuildId();
-                const refreshed_build_id = try self.ensureBuildId();
-                const retry_url = try std.fmt.allocPrint(
-                    a,
-                    "https://subdl.com/_next/data/{s}/{s}/search/{s}.json",
-                    .{ refreshed_build_id, language_code, encoded_query },
-                );
-                break :blk try self.fetchBytes(a, retry_url, "application/json");
-            },
-            else => return err,
-        };
+        _ = resolveProjectSearchLanguageCode(language) orelse return error.UnsupportedSearchLanguage;
+        const encoded_query = try common.encodeUriComponent(a, query);
+        const url = try std.fmt.allocPrint(a, "{s}/search?query={s}", .{ api_base, encoded_query });
+        const body = try self.fetchBytes(a, url, "application/json");
         const json_root = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
         const root_object = try asObject(json_root);
-        const page_props_val = try getRequiredField(root_object, "pageProps");
-        const page_props = try asObject(page_props_val);
-        const list_value = try getRequiredField(page_props, "list");
-        const result_array = try asArray(list_value);
+        const result_array = try asArray(try getRequiredField(root_object, "results"));
 
         var items: std.ArrayListUnmanaged(SearchItem) = .empty;
         for (result_array.items) |entry| {
             const entry_obj = try asObject(entry);
             const media_type_text = try getRequiredString(entry_obj, "type");
             const media_type = MediaType.fromString(media_type_text) orelse continue;
-            const sd_id = try getRequiredString(entry_obj, "sd_id");
-            const slug = try getRequiredString(entry_obj, "slug");
-            const link = try std.fmt.allocPrint(a, "/subtitle/{s}/{s}", .{ sd_id, slug });
+            const link = try getRequiredString(entry_obj, "link");
 
             try items.append(a, .{
                 .media_type = media_type,
                 .name = try getRequiredString(entry_obj, "name"),
-                .poster_url = try getRequiredString(entry_obj, "poster_url"),
+                .poster_url = try getStringOrDefault(entry_obj, "poster_url", ""),
                 .year = try getRequiredInt(entry_obj, "year"),
                 .link = link,
-                .original_name = try getRequiredString(entry_obj, "original_name"),
-                .subtitles_count = try getRequiredInt(entry_obj, "subtitles_count"),
+                .original_name = try getStringOrDefault(entry_obj, "original_name", try getRequiredString(entry_obj, "name")),
+                .subtitles_count = try getIntOrDefault(entry_obj, "subtitles_count", 0),
             });
         }
 
@@ -385,42 +357,17 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        const build_id = try self.ensureBuildId();
+        const path = if (season_slug) |season|
+            try std.fmt.allocPrint(a, "/subtitle/{s}/{s}/{s}", .{ parsed.subdl_id, parsed.slug, season })
+        else
+            try std.fmt.allocPrint(a, "/subtitle/{s}/{s}", .{ parsed.subdl_id, parsed.slug });
+        const url = try std.fmt.allocPrint(a, "{s}{s}", .{ site, path });
+        const body = try self.fetchBytes(a, url, "text/html");
+        var html_page = try common.parseHtmlStable(a, body);
 
-        const url = try buildSubtitleDataUrl(
-            a,
-            build_id,
-            parsed.subdl_id,
-            parsed.slug,
-            season_slug,
-            null,
-        );
-
-        const body = self.fetchBytes(a, url, "application/json") catch |err| switch (err) {
-            error.UnexpectedHttpStatus => blk: {
-                self.clearBuildId();
-                const refreshed_build_id = try self.ensureBuildId();
-                const retry_url = try buildSubtitleDataUrl(
-                    a,
-                    refreshed_build_id,
-                    parsed.subdl_id,
-                    parsed.slug,
-                    season_slug,
-                    null,
-                );
-                break :blk try self.fetchBytes(a, retry_url, "application/json");
-            },
-            else => return err,
-        };
-
-        const json_root = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
-        const root_obj = try asObject(json_root);
-        const page_props_val = try getRequiredField(root_obj, "pageProps");
-        const page_props = try asObject(page_props_val);
-
-        const movie_info = try parseTitleInfo(page_props);
-        const seasons = try parseSeasons(page_props, a);
-        const languages = try parseLanguages(page_props, a, self.options.include_empty_subtitle_groups);
+        const seasons = try parseHtmlSeasons(a, &html_page.doc, path);
+        const movie_info = try parseHtmlTitleInfo(a, &html_page.doc, body, parsed, seasons.len);
+        const languages = try parseHtmlLanguages(a, &html_page.doc, self.options.include_empty_subtitle_groups);
 
         return .{
             .arena = arena,
@@ -428,35 +375,6 @@ pub const Scraper = struct {
             .seasons = seasons,
             .languages = languages,
         };
-    }
-
-    fn ensureBuildId(self: *Scraper) ![]const u8 {
-        if (self.build_id) |build_id| return build_id;
-
-        const build_id = try self.fetchBuildId();
-        self.build_id = build_id;
-        return build_id;
-    }
-
-    fn clearBuildId(self: *Scraper) void {
-        if (self.build_id) |build_id| {
-            self.allocator.free(build_id);
-            self.build_id = null;
-        }
-    }
-
-    fn fetchBuildId(self: *Scraper) ![]u8 {
-        const body = try self.fetchBytes(self.allocator, build_id_source_url, "text/html");
-        defer self.allocator.free(body);
-
-        const marker = "\"buildId\":\"";
-        const marker_start = std.mem.indexOf(u8, body, marker) orelse return error.BuildIdNotFound;
-
-        const start = marker_start + marker.len;
-        const tail = body[start..];
-        const end_rel = std.mem.indexOfScalar(u8, tail, '"') orelse return error.BuildIdNotFound;
-
-        return try self.allocator.dupe(u8, tail[0..end_rel]);
     }
 
     fn fetchBytes(self: *Scraper, allocator: Allocator, url: []const u8, accept: []const u8) ![]u8 {
@@ -519,169 +437,161 @@ fn encodePathSegment(allocator: Allocator, value: []const u8) ![]u8 {
     return try out.toOwnedSlice(allocator);
 }
 
-fn buildSubtitleDataUrl(
+fn parseHtmlTitleInfo(
     allocator: Allocator,
-    build_id: []const u8,
-    subdl_id: []const u8,
-    slug: []const u8,
-    season_slug: ?[]const u8,
-    lang_slug: ?[]const u8,
-) ![]u8 {
-    if (season_slug) |season| {
-        if (lang_slug) |lang| {
-            return std.fmt.allocPrint(
-                allocator,
-                "https://subdl.com/_next/data/{s}/subtitle/{s}/{s}/{s}/{s}.json",
-                .{ build_id, subdl_id, slug, season, lang },
-            );
-        }
-        return std.fmt.allocPrint(
-            allocator,
-            "https://subdl.com/_next/data/{s}/subtitle/{s}/{s}/{s}.json",
-            .{ build_id, subdl_id, slug, season },
-        );
-    }
-
-    if (lang_slug) |lang| {
-        return std.fmt.allocPrint(
-            allocator,
-            "https://subdl.com/_next/data/{s}/subtitle/{s}/{s}/{s}.json",
-            .{ build_id, subdl_id, slug, lang },
-        );
-    }
-
-    return std.fmt.allocPrint(
-        allocator,
-        "https://subdl.com/_next/data/{s}/subtitle/{s}/{s}.json",
-        .{ build_id, subdl_id, slug },
-    );
-}
-
-fn parseTitleInfo(page_props: std.json.ObjectMap) !TitleInfo {
-    const movie_info_val = try getRequiredField(page_props, "movieInfo");
-    const movie_info = try asObject(movie_info_val);
-
-    const media_type_str = try getRequiredString(movie_info, "type");
-    const media_type = MediaType.fromString(media_type_str) orelse return error.UnexpectedTitleType;
+    doc: *const html.Document,
+    body: []const u8,
+    path: SubtitlePath,
+    season_count: usize,
+) !TitleInfo {
+    const heading = doc.queryOne("h1") orelse return error.MissingField;
+    const heading_text = try common.innerTextTrimmedOwned(allocator, heading);
+    const parsed_name = splitTitleYear(heading_text);
+    const poster = if (doc.queryOne("meta[property='og:image']")) |node|
+        common.getAttributeValueSafe(node, "content") orelse ""
+    else
+        "";
 
     return .{
-        .media_type = media_type,
-        .sd_id = try getRequiredInt(movie_info, "sd_id"),
-        .slug = try getRequiredString(movie_info, "slug"),
-        .name = try getRequiredString(movie_info, "name"),
-        .second_name = try getRequiredString(movie_info, "secondName"),
-        .poster_url = try getRequiredString(movie_info, "poster_url"),
-        .year = try getRequiredInt(movie_info, "year"),
-        .total_seasons = try getRequiredInt(movie_info, "total_seasons"),
+        .media_type = if (std.mem.indexOf(u8, body, "\"@type\":\"TVSeries\"") != null) .tv else .movie,
+        .sd_id = std.fmt.parseInt(i64, path.subdl_id[2..], 10) catch 0,
+        .slug = path.slug,
+        .name = parsed_name.name,
+        .second_name = parsed_name.name,
+        .poster_url = poster,
+        .year = parsed_name.year,
+        .total_seasons = @intCast(season_count),
     };
 }
 
-fn parseSeasons(page_props: std.json.ObjectMap, allocator: Allocator) ![]const SeasonInfo {
-    const movie_info_val = try getRequiredField(page_props, "movieInfo");
-    const movie_info = try asObject(movie_info_val);
+const ParsedTitle = struct { name: []const u8, year: i64 };
 
-    const seasons_val = try getRequiredField(movie_info, "seasons");
-    const seasons_arr = switch (seasons_val) {
-        .array => |arr| arr,
-        .null => return &.{},
-        else => return error.InvalidFieldType,
-    };
-
-    var seasons: std.ArrayListUnmanaged(SeasonInfo) = .empty;
-    for (seasons_arr.items) |season_val| {
-        const season_obj = try asObject(season_val);
-        try seasons.append(allocator, .{
-            .number = try getRequiredString(season_obj, "number"),
-            .name = try getRequiredString(season_obj, "name"),
-            .poster = try getRequiredString(season_obj, "poster"),
-        });
+fn splitTitleYear(value: []const u8) ParsedTitle {
+    if (value.len >= 6 and value[value.len - 1] == ')') {
+        const year_start = value.len - 6;
+        if (value[year_start] == '(') {
+            const year = std.fmt.parseInt(i64, value[year_start + 1 .. value.len - 1], 10) catch 0;
+            if (year != 0) return .{ .name = std.mem.trimEnd(u8, value[0..year_start], " \t"), .year = year };
+        }
     }
-
-    return try seasons.toOwnedSlice(allocator);
+    return .{ .name = value, .year = 0 };
 }
 
-fn parseLanguages(
-    page_props: std.json.ObjectMap,
-    allocator: Allocator,
-    include_empty_subtitle_groups: bool,
-) ![]const LanguageSubtitles {
-    const grouped_val = try getRequiredField(page_props, "groupedSubtitles");
-
-    return switch (grouped_val) {
-        .null => &.{},
-        .array => &.{},
-        .object => |grouped| parseGroupedSubtitles(grouped, allocator, include_empty_subtitle_groups),
-        else => error.InvalidFieldType,
-    };
+fn parseHtmlSeasons(allocator: Allocator, doc: *const html.Document, base_path: []const u8) ![]const SeasonInfo {
+    var result: std.ArrayListUnmanaged(SeasonInfo) = .empty;
+    var links = doc.query("a[href^='/subtitle/']");
+    defer links.deinit();
+    while (links.next()) |anchor| {
+        const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
+        if (!std.mem.startsWith(u8, href, base_path) or href.len <= base_path.len or href[base_path.len] != '/') continue;
+        const season_slug = href[base_path.len + 1 ..];
+        if (season_slug.len == 0 or std.mem.indexOfScalar(u8, season_slug, '/') != null) continue;
+        if (containsSeason(result.items, season_slug)) continue;
+        const heading = anchor.queryOne("h3") orelse continue;
+        const name = try common.innerTextTrimmedOwned(allocator, heading);
+        if (name.len == 0) continue;
+        try result.append(allocator, .{ .number = season_slug, .name = name, .poster = "" });
+    }
+    return result.toOwnedSlice(allocator);
 }
 
-fn parseGroupedSubtitles(
-    grouped: std.json.ObjectMap,
+fn containsSeason(seasons: []const SeasonInfo, slug: []const u8) bool {
+    for (seasons) |season| if (std.mem.eql(u8, season.number, slug)) return true;
+    return false;
+}
+
+fn parseHtmlLanguages(
     allocator: Allocator,
-    include_empty_subtitle_groups: bool,
+    doc: *const html.Document,
+    include_empty: bool,
 ) ![]const LanguageSubtitles {
     var result: std.ArrayListUnmanaged(LanguageSubtitles) = .empty;
-
-    var it = grouped.iterator();
-    while (it.next()) |entry| {
-        const language = entry.key_ptr.*;
-        const subtitles_array = try asArray(entry.value_ptr.*);
-
-        var subtitle_items: std.ArrayListUnmanaged(SubtitleItem) = .empty;
-        for (subtitles_array.items) |subtitle_val| {
-            const subtitle_obj = try asObject(subtitle_val);
-            try subtitle_items.append(allocator, try parseSubtitle(subtitle_obj, allocator));
+    var groups = doc.query("div[data-language]");
+    defer groups.deinit();
+    while (groups.next()) |group| {
+        const language = common.getAttributeValueSafe(group, "data-language-name") orelse
+            common.getAttributeValueSafe(group, "data-language") orelse continue;
+        var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
+        var rows = group.query("li[data-row]");
+        defer rows.deinit();
+        while (rows.next()) |row| {
+            const title_node = row.queryOne("h4") orelse continue;
+            const title = try common.innerTextTrimmedOwned(allocator, title_node);
+            if (title.len == 0) continue;
+            const detail_anchor = row.queryOne("a[href^='/s/info/']");
+            const detail_path = if (detail_anchor) |node| common.getAttributeValueSafe(node, "href") orelse "" else "";
+            const download_anchor = row.queryOne("a[href*='dl.subdl.com/subtitle/']");
+            const download_url = if (download_anchor) |node| common.getAttributeValueSafe(node, "href") orelse "" else "";
+            const author_anchor = row.queryOne("a[href^='/u/']");
+            const author = if (author_anchor) |node| try common.innerTextTrimmedOwned(allocator, node) else "";
+            const download_prefix = "https://dl.subdl.com/subtitle/";
+            const link = if (std.mem.startsWith(u8, download_url, download_prefix)) download_url[download_prefix.len..] else download_url;
+            const releases = try allocator.alloc([]const u8, 1);
+            releases[0] = title;
+            try subtitles.append(allocator, .{
+                .id = common.parseAttrInt(row, "data-id", i64) orelse 0,
+                .language = language,
+                .quality = findAncestorAttribute(row, "data-quality") orelse "",
+                .link = link,
+                .bucket_link = download_url,
+                .author = author,
+                .season = common.parseAttrInt(row, "data-season", i64) orelse 0,
+                .episode = common.parseAttrInt(row, "data-episode-from", i64) orelse 0,
+                .title = title,
+                .extra = if (detail_path.len == 0) "" else try std.fmt.allocPrint(allocator, "{s}{s}", .{ site, detail_path }),
+                .enabled = download_url.len != 0,
+                .n_id = downloadId(download_url),
+                .downloads = 0,
+                .hearing_impaired = try hasUseHref(allocator, row, "#sub-i-hi"),
+                .releases = releases,
+                .rate = null,
+                .date_ms = common.parseAttrInt(row, "data-date", i64) orelse 0,
+                .comment = "",
+                .slug = detailSlug(detail_path),
+            });
         }
-
-        if (!include_empty_subtitle_groups and subtitle_items.items.len == 0) continue;
-        const owned_subtitles = try subtitle_items.toOwnedSlice(allocator);
-        try result.append(allocator, .{
-            .language = language,
-            .subtitles = owned_subtitles,
-        });
+        if (subtitles.items.len == 0 and !include_empty) continue;
+        try result.append(allocator, .{ .language = language, .subtitles = try subtitles.toOwnedSlice(allocator) });
     }
-
-    return try result.toOwnedSlice(allocator);
+    return result.toOwnedSlice(allocator);
 }
 
-fn parseSubtitle(subtitle_obj: std.json.ObjectMap, allocator: Allocator) !SubtitleItem {
-    const releases = switch (subtitle_obj.get("releases") orelse std.json.Value{ .array = std.json.Array.init(allocator) }) {
-        .array => |arr| blk: {
-            var list: std.ArrayListUnmanaged([]const u8) = .empty;
-            for (arr.items) |release_val| {
-                if (release_val == .string) {
-                    try list.append(allocator, release_val.string);
-                }
-            }
-            break :blk try list.toOwnedSlice(allocator);
-        },
-        else => &.{},
-    };
+fn hasUseHref(allocator: Allocator, node: html.Node, wanted: []const u8) !bool {
+    var uses = node.query("use");
+    defer uses.deinit();
+    while (uses.next()) |use| {
+        if (common.getAttributeValueSafe(use, "href")) |href| {
+            if (std.mem.eql(u8, href, wanted)) return true;
+        }
+    }
+    // SVG foreign-content nodes are intentionally absent from some selector
+    // indexes, but remain available in the lossless subtree serialization.
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    try node.writeHtml(&output.writer);
+    return std.mem.indexOf(u8, output.written(), wanted) != null;
+}
 
-    const enabled_val = subtitle_obj.get("e") orelse return error.MissingField;
-    const hi_val = subtitle_obj.get("hi") orelse return error.MissingField;
+fn findAncestorAttribute(node: html.Node, attribute: []const u8) ?[]const u8 {
+    var current = node.parentNode();
+    while (current) |ancestor| : (current = ancestor.parentNode()) {
+        if (common.getAttributeValueSafe(ancestor, attribute)) |value| return value;
+    }
+    return null;
+}
 
-    return .{
-        .id = try getRequiredInt(subtitle_obj, "id"),
-        .language = try getRequiredString(subtitle_obj, "language"),
-        .quality = try getRequiredString(subtitle_obj, "quality"),
-        .link = try getRequiredString(subtitle_obj, "link"),
-        .bucket_link = try getRequiredString(subtitle_obj, "bucketLink"),
-        .author = try getRequiredString(subtitle_obj, "author"),
-        .season = try getRequiredInt(subtitle_obj, "season"),
-        .episode = try getRequiredInt(subtitle_obj, "episode"),
-        .title = try getRequiredString(subtitle_obj, "title"),
-        .extra = try getRequiredString(subtitle_obj, "extra"),
-        .enabled = try asBoolOrInt(enabled_val),
-        .n_id = try getRequiredString(subtitle_obj, "n_id"),
-        .downloads = try getRequiredInt(subtitle_obj, "downloads"),
-        .hearing_impaired = try asBoolOrInt(hi_val),
-        .releases = releases,
-        .rate = try getOptionalFloat(subtitle_obj, "rate"),
-        .date_ms = try getRequiredInt(subtitle_obj, "date"),
-        .comment = try getRequiredString(subtitle_obj, "comment"),
-        .slug = try getOptionalString(subtitle_obj, "slug"),
-    };
+fn downloadId(url: []const u8) []const u8 {
+    const prefix = "https://dl.subdl.com/subtitle/";
+    const tail = if (std.mem.startsWith(u8, url, prefix)) url[prefix.len..] else url;
+    const dash = std.mem.lastIndexOfScalar(u8, tail, '-') orelse return "";
+    const extension = std.mem.lastIndexOfScalar(u8, tail, '.') orelse tail.len;
+    return if (dash + 1 < extension) tail[dash + 1 .. extension] else "";
+}
+
+fn detailSlug(path: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, path, "/s/info/")) return null;
+    const token = path["/s/info/".len..];
+    const slash = std.mem.indexOfScalar(u8, token, '/') orelse return token;
+    return token[0..slash];
 }
 
 fn getRequiredField(obj: std.json.ObjectMap, field: []const u8) !std.json.Value {
@@ -691,6 +601,15 @@ fn getRequiredField(obj: std.json.ObjectMap, field: []const u8) !std.json.Value 
 fn getRequiredString(obj: std.json.ObjectMap, field: []const u8) ![]const u8 {
     const value = try getRequiredField(obj, field);
     return asString(value);
+}
+
+fn getStringOrDefault(obj: std.json.ObjectMap, field: []const u8, default: []const u8) ![]const u8 {
+    const value = obj.get(field) orelse return default;
+    return switch (value) {
+        .null => default,
+        .string => |string| string,
+        else => error.InvalidFieldType,
+    };
 }
 
 fn getOptionalString(obj: std.json.ObjectMap, field: []const u8) !?[]const u8 {
@@ -705,6 +624,14 @@ fn getOptionalString(obj: std.json.ObjectMap, field: []const u8) !?[]const u8 {
 fn getRequiredInt(obj: std.json.ObjectMap, field: []const u8) !i64 {
     const value = try getRequiredField(obj, field);
     return asInt(value);
+}
+
+fn getIntOrDefault(obj: std.json.ObjectMap, field: []const u8, default: i64) !i64 {
+    const value = obj.get(field) orelse return default;
+    return switch (value) {
+        .null => default,
+        else => asInt(value),
+    };
 }
 
 fn getOptionalFloat(obj: std.json.ObjectMap, field: []const u8) !?f64 {
@@ -847,23 +774,39 @@ test "scraper options default and opt-in include-empty-subtitle-groups" {
     try std.testing.expect(include_empty_scraper.options.include_empty_subtitle_groups);
 }
 
-test "grouped subtitle parsing excludes empty groups by default and includes with option" {
+test "current html page parsing extracts title seasons and rich subtitle rows" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    const fixture =
+        \\<html><head><meta property="og:image" content="https://poster.test/matrix.jpg"></head><body>
+        \\<script type="application/ld+json">{"@type":"TVSeries"}</script><h1>The Matrix (1999)</h1>
+        \\<a href="/subtitle/sd21581/the-matrix/first-season"><h3>Season 1</h3></a>
+        \\<div data-language="english" data-language-name="English"><div data-quality-group data-quality="bluray"><ul>
+        \\<li data-row data-id="560930" data-date="1589763900000" data-episode-from="2">
+        \\<a href="/s/info/DHDOatxKmT/the-matrix"><h4>The.Matrix.1999.2160p.BluRay</h4></a>
+        \\<a href="/u/Kosire">Kosire</a><svg><use href="#sub-i-hi"></use></svg>
+        \\<a href="https://dl.subdl.com/subtitle/560930-2216904.zip">Download</a></li>
+        \\</ul></div></div></body></html>
+    ;
+    var page = try common.parseHtmlStable(a, fixture);
+    defer page.deinit();
+    const parsed_path = try Scraper.parseSubtitleLink("/subtitle/sd21581/the-matrix");
+    const seasons = try parseHtmlSeasons(a, &page.doc, "/subtitle/sd21581/the-matrix");
+    const title = try parseHtmlTitleInfo(a, &page.doc, fixture, parsed_path, seasons.len);
+    const languages = try parseHtmlLanguages(a, &page.doc, false);
 
-    var grouped = try std.json.ObjectMap.init(a, &.{}, &.{});
-    try grouped.put(a, "english", .{ .array = std.json.Array.init(a) });
-    try grouped.put(a, "spanish", .{ .array = std.json.Array.init(a) });
-
-    const filtered = try parseGroupedSubtitles(grouped, a, false);
-    try std.testing.expectEqual(@as(usize, 0), filtered.len);
-
-    const included = try parseGroupedSubtitles(grouped, a, true);
-    try std.testing.expectEqual(@as(usize, 2), included.len);
-    for (included) |lang| {
-        try std.testing.expectEqual(@as(usize, 0), lang.subtitles.len);
-    }
+    try std.testing.expectEqual(MediaType.tv, title.media_type);
+    try std.testing.expectEqualStrings("The Matrix", title.name);
+    try std.testing.expectEqual(@as(i64, 1999), title.year);
+    try std.testing.expectEqualStrings("first-season", seasons[0].number);
+    try std.testing.expectEqualStrings("English", languages[0].language);
+    const subtitle = languages[0].subtitles[0];
+    try std.testing.expectEqualStrings("bluray", subtitle.quality);
+    try std.testing.expectEqualStrings("Kosire", subtitle.author);
+    try std.testing.expect(subtitle.hearing_impaired);
+    try std.testing.expectEqualStrings("560930-2216904.zip", subtitle.link);
+    try std.testing.expectEqualStrings("2216904", subtitle.n_id);
 }
 
 test "resolve project search language code accepts names and codes" {

@@ -37,6 +37,7 @@ pub const FetchCacheConfig = struct {
 
 var fetch_cache_config: FetchCacheConfig = .{};
 var fetch_cache_lock = std.atomic.Value(u8).init(0);
+var client_init_lock = std.atomic.Value(u8).init(0);
 
 const FetchCacheGuard = struct {
     fn lock() FetchCacheGuard {
@@ -298,6 +299,7 @@ fn ensureParentDir(path: []const u8) !void {
 }
 
 fn fetchBytesViaHttp(client: *std.http.Client, allocator: Allocator, url: []const u8, opts: FetchOptions) !HttpResponse {
+    try ensureClientTlsReady(client);
     var phase = LivePhase.init("http.fetch", url);
     phase.start();
     defer phase.finish();
@@ -311,17 +313,27 @@ fn fetchBytesViaHttp(client: *std.http.Client, allocator: Allocator, url: []cons
         }
     }
 
-    if (opts.content_type) |content_type| {
-        if (!hasHeader(opts.extra_headers, "content-type")) {
-            try headers.append(allocator, .{ .name = "content-type", .value = content_type });
-        }
+    for (opts.extra_headers) |header| {
+        if (isTypedRequestHeader(header.name)) continue;
+        try headers.append(allocator, header);
     }
 
-    if (!hasHeader(opts.extra_headers, "user-agent")) {
-        try headers.append(allocator, .{ .name = "user-agent", .value = default_user_agent });
-    }
-
-    try headers.appendSlice(allocator, opts.extra_headers);
+    const request_headers: std.http.Client.Request.Headers = .{
+        .host = typedHeaderOverride(opts.extra_headers, "host"),
+        .authorization = typedHeaderOverride(opts.extra_headers, "authorization"),
+        .user_agent = if (findHeaderValue(opts.extra_headers, "user-agent")) |value|
+            .{ .override = value }
+        else
+            .{ .override = default_user_agent },
+        .connection = typedHeaderOverride(opts.extra_headers, "connection"),
+        .accept_encoding = typedHeaderOverride(opts.extra_headers, "accept-encoding"),
+        .content_type = if (findHeaderValue(opts.extra_headers, "content-type")) |value|
+            .{ .override = value }
+        else if (opts.content_type) |value|
+            .{ .override = value }
+        else
+            .default,
+    };
 
     const normalized_url = try normalizeUrlForFetch(allocator, url);
     defer allocator.free(normalized_url);
@@ -335,6 +347,7 @@ fn fetchBytesViaHttp(client: *std.http.Client, allocator: Allocator, url: []cons
         .location = .{ .url = normalized_url },
         .method = opts.method,
         .payload = opts.payload,
+        .headers = request_headers,
         .extra_headers = headers.items,
         .response_writer = &body_writer.writer,
         .redirect_behavior = std.http.Client.Request.RedirectBehavior.init(5),
@@ -344,6 +357,41 @@ fn fetchBytesViaHttp(client: *std.http.Client, allocator: Allocator, url: []cons
         .status = fetched.status,
         .body = try allocator.dupe(u8, body_writer.writer.buffered()),
     };
+}
+
+fn ensureClientTlsReady(client: *std.http.Client) !void {
+    while (client_init_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) sleepMilliseconds(1);
+    defer client_init_lock.store(0, .release);
+    if (client.now != null) return;
+
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    errdefer bundle.deinit(client.allocator);
+    const now = std.Io.Clock.real.now(client.io);
+    try bundle.rescan(client.allocator, client.io, now);
+    client.now = now;
+    std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
+    bundle.deinit(client.allocator);
+}
+
+fn findHeaderValue(headers: []const std.http.Header, wanted_name: []const u8) ?[]const u8 {
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, wanted_name)) return header.value;
+    }
+    return null;
+}
+
+fn typedHeaderOverride(headers: []const std.http.Header, wanted_name: []const u8) std.http.Client.Request.Headers.Value {
+    const value = findHeaderValue(headers, wanted_name) orelse return .default;
+    return .{ .override = value };
+}
+
+fn isTypedRequestHeader(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "host") or
+        std.ascii.eqlIgnoreCase(name, "authorization") or
+        std.ascii.eqlIgnoreCase(name, "user-agent") or
+        std.ascii.eqlIgnoreCase(name, "connection") or
+        std.ascii.eqlIgnoreCase(name, "accept-encoding") or
+        std.ascii.eqlIgnoreCase(name, "content-type");
 }
 
 pub fn normalizeUrlForFetch(allocator: Allocator, url: []const u8) ![]u8 {
@@ -648,12 +696,18 @@ fn envBool(name: []const u8) ?bool {
 }
 
 pub fn getenv(name: []const u8) ?[]const u8 {
-    _ = name;
-    if (builtin.os.tag == .windows) {
-        return null;
-    }
-    return null;
+    if (builtin.os.tag == .windows or name.len > 256) return null;
+
+    var name_z: [256:0]u8 = undefined;
+    @memcpy(name_z[0..name.len], name);
+    name_z[name.len] = 0;
+    const value = PosixEnvironment.getenv(&name_z) orelse return null;
+    return std.mem.span(value);
 }
+
+const PosixEnvironment = if (builtin.os.tag == .windows) struct {} else struct {
+    extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+};
 
 pub fn providerMatchesLiveFilter(filter: ?[]const u8, provider_name: []const u8) bool {
     const f = filter orelse return true;

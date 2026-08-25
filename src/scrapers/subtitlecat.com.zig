@@ -69,7 +69,6 @@ pub const Scraper = struct {
         const response = try common.fetchBytes(self.client, a, url, .{ .accept = "text/html", .max_attempts = 2 });
 
         var parsed = try common.parseHtmlStable(a, response.body);
-        defer parsed.deinit();
 
         var items: std.ArrayListUnmanaged(SearchItem) = .empty;
         var anchors = parsed.doc.queryAll("table.sub-table tbody tr td:first-child a");
@@ -94,7 +93,6 @@ pub const Scraper = struct {
 
         const response = try common.fetchBytes(self.client, a, details_url, .{ .accept = "text/html", .max_attempts = 2 });
         var parsed = try common.parseHtmlStable(a, response.body);
-        defer parsed.deinit();
 
         var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
         var blocks = parsed.doc.queryAll("div.sub-single");

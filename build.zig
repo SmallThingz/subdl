@@ -20,6 +20,7 @@ pub fn build(b: *std.Build) void {
     const live_providers = b.option([]const u8, "live-providers", "Comma-separated provider filter for live tests, or '*' for all") orelse "*";
     const live_include_captcha = b.option(bool, "live-include-captcha", "Include captcha/cloudflare providers in live test runs") orelse false;
     const live_parallel_on_all = b.option(bool, "live-parallel-on-all", "Run one live subprocess per provider when -Dlive-providers=all/*") orelse true;
+    const live_timeout_seconds = b.option(u32, "live-timeout-seconds", "Hard deadline for each parallel live provider") orelse 60;
 
     const valid_mode = std.mem.eql(u8, live_mode, "off") or
         std.mem.eql(u8, live_mode, "smoke") or
@@ -68,6 +69,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/scrapers/subdl.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .strip = strip,
         .single_threaded = single_threaded,
         .omit_frame_pointer = omit_frame_pointer,
@@ -228,7 +230,7 @@ pub fn build(b: *std.Build) void {
     const test_live_step = b.step("test-live", "Run live tests using -Dlive, -Dlive-providers, -Dlive-include-captcha");
     if (live_tests_enabled and live_parallel_on_all and isAllLiveProviderSelection(live_providers)) {
         const include_captcha_arg = if (live_include_captcha) "true" else "false";
-        const script = makeParallelLiveRunScript(b, include_captcha_arg);
+        const script = makeParallelLiveRunScript(b, include_captcha_arg, live_timeout_seconds);
         const fanout_cmd = b.addSystemCommand(&.{ "bash", "-lc", script, "_test_bin_" });
         fanout_cmd.setCwd(b.path("."));
         fanout_cmd.addFileArg(scrapers_mod_tests.getEmittedBin());
@@ -281,6 +283,7 @@ fn isAllLiveProviderSelection(raw_filter: []const u8) bool {
 fn makeParallelLiveRunScript(
     b: *std.Build,
     include_captcha_arg: []const u8,
+    timeout_seconds: u32,
 ) []const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(b.allocator);
@@ -302,8 +305,10 @@ fn makeParallelLiveRunScript(
             \\
             \\(
             \\  set -o pipefail
-            \\  SCRAPERS_LIVE_PROVIDER_FILTER="{s}" SCRAPERS_LIVE_INCLUDE_CAPTCHA="{s}" "$test_bin" 2>&1 | sed -u 's/^/[live][{s}] /'
+            \\  set +e
+            \\  SCRAPERS_LIVE_PROVIDER_FILTER="{s}" SCRAPERS_LIVE_INCLUDE_CAPTCHA="{s}" timeout --signal=TERM --kill-after=5s {d}s "$test_bin" 2>&1 | sed -u 's/^/[live][{s}] /'
             \\  rc=${{PIPESTATUS[0]}}
+            \\  set -e
             \\  echo "$rc" > "$tmpdir/{s}.rc"
             \\  echo "[live][runner] END {s} rc=$rc"
             \\  exit "$rc"
@@ -315,6 +320,7 @@ fn makeParallelLiveRunScript(
             target_info.name,
             target_info.name,
             include_captcha_arg,
+            timeout_seconds,
             target_info.name,
             target_info.name,
             target_info.name,
@@ -512,6 +518,7 @@ fn createTargetModuleSet(
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .strip = strip,
         .single_threaded = single_threaded,
         .omit_frame_pointer = omit_frame_pointer,

@@ -98,7 +98,6 @@ pub const Scraper = struct {
 
         const response = try common.fetchBytes(self.client, a, movie_page_url, .{ .accept = "text/html", .max_attempts = 2 });
         var parsed = try common.parseHtmlStable(a, response.body);
-        defer parsed.deinit();
 
         const title_node = parsed.doc.queryOne("title");
         const title = if (title_node) |n|

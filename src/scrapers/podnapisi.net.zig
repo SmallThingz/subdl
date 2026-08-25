@@ -209,7 +209,6 @@ pub const Scraper = struct {
         if (response.status != .ok) return;
 
         var parsed = try common.parseHtmlStable(allocator, response.body);
-        defer parsed.deinit();
         has_next_page.* = hasNextHtmlSearchPage(&parsed.doc, page) catch false;
 
         var anchors = parsed.doc.queryAll("a[href*='/subtitles/search/']");
@@ -254,7 +253,6 @@ pub const Scraper = struct {
         if (response.status == .too_many_requests) return error.RateLimited;
 
         var parsed = try common.parseHtmlStable(a, response.body);
-        defer parsed.deinit();
 
         const header_row = blk: {
             const table = parsed.doc.queryOne("table") orelse break :blk null;

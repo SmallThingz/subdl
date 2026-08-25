@@ -3,9 +3,26 @@ const upstream = @import("htmlparser_upstream");
 
 pub const TextOptions = upstream.TextOptions;
 pub const Selector = upstream.Selector;
-pub const QueryDebugReport = upstream.QueryDebugReport;
-pub const DebugFailureKind = upstream.DebugFailureKind;
-pub const NearMiss = upstream.NearMiss;
+
+// Selector debugging was removed upstream. Keep the narrow report shape used by
+// scraper diagnostics until those call sites move to a dedicated tracing layer.
+pub const QueryDebugReport = struct {
+    visited_elements: usize = 0,
+    group_count: usize = 0,
+    runtime_parse_error: ?anyerror = null,
+    near_miss_len: usize = 0,
+    near_misses: [1]NearMiss = .{.{}},
+};
+pub const DebugFailureKind = enum { unavailable };
+pub const NearMiss = struct {
+    node_index: usize = 0,
+    reason: struct {
+        kind: DebugFailureKind = .unavailable,
+        group_index: usize = 0,
+        compound_index: usize = 0,
+        predicate_index: usize = 0,
+    } = .{},
+};
 
 /// Compatibility facade for the pre-rename html_parser API used by the scrapers.
 /// The latest upstream binds document types to parse options, so this facade uses
@@ -76,6 +93,7 @@ pub const Document = struct {
 
     pub fn queryOne(self: *const Document, comptime selector: []const u8) ?Node {
         var iter = self.query(selector);
+        defer iter.deinit();
         return iter.next();
     }
 
@@ -100,7 +118,7 @@ pub const Document = struct {
     }
 
     pub fn writeHtml(self: *const Document, writer: anytype) !void {
-        try self.inner.writeHtml(writer);
+        try self.inner.writeHtml(writer, .never);
     }
 };
 
@@ -170,6 +188,7 @@ pub const Node = struct {
 
     pub fn queryOne(self: Node, comptime selector: []const u8) ?Node {
         var iter = self.query(selector);
+        defer iter.deinit();
         return iter.next();
     }
 
@@ -178,7 +197,7 @@ pub const Node = struct {
     }
 
     pub fn writeHtml(self: Node, writer: anytype) !void {
-        try self.inner.writeHtml(writer);
+        try self.inner.writeHtml(writer, .never);
     }
 };
 
@@ -186,7 +205,11 @@ pub const CompatQueryIter = struct {
     inner: UpstreamQueryIter,
 
     pub fn next(self: *CompatQueryIter) ?Node {
-        return wrapNode(self.inner.next());
+        return wrapNode(self.inner.next() catch return null);
+    }
+
+    pub fn deinit(self: *CompatQueryIter) void {
+        self.inner.deinit();
     }
 };
 

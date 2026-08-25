@@ -87,7 +87,6 @@ pub const Scraper = struct {
             const url = try buildSearchUrl(a, encoded_query, page);
             const html_resp = try common.fetchBytes(self.client, a, url, .{ .accept = "text/html", .max_attempts = 2 });
             var parsed = try common.parseHtmlStable(a, html_resp.body);
-            defer parsed.deinit();
 
             const len_before = items.items.len;
             var links = parsed.doc.queryAll("div.inside-article header h2 a");
@@ -126,7 +125,6 @@ pub const Scraper = struct {
 
         const html_resp = try common.fetchBytes(self.client, a, page_url, .{ .accept = "text/html", .max_attempts = 2 });
         var parsed = try common.parseHtmlStable(a, html_resp.body);
-        defer parsed.deinit();
 
         const title_node = parsed.doc.queryOne("h1") orelse parsed.doc.queryOne("title") orelse return error.MissingField;
         const title = try common.innerTextTrimmedOwned(a, title_node);

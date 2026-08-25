@@ -77,7 +77,6 @@ pub const Scraper = struct {
 
         // This site frequently returns malformed HTML that is unsafe in turbo mode.
         var parsed = try common.parseHtmlStable(a, response.body);
-        defer parsed.deinit();
 
         var items: std.ArrayListUnmanaged(SearchItem) = .empty;
         var seen = std.StringHashMapUnmanaged(void).empty;
@@ -126,7 +125,6 @@ pub const Scraper = struct {
 
         const response = try common.fetchBytes(self.client, a, movie_link, .{ .accept = "text/html", .max_attempts = 2 });
         var parsed = try common.parseHtmlStable(a, response.body);
-        defer parsed.deinit();
 
         const title = blk: {
             if (parsed.doc.queryOne("h1")) |h1| break :blk try common.innerTextTrimmedOwned(a, h1);

@@ -33,12 +33,11 @@
     // internet connectivity.
     .dependencies = .{
         .libvaxis = .{
-            .url = "git+https://github.com/rockorager/libvaxis.git#60a507c25b5335e222eb12320aa7514db684d4a4",
-            .hash = "vaxis-0.6.0-BWNV_HHwCQCy33z_jb0RHLjoinqQ8tgQVZI9z2e5Yqdd",
+            .url = "git+https://github.com/rockorager/libvaxis.git#c060d314930c5552b99a89278a6a695baf0352da",
+            .hash = "vaxis-0.6.0-BWNV_LC4CwBka_bJk8SOXqzCM-nyQH00jzdL0kUhGwRE",
         },
         .htmlparser = .{
-            .url = "git+https://github.com/SmallThingz/htmlparser.git#a93e57647d08c864fdec25a8e18a287c7b07a050",
-            .hash = "html-0.0.0-dtdpOuMWBQC9s6xzSwlNzRXufohcB4o3RQbohJ1rz6AR",
+            .path = "../htmlparser",
         },
         .alldriver = .{
             .url = "git+https://github.com/SmallThingz/alldriver.git#ef2abd24e22f912b1c4afee5b268bbe35fe07529",
@@ -49,7 +48,8 @@
             .hash = "unarr-0.0.0-9UpXAyjIAAAFFVhPGhpoLcdgKJgyUYhdcdi0Jhjkes3k",
         },
         .oneserial = .{
-            .path = "src/deps/oneserial_upstream",
+            .url = "git+https://github.com/SmallThingz/oneserial.git#a4c7df00afd84c9514013980aa11402ed0194171",
+            .hash = "oneserial-0.1.0-vr--ZrLDAQCwCiIL1hgQDU75YqeJHrOKgWETpavJlCe7",
         },
     },
     .paths = .{

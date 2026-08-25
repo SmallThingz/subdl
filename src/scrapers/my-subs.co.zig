@@ -92,7 +92,6 @@ pub const Scraper = struct {
         const response = try common.fetchBytes(self.client, a, page_url, .{ .accept = "text/html", .max_attempts = 2, .allow_non_ok = true });
         if (response.body.len > 0) {
             var parsed = try common.parseHtmlStable(a, response.body);
-            defer parsed.deinit();
 
             var anchors = parsed.doc.queryAll("a[href*='/showlistsubtitles-'], a[href*='/film-versions-']");
             while (anchors.next()) |anchor| {
@@ -147,7 +146,6 @@ pub const Scraper = struct {
         if (root_response.body.len == 0) return .{ .arena = arena, .subtitles = &.{} };
 
         var root = try common.parseHtmlStable(a, root_response.body);
-        defer root.deinit();
 
         if (media_kind == .tv and options.include_seasons) {
             var season_links = root.doc.queryAll("#saison a[href*='/versions-'][href*='-subtitles']");
@@ -168,7 +166,6 @@ pub const Scraper = struct {
             if (response.body.len == 0) continue;
 
             var parsed = try common.parseHtmlStable(a, response.body);
-            defer parsed.deinit();
 
             const page_title = if (parsed.doc.queryOne("h1")) |h1|
                 try common.innerTextTrimmedOwned(a, h1)

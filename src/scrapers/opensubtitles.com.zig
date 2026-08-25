@@ -383,7 +383,6 @@ fn parseLanguageFromCell(allocator: Allocator, cols: []const std.json.Value, idx
     };
     const wrapped = try std.fmt.allocPrint(allocator, "<div>{s}</div>", .{html});
     var parsed = try common.parseHtmlTurbo(allocator, wrapped);
-    defer parsed.deinit();
     if (parsed.doc.queryOne("*[title]")) |n| {
         const title = n.getAttributeValue("title") orelse return null;
         return try allocator.dupe(u8, title);
@@ -400,7 +399,6 @@ fn parseFilenameFromCell(allocator: Allocator, cols: []const std.json.Value, idx
     };
     const wrapped = try std.fmt.allocPrint(allocator, "<div>{s}</div>", .{html});
     var parsed = try common.parseHtmlTurbo(allocator, wrapped);
-    defer parsed.deinit();
     const div = parsed.doc.queryOne("div") orelse return null;
     const txt = try common.innerTextTrimmedOwned(allocator, div);
     if (txt.len == 0) return null;
@@ -418,7 +416,6 @@ fn summarizeRow(allocator: Allocator, cols: []const std.json.Value) !?[]const u8
         };
         const wrapped = try std.fmt.allocPrint(allocator, "<div>{s}</div>", .{html});
         var parsed = try common.parseHtmlTurbo(allocator, wrapped);
-        defer parsed.deinit();
         const div = parsed.doc.queryOne("div") orelse continue;
         const txt = try common.innerTextTrimmedOwned(allocator, div);
         if (txt.len == 0) continue;
@@ -440,7 +437,6 @@ fn parseRemoteEndpoint(allocator: Allocator, cols: []const std.json.Value) ![]co
 
     const wrapped = try std.fmt.allocPrint(allocator, "<div>{s}</div>", .{html});
     var parsed = try common.parseHtmlTurbo(allocator, wrapped);
-    defer parsed.deinit();
 
     const anchor = parsed.doc.queryOne("a[data-remote='true']") orelse return error.MissingField;
     const href = anchor.getAttributeValue("href") orelse return error.MissingField;

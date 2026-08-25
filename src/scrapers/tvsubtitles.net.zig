@@ -6,7 +6,8 @@ const HtmlDocument = HtmlParseOptions.GetDocument();
 const HtmlNode = HtmlParseOptions.GetNode();
 
 const Allocator = std.mem.Allocator;
-const site = "https://www.tvsubtitles.net";
+const site = "http://www.tvsubtitles.net";
+const request_site = "http://176.103.50.239";
 
 pub const SearchOptions = struct {
     _unused: void = {},
@@ -82,11 +83,12 @@ pub const Scraper = struct {
         var seen = std.StringHashMapUnmanaged(void).empty;
 
         const page_url = try buildSearchUrl(a, query);
-        const response = try fetchSearchPage(self.client, a, query, page_url);
+        const response = try fetchSearchPage(self.client, a, page_url);
+        if (common.getenv("SCRAPERS_DEBUG_TVSUB") != null) std.debug.print("[tvsubtitles] search status={d} bytes={d}\n", .{ @intFromEnum(response.status), response.body.len });
         if (response.body.len > 0) {
             var doc = try common.parseHtmlStable(a, response.body);
-            defer doc.deinit();
-            try collectSearchItems(a, &doc.doc, &out, &seen);
+            try collectSearchItems(a, &doc.doc, query, &out, &seen);
+            if (out.items.len == 0) try collectSearchItemsRaw(a, response.body, query, &out, &seen);
         }
 
         return .{
@@ -107,11 +109,10 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        const root_response = try common.fetchBytes(self.client, a, show_url, .{ .accept = "text/html", .max_attempts = 2, .allow_non_ok = true });
+        const root_response = try fetchTvHtml(self.client, a, show_url);
         if (root_response.body.len == 0) return .{ .arena = arena, .subtitles = &.{} };
 
         var root_doc = try common.parseHtmlStable(a, root_response.body);
-        defer root_doc.deinit();
 
         var season_urls: std.ArrayListUnmanaged([]const u8) = .empty;
         try season_urls.append(a, show_url);
@@ -134,11 +135,10 @@ pub const Scraper = struct {
             if (seen_season.contains(initial_season_url)) continue;
             try seen_season.put(a, initial_season_url, {});
 
-            const response = try common.fetchBytes(self.client, a, initial_season_url, .{ .accept = "text/html", .max_attempts = 2, .allow_non_ok = true });
+            const response = try fetchTvHtml(self.client, a, initial_season_url);
             if (response.body.len == 0) continue;
 
             var doc = try common.parseHtmlStable(a, response.body);
-            defer doc.deinit();
 
             var rows = doc.doc.queryAll("table#table5 tr[align='middle']");
             while (rows.next()) |row| {
@@ -189,7 +189,7 @@ pub const Scraper = struct {
     }
 
     fn resolveDownloadUrl(self: *Scraper, allocator: Allocator, download_page_url: []const u8) ![]const u8 {
-        const response = try common.fetchBytes(self.client, allocator, download_page_url, .{ .accept = "text/html", .max_attempts = 2, .allow_non_ok = true });
+        const response = try fetchTvHtml(self.client, allocator, download_page_url);
         defer allocator.free(response.body);
         if (response.status != .ok) return error.UnexpectedHttpStatus;
 
@@ -197,47 +197,66 @@ pub const Scraper = struct {
             defer allocator.free(script_path);
             const escaped = try escapeUrlPath(allocator, script_path);
             defer allocator.free(escaped);
-            return try common.resolveUrl(allocator, site, escaped);
+            return try common.resolveUrl(allocator, request_site, escaped);
         }
 
         const script_path = parseZipPathFromHtml(response.body) orelse return error.MissingField;
         const escaped = try escapeUrlPath(allocator, script_path);
         defer allocator.free(escaped);
-        return try common.resolveUrl(allocator, site, escaped);
+        return try common.resolveUrl(allocator, request_site, escaped);
     }
 };
 
-fn submitSearch(client: *std.http.Client, allocator: Allocator, query: []const u8) !common.HttpResponse {
-    const payload = try std.fmt.allocPrint(allocator, "qs={s}", .{try common.encodeUriComponent(allocator, query)});
-    return common.fetchBytes(client, allocator, site ++ "/search.php", .{
-        .method = .POST,
-        .payload = payload,
-        .content_type = "application/x-www-form-urlencoded",
-        .accept = "text/html",
-        .max_attempts = 2,
-        .allow_non_ok = true,
-    });
-}
-
 fn buildSearchUrl(allocator: Allocator, query: []const u8) ![]const u8 {
     const encoded = try common.encodeUriComponent(allocator, query);
-    return std.fmt.allocPrint(allocator, "{s}/search.php?qs={s}", .{ site, encoded });
+    return std.fmt.allocPrint(allocator, "{s}/search.php?qs={s}", .{ request_site, encoded });
 }
 
-fn fetchSearchPage(client: *std.http.Client, allocator: Allocator, query: []const u8, page_url: []const u8) !common.HttpResponse {
-    var response = try common.fetchBytes(client, allocator, page_url, .{
-        .accept = "text/html",
-        .max_attempts = 2,
-        .allow_non_ok = true,
-    });
-    if (response.body.len == 0) {
+fn collectSearchItemsRaw(allocator: Allocator, body: []const u8, query: []const u8, out: *std.ArrayListUnmanaged(SearchItem), seen: *std.StringHashMapUnmanaged(void)) !void {
+    var cursor: usize = 0;
+    const needle = "href=\"tvshow-";
+    while (std.mem.indexOfPos(u8, body, cursor, needle)) |marker| {
+        const href_start = marker + "href=\"".len;
+        const href_end = std.mem.indexOfScalarPos(u8, body, href_start, '"') orelse break;
+        cursor = href_end + 1;
+        const bold_start_marker = std.mem.indexOfPos(u8, body, href_end, "<b>") orelse continue;
+        if (bold_start_marker > href_end + 160) continue;
+        const title_start = bold_start_marker + 3;
+        const title_end = std.mem.indexOfPos(u8, body, title_start, "</b>") orelse continue;
+        const title = std.mem.trim(u8, body[title_start..title_end], " \t\r\n");
+        if (title.len == 0 or std.ascii.indexOfIgnoreCase(title, std.mem.trim(u8, query, " \t\r\n")) == null) continue;
+        const show_url = try common.resolveUrl(allocator, site, body[href_start..href_end]);
+        if (seen.contains(show_url)) continue;
+        try seen.put(allocator, show_url, {});
+        try out.append(allocator, .{ .title = try allocator.dupe(u8, title), .show_url = show_url });
+    }
+}
+
+fn fetchSearchPage(client: *std.http.Client, allocator: Allocator, page_url: []const u8) !common.HttpResponse {
+    var response = try fetchTvHtml(client, allocator, page_url);
+    if (response.status != .ok or response.body.len == 0 or std.mem.indexOf(u8, response.body, "tvshow-") == null) {
         allocator.free(response.body);
-        response = try submitSearch(client, allocator, query);
+        response = try fetchTvHtml(client, allocator, site ++ "/tvshows.html");
     }
     return response;
 }
 
-fn collectSearchItems(allocator: Allocator, doc: *const HtmlDocument, out: *std.ArrayListUnmanaged(SearchItem), seen: *std.StringHashMapUnmanaged(void)) !void {
+fn fetchTvHtml(client: *std.http.Client, allocator: Allocator, canonical_url: []const u8) !common.HttpResponse {
+    const request_url = if (std.mem.startsWith(u8, canonical_url, site))
+        try std.fmt.allocPrint(allocator, "{s}{s}", .{ request_site, canonical_url[site.len..] })
+    else
+        try allocator.dupe(u8, canonical_url);
+    defer allocator.free(request_url);
+    const headers = [_]std.http.Header{.{ .name = "host", .value = "www.tvsubtitles.net" }};
+    return common.fetchBytes(client, allocator, request_url, .{
+        .accept = "text/html",
+        .extra_headers = &headers,
+        .max_attempts = 2,
+        .allow_non_ok = true,
+    });
+}
+
+fn collectSearchItems(allocator: Allocator, doc: *const HtmlDocument, query: []const u8, out: *std.ArrayListUnmanaged(SearchItem), seen: *std.StringHashMapUnmanaged(void)) !void {
     const before_len = out.items.len;
     var anchors = doc.queryAll(".left_articles a[href*='tvshow-']");
     while (anchors.next()) |anchor| {
@@ -251,6 +270,7 @@ fn collectSearchItems(allocator: Allocator, doc: *const HtmlDocument, out: *std.
 
         const title = try common.innerTextTrimmedOwned(allocator, anchor);
         if (title.len == 0) continue;
+        if (std.ascii.indexOfIgnoreCase(title, std.mem.trim(u8, query, " \t\r\n")) == null) continue;
 
         try out.append(allocator, .{ .title = title, .show_url = show_url });
     }
@@ -268,6 +288,7 @@ fn collectSearchItems(allocator: Allocator, doc: *const HtmlDocument, out: *std.
 
             const title = try common.innerTextTrimmedOwned(allocator, anchor);
             if (title.len == 0) continue;
+            if (std.ascii.indexOfIgnoreCase(title, std.mem.trim(u8, query, " \t\r\n")) == null) continue;
 
             try out.append(allocator, .{ .title = title, .show_url = show_url });
         }

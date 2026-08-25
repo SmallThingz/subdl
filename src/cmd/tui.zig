@@ -954,7 +954,7 @@ fn runTui(ui: *Ui) !void {
                         }
                     }
 
-                    if (focus == .results and !query_dirty) {
+                    if (focus == .results) {
                         if (key.matches(vaxis.Key.enter, .{})) {
                             if (results) |*bundle| {
                                 const visible_order = try buildQueryHitOrder(ui.allocator, bundle, query_norm_view);
@@ -2246,19 +2246,27 @@ fn cleanSearchTitle(label: []const u8) []const u8 {
     return text;
 }
 
-fn formatQueryTopLine(
+fn formatHomeTopLine(
     buf: []u8,
+    focus: QueryFocus,
     enabled_provider_count: usize,
     provider_count: usize,
-    bundle: *const SearchBundle,
+    download_count: usize,
+    maybe_bundle: ?*const SearchBundle,
 ) ![]const u8 {
     var pos: usize = 0;
-    pos += (try std.fmt.bufPrint(buf[pos..], "F1 info • Esc settings • {d}/{d} providers", .{ enabled_provider_count, provider_count })).len;
-    if (bundle.hits.items.len > 0) pos += (try std.fmt.bufPrint(buf[pos..], " • {d} results", .{bundle.hits.items.len})).len;
-    if (bundle.live_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " • live {d}", .{bundle.live_count})).len;
-    if (bundle.cache_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " • cache {d}", .{bundle.cache_count})).len;
-    if (bundle.failed_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " • failed {d}", .{bundle.failed_count})).len;
-    if (bundle.pending_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " • pending {d}", .{bundle.pending_count})).len;
+    const search_tab = if (focus == .downloads) "Search" else "SEARCH";
+    const downloads_tab = if (focus == .downloads) "DOWNLOADS" else "Downloads";
+    pos += (try std.fmt.bufPrint(buf[pos..], "F1 Help · Esc Settings · {s}", .{search_tab})).len;
+    if (download_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {s} {d}", .{ downloads_tab, download_count })).len;
+    pos += (try std.fmt.bufPrint(buf[pos..], " · {d}/{d} providers", .{ enabled_provider_count, provider_count })).len;
+    if (maybe_bundle) |bundle| {
+        if (bundle.hits.items.len > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} results", .{bundle.hits.items.len})).len;
+        if (bundle.live_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} live", .{bundle.live_count})).len;
+        if (bundle.cache_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} cached", .{bundle.cache_count})).len;
+        if (bundle.failed_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} failed", .{bundle.failed_count})).len;
+        if (bundle.pending_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} pending", .{bundle.pending_count})).len;
+    }
     return buf[0..pos];
 }
 
@@ -2846,11 +2854,9 @@ fn renderQueryHome(
     win.setCursorShape(.beam);
 
     const provider_count = countEnabledFlags(&state.settings.providers_enabled);
-    var top_buf: [256]u8 = undefined;
-    const top = if (results) |bundle|
-        try formatQueryTopLine(&top_buf, provider_count, app.providerCount(), bundle)
-    else
-        std.fmt.bufPrint(&top_buf, "F1 info • Esc settings • {d}/{d} providers", .{ provider_count, app.providerCount() }) catch "F1 info • Esc settings";
+    const download_count = if (state.settings.download_cache_enabled) cachedDownloadCount(state.cache_root_path) else 0;
+    var top_buf: [320]u8 = undefined;
+    const top = try formatHomeTopLine(&top_buf, focus, provider_count, app.providerCount(), download_count, results);
     try renderCompactTopLine(ui, win, top, ui.styleTitle());
 
     const box_w: u16 = @min(if (win.width > 6) win.width - 6 else win.width, 86);
@@ -2858,7 +2864,8 @@ fn renderQueryHome(
     const box_y: u16 = 1;
     const border_style = if (query_dirty) ui.styleWarn() else if (focus == .query) ui.styleAccent() else ui.styleMuted();
     try renderBox(ui, win, box_x, box_y, box_w, 3, border_style);
-    const query_text = if (query.len == 0) "" else query;
+    try printFitted(ui, win, box_y, box_x + 2, " Search ", border_style, 10);
+    const query_text = if (query.len == 0) "Search films and series" else query;
     const query_style = if (query.len == 0) ui.styleMuted() else vaxis.Style{ .bold = true };
     try printFitted(ui, win, box_y + 1, box_x + 2, query_text, query_style, if (box_w > 4) @intCast(box_w - 4) else 0);
     if (focus == .query and win.width > 0) {
@@ -2904,14 +2911,14 @@ fn renderQueryHome(
             const item = bundle.searches.items[hit.response_index].items[hit.item_index];
             const title = cleanSearchTitle(item.label);
             const provider_tag = app.providerDisplayName(hit.provider);
-            const source_tag = if (hit.source == .cache) "cache" else "live";
+            const source_tag = if (hit.source == .cache) "cached" else "live";
             try printFitted(ui, win, row, 2, prefix, style, 2);
             const title_width = if (win.width > 40) @as(usize, @intCast(win.width - 34)) else if (win.width > 6) @as(usize, @intCast(win.width - 6)) else 0;
             try printFitted(ui, win, row, 4, title, style, title_width);
             if (win.width > 48) {
                 const tag_col: u16 = @intCast(@min(@as(usize, 4) + title_width + 2, @as(usize, win.width - 1)));
                 const tag_line = try frameFmt(ui, "{s}  {s}", .{ provider_tag, source_tag });
-                try printFitted(ui, win, row, tag_col, tag_line, ui.styleMuted(), if (win.width > tag_col) @intCast(win.width - tag_col - 1) else 0);
+                try printFitted(ui, win, row, tag_col, tag_line, if (hit.source == .live) ui.styleAccent() else ui.styleMuted(), if (win.width > tag_col) @intCast(win.width - tag_col - 1) else 0);
             }
             row += 1;
         }
@@ -2919,6 +2926,8 @@ fn renderQueryHome(
         const suggestions = try sortedKeywordIndexes(ui.frameAllocator(), state.keywords.items);
         var row = list_top;
         if (state.settings.keyword_cache_enabled and suggestions.len > 0) {
+            try printFitted(ui, win, row, 4, "Recent searches", ui.stylePaneTitle(), if (win.width > 8) @intCast(win.width - 8) else 0);
+            row += 1;
             var i: usize = 0;
             while (i < suggestions.len and i < 6 and row < list_bottom) : (i += 1) {
                 const keyword = state.keywords.items[suggestions[i]];

@@ -189,8 +189,7 @@ pub const Scraper = struct {
                 if (response.status == .too_many_requests) return error.RateLimited;
                 if (response.status != .ok) break;
 
-                var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body, .{});
-                defer parsed.deinit();
+                const parsed = try std.json.parseFromSlice(std.json.Value, a, response.body, .{});
 
                 const root = switch (parsed.value) {
                     .object => |o| o,
@@ -272,8 +271,7 @@ pub const Scraper = struct {
         const response = try getJson(self.client, allocator, url, auth, true);
         if (response.status != .ok) return .{ .download_token = null, .download_url = null };
 
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
-        defer parsed.deinit();
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
 
         const root = switch (parsed.value) {
             .object => |o| o,
@@ -312,10 +310,9 @@ fn resolveSearchQuery(client: *std.http.Client, allocator: Allocator, query: []c
     };
     if (response.status != .ok) return try allocator.dupe(u8, trimmed);
 
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response.body, .{}) catch {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, response.body, .{}) catch {
         return try allocator.dupe(u8, trimmed);
     };
-    defer parsed.deinit();
 
     const results = switch (parsed.value) {
         .object => |o| blk: {
@@ -363,8 +360,7 @@ fn appendSearchResults(
     if (response.status == .too_many_requests) return error.RateLimited;
     if (response.status != .ok) return;
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
-    defer parsed.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
 
     const root = switch (parsed.value) {
         .object => |o| o,

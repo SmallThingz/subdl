@@ -108,7 +108,6 @@ pub const Scraper = struct {
             maybeDebugDumpFirstPage(response.status, page_url, response.body, traversed);
 
             var parsed = try common.parseHtmlStable(a, response.body);
-            defer parsed.deinit();
 
             const before_len = out.items.len;
             try collectSearchItemsFromSelector(a, &parsed.doc, ".movie-list-info h3 a[href*='-subtitles']", &seen, &out);
@@ -175,7 +174,6 @@ pub const Scraper = struct {
             if (response.body.len == 0) break;
 
             var parsed = try common.parseHtmlStable(a, response.body);
-            defer parsed.deinit();
 
             if (title.len == 0) {
                 if (parsed.doc.queryOne("h1")) |h1| {
@@ -235,8 +233,13 @@ pub const Scraper = struct {
     }
 
     fn fetchHtml(self: *Scraper, allocator: Allocator, url: []const u8) !common.HttpResponse {
+        const headers = [_]std.http.Header{
+            .{ .name = "accept-encoding", .value = "identity" },
+            .{ .name = "accept-language", .value = "en-US,en;q=0.8" },
+        };
         return common.fetchBytes(self.client, allocator, url, .{
             .accept = "text/html",
+            .extra_headers = &headers,
             .max_attempts = 2,
             .allow_non_ok = true,
         });
@@ -314,8 +317,25 @@ fn textAt(node: HtmlNode, allocator: Allocator, comptime selector: []const u8) !
 fn buildSearchUrl(allocator: Allocator, query: []const u8, page: usize) ![]const u8 {
     const encoded = try common.encodeUriComponent(allocator, query);
     defer allocator.free(encoded);
-    if (page <= 1) return std.fmt.allocPrint(allocator, "{s}/search?kwd={s}", .{ site, encoded });
-    return std.fmt.allocPrint(allocator, "{s}/search?kwd={s}&p={d}", .{ site, encoded, page });
+    const form_query = try replaceEncodedSpaces(allocator, encoded);
+    defer allocator.free(form_query);
+    if (page <= 1) return std.fmt.allocPrint(allocator, "{s}/search?kwd={s}", .{ site, form_query });
+    return std.fmt.allocPrint(allocator, "{s}/search?kwd={s}&p={d}", .{ site, form_query, page });
+}
+
+fn replaceEncodedSpaces(allocator: Allocator, encoded: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var index: usize = 0;
+    while (index < encoded.len) {
+        if (index + 3 <= encoded.len and std.ascii.eqlIgnoreCase(encoded[index .. index + 3], "%20")) {
+            try out.append(allocator, '+');
+            index += 3;
+        } else {
+            try out.append(allocator, encoded[index]);
+            index += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn addOrReplacePageQuery(allocator: Allocator, base_url: []const u8, page: usize) ![]const u8 {
@@ -415,6 +435,7 @@ fn maybeDebugDumpFirstPage(status: std.http.Status, page_url: []const u8, body: 
     if (common.getenv("SCRAPERS_DEBUG_ISUB") == null) return;
 
     std.debug.print("[isubtitles] status={d} body_len={d} url={s}\n", .{ @intFromEnum(status), body.len, page_url });
+    if (status != .ok) std.debug.print("[isubtitles] response={s}\n", .{body[0..@min(body.len, 1200)]});
 }
 
 fn isLikelyNextText(text: []const u8) bool {

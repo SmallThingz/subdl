@@ -408,9 +408,9 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
     switch (provider) {
         .subdl_com => {
             var scraper = if (options.language_code) |language_code|
-                subdl.subdl_com.Scraper.initWithOptions(a, client, .{ .search_language = language_code })
+                subdl.subdl_com.Scraper.initWithOptions(allocator, client, .{ .search_language = language_code })
             else
-                subdl.subdl_com.Scraper.init(a, client);
+                subdl.subdl_com.Scraper.init(allocator, client);
             defer scraper.deinit();
             var response = try scraper.search(query);
             defer response.deinit();
@@ -431,9 +431,9 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
         },
         .opensubtitles_com => {
             var scraper = if (options.language_code) |language_code|
-                subdl.opensubtitles_com.Scraper.initWithOptions(a, client, .{ .language_code = language_code })
+                subdl.opensubtitles_com.Scraper.initWithOptions(allocator, client, .{ .language_code = language_code })
             else
-                subdl.opensubtitles_com.Scraper.init(a, client);
+                subdl.opensubtitles_com.Scraper.init(allocator, client);
             defer scraper.deinit();
             var response = try scraper.search(query);
             defer response.deinit();
@@ -464,9 +464,9 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
         },
         .opensubtitles_org => {
             var scraper = if (options.language_code) |language_code|
-                subdl.opensubtitles_org.Scraper.initWithOptions(a, client, .{ .language_code = language_code })
+                subdl.opensubtitles_org.Scraper.initWithOptions(allocator, client, .{ .language_code = language_code })
             else
-                subdl.opensubtitles_org.Scraper.init(a, client);
+                subdl.opensubtitles_org.Scraper.init(allocator, client);
             defer scraper.deinit();
             var response = try scraper.search(query);
             defer response.deinit();
@@ -484,7 +484,7 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
             }
         },
         .moviesubtitles_org => {
-            var scraper = subdl.moviesubtitles_org.Scraper.init(a, client);
+            var scraper = subdl.moviesubtitles_org.Scraper.init(allocator, client);
             defer scraper.deinit();
             var response = try scraper.search(query);
             defer response.deinit();
@@ -502,7 +502,7 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
             }
         },
         .moviesubtitlesrt_com => {
-            var scraper = subdl.moviesubtitlesrt_com.Scraper.init(a, client);
+            var scraper = subdl.moviesubtitlesrt_com.Scraper.init(allocator, client);
             defer scraper.deinit();
             var response = try scraper.search(query);
             defer response.deinit();
@@ -520,7 +520,7 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
             }
         },
         .podnapisi_net => {
-            var scraper = subdl.podnapisi_net.Scraper.init(a, client);
+            var scraper = subdl.podnapisi_net.Scraper.init(allocator, client);
             defer scraper.deinit();
             var response = try scraper.search(query);
             defer response.deinit();
@@ -543,7 +543,7 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
             }
         },
         .yifysubtitles_ch => {
-            var scraper = subdl.yifysubtitles_ch.Scraper.init(a, client);
+            var scraper = subdl.yifysubtitles_ch.Scraper.init(allocator, client);
             defer scraper.deinit();
             var response = try scraper.search(query);
             defer response.deinit();
@@ -561,7 +561,7 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
             }
         },
         .subtitlecat_com => {
-            var scraper = subdl.subtitlecat_com.Scraper.init(a, client);
+            var scraper = subdl.subtitlecat_com.Scraper.init(allocator, client);
             defer scraper.deinit();
             var response = try scraper.search(query);
             defer response.deinit();
@@ -579,7 +579,7 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
             }
         },
         .isubtitles_org => {
-            var scraper = subdl.isubtitles_org.Scraper.init(a, client);
+            var scraper = subdl.isubtitles_org.Scraper.init(allocator, client);
             defer scraper.deinit();
             var response = try scraper.searchWithOptions(query, .{ .max_pages = 3 });
             defer response.deinit();
@@ -602,7 +602,7 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
             }
         },
         .my_subs_co => {
-            var scraper = subdl.my_subs_co.Scraper.init(a, client);
+            var scraper = subdl.my_subs_co.Scraper.init(allocator, client);
             defer scraper.deinit();
             var response = try scraper.search(query);
             defer response.deinit();
@@ -622,7 +622,7 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
             }
         },
         .subsource_net => {
-            var scraper = subdl.subsource_net.Scraper.init(a, client);
+            var scraper = subdl.subsource_net.Scraper.init(allocator, client);
             defer scraper.deinit();
             var response = try scraper.searchWithOptions(query, .{
                 .max_pages = 3,
@@ -658,7 +658,7 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
             }
         },
         .tvsubtitles_net => {
-            var scraper = subdl.tvsubtitles_net.Scraper.init(a, client);
+            var scraper = subdl.tvsubtitles_net.Scraper.init(allocator, client);
             defer scraper.deinit();
             var response = try scraper.search(query);
             defer response.deinit();
@@ -714,9 +714,9 @@ pub fn searchPageWithOptions(allocator: Allocator, client: *std.http.Client, pro
     switch (provider) {
         .opensubtitles_org => {
             var scraper = if (options.language_code) |language_code|
-                subdl.opensubtitles_org.Scraper.initWithOptions(a, client, .{ .language_code = language_code })
+                subdl.opensubtitles_org.Scraper.initWithOptions(allocator, client, .{ .language_code = language_code })
             else
-                subdl.opensubtitles_org.Scraper.init(a, client);
+                subdl.opensubtitles_org.Scraper.init(allocator, client);
             defer scraper.deinit();
             var response = try scraper.searchWithOptions(query, .{
                 .page_start = requested_page,
@@ -738,7 +738,7 @@ pub fn searchPageWithOptions(allocator: Allocator, client: *std.http.Client, pro
             }
         },
         .moviesubtitlesrt_com => {
-            var scraper = subdl.moviesubtitlesrt_com.Scraper.init(a, client);
+            var scraper = subdl.moviesubtitlesrt_com.Scraper.init(allocator, client);
             defer scraper.deinit();
             var response = try scraper.searchWithOptions(query, .{
                 .page_start = requested_page,
@@ -760,7 +760,7 @@ pub fn searchPageWithOptions(allocator: Allocator, client: *std.http.Client, pro
             }
         },
         .podnapisi_net => {
-            var scraper = subdl.podnapisi_net.Scraper.init(a, client);
+            var scraper = subdl.podnapisi_net.Scraper.init(allocator, client);
             defer scraper.deinit();
             var response = try scraper.searchWithOptions(query, .{
                 .page_start = requested_page,
@@ -787,7 +787,7 @@ pub fn searchPageWithOptions(allocator: Allocator, client: *std.http.Client, pro
             }
         },
         .isubtitles_org => {
-            var scraper = subdl.isubtitles_org.Scraper.init(a, client);
+            var scraper = subdl.isubtitles_org.Scraper.init(allocator, client);
             defer scraper.deinit();
             var response = try scraper.searchWithOptions(query, .{
                 .page_start = requested_page,
@@ -837,7 +837,7 @@ pub fn fetchSubdlSeasons(allocator: Allocator, client: *std.http.Client, ref: Se
     switch (ref) {
         .subdl_com => |item| {
             if (item.media_type != .tv) return error.UnexpectedTitleType;
-            var scraper = subdl.subdl_com.Scraper.init(a, client);
+            var scraper = subdl.subdl_com.Scraper.init(allocator, client);
             defer scraper.deinit();
 
             var seasons = try scraper.fetchTvSeasonsByLink(item.link);
@@ -877,17 +877,17 @@ pub fn fetchSubdlSeasonSubtitles(allocator: Allocator, client: *std.http.Client,
     switch (ref) {
         .subdl_com => |item| {
             if (item.media_type != .tv) return error.UnexpectedTitleType;
-            var scraper = subdl.subdl_com.Scraper.init(a, client);
+            var scraper = subdl.subdl_com.Scraper.init(allocator, client);
             defer scraper.deinit();
 
             var season_data = try scraper.fetchTvSeasonByLink(item.link, season_slug);
             defer season_data.deinit();
-            title = try std.fmt.allocPrint(a, "{s} | {s}", .{ season_data.tv.name, season_slug });
+            title = try std.fmt.allocPrint(a, "{s} • {s}", .{ season_data.tv.name, season_slug });
 
             for (season_data.languages) |group| {
                 for (group.subtitles) |subtitle| {
                     const download_url = try std.fmt.allocPrint(a, "https://dl.subdl.com/subtitle/{s}", .{subtitle.link});
-                    const label = try std.fmt.allocPrint(a, "{s} | {s}", .{ group.language, subtitle.title });
+                    const label = try std.fmt.allocPrint(a, "{s} • {s}", .{ group.language, subtitle.title });
                     try out.append(a, .{
                         .label = label,
                         .language = try a.dupe(u8, group.language),
@@ -948,7 +948,7 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
     switch (ref) {
         .subdl_com => |item| {
             title = try a.dupe(u8, item.title);
-            var scraper = subdl.subdl_com.Scraper.init(a, client);
+            var scraper = subdl.subdl_com.Scraper.init(allocator, client);
             defer scraper.deinit();
 
             switch (item.media_type) {
@@ -960,7 +960,7 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                     for (movie.languages) |group| {
                         for (group.subtitles) |subtitle| {
                             const download_url = try std.fmt.allocPrint(a, "https://dl.subdl.com/subtitle/{s}", .{subtitle.link});
-                            const label = try std.fmt.allocPrint(a, "{s} | {s}", .{ group.language, subtitle.title });
+                            const label = try std.fmt.allocPrint(a, "{s} • {s}", .{ group.language, subtitle.title });
                             try out.append(a, .{
                                 .label = label,
                                 .language = try a.dupe(u8, group.language),
@@ -982,7 +982,7 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                         for (season_data.languages) |group| {
                             for (group.subtitles) |subtitle| {
                                 const download_url = try std.fmt.allocPrint(a, "https://dl.subdl.com/subtitle/{s}", .{subtitle.link});
-                                const label = try std.fmt.allocPrint(a, "{s} | {s} | {s}", .{ season.name, group.language, subtitle.title });
+                                const label = try std.fmt.allocPrint(a, "{s} • {s} • {s}", .{ season.name, group.language, subtitle.title });
                                 try out.append(a, .{
                                     .label = label,
                                     .language = try a.dupe(u8, group.language),
@@ -997,7 +997,7 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
         },
         .opensubtitles_com => |item| {
             title = try a.dupe(u8, item.title);
-            var scraper = subdl.opensubtitles_com.Scraper.init(a, client);
+            var scraper = subdl.opensubtitles_com.Scraper.init(allocator, client);
             defer scraper.deinit();
 
             const query_item: subdl.opensubtitles_com.SearchItem = .{
@@ -1029,7 +1029,7 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
         },
         .opensubtitles_org => |item| {
             title = try a.dupe(u8, item.title);
-            var scraper = subdl.opensubtitles_org.Scraper.init(a, client);
+            var scraper = subdl.opensubtitles_org.Scraper.init(allocator, client);
             defer scraper.deinit();
             var subtitles = try scraper.fetchSubtitlesByMoviePage(item.page_url);
             defer subtitles.deinit();
@@ -1049,7 +1049,7 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
         },
         .moviesubtitles_org => |item| {
             title = try a.dupe(u8, item.title);
-            var scraper = subdl.moviesubtitles_org.Scraper.init(a, client);
+            var scraper = subdl.moviesubtitles_org.Scraper.init(allocator, client);
             defer scraper.deinit();
             var subtitles = try scraper.fetchSubtitlesByMovieLink(item.link);
             defer subtitles.deinit();
@@ -1067,7 +1067,7 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
         },
         .moviesubtitlesrt_com => |item| {
             title = try a.dupe(u8, item.title);
-            var scraper = subdl.moviesubtitlesrt_com.Scraper.init(a, client);
+            var scraper = subdl.moviesubtitlesrt_com.Scraper.init(allocator, client);
             defer scraper.deinit();
             var subtitle = try scraper.fetchSubtitleByLink(item.page_url);
             defer subtitle.deinit();
@@ -1083,7 +1083,7 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
         },
         .podnapisi_net => |item| {
             title = try a.dupe(u8, item.title);
-            var scraper = subdl.podnapisi_net.Scraper.init(a, client);
+            var scraper = subdl.podnapisi_net.Scraper.init(allocator, client);
             defer scraper.deinit();
             var subtitles = try scraper.fetchSubtitlesBySearchLink(item.subtitles_page_url);
             defer subtitles.deinit();
@@ -1100,7 +1100,7 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
         },
         .yifysubtitles_ch => |item| {
             title = try a.dupe(u8, item.title);
-            var scraper = subdl.yifysubtitles_ch.Scraper.init(a, client);
+            var scraper = subdl.yifysubtitles_ch.Scraper.init(allocator, client);
             defer scraper.deinit();
             var subtitles = try scraper.fetchSubtitlesByMovieLink(item.movie_page_url);
             defer subtitles.deinit();
@@ -1118,7 +1118,7 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
         },
         .subtitlecat_com => |item| {
             title = try a.dupe(u8, item.title);
-            var scraper = subdl.subtitlecat_com.Scraper.init(a, client);
+            var scraper = subdl.subtitlecat_com.Scraper.init(allocator, client);
             defer scraper.deinit();
             var subtitles = try scraper.fetchSubtitlesByDetailsLink(item.details_url);
             defer subtitles.deinit();
@@ -1150,7 +1150,7 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
         },
         .isubtitles_org => |item| {
             title = try a.dupe(u8, item.title);
-            var scraper = subdl.isubtitles_org.Scraper.init(a, client);
+            var scraper = subdl.isubtitles_org.Scraper.init(allocator, client);
             defer scraper.deinit();
             var subtitles = try scraper.fetchSubtitlesByMovieLinkWithOptions(item.details_url, .{ .max_pages = 3 });
             defer subtitles.deinit();
@@ -1168,7 +1168,7 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
         },
         .my_subs_co => |item| {
             title = try a.dupe(u8, item.title);
-            var scraper = subdl.my_subs_co.Scraper.init(a, client);
+            var scraper = subdl.my_subs_co.Scraper.init(allocator, client);
             defer scraper.deinit();
             var subtitles = try scraper.fetchSubtitlesByDetailsLinkWithOptions(item.details_url, item.media_kind, .{
                 .resolve_download_links = false,
@@ -1189,7 +1189,7 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
         },
         .subsource_net => |item| {
             title = try a.dupe(u8, item.title);
-            var scraper = subdl.subsource_net.Scraper.init(a, client);
+            var scraper = subdl.subsource_net.Scraper.init(allocator, client);
             defer scraper.deinit();
 
             const fake_item: subdl.subsource_net.SearchItem = .{
@@ -1223,7 +1223,7 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
         },
         .tvsubtitles_net => |item| {
             title = try a.dupe(u8, item.title);
-            var scraper = subdl.tvsubtitles_net.Scraper.init(a, client);
+            var scraper = subdl.tvsubtitles_net.Scraper.init(allocator, client);
             defer scraper.deinit();
             var subtitles = try scraper.fetchSubtitlesByShowLinkWithOptions(item.show_url, .{
                 .include_all_seasons = true,
@@ -1279,7 +1279,7 @@ pub fn fetchSubtitlesPage(allocator: Allocator, client: *std.http.Client, ref: S
 
     switch (ref) {
         .opensubtitles_org => |item| {
-            var scraper = subdl.opensubtitles_org.Scraper.init(a, client);
+            var scraper = subdl.opensubtitles_org.Scraper.init(allocator, client);
             defer scraper.deinit();
             var subtitles = try scraper.fetchSubtitlesByMoviePageWithOptions(item.page_url, .{
                 .page_start = requested_page,
@@ -1302,7 +1302,7 @@ pub fn fetchSubtitlesPage(allocator: Allocator, client: *std.http.Client, ref: S
             }
         },
         .isubtitles_org => |item| {
-            var scraper = subdl.isubtitles_org.Scraper.init(a, client);
+            var scraper = subdl.isubtitles_org.Scraper.init(allocator, client);
             defer scraper.deinit();
             var subtitles = try scraper.fetchSubtitlesByMovieLinkWithOptions(item.details_url, .{
                 .page_start = requested_page,
@@ -1930,14 +1930,16 @@ fn resolveDownloadUrlIfNeeded(allocator: Allocator, client: *std.http.Client, do
 /// accept normal search requests but protect binary/archive endpoints.
 fn fetchDownloadBytes(client: *std.http.Client, allocator: Allocator, url: []const u8) !common.HttpResponse {
     const yify_referer = yifyRefererForUrl(url);
-    const yify_headers = if (yify_referer) |referer|
+    const provider_headers = if (yify_referer) |referer|
         &[_]std.http.Header{.{ .name = "referer", .value = referer }}
+    else if (std.mem.startsWith(u8, url, "http://176.103.50.239/"))
+        &[_]std.http.Header{.{ .name = "host", .value = "www.tvsubtitles.net" }}
     else
         &[_]std.http.Header{};
 
     const primary = try common.fetchBytes(client, allocator, url, .{
         .accept = "*/*",
-        .extra_headers = yify_headers,
+        .extra_headers = provider_headers,
         .allow_non_ok = true,
         .max_attempts = 2,
     });
@@ -2227,13 +2229,13 @@ fn subtitleLabel(allocator: Allocator, language: ?[]const u8, filename: ?[]const
     const filename_trimmed = nonEmptyTrimmed(filename) orelse "Without release";
     if (download_url == null) {
         if (language_trimmed) |lang| {
-            return try std.fmt.allocPrint(allocator, "{s} | {s} [no direct download]", .{ lang, filename_trimmed });
+            return try std.fmt.allocPrint(allocator, "{s} • {s} [no direct download]", .{ lang, filename_trimmed });
         }
         return try std.fmt.allocPrint(allocator, "{s} [no direct download]", .{filename_trimmed});
     }
 
     if (language_trimmed) |lang| {
-        return try std.fmt.allocPrint(allocator, "{s} | {s}", .{ lang, filename_trimmed });
+        return try std.fmt.allocPrint(allocator, "{s} • {s}", .{ lang, filename_trimmed });
     }
     return try allocator.dupe(u8, filename_trimmed);
 }
@@ -2687,7 +2689,7 @@ test "subtitleLabel uses Without release fallback for missing filename" {
 
     const b = try subtitleLabel(allocator, "English", "", "https://example.com/sub.zip");
     defer allocator.free(b);
-    try std.testing.expectEqualStrings("English | Without release", b);
+    try std.testing.expectEqualStrings("English • Without release", b);
 
     const c = try subtitleLabel(allocator, "  ", " \t ", null);
     defer allocator.free(c);
