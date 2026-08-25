@@ -12,6 +12,20 @@ const fallback_user_agent = "subdl-zig-scrapers/0.2 (+https://subdl.com)";
 const session_ttl_seconds: i64 = 5 * 60 * 60;
 const challenge_timeout_ms: i64 = 4 * 60 * 1000;
 const challenge_poll_interval_ms: i64 = 1000;
+var session_acquire_lock = std.atomic.Value(u8).init(0);
+
+const SessionAcquireGuard = struct {
+    fn lock() SessionAcquireGuard {
+        while (session_acquire_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            common.sleepMilliseconds(25);
+        }
+        return .{};
+    }
+
+    fn unlock(_: SessionAcquireGuard) void {
+        session_acquire_lock.store(0, .release);
+    }
+};
 
 pub const Error = error{
     CloudflareSessionUnavailable,
@@ -67,6 +81,9 @@ pub fn ensureSession(allocator: Allocator, options: EnsureOptions) !Session {
 }
 
 pub fn ensureDomainSession(allocator: Allocator, options: EnsureDomainOptions) !Session {
+    const acquire_guard = SessionAcquireGuard.lock();
+    defer acquire_guard.unlock();
+
     const normalized_domain = try normalizeDomain(allocator, options.domain);
     defer allocator.free(normalized_domain);
 
@@ -81,12 +98,11 @@ pub fn ensureDomainSession(allocator: Allocator, options: EnsureDomainOptions) !
     };
 
     const now = common.compatUnixTimestamp();
-    if (!options.force_refresh) {
-        if (try loadSessionForDomain(allocator, normalized_domain)) |cached| {
-            if (!cached.isLikelyExpired(now) and isUsableSession(cached)) return cached;
-            var owned = cached;
-            owned.deinit(allocator);
-        }
+    if (try loadSessionForDomain(allocator, normalized_domain)) |cached| {
+        const is_fresh_retry_session = options.force_refresh and now - cached.acquired_at_unix < 60;
+        if (!cached.isLikelyExpired(now) and isUsableSession(cached) and (!options.force_refresh or is_fresh_retry_session)) return cached;
+        var owned = cached;
+        owned.deinit(allocator);
     }
 
     const acquired = try acquireSessionViaAllDriver(allocator, normalized_domain, challenge_url);

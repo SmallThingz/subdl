@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) void {
     const llvm = b.option(bool, "llvm", "Use LLVM codegen backend");
     const enable_tui = b.option(bool, "enable-tui", "Enable TUI support via libvaxis") orelse true;
     const enable_alldriver = b.option(bool, "enable-alldriver", "Enable browser automation support via alldriver") orelse false;
-    const enable_unarr = b.option(bool, "enable-unarr", "Enable archive extraction support via unarr") orelse false;
+    const enable_unarr = b.option(bool, "enable-unarr", "Enable archive extraction support via unarr") orelse true;
     const live_mode = b.option([]const u8, "live", "Live test mode: off | smoke | named | extensive | all") orelse "off";
     const live_providers = b.option([]const u8, "live-providers", "Comma-separated provider filter for live tests, or '*' for all") orelse "*";
     const live_include_captcha = b.option(bool, "live-include-captcha", "Include captcha/cloudflare providers in live test runs") orelse false;
@@ -401,6 +401,7 @@ fn createTargetModuleSet(
     enable_alldriver: bool,
     enable_unarr: bool,
 ) TargetModuleSet {
+    _ = static_libc;
     const htmlparser_dep = b.dependency("htmlparser", .{
         .target = target,
         .optimize = optimize,
@@ -458,7 +459,7 @@ fn createTargetModuleSet(
         const unarr_dep = b.lazyDependency("unarr", .{
             .target = target,
             .optimize = optimize,
-            .static_libc = static_libc,
+            .static_libc = false,
         }) orelse @panic("enable-unarr requested but unarr dependency is unavailable");
         break :blk b.createModule(.{
             .root_source_file = b.path("src/deps/unarr_compat.zig"),

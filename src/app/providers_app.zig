@@ -390,7 +390,15 @@ pub const DownloadResult = struct {
     }
 };
 
+pub const SearchOptions = struct {
+    language_code: ?[]const u8 = null,
+};
+
 pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider, query: []const u8) !SearchResponse {
+    return searchWithOptions(allocator, client, provider, query, .{});
+}
+
+pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provider: Provider, query: []const u8, options: SearchOptions) !SearchResponse {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -399,7 +407,10 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
 
     switch (provider) {
         .subdl_com => {
-            var scraper = subdl.subdl_com.Scraper.init(a, client);
+            var scraper = if (options.language_code) |language_code|
+                subdl.subdl_com.Scraper.initWithOptions(a, client, .{ .search_language = language_code })
+            else
+                subdl.subdl_com.Scraper.init(a, client);
             defer scraper.deinit();
             var response = try scraper.search(query);
             defer response.deinit();
@@ -419,7 +430,10 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
             }
         },
         .opensubtitles_com => {
-            var scraper = subdl.opensubtitles_com.Scraper.init(a, client);
+            var scraper = if (options.language_code) |language_code|
+                subdl.opensubtitles_com.Scraper.initWithOptions(a, client, .{ .language_code = language_code })
+            else
+                subdl.opensubtitles_com.Scraper.init(a, client);
             defer scraper.deinit();
             var response = try scraper.search(query);
             defer response.deinit();
@@ -449,7 +463,10 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
             }
         },
         .opensubtitles_org => {
-            var scraper = subdl.opensubtitles_org.Scraper.init(a, client);
+            var scraper = if (options.language_code) |language_code|
+                subdl.opensubtitles_org.Scraper.initWithOptions(a, client, .{ .language_code = language_code })
+            else
+                subdl.opensubtitles_org.Scraper.init(a, client);
             defer scraper.deinit();
             var response = try scraper.search(query);
             defer response.deinit();
@@ -671,10 +688,14 @@ pub fn search(allocator: Allocator, client: *std.http.Client, provider: Provider
 /// as normal data and every later page as an empty, non-network response so the
 /// UI never invents fake pagination for those providers.
 pub fn searchPage(allocator: Allocator, client: *std.http.Client, provider: Provider, query: []const u8, page: usize) !SearchResponse {
+    return searchPageWithOptions(allocator, client, provider, query, page, .{});
+}
+
+pub fn searchPageWithOptions(allocator: Allocator, client: *std.http.Client, provider: Provider, query: []const u8, page: usize, options: SearchOptions) !SearchResponse {
     const requested_page = if (page == 0) 1 else page;
     if (!providerSupportsSearchPagination(provider)) {
         if (requested_page == 1) {
-            var first = try search(allocator, client, provider, query);
+            var first = try searchWithOptions(allocator, client, provider, query, options);
             first.page = 1;
             first.has_prev_page = false;
             first.has_next_page = false;
@@ -692,7 +713,10 @@ pub fn searchPage(allocator: Allocator, client: *std.http.Client, provider: Prov
 
     switch (provider) {
         .opensubtitles_org => {
-            var scraper = subdl.opensubtitles_org.Scraper.init(a, client);
+            var scraper = if (options.language_code) |language_code|
+                subdl.opensubtitles_org.Scraper.initWithOptions(a, client, .{ .language_code = language_code })
+            else
+                subdl.opensubtitles_org.Scraper.init(a, client);
             defer scraper.deinit();
             var response = try scraper.searchWithOptions(query, .{
                 .page_start = requested_page,
@@ -1391,7 +1415,8 @@ pub fn downloadSubtitleWithProgressAndOptions(
     defer allocator.free(response.body);
     if (response.status != .ok) return error.UnexpectedHttpStatus;
 
-    const preferred_name = subtitle.filename orelse inferFilenameFromUrl(url) orelse "subtitle";
+    const preferred_name = try preferredSubtitleDownloadName(allocator, subtitle, url);
+    defer allocator.free(preferred_name);
     const archive_kind = detectArchiveKind(preferred_name, url, response.body);
     const raw_name = try ensureFilenameExtension(allocator, preferred_name, url, archive_kind, ".srt");
     defer allocator.free(raw_name);
@@ -1425,10 +1450,8 @@ pub fn downloadSubtitleWithProgressAndOptions(
         };
     }
 
-    if (!unarr.enabled) return error.ArchiveExtractionUnavailable;
-
     emitDownloadPhase(progress, .extracting_archive);
-    const extracted_files = try extractArchiveFiles(allocator, response.body, archive_kind, out_dir);
+    const extracted_files = try extractArchiveFiles(allocator, response.body, archive_kind, out_dir, output_path);
     errdefer {
         for (extracted_files) |path| allocator.free(path);
         allocator.free(extracted_files);
@@ -1604,7 +1627,8 @@ fn downloadSubtitlecatTranslated(
 
     emitDownloadPhase(progress, .writing_output);
     try std.Io.Dir.cwd().createDirPath(runtime_io.get(), out_dir);
-    const preferred_name = if (subtitle.filename) |name| name else token.filename;
+    const preferred_name = try preferredSubtitleDownloadName(allocator, subtitle, token.source_url);
+    defer allocator.free(preferred_name);
     const raw_name = try ensureFilenameExtension(allocator, preferred_name, token.source_url, .none, ".srt");
     defer allocator.free(raw_name);
     const safe_name = try sanitizeFilename(allocator, raw_name);
@@ -2039,7 +2063,12 @@ fn extractArchiveFiles(
     archive_body: []const u8,
     archive_kind: ArchiveKind,
     out_dir: []const u8,
+    archive_path: []const u8,
 ) ![]const []const u8 {
+    if (comptime !unarr.enabled) {
+        return extractArchiveFilesWithStd(allocator, archive_kind, out_dir, archive_path);
+    }
+
     const archive_format: unarr.Format = switch (archive_kind) {
         .zip => .zip,
         .rar => .rar,
@@ -2085,6 +2114,84 @@ fn extractArchiveFiles(
 
     if (extracted.items.len == 0) return error.ArchiveExtractionFailed;
     return try extracted.toOwnedSlice(allocator);
+}
+
+const extractArchiveFilesWithStd = if (!unarr.enabled)
+    struct {
+        fn call(
+            allocator: Allocator,
+            archive_kind: ArchiveKind,
+            out_dir: []const u8,
+            archive_path: []const u8,
+        ) ![]const []const u8 {
+            if (archive_kind != .zip) return error.ArchiveExtractionUnavailable;
+
+            const extract_dir_name = try extractionDirBaseName(allocator, archive_path);
+            defer allocator.free(extract_dir_name);
+            const extract_dir_path = try nextAvailableOutputPath(allocator, out_dir, extract_dir_name);
+            errdefer allocator.free(extract_dir_path);
+
+            try std.Io.Dir.cwd().createDirPath(runtime_io.get(), extract_dir_path);
+            var dest_dir = try std.Io.Dir.cwd().openDir(runtime_io.get(), extract_dir_path, .{ .iterate = true });
+            defer dest_dir.close(runtime_io.get());
+
+            var archive_file = try std.Io.Dir.cwd().openFile(runtime_io.get(), archive_path, .{});
+            defer archive_file.close(runtime_io.get());
+            var file_buf: [16 * 1024]u8 = undefined;
+            var file_reader = archive_file.reader(runtime_io.get(), &file_buf);
+
+            std.zip.extract(dest_dir, &file_reader, .{ .allow_backslashes = true }) catch return error.ArchiveExtractionFailed;
+            const files = try collectExtractedFilesRecursive(allocator, extract_dir_path);
+            allocator.free(extract_dir_path);
+            if (files.len == 0) {
+                allocator.free(files);
+                return error.ArchiveExtractionFailed;
+            }
+            return files;
+        }
+    }.call
+else {};
+
+fn extractionDirBaseName(allocator: Allocator, archive_path: []const u8) ![]u8 {
+    const base = pathBaseNameLocal(archive_path);
+    const sanitized = try sanitizeFilename(allocator, base);
+    defer allocator.free(sanitized);
+    const raw_stem = if (std.mem.lastIndexOfScalar(u8, sanitized, '.')) |dot| sanitized[0..dot] else sanitized;
+    const stem = std.mem.trim(u8, raw_stem, " .");
+    const chosen = if (stem.len == 0) "archive" else stem;
+    return try std.fmt.allocPrint(allocator, "{s}.extracted", .{chosen});
+}
+
+fn collectExtractedFilesRecursive(allocator: Allocator, root_path: []const u8) ![]const []const u8 {
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (out.items) |path| allocator.free(path);
+        out.deinit(allocator);
+    }
+    try collectExtractedFilesRecursiveInner(allocator, root_path, &out);
+    return try out.toOwnedSlice(allocator);
+}
+
+fn collectExtractedFilesRecursiveInner(
+    allocator: Allocator,
+    dir_path: []const u8,
+    out: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var dir = try std.Io.Dir.cwd().openDir(runtime_io.get(), dir_path, .{ .iterate = true });
+    defer dir.close(runtime_io.get());
+    var it = dir.iterate();
+    while (try it.next(runtime_io.get())) |entry| {
+        const path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        errdefer allocator.free(path);
+        switch (entry.kind) {
+            .file => try out.append(allocator, path),
+            .directory => {
+                try collectExtractedFilesRecursiveInner(allocator, path, out);
+                allocator.free(path);
+            },
+            else => allocator.free(path),
+        }
+    }
 }
 
 fn archiveEntryOutputName(allocator: Allocator, entry_name: []const u8, entry_num: usize) ![]u8 {
@@ -2161,6 +2268,55 @@ fn inferFilenameFromUrl(url: []const u8) ?[]const u8 {
     const slash = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse return null;
     if (slash + 1 >= trimmed.len) return null;
     return trimmed[slash + 1 ..];
+}
+
+fn preferredSubtitleDownloadName(allocator: Allocator, subtitle: SubtitleChoice, source_url: []const u8) ![]u8 {
+    if (nonEmptyTrimmed(subtitle.filename)) |name| {
+        if (!isGenericSubtitleFilename(name)) return try allocator.dupe(u8, name);
+    }
+    if (subtitleNameFromLabel(subtitle.label)) |name| {
+        if (!isGenericSubtitleFilename(name)) return try allocator.dupe(u8, name);
+    }
+    if (inferFilenameFromUrl(source_url)) |name| {
+        if (!isGenericSubtitleFilename(name)) return try allocator.dupe(u8, name);
+    }
+    return try allocator.dupe(u8, "subtitle");
+}
+
+fn subtitleNameFromLabel(label: []const u8) ?[]const u8 {
+    var text = std.mem.trim(u8, label, " \t\r\n");
+    if (std.mem.endsWith(u8, text, "[no direct download]")) {
+        text = std.mem.trim(u8, text[0 .. text.len - "[no direct download]".len], " \t\r\n");
+    }
+    var last = text;
+    var it = std.mem.splitScalar(u8, text, '|');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len > 0) last = trimmed;
+    }
+    if (std.ascii.eqlIgnoreCase(last, "Without release")) return null;
+    return if (last.len > 0) last else null;
+}
+
+fn isGenericSubtitleFilename(name: []const u8) bool {
+    const trimmed = std.mem.trim(u8, pathBaseNameLocal(name), " \t\r\n.");
+    if (trimmed.len == 0) return true;
+    const stem = if (std.mem.lastIndexOfScalar(u8, trimmed, '.')) |dot| trimmed[0..dot] else trimmed;
+    return std.ascii.eqlIgnoreCase(stem, "subtitle") or
+        std.ascii.eqlIgnoreCase(stem, "subtitles") or
+        std.ascii.eqlIgnoreCase(stem, "sub") or
+        std.ascii.eqlIgnoreCase(stem, "subs") or
+        std.ascii.eqlIgnoreCase(stem, "download") or
+        std.ascii.eqlIgnoreCase(stem, "file") or
+        std.ascii.eqlIgnoreCase(stem, "default") or
+        std.ascii.eqlIgnoreCase(stem, "index") or
+        std.ascii.eqlIgnoreCase(stem, "srt") or
+        std.ascii.eqlIgnoreCase(stem, "zip");
+}
+
+fn pathBaseNameLocal(path: []const u8) []const u8 {
+    const slash = std.mem.lastIndexOfAny(u8, path, "/\\") orelse return path;
+    return path[slash + 1 ..];
 }
 
 fn ensureFilenameExtension(

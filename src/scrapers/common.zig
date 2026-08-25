@@ -26,7 +26,34 @@ pub const FetchOptions = struct {
     max_attempts: usize = 1,
     retry_initial_backoff_ms: u64 = 200,
     retry_on_429: bool = true,
+    cache: bool = true,
 };
+
+pub const FetchCacheConfig = struct {
+    enabled: bool = false,
+    root_dir: ?[]const u8 = null,
+    ttl_seconds: i64 = 12 * 60 * 60,
+};
+
+var fetch_cache_config: FetchCacheConfig = .{};
+var fetch_cache_lock = std.atomic.Value(u8).init(0);
+
+const FetchCacheGuard = struct {
+    fn lock() FetchCacheGuard {
+        while (fetch_cache_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) sleepMilliseconds(5);
+        return .{};
+    }
+
+    fn unlock(_: FetchCacheGuard) void {
+        fetch_cache_lock.store(0, .release);
+    }
+};
+
+pub fn configureFetchCache(config: FetchCacheConfig) void {
+    const guard = FetchCacheGuard.lock();
+    defer guard.unlock();
+    fetch_cache_config = config;
+}
 
 pub const ParsedHtml = struct {
     allocator: Allocator,
@@ -125,6 +152,8 @@ fn selectorDebugEnabled() bool {
 }
 
 pub fn fetchBytes(client: *std.http.Client, allocator: Allocator, url: []const u8, opts: FetchOptions) !HttpResponse {
+    if (try loadFetchCache(allocator, url, opts)) |cached| return cached;
+
     var attempts: usize = 0;
     while (true) : (attempts += 1) {
         if (livePhaseLoggingEnabled()) {
@@ -150,8 +179,122 @@ pub fn fetchBytes(client: *std.http.Client, allocator: Allocator, url: []const u
             allocator.free(response.body);
             return error.UnexpectedHttpStatus;
         }
+        try storeFetchCache(allocator, url, opts, response);
         return response;
     }
+}
+
+const fetch_cache_magic = "subdl-http-cache-v1\n";
+
+fn loadFetchCache(allocator: Allocator, url: []const u8, opts: FetchOptions) !?HttpResponse {
+    if (!opts.cache) return null;
+    const config = currentFetchCacheConfig();
+    if (!config.enabled or config.ttl_seconds < 0) return null;
+    const root = config.root_dir orelse return null;
+
+    const path = try fetchCachePath(allocator, root, url, opts);
+    defer allocator.free(path);
+
+    const guard = FetchCacheGuard.lock();
+    defer guard.unlock();
+
+    const data = std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), path, allocator, .limited(128 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return null,
+    };
+    defer allocator.free(data);
+
+    var it = std.mem.splitScalar(u8, data, '\n');
+    const magic = it.next() orelse return null;
+    if (!std.mem.eql(u8, magic, fetch_cache_magic[0 .. fetch_cache_magic.len - 1])) return null;
+    const fetched_line = it.next() orelse return null;
+    const status_line = it.next() orelse return null;
+    const body_len_line = it.next() orelse return null;
+    const body = it.rest();
+
+    const fetched_at = std.fmt.parseInt(i64, fetched_line, 10) catch return null;
+    const now = compatUnixTimestamp();
+    if (fetched_at > now) return null;
+    if (config.ttl_seconds > 0 and now - fetched_at > config.ttl_seconds) return null;
+    const status_int = std.fmt.parseInt(u10, status_line, 10) catch return null;
+    const body_len = std.fmt.parseInt(usize, body_len_line, 10) catch return null;
+    if (body.len != body_len) return null;
+
+    return .{
+        .status = @enumFromInt(status_int),
+        .body = try allocator.dupe(u8, body),
+    };
+}
+
+fn storeFetchCache(allocator: Allocator, url: []const u8, opts: FetchOptions, response: HttpResponse) !void {
+    if (!opts.cache) return;
+    if (opts.method != .GET and opts.method != .POST) return;
+    const config = currentFetchCacheConfig();
+    if (!config.enabled or config.ttl_seconds < 0) return;
+    const root = config.root_dir orelse return;
+    if (response.status != .ok) return;
+
+    const path = try fetchCachePath(allocator, root, url, opts);
+    defer allocator.free(path);
+    try ensureParentDir(path);
+
+    const header = try std.fmt.allocPrint(allocator, "{s}{d}\n{d}\n{d}\n", .{
+        fetch_cache_magic,
+        compatUnixTimestamp(),
+        @intFromEnum(response.status),
+        response.body.len,
+    });
+    defer allocator.free(header);
+    var data: std.ArrayListUnmanaged(u8) = .empty;
+    defer data.deinit(allocator);
+    try data.appendSlice(allocator, header);
+    try data.appendSlice(allocator, response.body);
+
+    const guard = FetchCacheGuard.lock();
+    defer guard.unlock();
+    std.Io.Dir.cwd().writeFile(runtime_io.get(), .{ .sub_path = path, .data = data.items }) catch {};
+}
+
+fn currentFetchCacheConfig() FetchCacheConfig {
+    const guard = FetchCacheGuard.lock();
+    defer guard.unlock();
+    return fetch_cache_config;
+}
+
+fn fetchCachePath(allocator: Allocator, root: []const u8, url: []const u8, opts: FetchOptions) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(@tagName(opts.method));
+    hasher.update("\n");
+    hasher.update(url);
+    hasher.update("\n");
+    if (opts.accept) |accept| hasher.update(accept);
+    hasher.update("\n");
+    if (opts.content_type) |content_type| hasher.update(content_type);
+    hasher.update("\n");
+    for (opts.extra_headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "cookie")) continue;
+        hasher.update(header.name);
+        hasher.update(":");
+        hasher.update(header.value);
+        hasher.update("\n");
+    }
+    if (opts.payload) |payload| hasher.update(payload);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+
+    var hex: [64]u8 = undefined;
+    const table = "0123456789abcdef";
+    for (digest, 0..) |byte, idx| {
+        hex[idx * 2] = table[byte >> 4];
+        hex[idx * 2 + 1] = table[byte & 0x0f];
+    }
+    return std.fmt.allocPrint(allocator, "{s}/http/{s}.cache", .{ root, &hex });
+}
+
+fn ensureParentDir(path: []const u8) !void {
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return;
+    if (slash == 0) return;
+    try std.Io.Dir.cwd().createDirPath(runtime_io.get(), path[0..slash]);
 }
 
 fn fetchBytesViaHttp(client: *std.http.Client, allocator: Allocator, url: []const u8, opts: FetchOptions) !HttpResponse {
@@ -372,6 +515,36 @@ pub fn normalizeLanguageCode(language_or_code: []const u8) ?[]const u8 {
     if (eqlCode(s, "zh-tw") or std.ascii.eqlIgnoreCase(s, "traditional chinese")) return "zh-tw";
     if (eqlCode(s, "id") or std.ascii.eqlIgnoreCase(s, "indonesian")) return "id";
     if (eqlCode(s, "vi") or std.ascii.eqlIgnoreCase(s, "vietnamese")) return "vi";
+    if (eqlCode(s, "hi") or std.ascii.eqlIgnoreCase(s, "hindi")) return "hi";
+    if (eqlCode(s, "fa") or std.ascii.eqlIgnoreCase(s, "persian") or std.ascii.eqlIgnoreCase(s, "farsi")) return "fa";
+    if (eqlCode(s, "uk") or std.ascii.eqlIgnoreCase(s, "ukrainian")) return "uk";
+    if (eqlCode(s, "bg") or std.ascii.eqlIgnoreCase(s, "bulgarian")) return "bg";
+    if (eqlCode(s, "hr") or std.ascii.eqlIgnoreCase(s, "croatian")) return "hr";
+    if (eqlCode(s, "sr") or std.ascii.eqlIgnoreCase(s, "serbian")) return "sr";
+    if (eqlCode(s, "sk") or std.ascii.eqlIgnoreCase(s, "slovak")) return "sk";
+    if (eqlCode(s, "sl") or std.ascii.eqlIgnoreCase(s, "slovenian")) return "sl";
+    if (eqlCode(s, "he") or eqlCode(s, "iw") or std.ascii.eqlIgnoreCase(s, "hebrew")) return "he";
+    if (eqlCode(s, "th") or std.ascii.eqlIgnoreCase(s, "thai")) return "th";
+    if (eqlCode(s, "ms") or std.ascii.eqlIgnoreCase(s, "malay")) return "ms";
+    if (eqlCode(s, "bn") or std.ascii.eqlIgnoreCase(s, "bengali")) return "bn";
+    if (eqlCode(s, "ta") or std.ascii.eqlIgnoreCase(s, "tamil")) return "ta";
+    if (eqlCode(s, "te") or std.ascii.eqlIgnoreCase(s, "telugu")) return "te";
+    if (eqlCode(s, "ml") or std.ascii.eqlIgnoreCase(s, "malayalam")) return "ml";
+    if (eqlCode(s, "mr") or std.ascii.eqlIgnoreCase(s, "marathi")) return "mr";
+    if (eqlCode(s, "ur") or std.ascii.eqlIgnoreCase(s, "urdu")) return "ur";
+    if (eqlCode(s, "ca") or std.ascii.eqlIgnoreCase(s, "catalan")) return "ca";
+    if (eqlCode(s, "eu") or std.ascii.eqlIgnoreCase(s, "basque")) return "eu";
+    if (eqlCode(s, "gl") or std.ascii.eqlIgnoreCase(s, "galician")) return "gl";
+    if (eqlCode(s, "lt") or std.ascii.eqlIgnoreCase(s, "lithuanian")) return "lt";
+    if (eqlCode(s, "lv") or std.ascii.eqlIgnoreCase(s, "latvian")) return "lv";
+    if (eqlCode(s, "et") or std.ascii.eqlIgnoreCase(s, "estonian")) return "et";
+    if (eqlCode(s, "is") or std.ascii.eqlIgnoreCase(s, "icelandic")) return "is";
+    if (eqlCode(s, "ga") or std.ascii.eqlIgnoreCase(s, "irish")) return "ga";
+    if (eqlCode(s, "af") or std.ascii.eqlIgnoreCase(s, "afrikaans")) return "af";
+    if (eqlCode(s, "sw") or std.ascii.eqlIgnoreCase(s, "swahili")) return "sw";
+    if (eqlCode(s, "sq") or std.ascii.eqlIgnoreCase(s, "albanian")) return "sq";
+    if (eqlCode(s, "mk") or std.ascii.eqlIgnoreCase(s, "macedonian")) return "mk";
+    if (eqlCode(s, "bs") or std.ascii.eqlIgnoreCase(s, "bosnian")) return "bs";
 
     return null;
 }

@@ -121,6 +121,90 @@ const SubtitleSort = enum {
     label,
 };
 
+const LanguageOption = struct {
+    code: []const u8,
+    name: []const u8,
+};
+
+const language_options = [_]LanguageOption{
+    .{ .code = "en", .name = "English" },
+    .{ .code = "es", .name = "Spanish" },
+    .{ .code = "fr", .name = "French" },
+    .{ .code = "de", .name = "German" },
+    .{ .code = "it", .name = "Italian" },
+    .{ .code = "pt", .name = "Portuguese" },
+    .{ .code = "pt-br", .name = "Portuguese (Brazil)" },
+    .{ .code = "nl", .name = "Dutch" },
+    .{ .code = "ar", .name = "Arabic" },
+    .{ .code = "hi", .name = "Hindi" },
+    .{ .code = "ja", .name = "Japanese" },
+    .{ .code = "ko", .name = "Korean" },
+    .{ .code = "zh", .name = "Chinese" },
+    .{ .code = "zh-tw", .name = "Chinese (Traditional)" },
+    .{ .code = "ru", .name = "Russian" },
+    .{ .code = "tr", .name = "Turkish" },
+    .{ .code = "fa", .name = "Persian" },
+    .{ .code = "sv", .name = "Swedish" },
+    .{ .code = "da", .name = "Danish" },
+    .{ .code = "fi", .name = "Finnish" },
+    .{ .code = "no", .name = "Norwegian" },
+    .{ .code = "pl", .name = "Polish" },
+    .{ .code = "cs", .name = "Czech" },
+    .{ .code = "hu", .name = "Hungarian" },
+    .{ .code = "ro", .name = "Romanian" },
+    .{ .code = "el", .name = "Greek" },
+    .{ .code = "id", .name = "Indonesian" },
+    .{ .code = "vi", .name = "Vietnamese" },
+    .{ .code = "uk", .name = "Ukrainian" },
+    .{ .code = "bg", .name = "Bulgarian" },
+    .{ .code = "hr", .name = "Croatian" },
+    .{ .code = "sr", .name = "Serbian" },
+    .{ .code = "sk", .name = "Slovak" },
+    .{ .code = "sl", .name = "Slovenian" },
+    .{ .code = "he", .name = "Hebrew" },
+    .{ .code = "th", .name = "Thai" },
+    .{ .code = "ms", .name = "Malay" },
+    .{ .code = "bn", .name = "Bengali" },
+    .{ .code = "ta", .name = "Tamil" },
+    .{ .code = "te", .name = "Telugu" },
+    .{ .code = "ml", .name = "Malayalam" },
+    .{ .code = "mr", .name = "Marathi" },
+    .{ .code = "ur", .name = "Urdu" },
+    .{ .code = "ca", .name = "Catalan" },
+    .{ .code = "eu", .name = "Basque" },
+    .{ .code = "gl", .name = "Galician" },
+    .{ .code = "lt", .name = "Lithuanian" },
+    .{ .code = "lv", .name = "Latvian" },
+    .{ .code = "et", .name = "Estonian" },
+    .{ .code = "is", .name = "Icelandic" },
+    .{ .code = "ga", .name = "Irish" },
+    .{ .code = "af", .name = "Afrikaans" },
+    .{ .code = "sw", .name = "Swahili" },
+    .{ .code = "sq", .name = "Albanian" },
+    .{ .code = "mk", .name = "Macedonian" },
+    .{ .code = "bs", .name = "Bosnian" },
+};
+
+fn languageCount() usize {
+    return language_options.len;
+}
+
+fn languageSelectionAll() [languageCount()]bool {
+    return [_]bool{true} ** languageCount();
+}
+
+fn languageSelectionEnglish() [languageCount()]bool {
+    var out = [_]bool{false} ** languageCount();
+    out[0] = true;
+    return out;
+}
+
+fn languageSelectionOnly(index: usize) [languageCount()]bool {
+    var out = [_]bool{false} ** languageCount();
+    if (index < out.len) out[index] = true;
+    return out;
+}
+
 const FetchControl = enum {
     completed,
     canceled,
@@ -180,7 +264,10 @@ const KeywordEntry = struct {
 
 const TuiSettings = struct {
     providers_enabled: [app.providerCount()]bool,
+    languages_enabled: [languageCount()]bool,
+    language_filter_enabled: bool,
     cache_enabled: bool,
+    download_cache_enabled: bool,
     cache_ttl_seconds: i64,
     keyword_cache_enabled: bool,
 };
@@ -203,12 +290,14 @@ const TuiRuntimeState = struct {
     keywords: std.ArrayListUnmanaged(KeywordEntry) = .empty,
     state_path: []u8,
     keyword_path: []u8,
+    cache_root_path: []u8,
 
     fn deinit(self: *TuiRuntimeState, allocator: std.mem.Allocator) void {
         self.cache_entries.deinit(allocator);
         self.keywords.deinit(allocator);
         allocator.free(self.state_path);
         allocator.free(self.keyword_path);
+        allocator.free(self.cache_root_path);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -217,6 +306,7 @@ const TuiRuntimeState = struct {
 const QueryFocus = enum {
     query,
     results,
+    downloads,
 };
 
 const SearchBundle = struct {
@@ -227,6 +317,8 @@ const SearchBundle = struct {
     live_count: usize = 0,
     cache_count: usize = 0,
     failed_count: usize = 0,
+    pending_count: usize = 0,
+    searching: bool = false,
 
     fn deinit(self: *SearchBundle, allocator: std.mem.Allocator) void {
         allocator.free(self.query_norm);
@@ -241,6 +333,17 @@ const SearchBundle = struct {
 const SearchTask = struct {
     provider: app.Provider,
     query: []const u8,
+    language_code: ?[]const u8 = null,
+    page: usize = 1,
+    done: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    err: ?anyerror = null,
+    result: ?app.SearchResponse = null,
+};
+
+const ProviderSearchTask = struct {
+    provider: app.Provider,
+    query: []const u8,
+    language_code: ?[]const u8 = null,
     page: usize = 1,
     done: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     err: ?anyerror = null,
@@ -266,6 +369,7 @@ const SubdlSeasonsTask = struct {
 const DownloadTask = struct {
     subtitle: app.SubtitleChoice,
     out_dir: []const u8,
+    extract_archive: bool = true,
     phase: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(app.DownloadPhase.idle)),
     phase_done: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     phase_total: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -396,7 +500,24 @@ fn searchTaskMain(task: *SearchTask) void {
     var client: std.http.Client = .{ .allocator = std.heap.page_allocator, .io = runtime_io.get() };
     defer client.deinit();
 
-    task.result = app.searchPage(std.heap.page_allocator, &client, task.provider, task.query, task.page) catch |err| {
+    task.result = app.searchPageWithOptions(std.heap.page_allocator, &client, task.provider, task.query, task.page, .{
+        .language_code = task.language_code,
+    }) catch |err| {
+        task.err = err;
+        task.done.store(1, .release);
+        return;
+    };
+    task.done.store(1, .release);
+}
+
+fn providerSearchTaskMain(task: *ProviderSearchTask) void {
+    configureWorkerHardCancel();
+    var client: std.http.Client = .{ .allocator = std.heap.page_allocator, .io = runtime_io.get() };
+    defer client.deinit();
+
+    task.result = app.searchPageWithOptions(std.heap.page_allocator, &client, task.provider, task.query, task.page, .{
+        .language_code = task.language_code,
+    }) catch |err| {
         task.err = err;
         task.done.store(1, .release);
         return;
@@ -446,7 +567,9 @@ fn downloadTaskMain(task: *DownloadTask) void {
         .on_units = onDownloadProgressUnits,
     };
 
-    task.result = app.downloadSubtitleWithProgressAndOptions(std.heap.page_allocator, &client, task.subtitle, task.out_dir, &progress, .{}) catch |err| {
+    task.result = app.downloadSubtitleWithProgressAndOptions(std.heap.page_allocator, &client, task.subtitle, task.out_dir, &progress, .{
+        .extract_archive = task.extract_archive,
+    }) catch |err| {
         task.err = err;
         task.done.store(1, .release);
         return;
@@ -477,7 +600,7 @@ fn toU32Saturating(value: usize) u32 {
 }
 
 fn waitForFetch(ui: *Ui, done: *const std.atomic.Value(u8), title: []const u8, detail: []const u8) !FetchControl {
-    const spinner = [_][]const u8{ "|", "/", "-", "\\" };
+    const spinner = [_][]const u8{ "-", "\\", "-", "/" };
     var spinner_idx: usize = 0;
 
     while (done.load(.acquire) == 0) {
@@ -490,6 +613,7 @@ fn waitForFetch(ui: *Ui, done: *const std.atomic.Value(u8), title: []const u8, d
             switch (event) {
                 .winsize => |ws| try ui.resize(ws),
                 .key_press => |key| {
+                    if (key.isModifier()) continue;
                     if (key.matches(vaxis.Key.f2, .{})) {
                         ui.toggleConfirm();
                         continue;
@@ -520,7 +644,7 @@ fn waitForTask(ui: *Ui, done: *const std.atomic.Value(u8), title: []const u8, de
 }
 
 fn waitForDownloadTask(ui: *Ui, task: *const DownloadTask, title: []const u8, detail: []const u8) !FetchControl {
-    const spinner = [_][]const u8{ "|", "/", "-", "\\" };
+    const spinner = [_][]const u8{ "-", "\\", "-", "/" };
     var spinner_idx: usize = 0;
 
     while (task.done.load(.acquire) == 0) {
@@ -551,6 +675,7 @@ fn waitForDownloadTask(ui: *Ui, task: *const DownloadTask, title: []const u8, de
             switch (event) {
                 .winsize => |ws| try ui.resize(ws),
                 .key_press => |key| {
+                    if (key.isModifier()) continue;
                     if (key.matches(vaxis.Key.f2, .{})) {
                         ui.toggleConfirm();
                         continue;
@@ -690,6 +815,7 @@ fn runTui(ui: *Ui) !void {
 
     var state = try loadTuiRuntimeState(ui.allocator, ui.environ_map);
     defer state.deinit(ui.allocator);
+    applyRuntimeCacheSettings(&state);
     ui.provider_enabled = state.settings.providers_enabled;
 
     var query: std.ArrayList(u8) = .empty;
@@ -698,6 +824,8 @@ fn runTui(ui: *Ui) !void {
     var focus: QueryFocus = .query;
     var selected_result: usize = 0;
     var result_scroll: usize = 0;
+    var selected_download: usize = 0;
+    var download_scroll: usize = 0;
     var info_open = false;
     var history_pick: ?usize = null;
     var last_searched_norm: []u8 = try ui.allocator.dupe(u8, "");
@@ -709,187 +837,245 @@ fn runTui(ui: *Ui) !void {
         ui.provider_enabled = state.settings.providers_enabled;
         const query_norm_view = normalizeQueryView(query.items);
         const query_dirty = !std.mem.eql(u8, query_norm_view, last_searched_norm);
-        try renderQueryHome(ui, &state, query.items, cursor_pos, focus, query_dirty, if (results) |*b| b else null, selected_result, result_scroll, info_open);
+        try renderQueryHome(ui, &state, query.items, cursor_pos, focus, query_dirty, if (results) |*b| b else null, &selected_result, &result_scroll, &selected_download, &download_scroll, info_open, true);
 
-        const event = try ui.loop.nextEvent();
-        switch (event) {
-            .winsize => |ws| try ui.resize(ws),
-            .mouse => |mouse| {
-                if (results) |*bundle| {
-                    if (mouse.type == .press and bundle.hits.items.len > 0) switch (mouse.button) {
-                        .wheel_down => {
-                            selected_result = @min(bundle.hits.items.len - 1, selected_result + 3);
-                            focus = .results;
-                        },
-                        .wheel_up => {
-                            selected_result = selected_result -| 3;
-                            focus = .results;
-                        },
-                        else => {},
-                    };
-                    if (focus == .results) {
-                        focus = .results;
+        const batch = try readEventBatch(ui, try ui.loop.nextEvent());
+        for (batch.slice()) |event| {
+            switch (event) {
+                .winsize => |ws| try ui.resize(ws),
+                .mouse => |mouse| {
+                    if (info_open) continue;
+                    if (focus == .downloads and state.settings.download_cache_enabled) {
+                        const download_count = cachedDownloadCount(state.cache_root_path);
+                        if (mouse.type == .press and download_count > 0) switch (mouse.button) {
+                            .wheel_down => scrollSelection(&selected_download, download_count, .forward, list_mouse_wheel_step),
+                            .wheel_up => scrollSelection(&selected_download, download_count, .backward, list_mouse_wheel_step),
+                            .left => {
+                                const win = ui.vx.window();
+                                if (mouseRowIndex(mouse, 4, win.height, download_scroll, download_count)) |row_idx| selected_download = row_idx;
+                            },
+                            else => {},
+                        };
+                    } else if (results) |*bundle| {
+                        const visible_count = queryVisibleHitCount(bundle, query_norm_view);
+                        if (mouse.type == .press and visible_count > 0) switch (mouse.button) {
+                            .wheel_down => {
+                                scrollSelection(&selected_result, visible_count, .forward, list_mouse_wheel_step);
+                                focus = .results;
+                            },
+                            .wheel_up => {
+                                scrollSelection(&selected_result, visible_count, .backward, list_mouse_wheel_step);
+                                focus = .results;
+                            },
+                            .left => {
+                                const win = ui.vx.window();
+                                if (mouseRowIndex(mouse, 4, win.height, result_scroll, visible_count)) |row_idx| {
+                                    selected_result = row_idx;
+                                    focus = .results;
+                                }
+                            },
+                            else => {},
+                        };
                     }
-                }
-            },
-            .key_press => |key| {
-                switch (handleGlobalKey(ui, key, true)) {
-                    .none => {},
-                    .consumed => continue,
-                    .to_query => {},
-                    .quit => return,
-                }
+                },
+                .key_press => |key| {
+                    switch (handleGlobalKey(ui, key, true)) {
+                        .none => {},
+                        .consumed => continue,
+                        .to_query => {},
+                        .quit => return,
+                    }
 
-                if (info_open) {
-                    if (key.matches(vaxis.Key.escape, .{}) or key.matches('i', .{}) or key.matches('?', .{})) {
-                        info_open = false;
+                    if (info_open) {
+                        if (key.matches(vaxis.Key.escape, .{}) or key.matches(vaxis.Key.f1, .{})) {
+                            info_open = false;
+                        }
+                        continue;
                     }
-                    continue;
-                }
 
-                if (key.matches('i', .{}) or key.matches('?', .{})) {
-                    info_open = true;
-                    continue;
-                }
-                if (key.matches('p', .{})) {
-                    try editProviderSettings(ui, &state);
-                    try saveTuiRuntimeState(ui.allocator, &state);
-                    continue;
-                }
-                if (key.matches('c', .{})) {
-                    state.settings.cache_enabled = !state.settings.cache_enabled;
-                    try saveTuiRuntimeState(ui.allocator, &state);
-                    continue;
-                }
-                if (key.matches('t', .{})) {
-                    state.settings.cache_ttl_seconds = nextCacheTtlSeconds(state.settings.cache_ttl_seconds);
-                    try saveTuiRuntimeState(ui.allocator, &state);
-                    continue;
-                }
-                if (key.matches('k', .{})) {
-                    state.settings.keyword_cache_enabled = !state.settings.keyword_cache_enabled;
-                    try saveTuiRuntimeState(ui.allocator, &state);
-                    continue;
-                }
-                if (key.matches('K', .{}) or key.matches('k', .{ .shift = true })) {
-                    state.keywords.clearRetainingCapacity();
-                    try saveKeywordRuntimeState(ui.allocator, &state);
-                    continue;
-                }
-                if (key.matches(vaxis.Key.tab, .{})) {
-                    if (results != null and results.?.hits.items.len > 0) {
-                        focus = if (focus == .query) .results else .query;
+                    if (key.matches(vaxis.Key.f1, .{})) {
+                        info_open = true;
+                        continue;
                     }
-                    continue;
-                }
-                if (key.matches(vaxis.Key.escape, .{})) {
-                    if (focus == .results) {
-                        focus = .query;
-                    } else if (query.items.len > 0) {
-                        query.clearRetainingCapacity();
-                        cursor_pos = 0;
-                    } else {
-                        return;
+                    if (key.matches(vaxis.Key.f2, .{})) continue;
+                    if (key.matches(vaxis.Key.tab, .{})) {
+                        focus = nextQueryFocus(focus, results != null and results.?.hits.items.len > 0, state.settings.download_cache_enabled and cachedDownloadCount(state.cache_root_path) > 0);
+                        continue;
                     }
-                    continue;
-                }
+                    if (key.matches(vaxis.Key.escape, .{})) {
+                        try editSettingsPopup(ui, &state, query.items, cursor_pos, focus, query_dirty, if (results) |*b| b else null, &selected_result, &result_scroll, &selected_download, &download_scroll, &info_open);
+                        continue;
+                    }
 
-                if (focus == .results and !query_dirty) {
-                    if (key.matches(vaxis.Key.enter, .{})) {
-                        if (results) |*bundle| {
-                            if (bundle.hits.items.len > 0) {
-                                switch (try openSearchResult(ui, bundle, selected_result)) {
-                                    .back, .to_query => focus = .results,
-                                    .quit => return,
+                    if (focus == .downloads and state.settings.download_cache_enabled) {
+                        const download_count = cachedDownloadCount(state.cache_root_path);
+                        if (key.matches(vaxis.Key.enter, .{}) and download_count > 0) {
+                            const input = try vaxisInput(ui, "Export Download", "Destination directory", "Directory", 240);
+                            const out_dir = switch (input) {
+                                .submit => |dir| dir,
+                                .back => continue,
+                                .quit => return,
+                            };
+                            defer ui.allocator.free(out_dir);
+                            const trimmed_dir = std.mem.trim(u8, out_dir, " \t\r\n");
+                            const exported = try exportCachedDownloadByIndex(ui.allocator, state.cache_root_path, selected_download, if (trimmed_dir.len == 0) "downloads" else trimmed_dir);
+                            defer ui.allocator.free(exported);
+                            const msg = try vaxisMessage(ui, "Exported", exported, "Press any key to continue.", ui.styleAccent());
+                            switch (msg) {
+                                .ok => {},
+                                .to_query => focus = .query,
+                                .quit => return,
+                            }
+                            continue;
+                        }
+                        if (key.matches(vaxis.Key.down, .{})) {
+                            if (selected_download + 1 < download_count) selected_download += 1;
+                            continue;
+                        }
+                        if (key.matches(vaxis.Key.up, .{})) {
+                            selected_download = selected_download -| 1;
+                            continue;
+                        }
+                        if (key.matches(vaxis.Key.page_down, .{})) {
+                            if (download_count > 0) selected_download = @min(download_count - 1, selected_download + queryPageSize(ui));
+                            continue;
+                        }
+                        if (key.matches(vaxis.Key.page_up, .{})) {
+                            selected_download = selected_download -| queryPageSize(ui);
+                            continue;
+                        }
+                        if (key.matches(vaxis.Key.end, .{})) {
+                            selected_download = download_count -| 1;
+                            continue;
+                        }
+                        if (key.matches(vaxis.Key.home, .{})) {
+                            selected_download = 0;
+                            continue;
+                        }
+                    }
+
+                    if (focus == .results and !query_dirty) {
+                        if (key.matches(vaxis.Key.enter, .{})) {
+                            if (results) |*bundle| {
+                                const visible_order = try buildQueryHitOrder(ui.allocator, bundle, query_norm_view);
+                                defer ui.allocator.free(visible_order);
+                                if (selected_result < visible_order.len) {
+                                    switch (try openSearchResult(ui, bundle, visible_order[selected_result], state.settings, state.cache_root_path)) {
+                                        .back, .to_query => focus = .results,
+                                        .quit => return,
+                                    }
                                 }
                             }
+                            continue;
                         }
-                        continue;
-                    }
-                    if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
-                        if (results) |*bundle| {
-                            if (selected_result + 1 < bundle.hits.items.len) selected_result += 1;
+                        if (key.matches(vaxis.Key.down, .{})) {
+                            if (results) |*bundle| {
+                                const visible_count = queryVisibleHitCount(bundle, query_norm_view);
+                                if (selected_result + 1 < visible_count) selected_result += 1;
+                            }
+                            continue;
                         }
-                        continue;
+                        if (key.matches(vaxis.Key.up, .{})) {
+                            if (selected_result > 0) selected_result -= 1;
+                            continue;
+                        }
+                        if (key.matches(vaxis.Key.page_down, .{})) {
+                            if (results) |*bundle| {
+                                const visible_count = queryVisibleHitCount(bundle, query_norm_view);
+                                if (visible_count > 0) selected_result = @min(visible_count - 1, selected_result + queryPageSize(ui));
+                            }
+                            continue;
+                        }
+                        if (key.matches(vaxis.Key.page_up, .{})) {
+                            selected_result = selected_result -| queryPageSize(ui);
+                            continue;
+                        }
+                        if (key.matches(vaxis.Key.end, .{})) {
+                            if (results) |*bundle| {
+                                const visible_count = queryVisibleHitCount(bundle, query_norm_view);
+                                selected_result = visible_count -| 1;
+                            }
+                            continue;
+                        }
+                        if (key.matches(vaxis.Key.home, .{})) {
+                            selected_result = 0;
+                            continue;
+                        }
                     }
-                    if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
-                        if (selected_result > 0) selected_result -= 1;
-                        continue;
-                    }
-                    if (key.matches(vaxis.Key.page_down, .{}) or key.matches(vaxis.Key.space, .{})) {
-                        if (results) |*bundle| selected_result = @min(bundle.hits.items.len -| 1, selected_result + 10);
-                        continue;
-                    }
-                    if (key.matches(vaxis.Key.page_up, .{}) or key.matches('b', .{})) {
-                        selected_result = selected_result -| 10;
-                        continue;
-                    }
-                    if (key.matches('/', .{})) {
-                        focus = .query;
-                        continue;
-                    }
-                }
 
-                focus = .query;
-                if (key.matches(vaxis.Key.enter, .{})) {
-                    if (query_norm_view.len == 0) continue;
-                    if (results) |*bundle| bundle.deinit(ui.allocator);
-                    results = null;
-                    const owned_query = try ui.allocator.dupe(u8, query_norm_view);
-                    defer ui.allocator.free(owned_query);
-                    try rememberKeyword(ui.allocator, &state, owned_query);
-                    results = executeQuerySearch(ui, &state, owned_query) catch |err| switch (err) {
-                        error.TuiQuit => return,
-                        else => return err,
-                    };
-                    ui.allocator.free(last_searched_norm);
-                    last_searched_norm = try ui.allocator.dupe(u8, owned_query);
-                    selected_result = 0;
-                    result_scroll = 0;
-                    focus = .results;
-                    try saveTuiRuntimeState(ui.allocator, &state);
-                    try saveKeywordRuntimeState(ui.allocator, &state);
-                    continue;
-                }
-                if (key.matches(vaxis.Key.up, .{})) {
-                    if (try applyHistorySuggestion(ui.allocator, &state, &query, &cursor_pos, .backward, &history_pick)) continue;
-                } else if (key.matches(vaxis.Key.down, .{})) {
-                    if (try applyHistorySuggestion(ui.allocator, &state, &query, &cursor_pos, .forward, &history_pick)) continue;
-                } else if (key.matches(vaxis.Key.left, .{})) {
-                    cursor_pos = prevCodepointStart(query.items, cursor_pos);
-                } else if (key.matches(vaxis.Key.right, .{})) {
-                    cursor_pos = nextCodepointEnd(query.items, cursor_pos);
-                } else if (key.matches('a', .{ .ctrl = true })) {
-                    cursor_pos = 0;
-                } else if (key.matches('e', .{ .ctrl = true })) {
-                    cursor_pos = query.items.len;
-                } else if (key.matches('u', .{ .ctrl = true })) {
-                    query.clearRetainingCapacity();
-                    cursor_pos = 0;
-                    history_pick = null;
-                } else if (key.matches(vaxis.Key.backspace, .{})) {
-                    if (cursor_pos > 0) {
-                        const prev = prevCodepointStart(query.items, cursor_pos);
-                        query.replaceRangeAssumeCapacity(prev, cursor_pos - prev, "");
-                        cursor_pos = prev;
-                        history_pick = null;
+                    if (key.matches(vaxis.Key.enter, .{})) {
+                        if (query_norm_view.len == 0) continue;
+                        if (results) |*bundle| bundle.deinit(ui.allocator);
+                        results = null;
+                        const owned_query = try ui.allocator.dupe(u8, query_norm_view);
+                        defer ui.allocator.free(owned_query);
+                        try rememberKeyword(ui.allocator, &state, owned_query);
+                        results = executeQuerySearchIncremental(ui, &state, owned_query, query.items, cursor_pos, &selected_result, &result_scroll, &info_open) catch |err| switch (err) {
+                            error.TuiQuit => return,
+                            else => return err,
+                        };
+                        ui.allocator.free(last_searched_norm);
+                        last_searched_norm = try ui.allocator.dupe(u8, owned_query);
+                        selected_result = 0;
+                        result_scroll = 0;
+                        focus = .results;
+                        try saveTuiRuntimeState(ui.allocator, &state);
+                        try saveKeywordRuntimeState(ui.allocator, &state);
+                        continue;
                     }
-                } else if (key.matches(vaxis.Key.delete, .{})) {
-                    if (cursor_pos < query.items.len) {
-                        const next = nextCodepointEnd(query.items, cursor_pos);
-                        query.replaceRangeAssumeCapacity(cursor_pos, next - cursor_pos, "");
+                    if (key.matches(vaxis.Key.up, .{})) {
+                        if (try applyHistorySuggestion(ui.allocator, &state, &query, &cursor_pos, .backward, &history_pick)) continue;
+                    } else if (key.matches(vaxis.Key.down, .{})) {
+                        if (try applyHistorySuggestion(ui.allocator, &state, &query, &cursor_pos, .forward, &history_pick)) continue;
+                    } else if (key.matches(vaxis.Key.left, .{})) {
+                        cursor_pos = prevCodepointStart(query.items, cursor_pos);
+                    } else if (key.matches(vaxis.Key.right, .{})) {
+                        cursor_pos = nextCodepointEnd(query.items, cursor_pos);
+                    } else if (key.matches('a', .{ .ctrl = true })) {
+                        cursor_pos = 0;
+                    } else if (key.matches('e', .{ .ctrl = true })) {
+                        cursor_pos = query.items.len;
+                    } else if (key.matches('u', .{ .ctrl = true })) {
+                        query.clearRetainingCapacity();
+                        cursor_pos = 0;
                         history_pick = null;
+                        focus = .query;
+                    } else if (key.matches(vaxis.Key.backspace, .{})) {
+                        if (cursor_pos > 0) {
+                            const prev = prevCodepointStart(query.items, cursor_pos);
+                            query.replaceRangeAssumeCapacity(prev, cursor_pos - prev, "");
+                            cursor_pos = prev;
+                            history_pick = null;
+                            focus = .query;
+                        }
+                    } else if (key.matches(vaxis.Key.delete, .{})) {
+                        if (cursor_pos < query.items.len) {
+                            const next = nextCodepointEnd(query.items, cursor_pos);
+                            query.replaceRangeAssumeCapacity(cursor_pos, next - cursor_pos, "");
+                            history_pick = null;
+                            focus = .query;
+                        }
+                    } else if (isTextKey(key)) {
+                        const text = key.text orelse continue;
+                        if (query.items.len + text.len <= 180) {
+                            try query.insertSlice(ui.allocator, cursor_pos, text);
+                            cursor_pos += text.len;
+                            history_pick = null;
+                            focus = .query;
+                        }
                     }
-                } else if (isTextKey(key)) {
-                    const text = key.text orelse continue;
-                    if (query.items.len + text.len <= 180) {
-                        try query.insertSlice(ui.allocator, cursor_pos, text);
-                        cursor_pos += text.len;
-                        history_pick = null;
-                    }
-                }
-            },
-            else => {},
+                },
+                else => {},
+            }
+        }
+        if (batch.wheel_delta != 0 and !info_open) {
+            if (focus == .downloads and state.settings.download_cache_enabled) {
+                applyWheelDelta(&selected_download, cachedDownloadCount(state.cache_root_path), batch.wheel_delta, list_mouse_wheel_step);
+            } else if (results) |*bundle| {
+                const visible_count = queryVisibleHitCount(bundle, query_norm_view);
+                applyWheelDelta(&selected_result, visible_count, batch.wheel_delta, list_mouse_wheel_step);
+                if (visible_count > 0) focus = .results;
+            }
         }
     }
 }
@@ -902,7 +1088,7 @@ fn runProviderFirstTui(ui: *Ui) !void {
     var provider_default: ?usize = 0;
 
     provider_loop: while (true) {
-        setContext(ui, "Provider list | URL: choose provider");
+        setContext(ui, "Provider list • URL: choose provider");
         const provider_choice = try vaxisSelect(
             ui,
             "Subtitle Downloader",
@@ -952,7 +1138,7 @@ fn runProviderFirstTui(ui: *Ui) !void {
 
             const query_context = try std.fmt.allocPrint(
                 ui.allocator,
-                "Provider: {s} | URL: {s}",
+                "Provider: {s} • URL: {s}",
                 .{ app.providerName(provider), provider_url },
             );
             defer ui.allocator.free(query_context);
@@ -989,7 +1175,7 @@ fn runProviderFirstTui(ui: *Ui) !void {
                     const search_context = if (supports_search_pagination)
                         try std.fmt.allocPrint(
                             ui.allocator,
-                            "Search URL base: {s} | page={d}",
+                            "Search URL base: {s} • page={d}",
                             .{ provider_url, search_page_current },
                         )
                     else
@@ -1076,13 +1262,13 @@ fn runProviderFirstTui(ui: *Ui) !void {
                 const title_context = if (supports_search_pagination)
                     try std.fmt.allocPrint(
                         ui.allocator,
-                        "Provider: {s} | Search base URL: {s} | page={d}",
+                        "Provider: {s} • Search base URL: {s} • page={d}",
                         .{ app.providerName(provider), provider_url, search_page_current },
                     )
                 else
                     try std.fmt.allocPrint(
                         ui.allocator,
-                        "Provider: {s} | Search base URL: {s}",
+                        "Provider: {s} • Search base URL: {s}",
                         .{ app.providerName(provider), provider_url },
                     );
                 defer ui.allocator.free(title_context);
@@ -1237,6 +1423,7 @@ fn runProviderFirstTui(ui: *Ui) !void {
                 var subtitle_pages: std.ArrayListUnmanaged(SubtitlesPageCacheEntry) = .empty;
                 defer deinitSubtitlesPageCache(ui.allocator, &subtitle_pages);
                 var subtitle_page_current: usize = 1;
+                var allow_auto_subtitle_select = true;
 
                 subtitle_page_loop: while (true) {
                     const subtitles_idx = findSubtitlesPageCacheIndex(subtitle_pages.items, subtitle_page_current) orelse blk_fetch: {
@@ -1244,19 +1431,19 @@ fn runProviderFirstTui(ui: *Ui) !void {
                             if (supports_subtitles_pagination)
                                 try std.fmt.allocPrint(
                                     ui.allocator,
-                                    "{s} | {s} | page={d}",
+                                    "{s} • {s} • page={d}",
                                     .{ selected_title.label, season_label, subtitle_page_current },
                                 )
                             else
                                 try std.fmt.allocPrint(
                                     ui.allocator,
-                                    "{s} | {s}",
+                                    "{s} • {s}",
                                     .{ selected_title.label, season_label },
                                 )
                         else if (supports_subtitles_pagination)
                             try std.fmt.allocPrint(
                                 ui.allocator,
-                                "{s} | page={d}",
+                                "{s} • page={d}",
                                 .{ selected_title.label, subtitle_page_current },
                             )
                         else
@@ -1270,7 +1457,7 @@ fn runProviderFirstTui(ui: *Ui) !void {
                         const subtitles_context = if (supports_subtitles_pagination)
                             try std.fmt.allocPrint(
                                 ui.allocator,
-                                "Title URL: {s} | page={d}",
+                                "Title URL: {s} • page={d}",
                                 .{ subtitle_ref_url, subtitle_page_current },
                             )
                         else
@@ -1353,13 +1540,13 @@ fn runProviderFirstTui(ui: *Ui) !void {
                         }
                     }
 
-                    const subtitle_enabled = try buildSubtitleEnabled(ui.allocator, subtitles.items);
+                    const subtitle_enabled = try buildSubtitleEnabled(ui.allocator, subtitles.items, defaultTuiSettings());
                     defer ui.allocator.free(subtitle_enabled);
 
                     const subtitle_context = if (supports_subtitles_pagination)
                         try std.fmt.allocPrint(
                             ui.allocator,
-                            "Title URL: {s} | page={d}",
+                            "Title URL: {s} • page={d}",
                             .{ subtitle_ref_url, subtitle_page_current },
                         )
                     else
@@ -1378,33 +1565,36 @@ fn runProviderFirstTui(ui: *Ui) !void {
                         .has_next = subtitles.has_next_page,
                     };
                     const subtitle_page_nav_opt: ?PageNav = if (subtitle_page_nav.enabled) subtitle_page_nav else null;
-                    const subtitle_choice = try vaxisSelectSubtitle(
-                        ui,
-                        "Select Subtitle",
-                        if (supports_subtitles_pagination)
-                            "s sort, / filter, [ prev page, ] next page, Esc titles."
-                        else
-                            "s sort, / filter, Esc titles.",
-                        subtitles.items,
-                        subtitle_enabled,
-                        subtitle_page_nav_opt,
-                    );
+                    const subtitle_idx = (if (allow_auto_subtitle_select) singleEnabledIndex(subtitle_enabled) else null) orelse blk: {
+                        const subtitle_choice = try vaxisSelectSubtitle(
+                            ui,
+                            "Select Subtitle",
+                            if (supports_subtitles_pagination)
+                                "s sort, / filter, [ prev page, ] next page, Esc titles."
+                            else
+                                "s sort, / filter, Esc titles.",
+                            subtitles.items,
+                            subtitle_enabled,
+                            subtitle_page_nav_opt,
+                        );
 
-                    const subtitle_idx = switch (subtitle_choice) {
-                        .selected => |idx| idx,
-                        .back => continue :title_loop,
-                        .to_query => continue :query_loop,
-                        .page_prev => {
-                            if (subtitle_page_nav.enabled and subtitle_page_current > 1) subtitle_page_current -= 1;
-                            continue :subtitle_page_loop;
-                        },
-                        .page_next => {
-                            if (!subtitle_page_nav.enabled or !subtitles.has_next_page) continue :subtitle_page_loop;
-                            subtitle_page_current += 1;
-                            continue :subtitle_page_loop;
-                        },
-                        .quit => return,
+                        break :blk switch (subtitle_choice) {
+                            .selected => |idx| idx,
+                            .back => continue :title_loop,
+                            .to_query => continue :query_loop,
+                            .page_prev => {
+                                if (subtitle_page_nav.enabled and subtitle_page_current > 1) subtitle_page_current -= 1;
+                                continue :subtitle_page_loop;
+                            },
+                            .page_next => {
+                                if (!subtitle_page_nav.enabled or !subtitles.has_next_page) continue :subtitle_page_loop;
+                                subtitle_page_current += 1;
+                                continue :subtitle_page_loop;
+                            },
+                            .quit => return,
+                        };
                     };
+                    allow_auto_subtitle_select = false;
 
                     const selected_subtitle = subtitles.items[subtitle_idx];
                     const download_url = selected_subtitle.download_url orelse "(no direct URL)";
@@ -1458,9 +1648,13 @@ fn runProviderFirstTui(ui: *Ui) !void {
                     defer ui.allocator.free(download_context);
                     setContext(ui, download_context);
 
+                    const download_out_dir = try ui.allocator.dupe(u8, "downloads");
+                    defer ui.allocator.free(download_out_dir);
+
                     var download_task: DownloadTask = .{
                         .subtitle = selected_subtitle,
-                        .out_dir = "downloads",
+                        .out_dir = download_out_dir,
+                        .extract_archive = true,
                     };
                     const download_thread = try std.Thread.spawn(.{}, downloadTaskMain, .{&download_task});
                     const download_control = try waitForDownloadTask(ui, &download_task, "Download", download_detail);
@@ -1547,7 +1741,7 @@ fn deinitSubtitlesPageCache(allocator: std.mem.Allocator, pages: *std.ArrayListU
     pages.deinit(allocator);
 }
 
-const persistent_version = 2;
+const persistent_version = 5;
 const default_cache_ttl_seconds: i64 = 12 * 60 * 60;
 const search_state_magic = "subdl-tui-search-state-v1\n";
 const keyword_state_magic = "subdl-tui-keywords-v1\n";
@@ -1555,7 +1749,10 @@ const keyword_state_magic = "subdl-tui-keywords-v1\n";
 fn defaultTuiSettings() TuiSettings {
     return .{
         .providers_enabled = app.providerSelectionAll(),
+        .languages_enabled = languageSelectionEnglish(),
+        .language_filter_enabled = true,
         .cache_enabled = true,
+        .download_cache_enabled = true,
         .cache_ttl_seconds = default_cache_ttl_seconds,
         .keyword_cache_enabled = true,
     };
@@ -1569,12 +1766,15 @@ fn loadTuiRuntimeState(allocator: std.mem.Allocator, environ_map: *std.process.E
     errdefer allocator.free(state_path);
     const keyword_path = try tuiCachePath(allocator, environ_map, "keywords.oneserial");
     errdefer allocator.free(keyword_path);
+    const cache_root_path = try tuiCachePath(allocator, environ_map, "cache");
+    errdefer allocator.free(cache_root_path);
 
     var out: TuiRuntimeState = .{
         .arena = arena,
         .settings = defaultTuiSettings(),
         .state_path = state_path,
         .keyword_path = keyword_path,
+        .cache_root_path = cache_root_path,
     };
     errdefer out.deinit(allocator);
 
@@ -1597,8 +1797,17 @@ fn loadTuiRuntimeState(allocator: std.mem.Allocator, environ_map: *std.process.E
 fn sanitizeSettings(settings: TuiSettings) TuiSettings {
     var out = settings;
     if (countEnabledFlags(&out.providers_enabled) == 0) out.providers_enabled = app.providerSelectionAll();
-    if (out.cache_ttl_seconds <= 0) out.cache_ttl_seconds = default_cache_ttl_seconds;
+    if (singleEnabledIndex(&out.languages_enabled) == null) out.languages_enabled = languageSelectionEnglish();
+    if (out.cache_ttl_seconds < 0) out.cache_ttl_seconds = default_cache_ttl_seconds;
     return out;
+}
+
+fn applyRuntimeCacheSettings(state: *const TuiRuntimeState) void {
+    scrapers.common.configureFetchCache(.{
+        .enabled = state.settings.cache_enabled,
+        .root_dir = state.cache_root_path,
+        .ttl_seconds = state.settings.cache_ttl_seconds,
+    });
 }
 
 fn loadPersistentSearchState(allocator: std.mem.Allocator, path: []const u8) !?PersistentSearchState {
@@ -1674,7 +1883,8 @@ fn normalizeQueryView(query: []const u8) []const u8 {
 }
 
 fn cacheFresh(entry: QueryCacheEntry, now: i64, ttl_seconds: i64) bool {
-    if (ttl_seconds <= 0) return false;
+    if (ttl_seconds == 0) return true;
+    if (ttl_seconds < 0) return false;
     if (entry.fetched_at_unix > now) return false;
     return now - entry.fetched_at_unix <= ttl_seconds;
 }
@@ -1825,6 +2035,7 @@ fn executeQuerySearch(ui: *Ui, state: *TuiRuntimeState, query_norm: []const u8) 
         var search_task: SearchTask = .{
             .provider = provider,
             .query = query_norm,
+            .language_code = primaryLanguageCode(state.settings),
             .page = 1,
         };
         const search_thread = try std.Thread.spawn(.{}, searchTaskMain, .{&search_task});
@@ -1857,6 +2068,270 @@ fn executeQuerySearch(ui: *Ui, state: *TuiRuntimeState, query_norm: []const u8) 
 
     bundle.labels = try buildCombinedSearchLabelsWithSource(ui.allocator, bundle.searches.items, bundle.hits.items);
     return bundle;
+}
+
+fn executeQuerySearchIncremental(
+    ui: *Ui,
+    state: *TuiRuntimeState,
+    query_norm: []const u8,
+    query_display: []const u8,
+    cursor_pos: usize,
+    selected_result: *usize,
+    result_scroll: *usize,
+    info_open: *bool,
+) !SearchBundle {
+    var bundle: SearchBundle = .{
+        .query_norm = try ui.allocator.dupe(u8, query_norm),
+        .searching = true,
+    };
+    errdefer bundle.deinit(ui.allocator);
+    var selected_download: usize = 0;
+    var download_scroll: usize = 0;
+
+    var tasks = try ui.allocator.alloc(ProviderSearchTask, app.providerCount());
+    defer ui.allocator.free(tasks);
+    var consumed = try ui.allocator.alloc(bool, app.providerCount());
+    defer ui.allocator.free(consumed);
+    @memset(consumed, false);
+    var threads: std.ArrayListUnmanaged(std.Thread) = .empty;
+    defer threads.deinit(ui.allocator);
+
+    var task_count: usize = 0;
+    const language_code = primaryLanguageCode(state.settings);
+    for (app.providers()) |provider| {
+        if (!state.settings.providers_enabled[app.providerIndex(provider)]) continue;
+        tasks[task_count] = .{
+            .provider = provider,
+            .query = query_norm,
+            .language_code = language_code,
+            .page = 1,
+        };
+        const thread = try std.Thread.spawn(.{}, providerSearchTaskMain, .{&tasks[task_count]});
+        try threads.append(ui.allocator, thread);
+        task_count += 1;
+        bundle.pending_count += 1;
+    }
+
+    while (bundle.pending_count > 0) {
+        var idx: usize = 0;
+        while (idx < task_count) : (idx += 1) {
+            if (consumed[idx]) continue;
+            if (tasks[idx].done.load(.acquire) == 0) continue;
+            consumed[idx] = true;
+            bundle.pending_count -= 1;
+            if (tasks[idx].err) |_| {
+                bundle.failed_count += 1;
+                continue;
+            }
+            const search_result = tasks[idx].result orelse {
+                bundle.failed_count += 1;
+                continue;
+            };
+            const response_index = bundle.searches.items.len;
+            try bundle.searches.append(ui.allocator, search_result);
+            for (bundle.searches.items[response_index].items, 0..) |_, item_index| {
+                try bundle.hits.append(ui.allocator, .{ .provider = tasks[idx].provider, .response_index = response_index, .item_index = item_index, .source = .live });
+            }
+            bundle.live_count += 1;
+        }
+
+        clampSelection(selected_result, bundle.hits.items.len);
+        try renderQueryHome(ui, state, query_display, cursor_pos, if (bundle.hits.items.len > 0) .results else .query, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
+
+        var wheel_delta: i32 = 0;
+        while (try ui.loop.tryEvent()) |event| {
+            switch (event) {
+                .winsize => |ws| try ui.resize(ws),
+                .mouse => |mouse| {
+                    if (info_open.*) continue;
+                    if (mouseWheelDelta(mouse)) |delta| {
+                        wheel_delta += delta;
+                    } else if (mouse.type == .press and bundle.hits.items.len > 0) switch (mouse.button) {
+                        .left => {
+                            const win = ui.vx.window();
+                            if (mouseRowIndex(mouse, 4, win.height, result_scroll.*, bundle.hits.items.len)) |row_idx| {
+                                selected_result.* = row_idx;
+                            }
+                        },
+                        else => {},
+                    };
+                },
+                .key_press => |key| {
+                    if (key.isModifier()) continue;
+                    if (key.matches('d', .{ .ctrl = true })) {
+                        cancelSearchThreads(threads.items);
+                        cleanupUnconsumedProviderTasks(tasks[0..task_count], consumed[0..task_count]);
+                        return error.TuiQuit;
+                    }
+                    if (key.matches('c', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{})) {
+                        cancelSearchThreads(threads.items);
+                        cleanupUnconsumedProviderTasks(tasks[0..task_count], consumed[0..task_count]);
+                        return bundle;
+                    }
+                    if (key.matches(vaxis.Key.f1, .{})) {
+                        info_open.* = !info_open.*;
+                        continue;
+                    }
+                    if (bundle.hits.items.len > 0 and key.matches(vaxis.Key.down, .{})) {
+                        selected_result.* = @min(bundle.hits.items.len - 1, selected_result.* + 1);
+                        continue;
+                    }
+                    if (bundle.hits.items.len > 0 and key.matches(vaxis.Key.up, .{})) {
+                        selected_result.* = selected_result.* -| 1;
+                        continue;
+                    }
+                    if (bundle.hits.items.len > 0 and key.matches(vaxis.Key.page_down, .{})) {
+                        selected_result.* = @min(bundle.hits.items.len - 1, selected_result.* + queryPageSize(ui));
+                        continue;
+                    }
+                    if (key.matches(vaxis.Key.page_up, .{})) {
+                        selected_result.* = selected_result.* -| queryPageSize(ui);
+                        continue;
+                    }
+                    if (bundle.hits.items.len > 0 and key.matches(vaxis.Key.end, .{})) {
+                        selected_result.* = bundle.hits.items.len - 1;
+                        continue;
+                    }
+                    if (key.matches(vaxis.Key.home, .{})) {
+                        selected_result.* = 0;
+                        continue;
+                    }
+                },
+                else => {},
+            }
+        }
+        applyWheelDelta(selected_result, bundle.hits.items.len, wheel_delta, list_mouse_wheel_step);
+        try runtime_io.get().sleep(.fromMilliseconds(search_poll_interval_ms), .awake);
+    }
+
+    for (threads.items) |thread| thread.join();
+    bundle.searching = false;
+    try renderQueryHome(ui, state, query_display, cursor_pos, if (bundle.hits.items.len > 0) .results else .query, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
+    return bundle;
+}
+
+fn cancelSearchThreads(threads: []const std.Thread) void {
+    for (threads) |thread| _ = requestHardThreadCancel(thread);
+    for (threads) |thread| thread.join();
+}
+
+fn cleanupUnconsumedProviderTasks(tasks: []ProviderSearchTask, consumed: []const bool) void {
+    for (tasks, 0..) |*task, idx| {
+        if (consumed[idx]) continue;
+        if (task.result) |*result| result.deinit();
+    }
+}
+
+fn queryPageSize(ui: *Ui) usize {
+    const win = ui.vx.window();
+    if (win.height <= 12) return 4;
+    return @max(@as(usize, 4), @as(usize, @intCast(win.height - 10)));
+}
+
+fn nextQueryFocus(current: QueryFocus, has_results: bool, has_downloads: bool) QueryFocus {
+    return switch (current) {
+        .query => if (has_results) .results else if (has_downloads) .downloads else .query,
+        .results => if (has_downloads) .downloads else .query,
+        .downloads => .query,
+    };
+}
+
+fn cleanSearchTitle(label: []const u8) []const u8 {
+    var text = std.mem.trim(u8, label, " \t\r\n");
+    while (std.mem.startsWith(u8, text, "[")) {
+        const end = std.mem.indexOfScalar(u8, text, ']') orelse break;
+        if (end > 24) break;
+        text = std.mem.trim(u8, text[end + 1 ..], " \t");
+    }
+    return text;
+}
+
+fn formatQueryTopLine(
+    buf: []u8,
+    enabled_provider_count: usize,
+    provider_count: usize,
+    bundle: *const SearchBundle,
+) ![]const u8 {
+    var pos: usize = 0;
+    pos += (try std.fmt.bufPrint(buf[pos..], "F1 info • Esc settings • {d}/{d} providers", .{ enabled_provider_count, provider_count })).len;
+    if (bundle.hits.items.len > 0) pos += (try std.fmt.bufPrint(buf[pos..], " • {d} results", .{bundle.hits.items.len})).len;
+    if (bundle.live_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " • live {d}", .{bundle.live_count})).len;
+    if (bundle.cache_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " • cache {d}", .{bundle.cache_count})).len;
+    if (bundle.failed_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " • failed {d}", .{bundle.failed_count})).len;
+    if (bundle.pending_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " • pending {d}", .{bundle.pending_count})).len;
+    return buf[0..pos];
+}
+
+fn queryVisibleHitCount(bundle: *const SearchBundle, query_norm: []const u8) usize {
+    if (query_norm.len == 0) return bundle.hits.items.len;
+    var count: usize = 0;
+    for (bundle.hits.items, 0..) |_, idx| {
+        if (queryHitScore(bundle, idx, query_norm) > 0) count += 1;
+    }
+    return if (count == 0) bundle.hits.items.len else count;
+}
+
+fn buildQueryHitOrder(
+    allocator: std.mem.Allocator,
+    bundle: *const SearchBundle,
+    query_norm: []const u8,
+) ![]usize {
+    const match_count = queryVisibleHitCount(bundle, query_norm);
+    const include_all = query_norm.len == 0 or match_count == bundle.hits.items.len;
+    const out = try allocator.alloc(usize, match_count);
+    var out_len: usize = 0;
+    for (bundle.hits.items, 0..) |_, idx| {
+        if (include_all or queryHitScore(bundle, idx, query_norm) > 0) {
+            out[out_len] = idx;
+            out_len += 1;
+        }
+    }
+
+    const Ctx = struct {
+        bundle: *const SearchBundle,
+        query: []const u8,
+
+        fn less(ctx: @This(), lhs: usize, rhs: usize) bool {
+            const lhs_score = queryHitScore(ctx.bundle, lhs, ctx.query);
+            const rhs_score = queryHitScore(ctx.bundle, rhs, ctx.query);
+            if (lhs_score != rhs_score) return lhs_score > rhs_score;
+            return lhs < rhs;
+        }
+    };
+    std.mem.sort(usize, out, Ctx{ .bundle = bundle, .query = query_norm }, Ctx.less);
+    return out;
+}
+
+fn queryHitScore(bundle: *const SearchBundle, hit_idx: usize, query_norm: []const u8) u32 {
+    if (query_norm.len == 0 or hit_idx >= bundle.hits.items.len) return 1;
+    const hit = bundle.hits.items[hit_idx];
+    const item = bundle.searches.items[hit.response_index].items[hit.item_index];
+    const title = cleanSearchTitle(item.label);
+    var score: u32 = 0;
+    if (startsWithCaseInsensitive(title, query_norm)) {
+        score += 1000;
+    } else if (containsCaseInsensitive(title, query_norm)) {
+        score += 700;
+    }
+    if (containsCaseInsensitive(app.providerDisplayName(hit.provider), query_norm) or containsCaseInsensitive(app.providerName(hit.provider), query_norm)) {
+        score += 100;
+    }
+    var terms = std.mem.tokenizeAny(u8, query_norm, " \t\r\n._-");
+    while (terms.next()) |term| {
+        if (term.len < 2) continue;
+        if (containsCaseInsensitive(title, term)) score += 50;
+    }
+    return score;
+}
+
+fn startsWithCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i < needle.len) : (i += 1) {
+        if (std.ascii.toLower(haystack[i]) != std.ascii.toLower(needle[i])) return false;
+    }
+    return true;
 }
 
 fn rememberKeyword(allocator: std.mem.Allocator, state: *TuiRuntimeState, query_norm: []const u8) !void {
@@ -1915,31 +2390,439 @@ fn sortedKeywordIndexes(allocator: std.mem.Allocator, keywords: []const KeywordE
     return order;
 }
 
-fn nextCacheTtlSeconds(current: i64) i64 {
-    if (current <= 60 * 60) return 6 * 60 * 60;
-    if (current <= 6 * 60 * 60) return 12 * 60 * 60;
-    if (current <= 12 * 60 * 60) return 24 * 60 * 60;
-    return 60 * 60;
+const SettingsPanel = enum { main, providers, languages, cache_ttl };
+
+const SettingsPopupMetrics = struct {
+    width: u16,
+    height: u16,
+    x: u16,
+    y: u16,
+    row_start: u16,
+    row_end: u16,
+};
+
+fn settingsPopupMetrics(win_width: u16, win_height: u16) SettingsPopupMetrics {
+    const width: u16 = @min(if (win_width > 8) win_width - 8 else win_width, 68);
+    const height: u16 = @min(if (win_height > 6) win_height - 4 else win_height, 22);
+    const x: u16 = if (win_width > width) (win_width - width) / 2 else 0;
+    const y: u16 = if (win_height > height) (win_height - height) / 2 else 0;
+    return .{
+        .width = width,
+        .height = height,
+        .x = x,
+        .y = y,
+        .row_start = y + 3,
+        .row_end = y + height -| 2,
+    };
 }
 
-fn editProviderSettings(ui: *Ui, state: *TuiRuntimeState) !void {
-    const provider_names = try buildProviderNames(ui.allocator);
-    defer freeOwnedStrings(ui.allocator, provider_names);
-    setContext(ui, "Settings: providers");
-    const result = try vaxisSelect(
-        ui,
-        "Providers",
-        "Space toggles providers. Enter closes with highlighted provider active.",
-        provider_names,
-        null,
-        null,
-        null,
-        &state.settings.providers_enabled,
-    );
-    switch (result) {
-        .selected, .back, .to_query, .page_prev, .page_next => {},
-        .quit => return error.TuiQuit,
+fn settingsPageSize(metrics: SettingsPopupMetrics) usize {
+    return if (metrics.row_end > metrics.row_start) @intCast(metrics.row_end - metrics.row_start) else 1;
+}
+
+fn editSettingsPopup(
+    ui: *Ui,
+    state: *TuiRuntimeState,
+    query: []const u8,
+    cursor_pos: usize,
+    focus: QueryFocus,
+    query_dirty: bool,
+    results: ?*SearchBundle,
+    selected_result: *usize,
+    result_scroll: *usize,
+    selected_download: *usize,
+    download_scroll: *usize,
+    info_open: *bool,
+) !void {
+    var panel: SettingsPanel = .main;
+    var main_selected: usize = 0;
+    var provider_selected: usize = 0;
+    var language_selected: usize = 0;
+    var provider_scroll: usize = 0;
+    var language_scroll: usize = 0;
+    var ttl_input: std.ArrayList(u8) = .empty;
+    defer ttl_input.deinit(ui.allocator);
+    var ttl_cursor: usize = 0;
+    var ttl_error: ?[]const u8 = null;
+    info_open.* = false;
+    language_selected = if (state.settings.language_filter_enabled)
+        (singleEnabledIndex(&state.settings.languages_enabled) orelse 0) + 1
+    else
+        0;
+
+    while (true) {
+        const win = ui.vx.window();
+        const metrics = settingsPopupMetrics(win.width, win.height);
+        const page_size = settingsPageSize(metrics);
+        ensureVisible(provider_selected, &provider_scroll, page_size);
+        ensureVisible(language_selected, &language_scroll, page_size);
+
+        try renderQueryHome(ui, state, query, cursor_pos, focus, query_dirty, results, selected_result, result_scroll, selected_download, download_scroll, false, false);
+        try renderSettingsPopup(ui, win, state, panel, main_selected, provider_selected, language_selected, provider_scroll, language_scroll, ttl_input.items, ttl_cursor, ttl_error);
+        try ui.render();
+
+        const batch = try readEventBatch(ui, try ui.loop.nextEvent());
+        for (batch.slice()) |event| {
+            switch (event) {
+                .winsize => |ws| try ui.resize(ws),
+                .mouse => |mouse| {
+                    if (mouse.type != .press) continue;
+                    const win_now = ui.vx.window();
+                    const metrics_now = settingsPopupMetrics(win_now.width, win_now.height);
+                    switch (panel) {
+                        .main => {
+                            const item_count: usize = 7;
+                            switch (mouse.button) {
+                                .wheel_down => scrollSelection(&main_selected, item_count, .forward, 1),
+                                .wheel_up => scrollSelection(&main_selected, item_count, .backward, 1),
+                                .left => {
+                                    if (mouseRowIndex(mouse, metrics_now.row_start, metrics_now.row_end, 0, item_count)) |idx| main_selected = idx;
+                                },
+                                else => {},
+                            }
+                        },
+                        .providers => {
+                            switch (mouse.button) {
+                                .wheel_down => scrollSelection(&provider_selected, app.providerCount(), .forward, list_mouse_wheel_step),
+                                .wheel_up => scrollSelection(&provider_selected, app.providerCount(), .backward, list_mouse_wheel_step),
+                                .left => {
+                                    if (mouseRowIndex(mouse, metrics_now.row_start, metrics_now.row_end, provider_scroll, app.providerCount())) |idx| {
+                                        provider_selected = idx;
+                                        state.settings.providers_enabled[idx] = !state.settings.providers_enabled[idx];
+                                        if (countEnabledFlags(&state.settings.providers_enabled) == 0) state.settings.providers_enabled[idx] = true;
+                                        try saveTuiRuntimeState(ui.allocator, state);
+                                    }
+                                },
+                                else => {},
+                            }
+                        },
+                        .languages => {
+                            const language_items = languageCount() + 1;
+                            switch (mouse.button) {
+                                .wheel_down => scrollSelection(&language_selected, language_items, .forward, list_mouse_wheel_step),
+                                .wheel_up => scrollSelection(&language_selected, language_items, .backward, list_mouse_wheel_step),
+                                .left => {
+                                    if (mouseRowIndex(mouse, metrics_now.row_start, metrics_now.row_end, language_scroll, language_items)) |idx| {
+                                        language_selected = idx;
+                                        if (idx == 0) {
+                                            state.settings.language_filter_enabled = false;
+                                        } else {
+                                            state.settings.language_filter_enabled = true;
+                                            state.settings.languages_enabled = languageSelectionOnly(idx - 1);
+                                        }
+                                        try saveTuiRuntimeState(ui.allocator, state);
+                                    }
+                                },
+                                else => {},
+                            }
+                        },
+                        .cache_ttl => {},
+                    }
+                },
+                .key_press => |key| {
+                    if (key.isModifier()) continue;
+                    if (key.matches('d', .{ .ctrl = true })) return error.TuiQuit;
+                    switch (panel) {
+                        .main => {
+                            const item_count: usize = 7;
+                            if (key.matches(vaxis.Key.escape, .{})) return;
+                            if (key.matches(vaxis.Key.down, .{})) {
+                                if (main_selected + 1 < item_count) main_selected += 1;
+                                continue;
+                            }
+                            if (key.matches(vaxis.Key.up, .{})) {
+                                main_selected = main_selected -| 1;
+                                continue;
+                            }
+                            if (!key.matches(vaxis.Key.enter, .{})) continue;
+                            switch (settingsMainAction(state.settings, main_selected)) {
+                                0 => panel = .providers,
+                                1 => panel = .languages,
+                                2 => state.settings.cache_enabled = !state.settings.cache_enabled,
+                                3 => {
+                                    ttl_input.clearRetainingCapacity();
+                                    const text = try cacheTtlInputText(ui.allocator, state.settings.cache_ttl_seconds);
+                                    defer ui.allocator.free(text);
+                                    try ttl_input.appendSlice(ui.allocator, text);
+                                    ttl_cursor = ttl_input.items.len;
+                                    ttl_error = null;
+                                    panel = .cache_ttl;
+                                },
+                                4 => state.settings.download_cache_enabled = !state.settings.download_cache_enabled,
+                                5 => state.settings.keyword_cache_enabled = !state.settings.keyword_cache_enabled,
+                                6 => {
+                                    state.keywords.clearRetainingCapacity();
+                                    try saveKeywordRuntimeState(ui.allocator, state);
+                                },
+                                else => {},
+                            }
+                            applyRuntimeCacheSettings(state);
+                            try saveTuiRuntimeState(ui.allocator, state);
+                        },
+                        .providers => {
+                            if (key.matches(vaxis.Key.escape, .{})) {
+                                panel = .main;
+                                continue;
+                            }
+                            if (key.matches(vaxis.Key.down, .{})) {
+                                if (provider_selected + 1 < app.providerCount()) provider_selected += 1;
+                                continue;
+                            }
+                            if (key.matches(vaxis.Key.up, .{})) {
+                                provider_selected = provider_selected -| 1;
+                                continue;
+                            }
+                            if (key.matches(vaxis.Key.enter, .{}) or key.matches(vaxis.Key.space, .{})) {
+                                state.settings.providers_enabled[provider_selected] = !state.settings.providers_enabled[provider_selected];
+                                if (countEnabledFlags(&state.settings.providers_enabled) == 0) state.settings.providers_enabled[provider_selected] = true;
+                                try saveTuiRuntimeState(ui.allocator, state);
+                                continue;
+                            }
+                        },
+                        .languages => {
+                            const language_items = languageCount() + 1;
+                            if (key.matches(vaxis.Key.escape, .{})) {
+                                panel = .main;
+                                continue;
+                            }
+                            if (key.matches(vaxis.Key.down, .{})) {
+                                if (language_selected + 1 < language_items) language_selected += 1;
+                                continue;
+                            }
+                            if (key.matches(vaxis.Key.up, .{})) {
+                                language_selected = language_selected -| 1;
+                                continue;
+                            }
+                            if (key.matches(vaxis.Key.enter, .{}) or key.matches(vaxis.Key.space, .{})) {
+                                if (language_selected == 0) {
+                                    state.settings.language_filter_enabled = false;
+                                } else {
+                                    state.settings.language_filter_enabled = true;
+                                    state.settings.languages_enabled = languageSelectionOnly(language_selected - 1);
+                                }
+                                try saveTuiRuntimeState(ui.allocator, state);
+                                continue;
+                            }
+                        },
+                        .cache_ttl => {
+                            if (key.matches(vaxis.Key.escape, .{})) {
+                                panel = .main;
+                                ttl_error = null;
+                                continue;
+                            }
+                            if (key.matches(vaxis.Key.enter, .{})) {
+                                const ttl = parseCacheTtlSeconds(ttl_input.items) orelse {
+                                    ttl_error = "Enter decimal hours, 0, or inf.";
+                                    continue;
+                                };
+                                state.settings.cache_ttl_seconds = ttl;
+                                applyRuntimeCacheSettings(state);
+                                try saveTuiRuntimeState(ui.allocator, state);
+                                panel = .main;
+                                ttl_error = null;
+                                continue;
+                            }
+                            if (key.matches(vaxis.Key.left, .{})) {
+                                ttl_cursor = ttl_cursor -| 1;
+                                continue;
+                            }
+                            if (key.matches(vaxis.Key.right, .{})) {
+                                if (ttl_cursor < ttl_input.items.len) ttl_cursor += 1;
+                                continue;
+                            }
+                            if (key.matches(vaxis.Key.backspace, .{})) {
+                                if (ttl_cursor > 0) {
+                                    _ = ttl_input.orderedRemove(ttl_cursor - 1);
+                                    ttl_cursor -= 1;
+                                }
+                                ttl_error = null;
+                                continue;
+                            }
+                            if (key.matches(vaxis.Key.delete, .{})) {
+                                if (ttl_cursor < ttl_input.items.len) _ = ttl_input.orderedRemove(ttl_cursor);
+                                ttl_error = null;
+                                continue;
+                            }
+                            if (isTextKey(key)) {
+                                const text = key.text orelse continue;
+                                for (text) |ch| {
+                                    const ok = std.ascii.isDigit(ch) or ch == '.' or std.ascii.isAlphabetic(ch);
+                                    if (!ok) continue;
+                                    if (ttl_input.items.len < 32) {
+                                        try ttl_input.insert(ui.allocator, ttl_cursor, ch);
+                                        ttl_cursor += 1;
+                                    }
+                                }
+                                ttl_error = null;
+                            }
+                        },
+                    }
+                },
+                else => {},
+            }
+        }
+        if (batch.wheel_delta != 0) {
+            switch (panel) {
+                .main => applyWheelDelta(&main_selected, 7, batch.wheel_delta, 1),
+                .providers => applyWheelDelta(&provider_selected, app.providerCount(), batch.wheel_delta, list_mouse_wheel_step),
+                .languages => applyWheelDelta(&language_selected, languageCount() + 1, batch.wheel_delta, list_mouse_wheel_step),
+                .cache_ttl => {},
+            }
+        }
     }
+}
+
+fn renderSettingsPopup(
+    ui: *Ui,
+    win: anytype,
+    state: *const TuiRuntimeState,
+    panel: SettingsPanel,
+    main_selected: usize,
+    provider_selected: usize,
+    language_selected: usize,
+    provider_scroll: usize,
+    language_scroll: usize,
+    ttl_input: []const u8,
+    ttl_cursor: usize,
+    ttl_error: ?[]const u8,
+) !void {
+    const metrics = settingsPopupMetrics(win.width, win.height);
+    const width = metrics.width;
+    const height = metrics.height;
+    const x = metrics.x;
+    const y = metrics.y;
+    try renderBox(ui, win, x, y, width, height, ui.styleAccent());
+    try printFitted(ui, win, y + 1, x + 2, "Settings", ui.stylePaneTitle(), width -| 4);
+
+    const row_start = metrics.row_start;
+    const row_end = metrics.row_end;
+    switch (panel) {
+        .main => {
+            var provider_buf: [64]u8 = undefined;
+            var language_buf: [64]u8 = undefined;
+            var cache_buf: [64]u8 = undefined;
+            var download_cache_buf: [64]u8 = undefined;
+            var ttl_buf: [64]u8 = undefined;
+            var history_buf: [64]u8 = undefined;
+            var rows: [7][]const u8 = undefined;
+            rows[0] = std.fmt.bufPrint(&provider_buf, "Providers  {d}/{d}", .{ countEnabledFlags(&state.settings.providers_enabled), app.providerCount() }) catch "Providers";
+            rows[1] = formatLanguageSetting(&language_buf, state.settings) catch "Language";
+            rows[2] = std.fmt.bufPrint(&cache_buf, "URL cache  {s}", .{if (state.settings.cache_enabled) "on" else "off"}) catch "URL cache";
+            rows[3] = formatCacheTtlSetting(&ttl_buf, state.settings.cache_ttl_seconds) catch "Retention";
+            rows[4] = std.fmt.bufPrint(&download_cache_buf, "Download cache  {s}", .{if (state.settings.download_cache_enabled) "on" else "off"}) catch "Download cache";
+            var row_count: usize = 5;
+            rows[row_count] = std.fmt.bufPrint(&history_buf, "History  {s}", .{if (state.settings.keyword_cache_enabled) "on" else "off"}) catch "History";
+            row_count += 1;
+            rows[row_count] = "Clear history";
+            row_count += 1;
+            const visible_rows = rows[0..row_count];
+            var row = row_start;
+            for (visible_rows, 0..) |line, idx| {
+                if (row >= row_end) break;
+                const style = if (idx == main_selected) ui.styleSelected() else vaxis.Style{};
+                try printFitted(ui, win, row, x + 2, if (idx == main_selected) "›" else " ", style, 1);
+                try printFitted(ui, win, row, x + 4, line, style, width -| 6);
+                row += 1;
+            }
+        },
+        .providers => {
+            try printFitted(ui, win, y + 2, x + 2, "Enter toggles provider. Esc returns.", ui.styleMuted(), width -| 4);
+            var row = row_start;
+            var idx = provider_scroll;
+            while (idx < app.providerCount() and row < row_end) : (idx += 1) {
+                const provider = app.providers()[idx];
+                if (row >= row_end) break;
+                const checked = if (state.settings.providers_enabled[idx]) "on " else "off";
+                const style = if (idx == provider_selected) ui.styleSelected() else vaxis.Style{};
+                const line = try frameFmt(ui, "{s}  {s}", .{ checked, app.providerName(provider) });
+                try printFitted(ui, win, row, x + 2, if (idx == provider_selected) "›" else " ", style, 1);
+                try printFitted(ui, win, row, x + 4, line, style, width -| 6);
+                row += 1;
+            }
+        },
+        .languages => {
+            try printFitted(ui, win, y + 2, x + 2, "Enter chooses primary language. Esc returns.", ui.styleMuted(), width -| 4);
+            var row = row_start;
+            var idx = language_scroll;
+            const language_items = language_options.len + 1;
+            while (idx < language_items and row < row_end) : (idx += 1) {
+                if (row >= row_end) break;
+                const selected = if (idx == 0)
+                    !state.settings.language_filter_enabled
+                else
+                    state.settings.language_filter_enabled and state.settings.languages_enabled[idx - 1];
+                const checked = if (selected) "on " else "off";
+                const style = if (idx == language_selected) ui.styleSelected() else vaxis.Style{};
+                const line = if (idx == 0)
+                    try frameFmt(ui, "{s}  off  No language filter", .{checked})
+                else blk: {
+                    const lang = language_options[idx - 1];
+                    break :blk try frameFmt(ui, "{s}  {s}  {s}", .{ checked, lang.code, lang.name });
+                };
+                try printFitted(ui, win, row, x + 2, if (idx == language_selected) "›" else " ", style, 1);
+                try printFitted(ui, win, row, x + 4, line, style, width -| 6);
+                row += 1;
+            }
+        },
+        .cache_ttl => {
+            try printFitted(ui, win, y + 2, x + 2, "Hours; decimals allowed. 0 or inf keeps forever.", ui.styleMuted(), width -| 4);
+            try printFitted(ui, win, row_start, x + 2, "Hours", ui.styleAccent(), 8);
+            try printFitted(ui, win, row_start, x + 10, ttl_input, vaxis.Style{ .bold = true }, width -| 12);
+            if (ttl_error) |err| try printFitted(ui, win, row_start + 2, x + 2, err, ui.styleWarn(), width -| 4);
+            const col = x + 10 + @as(u16, @intCast(@min(ttl_cursor, @as(usize, width -| 12))));
+            win.showCursor(@min(col, win.width -| 1), row_start);
+        },
+    }
+}
+
+fn settingsMainAction(_: TuiSettings, visible_idx: usize) usize {
+    return visible_idx;
+}
+
+fn primaryLanguageIndex(settings: TuiSettings) ?usize {
+    if (!settings.language_filter_enabled) return null;
+    return singleEnabledIndex(&settings.languages_enabled) orelse 0;
+}
+
+fn primaryLanguageCode(settings: TuiSettings) ?[]const u8 {
+    const idx = primaryLanguageIndex(settings) orelse return null;
+    return language_options[@min(idx, language_options.len - 1)].code;
+}
+
+fn formatLanguageSetting(buf: []u8, settings: TuiSettings) ![]const u8 {
+    const idx = primaryLanguageIndex(settings) orelse return std.fmt.bufPrint(buf, "Language  off", .{});
+    const lang = language_options[@min(idx, language_options.len - 1)];
+    return std.fmt.bufPrint(buf, "Language  {s} {s}", .{ lang.code, lang.name });
+}
+
+fn formatCacheTtlSetting(buf: []u8, ttl_seconds: i64) ![]const u8 {
+    if (ttl_seconds == 0) return std.fmt.bufPrint(buf, "Retention  inf", .{});
+    const hours = @as(f64, @floatFromInt(ttl_seconds)) / 3600.0;
+    if (@mod(ttl_seconds, 3600) == 0) return std.fmt.bufPrint(buf, "Retention  {d}h", .{@divTrunc(ttl_seconds, 3600)});
+    return std.fmt.bufPrint(buf, "Retention  {d:.2}h", .{hours});
+}
+
+fn cacheTtlInputText(allocator: std.mem.Allocator, ttl_seconds: i64) ![]u8 {
+    if (ttl_seconds == 0) return try allocator.dupe(u8, "inf");
+    if (@mod(ttl_seconds, 3600) == 0) return try std.fmt.allocPrint(allocator, "{d}", .{@divTrunc(ttl_seconds, 3600)});
+    return try std.fmt.allocPrint(allocator, "{d:.4}", .{@as(f64, @floatFromInt(ttl_seconds)) / 3600.0});
+}
+
+fn parseCacheTtlSeconds(input: []const u8) ?i64 {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (std.ascii.eqlIgnoreCase(trimmed, "inf") or
+        std.ascii.eqlIgnoreCase(trimmed, "infinite") or
+        std.ascii.eqlIgnoreCase(trimmed, "infinity"))
+    {
+        return 0;
+    }
+    const hours = std.fmt.parseFloat(f64, trimmed) catch return null;
+    if (!std.math.isFinite(hours) or hours < 0) return null;
+    if (hours == 0) return 0;
+    const seconds_f = hours * 3600.0;
+    if (!std.math.isFinite(seconds_f) or seconds_f >= @as(f64, @floatFromInt(std.math.maxInt(i64)))) return null;
+    return @intFromFloat(@round(seconds_f));
 }
 
 fn renderQueryHome(
@@ -1950,9 +2833,12 @@ fn renderQueryHome(
     focus: QueryFocus,
     query_dirty: bool,
     results: ?*SearchBundle,
-    selected_result: usize,
-    scroll: usize,
+    selected_result: *usize,
+    scroll: *usize,
+    selected_download: *usize,
+    download_scroll: *usize,
     info_open: bool,
+    flush: bool,
 ) !void {
     const win = ui.vx.window();
     win.clear();
@@ -1960,20 +2846,16 @@ fn renderQueryHome(
     win.setCursorShape(.beam);
 
     const provider_count = countEnabledFlags(&state.settings.providers_enabled);
-    const ttl_hours = @divTrunc(state.settings.cache_ttl_seconds, 60 * 60);
-    const cache_status = if (state.settings.cache_enabled) "cache" else "no-cache";
-    const history_status = if (state.settings.keyword_cache_enabled) "history" else "no-history";
     var top_buf: [256]u8 = undefined;
-    const top = std.fmt.bufPrint(
-        &top_buf,
-        "p {d}/{d}  •  c {s} {d}h  •  k {s}  •  i",
-        .{ provider_count, app.providerCount(), cache_status, ttl_hours, history_status },
-    ) catch "i";
+    const top = if (results) |bundle|
+        try formatQueryTopLine(&top_buf, provider_count, app.providerCount(), bundle)
+    else
+        std.fmt.bufPrint(&top_buf, "F1 info • Esc settings • {d}/{d} providers", .{ provider_count, app.providerCount() }) catch "F1 info • Esc settings";
     try renderCompactTopLine(ui, win, top, ui.styleTitle());
 
     const box_w: u16 = @min(if (win.width > 6) win.width - 6 else win.width, 86);
     const box_x: u16 = if (win.width > box_w) (win.width - box_w) / 2 else 0;
-    const box_y: u16 = if (win.height > 18) 4 else 2;
+    const box_y: u16 = 1;
     const border_style = if (query_dirty) ui.styleWarn() else if (focus == .query) ui.styleAccent() else ui.styleMuted();
     try renderBox(ui, win, box_x, box_y, box_w, 3, border_style);
     const query_text = if (query.len == 0) "" else query;
@@ -1985,33 +2867,52 @@ fn renderQueryHome(
         win.showCursor(@min(col, win.width -| 1), box_y + 1);
     }
 
-    if (query_dirty) {
-        try printFitted(ui, win, box_y + 4, box_x, "edited", ui.styleWarn(), @intCast(box_w));
-    }
-
-    const list_top = box_y + 6;
+    const list_top = box_y + 3;
     const list_bottom: u16 = win.height;
 
-    if (results) |bundle| {
-        var summary_buf: [256]u8 = undefined;
-        const summary = std.fmt.bufPrint(
-            &summary_buf,
-            "{d} results  •  live {d}  •  cache {d}  •  failed {d}",
-            .{ bundle.hits.items.len, bundle.live_count, bundle.cache_count, bundle.failed_count },
-        ) catch "";
-        try printFitted(ui, win, list_top, 2, summary, ui.stylePaneTitle(), if (win.width > 4) @intCast(win.width - 4) else 0);
-
-        const page_size: usize = if (list_bottom > list_top + 1) @intCast(list_bottom - list_top - 1) else 1;
-        var local_scroll = scroll;
-        ensureVisible(selected_result, &local_scroll, page_size);
-        var row = list_top + 2;
-        var i = local_scroll;
-        while (i < bundle.labels.len and row < list_bottom) : (i += 1) {
-            const active = focus == .results and i == selected_result;
+    if (focus == .downloads and state.settings.download_cache_enabled) {
+        const entries = try cachedDownloadLabels(ui.frameAllocator(), state.cache_root_path);
+        clampSelection(selected_download, entries.len);
+        const page_size: usize = if (list_bottom > list_top) @intCast(list_bottom - list_top) else 1;
+        ensureVisible(selected_download.*, download_scroll, page_size);
+        if (entries.len == 0) {
+            try printFitted(ui, win, list_top, 4, "No cached downloads.", ui.styleMuted(), if (win.width > 8) @intCast(win.width - 8) else 0);
+        } else {
+            var row = list_top;
+            var i = download_scroll.*;
+            while (i < entries.len and row < list_bottom) : (i += 1) {
+                const active = i == selected_download.*;
+                const style = if (active) ui.styleSelected() else vaxis.Style{};
+                try printFitted(ui, win, row, 2, if (active) "› " else "  ", style, 2);
+                try printFitted(ui, win, row, 4, entries[i], style, if (win.width > 8) @intCast(win.width - 8) else 0);
+                row += 1;
+            }
+        }
+    } else if (results) |bundle| {
+        const query_norm = normalizeQueryView(query);
+        const visible_order = try buildQueryHitOrder(ui.frameAllocator(), bundle, query_norm);
+        clampSelection(selected_result, visible_order.len);
+        const page_size: usize = if (list_bottom > list_top) @intCast(list_bottom - list_top) else 1;
+        ensureVisible(selected_result.*, scroll, page_size);
+        var row = list_top;
+        var i = scroll.*;
+        while (i < visible_order.len and row < list_bottom) : (i += 1) {
+            const active = focus == .results and i == selected_result.*;
             const style = if (active) ui.styleSelected() else vaxis.Style{};
             const prefix = if (active) "› " else "  ";
+            const hit = bundle.hits.items[visible_order[i]];
+            const item = bundle.searches.items[hit.response_index].items[hit.item_index];
+            const title = cleanSearchTitle(item.label);
+            const provider_tag = app.providerDisplayName(hit.provider);
+            const source_tag = if (hit.source == .cache) "cache" else "live";
             try printFitted(ui, win, row, 2, prefix, style, 2);
-            try printFitted(ui, win, row, 4, bundle.labels[i], style, if (win.width > 6) @intCast(win.width - 6) else 0);
+            const title_width = if (win.width > 40) @as(usize, @intCast(win.width - 34)) else if (win.width > 6) @as(usize, @intCast(win.width - 6)) else 0;
+            try printFitted(ui, win, row, 4, title, style, title_width);
+            if (win.width > 48) {
+                const tag_col: u16 = @intCast(@min(@as(usize, 4) + title_width + 2, @as(usize, win.width - 1)));
+                const tag_line = try frameFmt(ui, "{s}  {s}", .{ provider_tag, source_tag });
+                try printFitted(ui, win, row, tag_col, tag_line, ui.styleMuted(), if (win.width > tag_col) @intCast(win.width - tag_col - 1) else 0);
+            }
             row += 1;
         }
     } else {
@@ -2030,17 +2931,16 @@ fn renderQueryHome(
     if (info_open) {
         const lines = [_][]const u8{
             "Enter search/open",
-            "Tab query/results",
-            "Up/Down history or result movement",
-            "p providers",
-            "c cache, t ttl",
-            "k history, Shift+K clear history",
-            "Ctrl+C query, Ctrl+D quit",
+            "Tab query/results/downloads",
+            "Up/Down move through history or results",
+            "PageUp/PageDown scroll faster",
+            "Esc settings",
+            "Ctrl+C cancel/back, Ctrl+D quit",
         };
         try renderOverlayMenu(ui, win, "Info", &lines);
     }
 
-    try ui.render();
+    if (flush) try ui.render();
 }
 
 fn renderBox(ui: *Ui, win: anytype, x: u16, y: u16, width: u16, height: u16, style: vaxis.Style) !void {
@@ -2085,7 +2985,7 @@ fn buildCombinedSearchLabelsWithSource(
     return out;
 }
 
-fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize) !OpenResult {
+fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, settings: TuiSettings, cache_root_path: []const u8) !OpenResult {
     if (hit_idx >= bundle.hits.items.len) return .back;
     const hit = bundle.hits.items[hit_idx];
     const selected_title = bundle.searches.items[hit.response_index].items[hit.item_index];
@@ -2096,6 +2996,7 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize) !OpenResult 
     var subtitle_pages: std.ArrayListUnmanaged(SubtitlesPageCacheEntry) = .empty;
     defer deinitSubtitlesPageCache(ui.allocator, &subtitle_pages);
     var subtitle_page_current: usize = 1;
+    var allow_auto_subtitle_select = true;
     const supports_subtitles_pagination = app.providerSupportsSubtitlesPagination(selected_provider);
 
     subtitle_page_loop: while (true) {
@@ -2150,7 +3051,7 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize) !OpenResult 
             };
         }
 
-        const subtitle_enabled = try buildSubtitleEnabled(ui.allocator, subtitles.items);
+        const subtitle_enabled = try buildSubtitleEnabled(ui.allocator, subtitles.items, settings);
         defer ui.allocator.free(subtitle_enabled);
         const page_nav = PageNav{
             .enabled = supports_subtitles_pagination,
@@ -2159,28 +3060,31 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize) !OpenResult 
             .has_next = subtitles.has_next_page,
         };
         const page_nav_opt: ?PageNav = if (page_nav.enabled) page_nav else null;
-        const subtitle_choice = try vaxisSelectSubtitle(
-            ui,
-            "Select Subtitle",
-            if (supports_subtitles_pagination) "s sort, / filter, [ prev, ] next, Esc titles." else "s sort, / filter, Esc titles.",
-            subtitles.items,
-            subtitle_enabled,
-            page_nav_opt,
-        );
-        const subtitle_idx = switch (subtitle_choice) {
-            .selected => |idx| idx,
-            .back => return .back,
-            .to_query => return .to_query,
-            .page_prev => {
-                if (subtitle_page_current > 1) subtitle_page_current -= 1;
-                continue :subtitle_page_loop;
-            },
-            .page_next => {
-                if (subtitles.has_next_page) subtitle_page_current += 1;
-                continue :subtitle_page_loop;
-            },
-            .quit => return .quit,
+        const subtitle_idx = (if (allow_auto_subtitle_select) singleEnabledIndex(subtitle_enabled) else null) orelse blk: {
+            const subtitle_choice = try vaxisSelectSubtitle(
+                ui,
+                "Select Subtitle",
+                if (supports_subtitles_pagination) "s sort, / filter, [ prev, ] next, Esc titles." else "s sort, / filter, Esc titles.",
+                subtitles.items,
+                subtitle_enabled,
+                page_nav_opt,
+            );
+            break :blk switch (subtitle_choice) {
+                .selected => |idx| idx,
+                .back => return .back,
+                .to_query => return .to_query,
+                .page_prev => {
+                    if (subtitle_page_current > 1) subtitle_page_current -= 1;
+                    continue :subtitle_page_loop;
+                },
+                .page_next => {
+                    if (subtitles.has_next_page) subtitle_page_current += 1;
+                    continue :subtitle_page_loop;
+                },
+                .quit => return .quit,
+            };
         };
+        allow_auto_subtitle_select = false;
 
         const selected_subtitle = subtitles.items[subtitle_idx];
         const download_url = selected_subtitle.download_url orelse "(no direct URL)";
@@ -2207,7 +3111,17 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize) !OpenResult 
         const download_context = try std.fmt.allocPrint(ui.allocator, "Download URL: {s}", .{download_url_display});
         defer ui.allocator.free(download_context);
         setContext(ui, download_context);
-        var download_task: DownloadTask = .{ .subtitle = selected_subtitle, .out_dir = "downloads" };
+        const download_out_dir = if (settings.download_cache_enabled)
+            try std.fmt.allocPrint(ui.allocator, "{s}/downloads", .{cache_root_path})
+        else
+            try ui.allocator.dupe(u8, "downloads");
+        defer ui.allocator.free(download_out_dir);
+
+        var download_task: DownloadTask = .{
+            .subtitle = selected_subtitle,
+            .out_dir = download_out_dir,
+            .extract_archive = true,
+        };
         const download_thread = try std.Thread.spawn(.{}, downloadTaskMain, .{&download_task});
         const download_control = try waitForDownloadTask(ui, &download_task, "Download", download_detail);
         finalizeWorkerThread(download_thread, download_control);
@@ -2229,16 +3143,25 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize) !OpenResult 
         }
         var result = download_task.result orelse return error.UnexpectedHttpStatus;
         defer result.deinit(std.heap.page_allocator);
-        const detail = if (result.extracted_files.len > 0)
-            try std.fmt.allocPrint(ui.allocator, "{s} (+{d} extracted)", .{ result.file_path, result.extracted_files.len })
-        else
-            try ui.allocator.dupe(u8, result.file_path);
-        defer ui.allocator.free(detail);
-        const msg = try vaxisMessage(ui, "Downloaded", detail, "Press any key to keep browsing.", ui.styleAccent());
-        switch (msg) {
-            .ok => continue :subtitle_page_loop,
-            .to_query => return .to_query,
-            .quit => return .quit,
+        if (settings.download_cache_enabled) {
+            const export_result = try exportCachedDownload(ui, result);
+            switch (export_result) {
+                .ok => continue :subtitle_page_loop,
+                .to_query => return .to_query,
+                .quit => return .quit,
+            }
+        } else {
+            const detail = if (result.extracted_files.len > 0)
+                try std.fmt.allocPrint(ui.allocator, "{s} (+{d} extracted)", .{ result.file_path, result.extracted_files.len })
+            else
+                try ui.allocator.dupe(u8, result.file_path);
+            defer ui.allocator.free(detail);
+            const msg = try vaxisMessage(ui, "Downloaded", detail, "Press any key to keep browsing.", ui.styleAccent());
+            switch (msg) {
+                .ok => continue :subtitle_page_loop,
+                .to_query => return .to_query,
+                .quit => return .quit,
+            }
         }
     }
 }
@@ -2246,7 +3169,7 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize) !OpenResult 
 fn runCombinedSearch(ui: *Ui, provider_enabled: []const bool) !SelectResult {
     query_loop: while (true) {
         ui.active_provider = null;
-        setContext(ui, "Combined search | selected providers");
+        setContext(ui, "Combined search • selected providers");
         const input = try vaxisInput(ui, "Combined Search", "Searches every selected provider. Esc returns to providers.", "Query", 180);
         const query = switch (input) {
             .submit => |q| q,
@@ -2271,7 +3194,7 @@ fn runCombinedSearch(ui: *Ui, provider_enabled: []const bool) !SelectResult {
 
             const detail = try std.fmt.allocPrint(ui.allocator, "provider={s} query={s}", .{ app.providerName(provider), query });
             defer ui.allocator.free(detail);
-            const context = try std.fmt.allocPrint(ui.allocator, "Combined search | provider: {s}", .{app.providerName(provider)});
+            const context = try std.fmt.allocPrint(ui.allocator, "Combined search • provider: {s}", .{app.providerName(provider)});
             defer ui.allocator.free(context);
             setContext(ui, context);
 
@@ -2324,7 +3247,7 @@ fn runCombinedSearch(ui: *Ui, provider_enabled: []const bool) !SelectResult {
         defer freeOwnedStrings(ui.allocator, title_labels);
 
         title_loop: while (true) {
-            setContext(ui, "Combined search results | first page per provider");
+            setContext(ui, "Combined search results • first page per provider");
             const title_choice = try vaxisSelect(
                 ui,
                 "Combined Search Results",
@@ -2351,7 +3274,7 @@ fn runCombinedSearch(ui: *Ui, provider_enabled: []const bool) !SelectResult {
             const title_ref_url = app.searchRefUrl(selected_title.ref);
             const detail = try std.fmt.allocPrint(ui.allocator, "{s}", .{selected_title.label});
             defer ui.allocator.free(detail);
-            const context = try std.fmt.allocPrint(ui.allocator, "Provider: {s} | Title URL: {s}", .{ app.providerName(selected_provider), title_ref_url });
+            const context = try std.fmt.allocPrint(ui.allocator, "Provider: {s} • Title URL: {s}", .{ app.providerName(selected_provider), title_ref_url });
             defer ui.allocator.free(context);
             setContext(ui, context);
 
@@ -2397,27 +3320,31 @@ fn runCombinedSearch(ui: *Ui, provider_enabled: []const bool) !SelectResult {
                 }
             }
 
-            const subtitle_enabled = try buildSubtitleEnabled(ui.allocator, subtitles.items);
+            const subtitle_enabled = try buildSubtitleEnabled(ui.allocator, subtitles.items, defaultTuiSettings());
             defer ui.allocator.free(subtitle_enabled);
 
+            var allow_auto_subtitle_select = true;
             subtitle_loop: while (true) {
                 setContext(ui, context);
-                const subtitle_choice = try vaxisSelectSubtitle(
-                    ui,
-                    "Combined Search: Select Subtitle",
-                    "s sort, / filter, Esc titles.",
-                    subtitles.items,
-                    subtitle_enabled,
-                    null,
-                );
+                const subtitle_idx = (if (allow_auto_subtitle_select) singleEnabledIndex(subtitle_enabled) else null) orelse blk: {
+                    const subtitle_choice = try vaxisSelectSubtitle(
+                        ui,
+                        "Combined Search: Select Subtitle",
+                        "s sort, / filter, Esc titles.",
+                        subtitles.items,
+                        subtitle_enabled,
+                        null,
+                    );
 
-                const subtitle_idx = switch (subtitle_choice) {
-                    .selected => |idx| idx,
-                    .back => continue :title_loop,
-                    .to_query => continue :query_loop,
-                    .page_prev, .page_next => continue :subtitle_loop,
-                    .quit => return .quit,
+                    break :blk switch (subtitle_choice) {
+                        .selected => |idx| idx,
+                        .back => continue :title_loop,
+                        .to_query => continue :query_loop,
+                        .page_prev, .page_next => continue :subtitle_loop,
+                        .quit => return .quit,
+                    };
                 };
+                allow_auto_subtitle_select = false;
 
                 const selected_subtitle = subtitles.items[subtitle_idx];
                 const download_url = selected_subtitle.download_url orelse "(no direct URL)";
@@ -2558,12 +3485,231 @@ fn borrowSubdlSeasonLabels(allocator: std.mem.Allocator, items: []const app.Subd
     return out;
 }
 
-fn buildSubtitleEnabled(allocator: std.mem.Allocator, items: []const app.SubtitleChoice) ![]bool {
+fn buildSubtitleEnabled(allocator: std.mem.Allocator, items: []const app.SubtitleChoice, settings: TuiSettings) ![]bool {
     const out = try allocator.alloc(bool, items.len);
     for (items, 0..) |item, idx| {
-        out[idx] = item.download_url != null;
+        out[idx] = item.download_url != null and subtitleLanguageAllowed(item, settings);
     }
     return out;
+}
+
+fn singleEnabledIndex(flags: []const bool) ?usize {
+    var found: ?usize = null;
+    for (flags, 0..) |enabled, idx| {
+        if (!enabled) continue;
+        if (found != null) return null;
+        found = idx;
+    }
+    return found;
+}
+
+fn exportCachedDownload(ui: *Ui, result: app.DownloadResult) !MessageResult {
+    const files = if (result.extracted_files.len > 0) result.extracted_files else blk: {
+        const one = try ui.frameAllocator().alloc([]const u8, 1);
+        one[0] = result.file_path;
+        break :blk one;
+    };
+
+    const labels = try ui.allocator.alloc([]const u8, files.len);
+    defer ui.allocator.free(labels);
+    for (files, 0..) |path, idx| labels[idx] = pathBaseName(path);
+
+    while (true) {
+        const choice = try vaxisSelect(
+            ui,
+            "Cached Download",
+            "Enter exports selected subtitle file. Esc keeps it cached.",
+            labels,
+            null,
+            null,
+            null,
+            null,
+        );
+        const idx = switch (choice) {
+            .selected => |i| i,
+            .back, .page_prev, .page_next => return .ok,
+            .to_query => return .to_query,
+            .quit => return .quit,
+        };
+        const exported = try exportCachedFile(ui.allocator, files[idx], "downloads");
+        defer ui.allocator.free(exported);
+        const msg = try vaxisMessage(ui, "Exported", exported, "Press any key to continue.", ui.styleAccent());
+        switch (msg) {
+            .ok => return .ok,
+            .to_query => return .to_query,
+            .quit => return .quit,
+        }
+    }
+}
+
+fn exportCachedFile(allocator: std.mem.Allocator, source_path: []const u8, out_dir: []const u8) ![]u8 {
+    const data = try std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), source_path, allocator, .limited(128 * 1024 * 1024));
+    defer allocator.free(data);
+    try std.Io.Dir.cwd().createDirPath(runtime_io.get(), out_dir);
+    const safe = try sanitizeExportFilename(allocator, pathBaseName(source_path));
+    defer allocator.free(safe);
+    const out_path = try nextAvailableExportPath(allocator, out_dir, safe);
+    errdefer allocator.free(out_path);
+    try std.Io.Dir.cwd().writeFile(runtime_io.get(), .{ .sub_path = out_path, .data = data });
+    return out_path;
+}
+
+fn cachedDownloadCount(cache_root_path: []const u8) usize {
+    var dir_path_buf: [4096]u8 = undefined;
+    const dir_path = std.fmt.bufPrint(&dir_path_buf, "{s}/downloads", .{cache_root_path}) catch return 0;
+    return cachedDownloadCountRecursive(dir_path);
+}
+
+fn cachedDownloadLabels(allocator: std.mem.Allocator, cache_root_path: []const u8) ![][]const u8 {
+    const dir_path = try std.fmt.allocPrint(allocator, "{s}/downloads", .{cache_root_path});
+    defer allocator.free(dir_path);
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (out.items) |label| allocator.free(label);
+        out.deinit(allocator);
+    }
+    try cachedDownloadLabelsRecursive(allocator, dir_path, "", &out);
+    return try out.toOwnedSlice(allocator);
+}
+
+fn cachedDownloadCountRecursive(dir_path: []const u8) usize {
+    var dir = std.Io.Dir.cwd().openDir(runtime_io.get(), dir_path, .{ .iterate = true }) catch return 0;
+    defer dir.close(runtime_io.get());
+    var it = dir.iterate();
+    var count: usize = 0;
+    while (it.next(runtime_io.get()) catch null) |entry| {
+        switch (entry.kind) {
+            .file => count += 1,
+            .directory => {
+                var child_buf: [4096]u8 = undefined;
+                const child = std.fmt.bufPrint(&child_buf, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+                count += cachedDownloadCountRecursive(child);
+            },
+            else => {},
+        }
+    }
+    return count;
+}
+
+fn cachedDownloadLabelsRecursive(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    rel_prefix: []const u8,
+    out: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var dir = std.Io.Dir.cwd().openDir(runtime_io.get(), dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return,
+    };
+    defer dir.close(runtime_io.get());
+
+    var it = dir.iterate();
+    while (try it.next(runtime_io.get())) |entry| {
+        const rel = if (rel_prefix.len == 0)
+            try allocator.dupe(u8, entry.name)
+        else
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel_prefix, entry.name });
+        errdefer allocator.free(rel);
+        switch (entry.kind) {
+            .file => try out.append(allocator, rel),
+            .directory => {
+                const child = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+                defer allocator.free(child);
+                try cachedDownloadLabelsRecursive(allocator, child, rel, out);
+                allocator.free(rel);
+            },
+            else => allocator.free(rel),
+        }
+    }
+}
+
+fn exportCachedDownloadByIndex(allocator: std.mem.Allocator, cache_root_path: []const u8, wanted_idx: usize, out_dir: []const u8) ![]u8 {
+    const dir_path = try std.fmt.allocPrint(allocator, "{s}/downloads", .{cache_root_path});
+    defer allocator.free(dir_path);
+    var idx: usize = 0;
+    return exportCachedDownloadByIndexRecursive(allocator, dir_path, wanted_idx, &idx, out_dir);
+}
+
+fn exportCachedDownloadByIndexRecursive(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    wanted_idx: usize,
+    idx: *usize,
+    out_dir: []const u8,
+) anyerror![]u8 {
+    var dir = try std.Io.Dir.cwd().openDir(runtime_io.get(), dir_path, .{ .iterate = true });
+    defer dir.close(runtime_io.get());
+    var it = dir.iterate();
+    while (try it.next(runtime_io.get())) |entry| {
+        switch (entry.kind) {
+            .file => {
+                if (idx.* == wanted_idx) {
+                    const source = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+                    defer allocator.free(source);
+                    return exportCachedFile(allocator, source, out_dir);
+                }
+                idx.* += 1;
+            },
+            .directory => {
+                const child = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+                defer allocator.free(child);
+                const found = exportCachedDownloadByIndexRecursive(allocator, child, wanted_idx, idx, out_dir) catch |err| switch (err) {
+                    error.FileNotFound => null,
+                    else => return err,
+                };
+                if (found) |path| return path;
+            },
+            else => {},
+        }
+    }
+    return error.FileNotFound;
+}
+
+fn pathBaseName(path: []const u8) []const u8 {
+    const slash = std.mem.lastIndexOfAny(u8, path, "/\\") orelse return path;
+    return path[slash + 1 ..];
+}
+
+fn sanitizeExportFilename(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (input) |ch| {
+        const safe = switch (ch) {
+            '/', '\\', ':', '*', '?', '"', '<', '>', '|' => '_',
+            0...31 => '_',
+            else => ch,
+        };
+        try out.append(allocator, safe);
+    }
+    if (out.items.len == 0) try out.appendSlice(allocator, "subtitle.srt");
+    return try out.toOwnedSlice(allocator);
+}
+
+fn nextAvailableExportPath(allocator: std.mem.Allocator, out_dir: []const u8, filename: []const u8) ![]u8 {
+    var candidate = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ out_dir, filename });
+    var suffix: usize = 2;
+    while (true) : (suffix += 1) {
+        std.Io.Dir.cwd().access(runtime_io.get(), candidate, .{}) catch |err| switch (err) {
+            error.FileNotFound => return candidate,
+            else => return err,
+        };
+        allocator.free(candidate);
+        candidate = try std.fmt.allocPrint(allocator, "{s}/{d}-{s}", .{ out_dir, suffix, filename });
+    }
+}
+
+fn subtitleLanguageAllowed(item: app.SubtitleChoice, settings: TuiSettings) bool {
+    if (!settings.language_filter_enabled) return true;
+    const raw = item.language orelse return true;
+    const normalized = scrapers.common.normalizeLanguageCode(raw) orelse return true;
+    for (language_options, 0..) |option, idx| {
+        if (std.mem.eql(u8, option.code, normalized)) return settings.languages_enabled[idx];
+    }
+    const short = languageCode2(normalized);
+    for (language_options, 0..) |option, idx| {
+        if (std.mem.eql(u8, option.code, short)) return settings.languages_enabled[idx];
+    }
+    return true;
 }
 
 fn showFriendlyError(ui: *Ui, context: []const u8, err: anyerror) !MessageResult {
@@ -2580,6 +3726,7 @@ fn friendlyErrorMessage(err: anyerror) []const u8 {
         error.MissingField, error.InvalidField, error.InvalidFieldType => "Provider response format was not as expected.",
         error.CloudflareChallenge, error.CloudflareSessionUnavailable, error.SessionExpired => "Cloudflare session is missing or expired for this provider.",
         error.BrowserAutomationFailed => "Browser automation failed while acquiring session cookies.",
+        error.ArchiveExtractionUnavailable => "Archive extraction is not available for this archive format in this build.",
         error.ArchiveExtractionFailed => "Downloaded archive could not be extracted on this machine.",
         else => "An unexpected error occurred at this step.",
     };
@@ -2644,7 +3791,7 @@ fn vaxisInput(
             win.showCursor(@min(desired_col, max_col), 3);
         }
 
-        try renderBottomBar(ui, win, .{ .left = "Enter search | Esc back" });
+        try renderBottomBar(ui, win, .{ .left = "Enter search • Esc back" });
 
         if (error_text) |txt| {
             const err_segments = [_]vaxis.Segment{.{ .text = txt, .style = ui.styleError() }};
@@ -2653,54 +3800,56 @@ fn vaxisInput(
 
         try ui.render();
 
-        const event = try ui.loop.nextEvent();
-        switch (event) {
-            .winsize => |ws| try ui.resize(ws),
-            .key_press => |key| {
-                switch (handleGlobalKey(ui, key, true)) {
-                    .none => {},
-                    .consumed => continue,
-                    .to_query => {},
-                    .quit => return .quit,
-                }
+        const batch = try readEventBatch(ui, try ui.loop.nextEvent());
+        for (batch.slice()) |event| {
+            switch (event) {
+                .winsize => |ws| try ui.resize(ws),
+                .key_press => |key| {
+                    switch (handleGlobalKey(ui, key, true)) {
+                        .none => {},
+                        .consumed => continue,
+                        .to_query => {},
+                        .quit => return .quit,
+                    }
 
-                if (key.matches(vaxis.Key.escape, .{})) {
-                    return .back;
-                }
+                    if (key.matches(vaxis.Key.escape, .{})) {
+                        return .back;
+                    }
 
-                if (key.matches(vaxis.Key.enter, .{})) {
-                    if (query.items.len == 0) {
-                        error_text = "Query cannot be empty.";
-                    } else {
-                        return .{ .submit = try query.toOwnedSlice(ui.allocator) };
-                    }
-                } else if (key.matches(vaxis.Key.left, .{})) {
-                    cursor_pos = prevCodepointStart(query.items, cursor_pos);
-                } else if (key.matches(vaxis.Key.right, .{})) {
-                    cursor_pos = nextCodepointEnd(query.items, cursor_pos);
-                } else if (key.matches(vaxis.Key.backspace, .{})) {
-                    if (cursor_pos > 0) {
-                        const prev = prevCodepointStart(query.items, cursor_pos);
-                        query.replaceRangeAssumeCapacity(prev, cursor_pos - prev, "");
-                        cursor_pos = prev;
-                    }
-                    error_text = null;
-                } else if (key.matches(vaxis.Key.delete, .{})) {
-                    if (cursor_pos < query.items.len) {
-                        const next = nextCodepointEnd(query.items, cursor_pos);
-                        query.replaceRangeAssumeCapacity(cursor_pos, next - cursor_pos, "");
-                    }
-                    error_text = null;
-                } else if (isTextKey(key)) {
-                    const text = key.text orelse continue;
-                    if (query.items.len + text.len <= max_len) {
-                        try query.insertSlice(ui.allocator, cursor_pos, text);
-                        cursor_pos += text.len;
+                    if (key.matches(vaxis.Key.enter, .{})) {
+                        if (query.items.len == 0) {
+                            error_text = "Query cannot be empty.";
+                        } else {
+                            return .{ .submit = try query.toOwnedSlice(ui.allocator) };
+                        }
+                    } else if (key.matches(vaxis.Key.left, .{})) {
+                        cursor_pos = prevCodepointStart(query.items, cursor_pos);
+                    } else if (key.matches(vaxis.Key.right, .{})) {
+                        cursor_pos = nextCodepointEnd(query.items, cursor_pos);
+                    } else if (key.matches(vaxis.Key.backspace, .{})) {
+                        if (cursor_pos > 0) {
+                            const prev = prevCodepointStart(query.items, cursor_pos);
+                            query.replaceRangeAssumeCapacity(prev, cursor_pos - prev, "");
+                            cursor_pos = prev;
+                        }
                         error_text = null;
+                    } else if (key.matches(vaxis.Key.delete, .{})) {
+                        if (cursor_pos < query.items.len) {
+                            const next = nextCodepointEnd(query.items, cursor_pos);
+                            query.replaceRangeAssumeCapacity(cursor_pos, next - cursor_pos, "");
+                        }
+                        error_text = null;
+                    } else if (isTextKey(key)) {
+                        const text = key.text orelse continue;
+                        if (query.items.len + text.len <= max_len) {
+                            try query.insertSlice(ui.allocator, cursor_pos, text);
+                            cursor_pos += text.len;
+                            error_text = null;
+                        }
                     }
-                }
-            },
-            else => {},
+                },
+                else => {},
+            }
         }
     }
 }
@@ -2790,8 +3939,10 @@ fn vaxisSelect(
             const text_width = list_width -| prefix_width;
             const option_col: u16 = @intCast(1 + prefix_width);
 
-            const prefix = try frameFmt(ui, "{s}{s}", .{ cursor_prefix, toggle_prefix });
-            try printFitted(ui, win, row, 1, prefix, style, prefix_width);
+            try printFitted(ui, win, row, 1, cursor_prefix, style, cursor_prefix.len);
+            if (toggle_prefix.len > 0) {
+                try printFitted(ui, win, row, 1 + @as(u16, @intCast(cursor_prefix.len)), toggle_prefix, style, toggle_prefix.len);
+            }
             try printFitted(ui, win, row, option_col, options[option_idx], style, text_width);
 
             row += 1;
@@ -2834,7 +3985,7 @@ fn vaxisSelect(
         var compact_buf: [768]u8 = undefined;
         const compact_line = std.fmt.bufPrint(
             &compact_buf,
-            "{s} | {s}:{s} | {s}",
+            "{s} • {s}:{s} • {s}",
             .{ help_line, mode_text, filter_display, count_line },
         ) catch "j/k Enter / Esc";
         try renderCompactBottomLine(ui, win, compact_line);
@@ -2863,126 +4014,149 @@ fn vaxisSelect(
 
         try ui.render();
 
-        const event = try ui.loop.nextEvent();
-        switch (event) {
-            .winsize => |ws| try ui.resize(ws),
-            .key_press => |key| {
-                switch (handleGlobalKey(ui, key, false)) {
-                    .none => {},
-                    .consumed => continue,
-                    .to_query => return .to_query,
-                    .quit => return .quit,
-                }
-                if (key.matches('m', .{}) or key.matches('?', .{})) {
-                    info_menu_open = !info_menu_open;
-                    continue;
-                }
-                if (info_menu_open and key.matches(vaxis.Key.escape, .{})) {
-                    info_menu_open = false;
-                    continue;
-                }
+        const batch = try readEventBatch(ui, try ui.loop.nextEvent());
+        for (batch.slice()) |event| {
+            switch (event) {
+                .winsize => |ws| try ui.resize(ws),
+                .key_press => |key| {
+                    switch (handleGlobalKey(ui, key, false)) {
+                        .none => {},
+                        .consumed => continue,
+                        .to_query => return .to_query,
+                        .quit => return .quit,
+                    }
+                    if (key.matches('m', .{}) or key.matches('?', .{})) {
+                        info_menu_open = !info_menu_open;
+                        continue;
+                    }
+                    if (info_menu_open and key.matches(vaxis.Key.escape, .{})) {
+                        info_menu_open = false;
+                        continue;
+                    }
 
-                if (filter_mode) {
-                    if (key.matches(vaxis.Key.escape, .{}) or key.matches(vaxis.Key.enter, .{})) {
-                        filter_mode = false;
+                    if (filter_mode) {
+                        if (key.matches(vaxis.Key.escape, .{}) or key.matches(vaxis.Key.enter, .{})) {
+                            filter_mode = false;
+                            continue;
+                        }
+                        if (key.matches(vaxis.Key.backspace, .{})) {
+                            _ = filter.pop();
+                            try rebuildOptionMatches(ui.allocator, options, filter.items, &matches);
+                            selected_row = 0;
+                            scroll = 0;
+                            continue;
+                        }
+                        if (key.matches('u', .{ .ctrl = true })) {
+                            filter.clearRetainingCapacity();
+                            try rebuildOptionMatches(ui.allocator, options, filter.items, &matches);
+                            selected_row = 0;
+                            scroll = 0;
+                            continue;
+                        }
+                        if (isTextKey(key)) {
+                            const text = key.text orelse continue;
+                            try filter.appendSlice(ui.allocator, text);
+                            try rebuildOptionMatches(ui.allocator, options, filter.items, &matches);
+                            selected_row = 0;
+                            scroll = 0;
+                        }
                         continue;
                     }
-                    if (key.matches(vaxis.Key.backspace, .{})) {
-                        _ = filter.pop();
-                        try rebuildOptionMatches(ui.allocator, options, filter.items, &matches);
-                        selected_row = 0;
-                        scroll = 0;
-                        continue;
-                    }
-                    if (key.matches('u', .{ .ctrl = true })) {
-                        filter.clearRetainingCapacity();
-                        try rebuildOptionMatches(ui.allocator, options, filter.items, &matches);
-                        selected_row = 0;
-                        scroll = 0;
-                        continue;
-                    }
-                    if (isTextKey(key)) {
-                        const text = key.text orelse continue;
-                        try filter.appendSlice(ui.allocator, text);
-                        try rebuildOptionMatches(ui.allocator, options, filter.items, &matches);
-                        selected_row = 0;
-                        scroll = 0;
-                    }
-                    continue;
-                }
 
-                if (key.matches(vaxis.Key.escape, .{})) return .back;
-                if (can_page and key.matches('[', .{})) return .page_prev;
-                if (can_page and key.matches(']', .{})) return .page_next;
-                if (key.matches('/', .{})) {
-                    filter_mode = true;
-                    continue;
-                }
-                if (key.matches(vaxis.Key.enter, .{})) {
-                    if (matches.items.len > 0) {
-                        const option_idx = matches.items[selected_row];
-                        if (provider_toggles) |flags| {
-                            _ = flags;
-                            return .{ .selected = option_idx };
-                        } else if (isOptionEnabled(enabled, option_idx)) {
-                            return .{ .selected = option_idx };
+                    if (key.matches(vaxis.Key.escape, .{})) return .back;
+                    if (can_page and key.matches('[', .{})) return .page_prev;
+                    if (can_page and key.matches(']', .{})) return .page_next;
+                    if (key.matches('/', .{})) {
+                        filter_mode = true;
+                        continue;
+                    }
+                    if (key.matches(vaxis.Key.enter, .{})) {
+                        if (matches.items.len > 0) {
+                            const option_idx = matches.items[selected_row];
+                            if (provider_toggles) |flags| {
+                                _ = flags;
+                                return .{ .selected = option_idx };
+                            } else if (isOptionEnabled(enabled, option_idx)) {
+                                return .{ .selected = option_idx };
+                            }
+                        }
+                        continue;
+                    }
+                    if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
+                        if (selected_row + 1 < matches.items.len) selected_row += 1;
+                        if (provider_toggles == null) {
+                            moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
+                        }
+                        continue;
+                    }
+                    if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
+                        if (selected_row > 0) selected_row -= 1;
+                        if (provider_toggles == null) {
+                            moveSelectionToEnabled(matches.items, enabled, &selected_row, .backward);
+                        }
+                        continue;
+                    }
+                    if (provider_toggles) |flags| {
+                        if (key.matches(vaxis.Key.space, .{})) {
+                            if (matches.items.len == 0) continue;
+                            const option_idx = matches.items[selected_row];
+                            flags[option_idx] = !flags[option_idx];
+                            continue;
                         }
                     }
-                    continue;
-                }
-                if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
-                    if (selected_row + 1 < matches.items.len) selected_row += 1;
-                    if (provider_toggles == null) {
-                        moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
-                    }
-                    continue;
-                }
-                if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
-                    if (selected_row > 0) selected_row -= 1;
-                    if (provider_toggles == null) {
-                        moveSelectionToEnabled(matches.items, enabled, &selected_row, .backward);
-                    }
-                    continue;
-                }
-                if (provider_toggles) |flags| {
-                    if (key.matches(vaxis.Key.space, .{})) {
-                        if (matches.items.len == 0) continue;
-                        const option_idx = matches.items[selected_row];
-                        flags[option_idx] = !flags[option_idx];
+                    if (key.matches(vaxis.Key.page_down, .{}) or key.matches(vaxis.Key.space, .{})) {
+                        const win_now = ui.vx.window();
+                        const page_now: usize = if (win_now.height > 7) @intCast(win_now.height - 7) else 1;
+                        if (matches.items.len > 0) {
+                            selected_row = @min(matches.items.len - 1, selected_row + page_now);
+                            moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
+                        }
                         continue;
                     }
-                }
-                if (key.matches(vaxis.Key.page_down, .{}) or key.matches(vaxis.Key.space, .{})) {
-                    const win_now = ui.vx.window();
-                    const page_now: usize = if (win_now.height > 7) @intCast(win_now.height - 7) else 1;
-                    if (matches.items.len > 0) {
-                        selected_row = @min(matches.items.len - 1, selected_row + page_now);
-                        moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
+                    if (key.matches(vaxis.Key.page_up, .{}) or (provider_toggles == null and key.matches('b', .{}))) {
+                        const win_now = ui.vx.window();
+                        const page_now: usize = if (win_now.height > 7) @intCast(win_now.height - 7) else 1;
+                        selected_row = selected_row -| page_now;
+                        moveSelectionToEnabled(matches.items, enabled, &selected_row, .backward);
+                        continue;
                     }
-                    continue;
-                }
-                if (key.matches(vaxis.Key.page_up, .{}) or (provider_toggles == null and key.matches('b', .{}))) {
-                    const win_now = ui.vx.window();
-                    const page_now: usize = if (win_now.height > 7) @intCast(win_now.height - 7) else 1;
-                    selected_row = selected_row -| page_now;
-                    moveSelectionToEnabled(matches.items, enabled, &selected_row, .backward);
-                    continue;
-                }
-                if (key.matches('g', .{})) {
-                    selected_row = 0;
-                    moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
-                    continue;
-                }
-                if (key.matches('G', .{}) or key.matches('g', .{ .shift = true })) {
-                    if (matches.items.len > 0) selected_row = matches.items.len - 1;
-                    moveSelectionToEnabled(matches.items, enabled, &selected_row, .backward);
-                    continue;
-                }
-            },
-            .mouse => |mouse| {
-                if (handleMouseWheel(mouse, matches.items.len, &selected_row, provider_toggles == null, matches.items, enabled)) continue;
-            },
-            else => {},
+                    if (key.matches('g', .{})) {
+                        selected_row = 0;
+                        moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
+                        continue;
+                    }
+                    if (key.matches(vaxis.Key.end, .{})) {
+                        if (matches.items.len > 0) selected_row = matches.items.len - 1;
+                        moveSelectionToEnabled(matches.items, enabled, &selected_row, .backward);
+                        continue;
+                    }
+                },
+                .mouse => |mouse| {
+                    if (handleMouseWheel(mouse, matches.items.len, &selected_row, provider_toggles == null, matches.items, enabled)) continue;
+                    if (mouse.type == .press and mouse.button == .left) {
+                        if (mouseRowIndex(mouse, list_top, list_bottom, scroll, matches.items.len)) |row_idx| {
+                            const already_selected = row_idx == selected_row;
+                            selected_row = row_idx;
+                            if (provider_toggles == null) {
+                                moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
+                            }
+                            if (already_selected and selected_row < matches.items.len) {
+                                const option_idx = matches.items[selected_row];
+                                if (provider_toggles != null or isOptionEnabled(enabled, option_idx)) {
+                                    return .{ .selected = option_idx };
+                                }
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+        if (batch.wheel_delta != 0) {
+            applyWheelDelta(&selected_row, matches.items.len, batch.wheel_delta, list_mouse_wheel_step);
+            if (provider_toggles == null) {
+                moveSelectionToEnabled(matches.items, enabled, &selected_row, if (batch.wheel_delta > 0) .forward else .backward);
+            }
         }
     }
 }
@@ -3021,8 +4195,8 @@ fn vaxisSelectSubtitle(
         win.hideCursor();
 
         const show_pane = win.width >= 96;
-        const left_width: u16 = if (show_pane) @max(@as(u16, 36), (win.width * 58) / 100) else win.width;
-        const pane_col: u16 = left_width + 2;
+        const left_width: u16 = if (show_pane) @max(@as(u16, 36), (win.width * 56) / 100) else win.width;
+        const pane_col: u16 = left_width + 3;
         const pane_width: usize = if (show_pane and win.width > pane_col + 1) @intCast(win.width - pane_col - 1) else 0;
 
         try renderCompactTopLine(ui, win, title, ui.styleTitle());
@@ -3040,7 +4214,7 @@ fn vaxisSelectSubtitle(
         ensureVisible(selected_row, &scroll, page_size);
 
         const list_width: usize = if (left_width > 2) @intCast(left_width - 2) else 0;
-        const text_width = list_width -| 2;
+        const text_width = list_width -| 10;
 
         var row = list_top;
         var i = scroll;
@@ -3053,10 +4227,12 @@ fn vaxisSelectSubtitle(
                 ui.styleSelected()
             else
                 vaxis.Style{};
-            const prefix = if (active) "> " else "  ";
+            const prefix = if (active) "› " else "  ";
+            const lang = subtitleLanguageCodeForDisplay(subtitles[sub_idx]);
 
             try printFitted(ui, win, row, 1, prefix, style, 2);
-            try printFitted(ui, win, row, 3, subtitles[sub_idx].label, style, text_width);
+            try printFitted(ui, win, row, 3, lang, ui.styleMuted(), 5);
+            try printFitted(ui, win, row, 9, subtitleFilenameForDisplay(subtitles[sub_idx]), style, text_width);
             row += 1;
         }
 
@@ -3066,12 +4242,6 @@ fn vaxisSelectSubtitle(
         }
 
         if (show_pane) {
-            var sep_row: u16 = 1;
-            while (sep_row < win.height) : (sep_row += 1) {
-                const sep_segments = [_]vaxis.Segment{.{ .text = "|", .style = ui.styleMuted() }};
-                _ = win.print(&sep_segments, .{ .row_offset = sep_row, .col_offset = left_width + 1, .wrap = .none });
-            }
-
             const pane_header = [_]vaxis.Segment{.{ .text = "Details", .style = ui.stylePaneTitle() }};
             _ = win.print(&pane_header, .{ .row_offset = 1, .col_offset = pane_col, .wrap = .none });
 
@@ -3111,7 +4281,7 @@ fn vaxisSelectSubtitle(
         var compact_buf: [768]u8 = undefined;
         const compact_line = std.fmt.bufPrint(
             &compact_buf,
-            "{s} | {s} | {s}",
+            "{s}  •  {s}  •  {s}",
             .{ help_line, sort_line, count_line },
         ) catch "j/k Enter s / Esc";
         try renderCompactBottomLine(ui, win, compact_line);
@@ -3140,117 +4310,133 @@ fn vaxisSelectSubtitle(
 
         try ui.render();
 
-        const event = try ui.loop.nextEvent();
-        switch (event) {
-            .winsize => |ws| try ui.resize(ws),
-            .key_press => |key| {
-                switch (handleGlobalKey(ui, key, false)) {
-                    .none => {},
-                    .consumed => continue,
-                    .to_query => return .to_query,
-                    .quit => return .quit,
-                }
-                if (key.matches('m', .{}) or key.matches('?', .{})) {
-                    info_menu_open = !info_menu_open;
-                    continue;
-                }
-                if (info_menu_open and key.matches(vaxis.Key.escape, .{})) {
-                    info_menu_open = false;
-                    continue;
-                }
+        const batch = try readEventBatch(ui, try ui.loop.nextEvent());
+        for (batch.slice()) |event| {
+            switch (event) {
+                .winsize => |ws| try ui.resize(ws),
+                .key_press => |key| {
+                    switch (handleGlobalKey(ui, key, false)) {
+                        .none => {},
+                        .consumed => continue,
+                        .to_query => return .to_query,
+                        .quit => return .quit,
+                    }
+                    if (key.matches('m', .{}) or key.matches('?', .{})) {
+                        info_menu_open = !info_menu_open;
+                        continue;
+                    }
+                    if (info_menu_open and key.matches(vaxis.Key.escape, .{})) {
+                        info_menu_open = false;
+                        continue;
+                    }
 
-                if (filter_mode) {
-                    if (key.matches(vaxis.Key.escape, .{}) or key.matches(vaxis.Key.enter, .{})) {
-                        filter_mode = false;
+                    if (filter_mode) {
+                        if (key.matches(vaxis.Key.escape, .{}) or key.matches(vaxis.Key.enter, .{})) {
+                            filter_mode = false;
+                            continue;
+                        }
+                        if (key.matches(vaxis.Key.backspace, .{})) {
+                            _ = filter.pop();
+                            try rebuildSubtitleMatches(ui.allocator, subtitles, order, filter.items, &matches);
+                            selected_row = 0;
+                            scroll = 0;
+                            continue;
+                        }
+                        if (key.matches('u', .{ .ctrl = true })) {
+                            filter.clearRetainingCapacity();
+                            try rebuildSubtitleMatches(ui.allocator, subtitles, order, filter.items, &matches);
+                            selected_row = 0;
+                            scroll = 0;
+                            continue;
+                        }
+                        if (isTextKey(key)) {
+                            const text = key.text orelse continue;
+                            try filter.appendSlice(ui.allocator, text);
+                            try rebuildSubtitleMatches(ui.allocator, subtitles, order, filter.items, &matches);
+                            selected_row = 0;
+                            scroll = 0;
+                        }
                         continue;
                     }
-                    if (key.matches(vaxis.Key.backspace, .{})) {
-                        _ = filter.pop();
-                        try rebuildSubtitleMatches(ui.allocator, subtitles, order, filter.items, &matches);
-                        selected_row = 0;
-                        scroll = 0;
-                        continue;
-                    }
-                    if (key.matches('u', .{ .ctrl = true })) {
-                        filter.clearRetainingCapacity();
-                        try rebuildSubtitleMatches(ui.allocator, subtitles, order, filter.items, &matches);
-                        selected_row = 0;
-                        scroll = 0;
-                        continue;
-                    }
-                    if (isTextKey(key)) {
-                        const text = key.text orelse continue;
-                        try filter.appendSlice(ui.allocator, text);
-                        try rebuildSubtitleMatches(ui.allocator, subtitles, order, filter.items, &matches);
-                        selected_row = 0;
-                        scroll = 0;
-                    }
-                    continue;
-                }
 
-                if (key.matches(vaxis.Key.escape, .{})) return .back;
-                if (can_page and key.matches('[', .{})) return .page_prev;
-                if (can_page and key.matches(']', .{})) return .page_next;
-                if (key.matches('/', .{})) {
-                    filter_mode = true;
-                    continue;
-                }
-                if (key.matches('s', .{})) {
-                    sort_mode = nextSortMode(sort_mode);
-                    ui.allocator.free(order);
-                    order = try buildSubtitleOrder(ui.allocator, subtitles, sort_mode);
-                    try rebuildSubtitleMatches(ui.allocator, subtitles, order, filter.items, &matches);
-                    selected_row = 0;
-                    scroll = 0;
-                    continue;
-                }
-                if (key.matches(vaxis.Key.enter, .{})) {
-                    if (matches.items.len > 0 and enabled[matches.items[selected_row]]) {
-                        return .{ .selected = matches.items[selected_row] };
+                    if (key.matches(vaxis.Key.escape, .{})) return .back;
+                    if (can_page and key.matches('[', .{})) return .page_prev;
+                    if (can_page and key.matches(']', .{})) return .page_next;
+                    if (key.matches('/', .{})) {
+                        filter_mode = true;
+                        continue;
                     }
-                    continue;
-                }
-                if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
-                    if (selected_row + 1 < matches.items.len) selected_row += 1;
-                    moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
-                    continue;
-                }
-                if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
-                    if (selected_row > 0) selected_row -= 1;
-                    moveSelectionToEnabled(matches.items, enabled, &selected_row, .backward);
-                    continue;
-                }
-                if (key.matches(vaxis.Key.page_down, .{}) or key.matches(vaxis.Key.space, .{})) {
-                    const win_now = ui.vx.window();
-                    const page_now: usize = if (win_now.height > 7) @intCast(win_now.height - 7) else 1;
-                    if (matches.items.len > 0) {
-                        selected_row = @min(matches.items.len - 1, selected_row + page_now);
+                    if (key.matches('s', .{})) {
+                        sort_mode = nextSortMode(sort_mode);
+                        ui.allocator.free(order);
+                        order = try buildSubtitleOrder(ui.allocator, subtitles, sort_mode);
+                        try rebuildSubtitleMatches(ui.allocator, subtitles, order, filter.items, &matches);
+                        selected_row = 0;
+                        scroll = 0;
+                        continue;
+                    }
+                    if (key.matches(vaxis.Key.enter, .{})) {
+                        if (matches.items.len > 0 and enabled[matches.items[selected_row]]) {
+                            return .{ .selected = matches.items[selected_row] };
+                        }
+                        continue;
+                    }
+                    if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
+                        if (selected_row + 1 < matches.items.len) selected_row += 1;
                         moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
+                        continue;
                     }
-                    continue;
-                }
-                if (key.matches(vaxis.Key.page_up, .{}) or key.matches('b', .{})) {
-                    const win_now = ui.vx.window();
-                    const page_now: usize = if (win_now.height > 7) @intCast(win_now.height - 7) else 1;
-                    selected_row = selected_row -| page_now;
-                    moveSelectionToEnabled(matches.items, enabled, &selected_row, .backward);
-                    continue;
-                }
-                if (key.matches('g', .{})) {
-                    selected_row = 0;
-                    moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
-                    continue;
-                }
-                if (key.matches('G', .{}) or key.matches('g', .{ .shift = true })) {
-                    if (matches.items.len > 0) selected_row = matches.items.len - 1;
-                    moveSelectionToEnabled(matches.items, enabled, &selected_row, .backward);
-                    continue;
-                }
-            },
-            .mouse => |mouse| {
-                if (handleMouseWheel(mouse, matches.items.len, &selected_row, true, matches.items, enabled)) continue;
-            },
-            else => {},
+                    if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
+                        if (selected_row > 0) selected_row -= 1;
+                        moveSelectionToEnabled(matches.items, enabled, &selected_row, .backward);
+                        continue;
+                    }
+                    if (key.matches(vaxis.Key.page_down, .{}) or key.matches(vaxis.Key.space, .{})) {
+                        const win_now = ui.vx.window();
+                        const page_now: usize = if (win_now.height > 7) @intCast(win_now.height - 7) else 1;
+                        if (matches.items.len > 0) {
+                            selected_row = @min(matches.items.len - 1, selected_row + page_now);
+                            moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
+                        }
+                        continue;
+                    }
+                    if (key.matches(vaxis.Key.page_up, .{}) or key.matches('b', .{})) {
+                        const win_now = ui.vx.window();
+                        const page_now: usize = if (win_now.height > 7) @intCast(win_now.height - 7) else 1;
+                        selected_row = selected_row -| page_now;
+                        moveSelectionToEnabled(matches.items, enabled, &selected_row, .backward);
+                        continue;
+                    }
+                    if (key.matches('g', .{})) {
+                        selected_row = 0;
+                        moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
+                        continue;
+                    }
+                    if (key.matches(vaxis.Key.end, .{})) {
+                        if (matches.items.len > 0) selected_row = matches.items.len - 1;
+                        moveSelectionToEnabled(matches.items, enabled, &selected_row, .backward);
+                        continue;
+                    }
+                },
+                .mouse => |mouse| {
+                    if (handleMouseWheel(mouse, matches.items.len, &selected_row, true, matches.items, enabled)) continue;
+                    if (mouse.type == .press and mouse.button == .left) {
+                        if (mouseRowIndex(mouse, list_top, list_bottom, scroll, matches.items.len)) |row_idx| {
+                            const already_selected = row_idx == selected_row;
+                            selected_row = row_idx;
+                            moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
+                            if (already_selected and selected_row < matches.items.len and enabled[matches.items[selected_row]]) {
+                                return .{ .selected = matches.items[selected_row] };
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+        if (batch.wheel_delta != 0) {
+            applyWheelDelta(&selected_row, matches.items.len, batch.wheel_delta, list_mouse_wheel_step);
+            moveSelectionToEnabled(matches.items, enabled, &selected_row, if (batch.wheel_delta > 0) .forward else .backward);
         }
     }
 }
@@ -3270,24 +4456,26 @@ fn vaxisConfirm(ui: *Ui, title: []const u8, lines: []const []const u8) !ConfirmR
             row += 1;
         }
 
-        try renderBottomBar(ui, win, .{ .left = "Enter confirm | Esc back" });
+        try renderBottomBar(ui, win, .{ .left = "Enter confirm • Esc back" });
         try ui.render();
 
-        const event = try ui.loop.nextEvent();
-        switch (event) {
-            .winsize => |ws| try ui.resize(ws),
-            .key_press => |key| {
-                switch (handleGlobalKey(ui, key, false)) {
-                    .none => {},
-                    .consumed => continue,
-                    .to_query => return .to_query,
-                    .quit => return .quit,
-                }
+        const batch = try readEventBatch(ui, try ui.loop.nextEvent());
+        for (batch.slice()) |event| {
+            switch (event) {
+                .winsize => |ws| try ui.resize(ws),
+                .key_press => |key| {
+                    switch (handleGlobalKey(ui, key, false)) {
+                        .none => {},
+                        .consumed => continue,
+                        .to_query => return .to_query,
+                        .quit => return .quit,
+                    }
 
-                if (key.matches(vaxis.Key.enter, .{})) return .confirm;
-                if (key.matches(vaxis.Key.escape, .{})) return .back;
-            },
-            else => {},
+                    if (key.matches(vaxis.Key.enter, .{})) return .confirm;
+                    if (key.matches(vaxis.Key.escape, .{})) return .back;
+                },
+                else => {},
+            }
         }
     }
 }
@@ -3315,19 +4503,21 @@ fn vaxisMessage(
         try renderBottomBar(ui, win, .{ .left = "Press any key to continue" });
         try ui.render();
 
-        const event = try ui.loop.nextEvent();
-        switch (event) {
-            .winsize => |ws| try ui.resize(ws),
-            .key_press => |key| {
-                switch (handleGlobalKey(ui, key, false)) {
-                    .none => {},
-                    .consumed => continue,
-                    .to_query => return .to_query,
-                    .quit => return .quit,
-                }
-                return .ok;
-            },
-            else => {},
+        const batch = try readEventBatch(ui, try ui.loop.nextEvent());
+        for (batch.slice()) |event| {
+            switch (event) {
+                .winsize => |ws| try ui.resize(ws),
+                .key_press => |key| {
+                    switch (handleGlobalKey(ui, key, false)) {
+                        .none => {},
+                        .consumed => continue,
+                        .to_query => return .to_query,
+                        .quit => return .quit,
+                    }
+                    return .ok;
+                },
+                else => {},
+            }
         }
     }
 }
@@ -3470,10 +4660,12 @@ const KeyAction = enum {
 };
 
 fn handleGlobalKey(ui: *Ui, key: vaxis.Key, is_query_screen: bool) KeyAction {
+    if (key.isModifier()) return .consumed;
     if (key.matches('d', .{ .ctrl = true })) return .quit;
     if (key.matches('c', .{ .ctrl = true })) {
         return if (is_query_screen) .quit else .to_query;
     }
+    if (is_query_screen and key.matches(vaxis.Key.f2, .{})) return .none;
     if (key.matches(vaxis.Key.f2, .{})) {
         ui.toggleConfirm();
         return .consumed;
@@ -3542,6 +4734,91 @@ fn countEnabledFlags(flags: []const bool) usize {
     return count;
 }
 
+const list_mouse_wheel_step: usize = 3;
+const search_poll_interval_ms: u64 = 8;
+const max_events_per_frame: usize = 512;
+
+const EventBatch = struct {
+    items: [max_events_per_frame]Event = undefined,
+    len: usize = 0,
+    wheel_delta: i32 = 0,
+
+    fn append(self: *EventBatch, event: Event) void {
+        if (self.len >= self.items.len) return;
+        self.items[self.len] = event;
+        self.len += 1;
+    }
+
+    fn slice(self: *const EventBatch) []const Event {
+        return self.items[0..self.len];
+    }
+
+    fn collect(self: *EventBatch, event: Event) void {
+        if (eventWheelDelta(event)) |delta| {
+            self.wheel_delta += delta;
+        } else {
+            self.append(event);
+        }
+    }
+};
+
+fn readEventBatch(ui: *Ui, first: Event) !EventBatch {
+    var batch: EventBatch = .{};
+    batch.collect(first);
+
+    try ui.loop.queue.lock();
+    defer ui.loop.queue.unlock();
+    while (batch.len < max_events_per_frame) {
+        const event = ui.loop.queue.drain() orelse break;
+        batch.collect(event);
+    }
+    return batch;
+}
+
+fn eventWheelDelta(event: Event) ?i32 {
+    return switch (event) {
+        .mouse => |mouse| mouseWheelDelta(mouse),
+        else => null,
+    };
+}
+
+fn mouseWheelDelta(mouse: vaxis.Mouse) ?i32 {
+    if (mouse.type != .press) return null;
+    return switch (mouse.button) {
+        .wheel_down => 1,
+        .wheel_up => -1,
+        else => null,
+    };
+}
+
+fn applyWheelDelta(selected_row: *usize, item_count: usize, delta: i32, step: usize) void {
+    if (delta == 0 or item_count == 0) return;
+    const units: usize = @intCast(if (delta > 0) delta else -delta);
+    const rows = units * step;
+    if (delta > 0) {
+        scrollSelection(selected_row, item_count, .forward, rows);
+    } else {
+        scrollSelection(selected_row, item_count, .backward, rows);
+    }
+}
+
+fn mouseRowIndex(mouse: vaxis.Mouse, list_top: u16, list_bottom: u16, scroll: usize, total: usize) ?usize {
+    if (mouse.row < 0) return null;
+    const row: u16 = @intCast(mouse.row);
+    if (row < list_top or row >= list_bottom) return null;
+    const idx = scroll + @as(usize, @intCast(row - list_top));
+    if (idx >= total) return null;
+    return idx;
+}
+
+fn scrollSelection(selected_row: *usize, item_count: usize, direction: SearchDirection, step: usize) void {
+    if (item_count == 0) return;
+    switch (direction) {
+        .forward => selected_row.* = @min(item_count - 1, selected_row.* + step),
+        .backward => selected_row.* = selected_row.* -| step,
+    }
+}
+
 fn firstEnabledProvider(flags: []const bool) ?app.Provider {
     for (app.providers()) |provider| {
         if (flags[app.providerIndex(provider)]) return provider;
@@ -3559,18 +4836,14 @@ fn handleMouseWheel(
 ) bool {
     if (mouse.type != .press or item_count == 0) return false;
 
-    // Wheel events should be cheap: adjust the selected row only. Rendering
-    // happens once when the event loop iterates, avoiding page-sized jumps that
-    // make high-resolution scroll wheels feel laggy.
-    const step: usize = 3;
     switch (mouse.button) {
         .wheel_down => {
-            selected_row.* = @min(item_count - 1, selected_row.* + step);
+            scrollSelection(selected_row, item_count, .forward, list_mouse_wheel_step);
             if (skip_disabled) moveSelectionToEnabled(matches, enabled, selected_row, .forward);
             return true;
         },
         .wheel_up => {
-            selected_row.* = selected_row.* -| step;
+            scrollSelection(selected_row, item_count, .backward, list_mouse_wheel_step);
             if (skip_disabled) moveSelectionToEnabled(matches, enabled, selected_row, .backward);
             return true;
         },
@@ -3682,6 +4955,25 @@ fn printFitted(
 ) !void {
     if (max_width == 0) return;
 
+    if (isSimpleAsciiDisplay(text)) {
+        if (text.len <= max_width) {
+            const segs = [_]vaxis.Segment{.{ .text = text, .style = style }};
+            _ = win.print(&segs, .{ .row_offset = row, .col_offset = col, .wrap = .none });
+            return;
+        }
+        if (max_width <= 3) {
+            const segs = [_]vaxis.Segment{.{ .text = text[0..max_width], .style = style }};
+            _ = win.print(&segs, .{ .row_offset = row, .col_offset = col, .wrap = .none });
+            return;
+        }
+        const segs = [_]vaxis.Segment{
+            .{ .text = text[0 .. max_width - 3], .style = style },
+            .{ .text = "...", .style = style },
+        };
+        _ = win.print(&segs, .{ .row_offset = row, .col_offset = col, .wrap = .none });
+        return;
+    }
+
     var display_text = try ui.frameAllocator().dupe(u8, text);
 
     if (needsUtfSanitizeForDisplay(display_text)) {
@@ -3710,6 +5002,13 @@ fn printFitted(
         .{ .text = "...", .style = style },
     };
     _ = win.print(&segs, .{ .row_offset = row, .col_offset = col, .wrap = .none });
+}
+
+fn isSimpleAsciiDisplay(text: []const u8) bool {
+    for (text) |byte| {
+        if (byte < 0x20 or byte >= 0x7f) return false;
+    }
+    return true;
 }
 
 fn needsUtfSanitizeForDisplay(text: []const u8) bool {
@@ -3844,6 +5143,8 @@ test "query cache helpers trim and expire predictably" {
     try std.testing.expect(settings.cache_enabled);
     try std.testing.expect(settings.keyword_cache_enabled);
     try std.testing.expectEqual(@as(usize, app.providerCount()), countEnabledFlags(&settings.providers_enabled));
+    try std.testing.expectEqual(@as(usize, 1), countEnabledFlags(&settings.languages_enabled));
+    try std.testing.expect(settings.languages_enabled[0]);
     try std.testing.expectEqual(@as(i64, 12 * 60 * 60), settings.cache_ttl_seconds);
 
     const entry: QueryCacheEntry = .{
@@ -3861,9 +5162,10 @@ test "query cache helpers trim and expire predictably" {
     };
     try std.testing.expect(cacheFresh(entry, 100 + 60, 120));
     try std.testing.expect(!cacheFresh(entry, 100 + 121, 120));
-    try std.testing.expectEqual(@as(i64, 6 * 60 * 60), nextCacheTtlSeconds(60 * 60));
-    try std.testing.expectEqual(@as(i64, 12 * 60 * 60), nextCacheTtlSeconds(6 * 60 * 60));
-    try std.testing.expectEqual(@as(i64, 24 * 60 * 60), nextCacheTtlSeconds(12 * 60 * 60));
+    try std.testing.expect(cacheFresh(entry, 100 + 365 * 24 * 60 * 60, 0));
+    try std.testing.expectEqual(@as(?i64, 0), parseCacheTtlSeconds("inf"));
+    try std.testing.expectEqual(@as(?i64, 0), parseCacheTtlSeconds("0"));
+    try std.testing.expectEqual(@as(?i64, 5400), parseCacheTtlSeconds("1.5"));
 }
 
 test "keyword state serializes through oneserial" {
@@ -4015,12 +5317,16 @@ fn renderSubtitleDetails(
 ) !void {
     if (pane_width == 0) return;
 
-    var row: u16 = 2;
+    var row: u16 = 3;
     const max_row: u16 = if (win.height > 4) win.height - 4 else win.height;
     const is_translate = isSubtitlecatTranslateToken(subtitle.download_url);
 
-    try printFitted(ui, win, row, col, subtitle.label, ui.stylePaneTitle(), pane_width);
+    try printFitted(ui, win, row, col, subtitleFilenameForDisplay(subtitle), ui.stylePaneTitle(), pane_width);
     row += 2;
+
+    if (row >= max_row) return;
+    try printLabelValue(ui, win, row, col, pane_width, "Lang ", subtitleLanguageNameForDisplay(subtitle));
+    row += 1;
 
     if (row >= max_row) return;
     try printLabelValue(
@@ -4029,9 +5335,9 @@ fn renderSubtitleDetails(
         row,
         col,
         pane_width,
-        "Download: ",
+        "Mode ",
         if (subtitle.download_url == null)
-            "no direct url"
+            "unavailable"
         else if (is_translate)
             "translate"
         else
@@ -4040,15 +5346,11 @@ fn renderSubtitleDetails(
     row += 1;
 
     if (row >= max_row) return;
-    try printLabelValue(ui, win, row, col, pane_width, "Language: ", subtitle.language orelse "(unknown)");
+    try printLabelValue(ui, win, row, col, pane_width, "Code ", subtitleLanguageCodeForDisplay(subtitle));
     row += 1;
 
     if (row >= max_row) return;
-    try printLabelValue(ui, win, row, col, pane_width, "Filename: ", subtitleFilenameForDisplay(subtitle));
-    row += 1;
-
-    if (row >= max_row) return;
-    try printFitted(ui, win, row, col, "URL:", ui.styleAccent(), pane_width);
+    try printFitted(ui, win, row, col, "URL", ui.styleAccent(), pane_width);
     row += 1;
 
     if (row >= max_row) return;
@@ -4067,6 +5369,34 @@ fn renderSubtitleDetails(
         .{},
         pane_width,
     );
+}
+
+fn subtitleLanguageCodeForDisplay(subtitle: app.SubtitleChoice) []const u8 {
+    const raw = subtitle.language orelse return "--";
+    const normalized = scrapers.common.normalizeLanguageCode(raw) orelse raw;
+    for (language_options) |option| {
+        if (std.mem.eql(u8, option.code, normalized)) return option.code;
+    }
+    return languageCode2(normalized);
+}
+
+fn subtitleLanguageNameForDisplay(subtitle: app.SubtitleChoice) []const u8 {
+    const raw = subtitle.language orelse return "Unknown";
+    const normalized = scrapers.common.normalizeLanguageCode(raw) orelse raw;
+    for (language_options) |option| {
+        if (std.mem.eql(u8, option.code, normalized)) return option.name;
+    }
+    const short = languageCode2(normalized);
+    for (language_options) |option| {
+        if (std.mem.eql(u8, option.code, short)) return option.name;
+    }
+    return raw;
+}
+
+fn languageCode2(code: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, code, " \t\r\n");
+    if (trimmed.len >= 2) return trimmed[0..2];
+    return "--";
 }
 
 fn subtitleFilenameForDisplay(subtitle: app.SubtitleChoice) []const u8 {
