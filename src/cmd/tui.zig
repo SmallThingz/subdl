@@ -780,21 +780,7 @@ fn setContext(ui: *Ui, context_line: ?[]const u8) void {
 }
 
 fn providerHomeUrl(provider: app.Provider) []const u8 {
-    return switch (provider) {
-        .subdl_com => "https://subdl.com",
-        .opensubtitles_com => "https://www.opensubtitles.com",
-        .opensubtitles_org => "https://www.opensubtitles.org",
-        .moviesubtitles_org => "https://www.moviesubtitles.org",
-        .moviesubtitlesrt_com => "https://moviesubtitlesrt.com",
-        .podnapisi_net => "https://www.podnapisi.net",
-        .yifysubtitles_ch => "https://yifysubtitles.ch",
-        .subtitlecat_com => "https://www.subtitlecat.com",
-        .isubtitles_org => "https://isubtitles.org",
-        .my_subs_co => "https://my-subs.co",
-        .subsource_net => "https://subsource.net",
-        .sub_scene_com => "https://sub-scene.com",
-        .tvsubtitles_net => "https://www.tvsubtitles.net",
-    };
+    return app.providerSiteUrl(provider);
 }
 
 fn isSubdlSeriesRef(ref: app.SearchRef) bool {
@@ -2013,6 +1999,23 @@ fn cloneSearchRef(allocator: std.mem.Allocator, ref: app.SearchRef) !app.SearchR
             .page_url = try allocator.dupe(u8, item.page_url),
         } },
         .tvsubtitles_net => |item| .{ .tvsubtitles_net = .{ .title = try allocator.dupe(u8, item.title), .show_url = try allocator.dupe(u8, item.show_url) } },
+        .gestdown_info => |item| .{ .gestdown_info = .{
+            .title = try allocator.dupe(u8, item.title),
+            .id = try allocator.dupe(u8, item.id),
+            .seasons = try allocator.dupe(i64, item.seasons),
+        } },
+        .greeksubtitles_com => |item| .{ .greeksubtitles_com = .{
+            .title = try allocator.dupe(u8, item.title),
+            .language_code = try dupOptionalLocal(allocator, item.language_code),
+            .page_url = try allocator.dupe(u8, item.page_url),
+            .download_url = try allocator.dupe(u8, item.download_url),
+        } },
+        .subsunacs_net => |item| .{ .subsunacs_net = .{
+            .title = try allocator.dupe(u8, item.title),
+            .year = item.year,
+            .page_url = try allocator.dupe(u8, item.page_url),
+            .download_page_url = try allocator.dupe(u8, item.download_page_url),
+        } },
     };
 }
 

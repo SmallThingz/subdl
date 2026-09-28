@@ -16,6 +16,9 @@ pub const my_subs_co = @import("my-subs.co.zig");
 pub const subsource_net = @import("subsource.net.zig");
 pub const sub_scene_com = @import("sub-scene.com.zig");
 pub const tvsubtitles_net = @import("tvsubtitles.net.zig");
+pub const gestdown_info = @import("gestdown.info.zig");
+pub const greeksubtitles_com = @import("greek-subtitles.com.zig");
+pub const subsunacs_net = @import("subsunacs.net.zig");
 pub const opensubtitles_com_cf = @import("opensubtitles_com_cf.zig");
 
 pub const provider_union = @import("provider_union.zig");
@@ -52,6 +55,9 @@ test {
     _ = @import("subsource.net.zig");
     _ = @import("sub-scene.com.zig");
     _ = @import("tvsubtitles.net.zig");
+    _ = @import("gestdown.info.zig");
+    _ = @import("greek-subtitles.com.zig");
+    _ = @import("subsunacs.net.zig");
     _ = @import("opensubtitles_com_cf.zig");
     _ = @import("provider_union.zig");
     _ = @import("test_suite.zig");

@@ -109,12 +109,17 @@ Supported canonical provider IDs:
 - `my_subs_co`
 - `subsource_net`
 - `sub_scene_com`
+- `gestdown_info`
+- `greek_subtitles_com`
+- `subsunacs_net`
 
 The repository also retains inactive implementations for
 `opensubtitles_org`, `moviesubtitles_org`, `moviesubtitlesrt_com`,
 `podnapisi_net`, and `tvsubtitles_net`. Targeted live tests still cover
 those modules, but the CLI/TUI registry does not expose them while their
 current upstream/network path cannot complete a search.
+
+`gestdown_info` is TV-only. `yifysubtitles_ch` is movie-only.
 
 The parser also accepts dotted or hyphenated site forms such as `subsource.net`.
 
