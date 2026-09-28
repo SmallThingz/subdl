@@ -51,14 +51,12 @@ pub const Provider = enum {
 const provider_values = [_]Provider{
     .subdl_com,
     .opensubtitles_com,
-    .opensubtitles_org,
-    .moviesubtitles_org,
+    .yifysubtitles_ch,
     .subtitlecat_com,
     .isubtitles_org,
     .my_subs_co,
     .subsource_net,
     .sub_scene_com,
-    .tvsubtitles_net,
 };
 
 pub fn providers() []const Provider {
@@ -158,10 +156,8 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
 }
 
 pub fn providerRequiresBrowserSession(provider: Provider) bool {
-    return switch (provider) {
-        .opensubtitles_com, .sub_scene_com => true,
-        else => false,
-    };
+    _ = provider;
+    return false;
 }
 
 pub fn providerSupportsMovies(provider: Provider) bool {
@@ -1989,8 +1985,6 @@ fn fetchDownloadBytes(client: *std.http.Client, allocator: Allocator, url: []con
     const yify_referer = yifyRefererForUrl(url);
     const provider_headers = if (yify_referer) |referer|
         &[_]std.http.Header{.{ .name = "referer", .value = referer }}
-    else if (std.mem.startsWith(u8, url, "http://176.103.50.239/"))
-        &[_]std.http.Header{.{ .name = "host", .value = "www.tvsubtitles.net" }}
     else
         &[_]std.http.Header{};
 
@@ -2575,14 +2569,12 @@ test "active provider registry excludes retired providers" {
     const expected = [_][]const u8{
         "subdl_com",
         "opensubtitles_com",
-        "opensubtitles_org",
-        "moviesubtitles_org",
+        "yifysubtitles_ch",
         "subtitlecat_com",
         "isubtitles_org",
         "my_subs_co",
         "subsource_net",
         "sub_scene_com",
-        "tvsubtitles_net",
     };
 
     const actual = providers();
@@ -2603,29 +2595,29 @@ test "active provider registry excludes retired providers" {
 test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("subdl.com") == .subdl_com);
     try std.testing.expect(parseProvider("opensubtitles.com") == .opensubtitles_com);
-    try std.testing.expect(parseProvider("opensubtitles.org") == .opensubtitles_org);
-    try std.testing.expect(parseProvider("moviesubtitles.org") == .moviesubtitles_org);
+    try std.testing.expect(parseProvider("opensubtitles.org") == null);
+    try std.testing.expect(parseProvider("moviesubtitles.org") == null);
     try std.testing.expect(parseProvider("moviesubtitlesrt.com") == null);
     try std.testing.expect(parseProvider("podnapisi.net") == null);
-    try std.testing.expect(parseProvider("yifysubtitles.ch") == null);
+    try std.testing.expect(parseProvider("yifysubtitles.ch") == .yifysubtitles_ch);
     try std.testing.expect(parseProvider("subtitlecat.com") == .subtitlecat_com);
     try std.testing.expect(parseProvider("isubtitles.org") == .isubtitles_org);
     try std.testing.expect(parseProvider("my-subs.co") == .my_subs_co);
     try std.testing.expect(parseProvider("subsource.net") == .subsource_net);
     try std.testing.expect(parseProvider("sub-scene.com") == .sub_scene_com);
-    try std.testing.expect(parseProvider("tvsubtitles.net") == .tvsubtitles_net);
+    try std.testing.expect(parseProvider("tvsubtitles.net") == null);
 }
 
 test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("subdl") == .subdl_com);
-    try std.testing.expectError(error.UnknownProvider, resolveProvider("yify"));
+    try std.testing.expect(try resolveProvider("yify") == .yifysubtitles_ch);
     try std.testing.expect(try resolveProvider("subtitlecat") == .subtitlecat_com);
     try std.testing.expect(try resolveProvider("isubtitles") == .isubtitles_org);
     try std.testing.expect(try resolveProvider("my_subs") == .my_subs_co);
     try std.testing.expect(try resolveProvider("subsource") == .subsource_net);
     try std.testing.expect(try resolveProvider("sub_scene") == .sub_scene_com);
-    try std.testing.expect(try resolveProvider("tvsubtitles") == .tvsubtitles_net);
-    try std.testing.expectError(error.AmbiguousProvider, resolveProvider("open"));
+    try std.testing.expect(try resolveProvider("open") == .opensubtitles_com);
+    try std.testing.expectError(error.UnknownProvider, resolveProvider("tvsubtitles"));
     try std.testing.expectError(error.UnknownProvider, resolveProvider("missing"));
 }
 
@@ -2962,6 +2954,7 @@ fn runProviderTuiSmokeQuery(allocator: std.mem.Allocator, client: *std.http.Clie
 fn seriesQueryForProvider(provider: Provider) []const u8 {
     return switch (provider) {
         .subdl_com, .subsource_net, .subtitlecat_com => "Malcolm in the Middle",
+        .sub_scene_com => "Chernobyl - First Season",
         else => "Chernobyl",
     };
 }
@@ -3041,12 +3034,13 @@ fn runSubtitlecatTranslateDownloadLive(allocator: std.mem.Allocator, client: *st
 
 const tui_smoke_providers = [_]Provider{
     .subdl_com,
-    .isubtitles_org,
-    .moviesubtitles_org,
-    .my_subs_co,
+    .opensubtitles_com,
+    .yifysubtitles_ch,
     .subtitlecat_com,
+    .isubtitles_org,
+    .my_subs_co,
     .subsource_net,
-    .tvsubtitles_net,
+    .sub_scene_com,
 };
 
 fn runProvidersSmokeBatch(allocator: std.mem.Allocator, selected: []const Provider) !void {
@@ -3096,10 +3090,8 @@ fn liveBatchEnabled() bool {
 }
 
 fn isCaptchaProvider(provider: Provider) bool {
-    return switch (provider) {
-        .opensubtitles_com, .opensubtitles_org, .sub_scene_com => true,
-        else => false,
-    };
+    _ = provider;
+    return false;
 }
 
 fn shouldRunSingleProviderSmoke(provider: Provider) bool {
@@ -3198,6 +3190,10 @@ test "live providers_app tui-path smoke provider: yifysubtitles.ch" {
     try runSingleProviderSmokeTest(.yifysubtitles_ch);
 }
 
+test "live providers_app tui-path smoke provider: sub-scene.com" {
+    try runSingleProviderSmokeTest(.sub_scene_com);
+}
+
 test "live series download path provider: subdl.com" {
     try runSingleProviderSeriesTest(.subdl_com);
 }
@@ -3228,6 +3224,10 @@ test "live series download path provider: my-subs.co" {
 
 test "live series download path provider: subsource.net" {
     try runSingleProviderSeriesTest(.subsource_net);
+}
+
+test "live series download path provider: sub-scene.com" {
+    try runSingleProviderSeriesTest(.sub_scene_com);
 }
 
 test "live series download path provider: tvsubtitles.net" {

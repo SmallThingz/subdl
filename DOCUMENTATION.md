@@ -103,16 +103,18 @@ Supported canonical provider IDs:
 
 - `subdl_com`
 - `opensubtitles_com`
-- `opensubtitles_org`
-- `moviesubtitles_org`
-- `moviesubtitlesrt_com`
-- `podnapisi_net`
 - `yifysubtitles_ch`
 - `subtitlecat_com`
 - `isubtitles_org`
 - `my_subs_co`
 - `subsource_net`
-- `tvsubtitles_net`
+- `sub_scene_com`
+
+The repository also retains inactive implementations for
+`opensubtitles_org`, `moviesubtitles_org`, `moviesubtitlesrt_com`,
+`podnapisi_net`, and `tvsubtitles_net`. Targeted live tests still cover
+those modules, but the CLI/TUI registry does not expose them while their
+current upstream/network path cannot complete a search.
 
 The parser also accepts dotted or hyphenated site forms such as `subsource.net`.
 
@@ -149,7 +151,7 @@ Examples:
 
 ```bash
 zig build run -- --query "The Matrix"
-zig build run -- --providers podnapisi_net,subsource_net --query "Inception" --title-index 1 --subtitle-index 0
+zig build run -- --providers subdl_com,subsource_net --query "Inception" --title-index 1 --subtitle-index 0
 zig build run -- -p subdl --query "Breaking Bad" --out-dir /tmp/subtitles
 zig build run -- -pnone --query "The Matrix"
 zig build -Denable-unarr=true run -- --providers subsource --query "The Matrix" --extract

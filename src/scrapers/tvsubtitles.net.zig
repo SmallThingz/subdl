@@ -7,7 +7,6 @@ const HtmlNode = HtmlParseOptions.GetNode();
 
 const Allocator = std.mem.Allocator;
 const site = "http://www.tvsubtitles.net";
-const request_site = "http://176.103.50.239";
 
 pub const SearchOptions = struct {
     _unused: void = {},
@@ -197,19 +196,19 @@ pub const Scraper = struct {
             defer allocator.free(script_path);
             const escaped = try escapeUrlPath(allocator, script_path);
             defer allocator.free(escaped);
-            return try common.resolveUrl(allocator, request_site, escaped);
+            return try common.resolveUrl(allocator, site, escaped);
         }
 
         const script_path = parseZipPathFromHtml(response.body) orelse return error.MissingField;
         const escaped = try escapeUrlPath(allocator, script_path);
         defer allocator.free(escaped);
-        return try common.resolveUrl(allocator, request_site, escaped);
+        return try common.resolveUrl(allocator, site, escaped);
     }
 };
 
 fn buildSearchUrl(allocator: Allocator, query: []const u8) ![]const u8 {
     const encoded = try common.encodeUriComponent(allocator, query);
-    return std.fmt.allocPrint(allocator, "{s}/search.php?qs={s}", .{ request_site, encoded });
+    return std.fmt.allocPrint(allocator, "{s}/search.php?qs={s}", .{ site, encoded });
 }
 
 fn collectSearchItemsRaw(allocator: Allocator, body: []const u8, query: []const u8, out: *std.ArrayListUnmanaged(SearchItem), seen: *std.StringHashMapUnmanaged(void)) !void {
@@ -242,18 +241,16 @@ fn fetchSearchPage(client: *std.http.Client, allocator: Allocator, page_url: []c
 }
 
 fn fetchTvHtml(client: *std.http.Client, allocator: Allocator, canonical_url: []const u8) !common.HttpResponse {
-    const request_url = if (std.mem.startsWith(u8, canonical_url, site))
-        try std.fmt.allocPrint(allocator, "{s}{s}", .{ request_site, canonical_url[site.len..] })
-    else
-        try allocator.dupe(u8, canonical_url);
-    defer allocator.free(request_url);
-    const headers = [_]std.http.Header{.{ .name = "host", .value = "www.tvsubtitles.net" }};
-    return common.fetchBytes(client, allocator, request_url, .{
+    const response = try common.fetchBytes(client, allocator, canonical_url, .{
         .accept = "text/html",
-        .extra_headers = &headers,
         .max_attempts = 2,
         .allow_non_ok = true,
     });
+    if (common.isAustralianWebsiteBlockPage(response.body)) {
+        allocator.free(response.body);
+        return error.ProviderAccessBlocked;
+    }
+    return response;
 }
 
 fn collectSearchItems(allocator: Allocator, doc: *const HtmlDocument, query: []const u8, out: *std.ArrayListUnmanaged(SearchItem), seen: *std.StringHashMapUnmanaged(void)) !void {

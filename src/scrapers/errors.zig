@@ -9,6 +9,7 @@ pub const Error = error{
     CloudflareChallenge,
     CloudflareSessionUnavailable,
     BrowserAutomationFailed,
+    ProviderAccessBlocked,
     SessionExpired,
     UnsupportedSearchLanguage,
     InvalidDownloadUrl,

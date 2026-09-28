@@ -1,9 +1,8 @@
 const std = @import("std");
 const common = @import("common.zig");
-const cf = @import("opensubtitles_com_cf.zig");
 
 const Allocator = std.mem.Allocator;
-const site = "https://www.opensubtitles.com";
+const site = "https://rest.opensubtitles.com";
 
 pub const SearchItem = struct {
     title: []const u8,
@@ -72,12 +71,11 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        var session = try cf.ensureSession(a, .{});
         const encoded = try common.encodeUriComponent(a, query);
         const language = self.options.language_code;
         const url = try std.fmt.allocPrint(a, "{s}/{s}/{s}/search/autocomplete/{s}.json", .{ site, language, language, encoded });
 
-        const body = try fetchWithSession(self.client, a, &session, url, .{ .accept = "application/json" }, true);
+        const body = try fetchPublic(self.client, a, url, .{ .accept = "application/json" });
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
         const arr = switch (root) {
             .array => |arr| arr,
@@ -127,8 +125,7 @@ pub const Scraper = struct {
             }
             try replaced.appendSlice(a, path[cursor..]);
             const locale_path = replaced.items;
-            const feature_path = try replaceMoviesWithFeatures(a, locale_path);
-            const subtitles_list_url = try std.fmt.allocPrint(a, "{s}/{s}/subtitles_list.json", .{ site, feature_path });
+            const subtitles_list_url = try makeSubtitlesListUrl(a, locale_path);
 
             try out.append(a, .{
                 .title = title,
@@ -152,8 +149,7 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        var session = try cf.ensureSession(a, .{});
-        const list_body = try fetchWithSession(self.client, a, &session, item.subtitles_list_url, .{ .accept = "application/json" }, true);
+        const list_body = try fetchPublic(self.client, a, item.subtitles_list_url, .{ .accept = "application/json" });
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, list_body, .{});
         const obj = switch (root) {
             .object => |o| o,
@@ -182,8 +178,8 @@ pub const Scraper = struct {
             const should_resolve = options.resolve_downloads and
                 (options.resolve_limit == 0 or resolved_count < options.resolve_limit);
             const resolved: ResolvedDownload = if (should_resolve)
-                self.resolveAndVerifyDownloadWithSession(a, &session, remote) catch |err| switch (err) {
-                    error.CloudflareSessionUnavailable, error.UnexpectedHttpStatus => .{ .filename = null, .verified_url = null },
+                self.resolveAndVerifyDownloadPublic(a, remote) catch |err| switch (err) {
+                    error.UnexpectedHttpStatus => .{ .filename = null, .verified_url = null },
                     else => return err,
                 }
             else
@@ -213,8 +209,7 @@ pub const Scraper = struct {
         defer arena.deinit();
         const a = arena.allocator();
 
-        var session = try cf.ensureSession(a, .{});
-        const resolved = try self.resolveAndVerifyDownloadWithSession(a, &session, remote_endpoint);
+        const resolved = try self.resolveAndVerifyDownloadPublic(a, remote_endpoint);
         if (resolved.verified_url) |url| {
             return try allocator.dupe(u8, url);
         }
@@ -226,55 +221,34 @@ pub const Scraper = struct {
         defer arena.deinit();
         const a = arena.allocator();
 
-        var session = try cf.ensureSession(a, .{});
-        const resolved = try self.resolveAndVerifyDownloadWithSession(a, &session, remote_endpoint);
+        const resolved = try self.resolveAndVerifyDownloadPublic(a, remote_endpoint);
         return .{
             .filename = if (resolved.filename) |name| try self.allocator.dupe(u8, name) else null,
             .verified_url = if (resolved.verified_url) |url| try self.allocator.dupe(u8, url) else null,
         };
     }
 
-    fn resolveAndVerifyDownloadWithSession(self: *Scraper, allocator: Allocator, session: *cf.Session, remote_endpoint: []const u8) !ResolvedDownload {
-        const language = self.options.language_code;
+    fn resolveAndVerifyDownloadPublic(self: *Scraper, allocator: Allocator, remote_endpoint: []const u8) !ResolvedDownload {
         const remote_url = if (std.mem.startsWith(u8, remote_endpoint, "http"))
             remote_endpoint
         else
             try common.resolveUrl(allocator, site, remote_endpoint);
 
-        const csrf_token = session.csrf_token orelse "";
         const headers = [_]std.http.Header{
             .{ .name = "referer", .value = site ++ "/" },
             .{ .name = "x-requested-with", .value = "XMLHttpRequest" },
-            .{ .name = "x-csrf-token", .value = csrf_token },
             .{ .name = "accept", .value = "*/*" },
         };
 
-        const body = try fetchWithSession(self.client, allocator, session, remote_url, .{
+        const body = try fetchPublic(self.client, allocator, remote_url, .{
             .accept = "*/*",
             .extra_headers = &headers,
-            .allow_non_ok = true,
-        }, true);
+        });
 
         const parsed = parseFileDownload(body);
         if (parsed.url == null) return .{ .filename = null, .verified_url = null };
 
         const url = parsed.url orelse return .{ .filename = parsed.filename, .verified_url = null };
-        const verify_referer = try std.fmt.allocPrint(allocator, "{s}/{s}/", .{ site, language });
-        const verify_headers = [_]std.http.Header{
-            .{ .name = "cookie", .value = session.cookie_header },
-            .{ .name = "user-agent", .value = session.user_agent },
-            .{ .name = "referer", .value = verify_referer },
-            .{ .name = "accept", .value = "application/zip,application/octet-stream,*/*" },
-        };
-
-        const verify_status = verifyDownloadHeadWithSession(self.client, allocator, session.*, url, &verify_headers) catch null;
-        if (verify_status) |status| {
-            if (status != .ok and status != .found and status != .moved_permanently and status != .see_other and status != .temporary_redirect and status != .permanent_redirect) {
-                // Some mirrors/challenge edges reject HEAD while the URL is still valid for GET.
-                return .{ .filename = parsed.filename, .verified_url = url };
-            }
-        }
-
         return .{ .filename = parsed.filename, .verified_url = url };
     }
 };
@@ -285,48 +259,13 @@ const SessionFetchOptions = struct {
     allow_non_ok: bool = false,
 };
 
-fn fetchWithSession(client: *std.http.Client, allocator: Allocator, session: *cf.Session, url: []const u8, options: SessionFetchOptions, refresh_on_403: bool) ![]u8 {
-    const headers = try joinHeadersWithSession(allocator, session.*, options.extra_headers);
-    defer allocator.free(headers);
-
-    var response = try common.fetchBytes(client, allocator, url, .{
+fn fetchPublic(client: *std.http.Client, allocator: Allocator, url: []const u8, options: SessionFetchOptions) ![]u8 {
+    const response = try common.fetchBytes(client, allocator, url, .{
         .accept = options.accept,
-        .extra_headers = headers,
+        .extra_headers = options.extra_headers,
         .allow_non_ok = true,
         .max_attempts = 2,
     });
-
-    if (response.status == .forbidden and refresh_on_403) {
-        allocator.free(response.body);
-
-        // Cloudflare cookies can appear before the challenge flow has fully settled.
-        // Retry once with the same session before forcing a fresh browser run.
-        common.sleepMilliseconds(1200);
-        response = try common.fetchBytes(client, allocator, url, .{
-            .accept = options.accept,
-            .extra_headers = headers,
-            .allow_non_ok = true,
-            .max_attempts = 1,
-        });
-        if (response.status != .forbidden) {
-            if (!options.allow_non_ok and response.status != .ok) {
-                allocator.free(response.body);
-                return error.UnexpectedHttpStatus;
-            }
-            return response.body;
-        }
-
-        allocator.free(response.body);
-        session.* = try cf.ensureSession(allocator, .{ .force_refresh = true });
-        const refreshed_headers = try joinHeadersWithSession(allocator, session.*, options.extra_headers);
-        defer allocator.free(refreshed_headers);
-        response = try common.fetchBytes(client, allocator, url, .{
-            .accept = options.accept,
-            .extra_headers = refreshed_headers,
-            .allow_non_ok = true,
-            .max_attempts = 1,
-        });
-    }
 
     if (!options.allow_non_ok and response.status != .ok) {
         allocator.free(response.body);
@@ -336,71 +275,23 @@ fn fetchWithSession(client: *std.http.Client, allocator: Allocator, session: *cf
     return response.body;
 }
 
-fn joinHeadersWithSession(allocator: Allocator, session: cf.Session, headers: []const std.http.Header) ![]std.http.Header {
-    var out = try allocator.alloc(std.http.Header, headers.len + 2);
-    out[0] = .{ .name = "cookie", .value = session.cookie_header };
-    out[1] = .{ .name = "user-agent", .value = session.user_agent };
-    for (headers, 0..) |h, i| out[i + 2] = h;
-    return out;
-}
-
-fn verifyDownloadHeadWithSession(
-    client: *std.http.Client,
-    allocator: Allocator,
-    session: cf.Session,
-    url: []const u8,
-    headers: []const std.http.Header,
-) !?std.http.Status {
-    var phase = common.LivePhase.init("opensubtitles.com", "verify_download_head");
-    phase.start();
-    defer phase.finish();
-
-    var merged = std.ArrayList(std.http.Header).empty;
-    defer merged.deinit(allocator);
-    try merged.append(allocator, .{ .name = "cookie", .value = session.cookie_header });
-    try merged.append(allocator, .{ .name = "user-agent", .value = session.user_agent });
-    for (headers) |h| {
-        if (std.ascii.eqlIgnoreCase(h.name, "cookie")) continue;
-        if (std.ascii.eqlIgnoreCase(h.name, "user-agent")) continue;
-        try merged.append(allocator, h);
-    }
-
-    const response = common.fetchBytes(client, allocator, url, .{
-        .method = .HEAD,
-        .extra_headers = merged.items,
-        .allow_non_ok = true,
-        .max_attempts = 1,
-    }) catch return null;
-    defer allocator.free(response.body);
-    return response.status;
-}
-
 fn parseLanguageFromCell(allocator: Allocator, cols: []const std.json.Value, idx: usize) !?[]const u8 {
     if (idx >= cols.len) return null;
-    const html = switch (cols[idx]) {
+    const fragment = switch (cols[idx]) {
         .string => |s| s,
         else => return null,
     };
-    const wrapped = try std.fmt.allocPrint(allocator, "<div>{s}</div>", .{html});
-    var parsed = try common.parseHtmlTurbo(allocator, wrapped);
-    if (parsed.doc.queryOne("*[title]")) |n| {
-        const title = n.getAttributeValue("title") orelse return null;
-        return try allocator.dupe(u8, title);
-    }
-    const node = parsed.doc.queryOne("div") orelse return null;
-    return try common.innerTextTrimmedOwned(allocator, node);
+    if (try firstHtmlAttribute(allocator, fragment, "title")) |title| return title;
+    return @as(?[]const u8, try htmlFragmentText(allocator, fragment));
 }
 
 fn parseFilenameFromCell(allocator: Allocator, cols: []const std.json.Value, idx: usize) !?[]const u8 {
     if (idx >= cols.len) return null;
-    const html = switch (cols[idx]) {
+    const fragment = switch (cols[idx]) {
         .string => |s| s,
         else => return null,
     };
-    const wrapped = try std.fmt.allocPrint(allocator, "<div>{s}</div>", .{html});
-    var parsed = try common.parseHtmlTurbo(allocator, wrapped);
-    const div = parsed.doc.queryOne("div") orelse return null;
-    const txt = try common.innerTextTrimmedOwned(allocator, div);
+    const txt = try htmlFragmentText(allocator, fragment);
     if (txt.len == 0) return null;
     return txt;
 }
@@ -410,14 +301,11 @@ fn summarizeRow(allocator: Allocator, cols: []const std.json.Value) !?[]const u8
     errdefer out.deinit(allocator);
 
     for (cols, 0..) |col, i| {
-        const html = switch (col) {
+        const fragment = switch (col) {
             .string => |s| s,
             else => continue,
         };
-        const wrapped = try std.fmt.allocPrint(allocator, "<div>{s}</div>", .{html});
-        var parsed = try common.parseHtmlTurbo(allocator, wrapped);
-        const div = parsed.doc.queryOne("div") orelse continue;
-        const txt = try common.innerTextTrimmedOwned(allocator, div);
+        const txt = try htmlFragmentText(allocator, fragment);
         if (txt.len == 0) continue;
         if (out.items.len > 0) try out.appendSlice(allocator, " | ");
         try out.appendSlice(allocator, txt);
@@ -430,17 +318,113 @@ fn summarizeRow(allocator: Allocator, cols: []const std.json.Value) !?[]const u8
 
 fn parseRemoteEndpoint(allocator: Allocator, cols: []const std.json.Value) ![]const u8 {
     const idx = cols.len - 1;
-    const html = switch (cols[idx]) {
+    const fragment = switch (cols[idx]) {
         .string => |s| s,
         else => return error.MissingField,
     };
-
-    const wrapped = try std.fmt.allocPrint(allocator, "<div>{s}</div>", .{html});
-    var parsed = try common.parseHtmlTurbo(allocator, wrapped);
-
-    const anchor = parsed.doc.queryOne("a[data-remote='true']") orelse return error.MissingField;
-    const href = anchor.getAttributeValue("href") orelse return error.MissingField;
+    const remote_marker = "data-remote=\"true\"";
+    const marker = std.mem.indexOf(u8, fragment, remote_marker) orelse return error.MissingField;
+    const tag_start = std.mem.lastIndexOfScalar(u8, fragment[0..marker], '<') orelse return error.MissingField;
+    const tag_end_rel = std.mem.indexOfScalar(u8, fragment[marker..], '>') orelse return error.MissingField;
+    const tag_end = marker + tag_end_rel + 1;
+    const href = (try htmlAttribute(allocator, fragment[tag_start..tag_end], "href")) orelse return error.MissingField;
+    defer allocator.free(href);
     return try common.resolveUrl(allocator, site, href);
+}
+
+fn firstHtmlAttribute(allocator: Allocator, fragment: []const u8, name: []const u8) !?[]const u8 {
+    var pos: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, fragment, pos, '<')) |start| {
+        const end = std.mem.indexOfScalarPos(u8, fragment, start, '>') orelse return null;
+        if (try htmlAttribute(allocator, fragment[start .. end + 1], name)) |value| return value;
+        pos = end + 1;
+    }
+    return null;
+}
+
+fn htmlAttribute(allocator: Allocator, tag: []const u8, name: []const u8) !?[]const u8 {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, tag, pos, name)) |idx| {
+        if (idx > 0 and (std.ascii.isAlphanumeric(tag[idx - 1]) or tag[idx - 1] == '-' or tag[idx - 1] == '_')) {
+            pos = idx + name.len;
+            continue;
+        }
+        var cursor = idx + name.len;
+        while (cursor < tag.len and std.ascii.isWhitespace(tag[cursor])) : (cursor += 1) {}
+        if (cursor >= tag.len or tag[cursor] != '=') {
+            pos = idx + name.len;
+            continue;
+        }
+        cursor += 1;
+        while (cursor < tag.len and std.ascii.isWhitespace(tag[cursor])) : (cursor += 1) {}
+        if (cursor >= tag.len) return null;
+        const quote = tag[cursor];
+        if (quote != '"' and quote != '\'') return null;
+        cursor += 1;
+        const end = std.mem.indexOfScalarPos(u8, tag, cursor, quote) orelse return null;
+        return @as(?[]const u8, try decodeBasicHtmlEntities(allocator, tag[cursor..end]));
+    }
+    return null;
+}
+
+fn htmlFragmentText(allocator: Allocator, fragment: []const u8) ![]const u8 {
+    var raw: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer raw.deinit(allocator);
+    var in_tag = false;
+    var pending_space = false;
+    for (fragment) |c| {
+        if (c == '<') {
+            in_tag = true;
+            pending_space = raw.items.len > 0;
+            continue;
+        }
+        if (c == '>') {
+            in_tag = false;
+            continue;
+        }
+        if (in_tag) continue;
+        if (std.ascii.isWhitespace(c)) {
+            pending_space = raw.items.len > 0;
+            continue;
+        }
+        if (pending_space and raw.items.len > 0 and raw.items[raw.items.len - 1] != ' ') try raw.append(allocator, ' ');
+        pending_space = false;
+        try raw.append(allocator, c);
+    }
+    const decoded = try decodeBasicHtmlEntities(allocator, raw.items);
+    raw.deinit(allocator);
+    return decoded;
+}
+
+fn decodeBasicHtmlEntities(allocator: Allocator, input: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] == '&') {
+            const replacements = [_]struct { encoded: []const u8, decoded: []const u8 }{
+                .{ .encoded = "&amp;", .decoded = "&" },
+                .{ .encoded = "&quot;", .decoded = "\"" },
+                .{ .encoded = "&#39;", .decoded = "'" },
+                .{ .encoded = "&apos;", .decoded = "'" },
+                .{ .encoded = "&lt;", .decoded = "<" },
+                .{ .encoded = "&gt;", .decoded = ">" },
+                .{ .encoded = "&nbsp;", .decoded = " " },
+            };
+            var matched = false;
+            for (replacements) |replacement| {
+                if (!std.mem.startsWith(u8, input[i..], replacement.encoded)) continue;
+                try out.appendSlice(allocator, replacement.decoded);
+                i += replacement.encoded.len;
+                matched = true;
+                break;
+            }
+            if (matched) continue;
+        }
+        try out.append(allocator, input[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 const FileDownload = struct {
@@ -478,10 +462,51 @@ fn replaceMoviesWithFeatures(allocator: Allocator, input: []const u8) ![]const u
     return try out.toOwnedSlice(allocator);
 }
 
+fn makeSubtitlesListUrl(allocator: Allocator, locale_path: []const u8) ![]const u8 {
+    const feature_path = try replaceMoviesWithFeatures(allocator, locale_path);
+    defer allocator.free(feature_path);
+    return std.fmt.allocPrint(allocator, "{s}{s}/subtitles_list.json", .{ site, feature_path });
+}
+
 test "parse opensubtitles.com file_download" {
     const parsed = parseFileDownload("x file_download('name.zip','https://a/b.zip') y");
     try std.testing.expectEqualStrings("name.zip", parsed.filename.?);
     try std.testing.expectEqualStrings("https://a/b.zip", parsed.url.?);
+}
+
+test "opensubtitles.com public listing url has one host separator" {
+    const allocator = std.testing.allocator;
+    const url = try makeSubtitlesListUrl(allocator, "/en/movies/1999-the-matrix");
+    defer allocator.free(url);
+    try std.testing.expectEqualStrings(
+        "https://rest.opensubtitles.com/en/features/1999-the-matrix/subtitles_list.json",
+        url,
+    );
+}
+
+test "opensubtitles.com parses listing cells without reparsing html documents" {
+    const allocator = std.testing.allocator;
+    const cols = [_]std.json.Value{
+        .{ .string = "en" },
+        .{ .string = "<a title=\"English\" href=\"/x\"><i class=\"flag en\"></i></a>" },
+        .{ .string = "<a href=\"/x\">The Matrix &amp; Extras</a><div><strong>HD</strong></div>" },
+        .{ .string = "2026-01-01" },
+        .{ .string = "user" },
+        .{ .string = "23.976" },
+        .{ .string = "100%" },
+        .{ .string = "1" },
+        .{ .string = "42" },
+        .{ .string = "<a data-remote=\"true\" href=\"/nocache/download/1/subreq.js?direct_dl=true&amp;locale=en\">Direct</a>" },
+    };
+    const language = (try parseLanguageFromCell(allocator, &cols, 1)).?;
+    defer allocator.free(language);
+    try std.testing.expectEqualStrings("English", language);
+    const filename = (try parseFilenameFromCell(allocator, &cols, 2)).?;
+    defer allocator.free(filename);
+    try std.testing.expectEqualStrings("The Matrix & Extras HD", filename);
+    const remote = try parseRemoteEndpoint(allocator, &cols);
+    defer allocator.free(remote);
+    try std.testing.expectEqualStrings("https://rest.opensubtitles.com/nocache/download/1/subreq.js?direct_dl=true&locale=en", remote);
 }
 
 test "live opensubtitles.com search and resolve" {

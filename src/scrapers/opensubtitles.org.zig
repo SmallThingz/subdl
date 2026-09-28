@@ -211,12 +211,29 @@ pub const Scraper = struct {
     }
 
     fn fetchHtmlWithDoh(self: *Scraper, allocator: Allocator, url: []const u8) !common.HttpResponse {
-        _ = allocator;
-        return common.fetchBytes(self.client, self.allocator, url, .{
+        const response = common.fetchBytes(self.client, self.allocator, url, .{
             .accept = "text/html",
             .allow_non_ok = true,
             .max_attempts = 2,
-        });
+        }) catch |err| {
+            if (err != error.ConnectionRefused or !std.mem.startsWith(u8, url, "https://www.opensubtitles.org/")) return err;
+
+            const diagnostic_url = try std.fmt.allocPrint(allocator, "http://www.opensubtitles.org/{s}", .{url["https://www.opensubtitles.org/".len..]});
+            const diagnostic = common.fetchBytes(self.client, self.allocator, diagnostic_url, .{
+                .accept = "text/html",
+                .allow_non_ok = true,
+                .max_attempts = 1,
+                .cache = false,
+            }) catch return err;
+            defer self.allocator.free(diagnostic.body);
+            if (common.isAustralianWebsiteBlockPage(diagnostic.body)) return error.ProviderAccessBlocked;
+            return err;
+        };
+        if (common.isAustralianWebsiteBlockPage(response.body)) {
+            self.allocator.free(response.body);
+            return error.ProviderAccessBlocked;
+        }
+        return response;
     }
 
     fn resolveHostViaDoh(self: *Scraper, allocator: Allocator, host: []const u8) ![]const u8 {

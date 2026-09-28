@@ -261,13 +261,16 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "subdl.com" },
     .{ .name = "isubtitles.org" },
     .{ .name = "moviesubtitles.org" },
+    .{ .name = "moviesubtitlesrt.com" },
     .{ .name = "my-subs.co" },
+    .{ .name = "podnapisi.net" },
     .{ .name = "subtitlecat.com" },
     .{ .name = "subsource.net" },
-    .{ .name = "sub-scene.com", .captcha = true },
+    .{ .name = "sub-scene.com" },
     .{ .name = "tvsubtitles.net" },
-    .{ .name = "opensubtitles.org", .captcha = true },
-    .{ .name = "opensubtitles.com", .captcha = true },
+    .{ .name = "yifysubtitles.ch" },
+    .{ .name = "opensubtitles.org" },
+    .{ .name = "opensubtitles.com" },
 };
 
 fn isAllLiveProviderSelection(raw_filter: []const u8) bool {
@@ -288,7 +291,8 @@ fn makeParallelLiveRunScript(
     out.appendSlice(b.allocator,
         \\set -euo pipefail
         \\test_bin="$1"
-        \\tmpdir="$(mktemp -d)"
+        \\mkdir -p .tmp
+        \\tmpdir="$(mktemp -d .tmp/live-runner.XXXXXX)"
         \\cleanup() { rm -rf "$tmpdir"; }
         \\trap cleanup EXIT
         \\declare -a names=()
@@ -333,7 +337,7 @@ fn makeParallelLiveRunScript(
         \\    for i in "${!pids[@]}"; do
         \\      pid="${pids[$i]}"
         \\      name="${names[$i]}"
-        \\      if kill -0 "$pid" 2>/dev/null; then
+        \\      if [[ -d "/proc/$pid" ]]; then
         \\        if [[ -z "$active_names" ]]; then
         \\          active_names="$name"
         \\        else
@@ -368,9 +372,6 @@ fn makeParallelLiveRunScript(
         \\    overall_rc=1
         \\  fi
         \\done
-        \\if kill -0 "$monitor_pid" 2>/dev/null; then
-        \\  kill "$monitor_pid" 2>/dev/null || true
-        \\fi
         \\wait "$monitor_pid" 2>/dev/null || true
         \\exit "$overall_rc"
         \\

@@ -99,6 +99,11 @@ pub fn sleepMilliseconds(ms: u64) void {
     runtime_io.get().sleep(.fromMilliseconds(@intCast(ms)), .awake) catch {};
 }
 
+pub fn isAustralianWebsiteBlockPage(body: []const u8) bool {
+    return std.mem.indexOf(u8, body, "Access to Website Disabled") != null and
+        std.mem.indexOf(u8, body, "Federal Court of Australia") != null;
+}
+
 pub const LivePhase = struct {
     scope: []const u8,
     phase: []const u8,
@@ -136,15 +141,22 @@ pub const LivePhase = struct {
     }
 
     fn run(self: *LivePhase) void {
+        const stop_poll_ms: u64 = 50;
+        var until_tick_ms = self.tick_ms;
         while (!self.stopped.load(.acquire)) {
-            sleepMilliseconds(self.tick_ms);
+            const sleep_ms = @min(until_tick_ms, stop_poll_ms);
+            sleepMilliseconds(sleep_ms);
             if (self.stopped.load(.acquire)) break;
+            until_tick_ms -= sleep_ms;
+            if (until_tick_ms > 0) continue;
+
             const elapsed_ms = compatMilliTimestamp() - self.start_ms;
             std.debug.print("[live][phase][{s}] running {s} elapsed_ms={d}\n", .{
                 self.scope,
                 self.phase,
                 elapsed_ms,
             });
+            until_tick_ms = self.tick_ms;
         }
     }
 };
@@ -461,14 +473,9 @@ pub fn parseHtmlTurbo(allocator: Allocator, source: []const u8) !ParsedHtml {
     var doc = HtmlDocument.init(allocator);
     errdefer doc.deinit();
 
-    {
-        var phase = LivePhase.init("html.parse", "turbo");
-        phase.start();
-        defer phase.finish();
-        try doc.parse(html_bytes, .{
-            .drop_whitespace_text_nodes = true,
-        });
-    }
+    try doc.parse(html_bytes, .{
+        .drop_whitespace_text_nodes = true,
+    });
 
     if (debug_timing) {
         const elapsed_ns = compatNanoTimestamp() - started_ns;
@@ -488,14 +495,9 @@ pub fn parseHtmlStable(allocator: Allocator, source: []const u8) !ParsedHtml {
 
     var doc = HtmlDocument.init(allocator);
     errdefer doc.deinit();
-    {
-        var phase = LivePhase.init("html.parse", "stable");
-        phase.start();
-        defer phase.finish();
-        try doc.parse(html_bytes, .{
-            .drop_whitespace_text_nodes = false,
-        });
-    }
+    try doc.parse(html_bytes, .{
+        .drop_whitespace_text_nodes = false,
+    });
 
     if (debug_timing) {
         const elapsed_ns = compatNanoTimestamp() - started_ns;
@@ -948,9 +950,8 @@ fn namedLiveProvider(name: []const u8) ?[]const u8 {
 }
 
 fn isCaptchaProviderName(provider_name: []const u8) bool {
-    return providerNameEq(provider_name, "opensubtitles.org") or
-        providerNameEq(provider_name, "opensubtitles.com") or
-        providerNameEq(provider_name, "yifysubtitles.ch");
+    _ = provider_name;
+    return false;
 }
 
 fn providerNameEq(a: []const u8, b: []const u8) bool {
@@ -1158,6 +1159,13 @@ test "validate live utf8 rejects invalid and replacement" {
     try std.testing.expectError(error.InvalidUtf8Data, validateLiveUtf8(&.{0xAA}));
     try std.testing.expectError(error.InvalidUtf8Data, validateLiveUtf8("\xEF\xBF\xBD"));
     try validateLiveUtf8("Matrix");
+}
+
+test "detect Australian website block page" {
+    try std.testing.expect(isAustralianWebsiteBlockPage(
+        "<h2>Access to Website Disabled</h2><p>the Federal Court of Australia has determined that the website infringes</p>",
+    ));
+    try std.testing.expect(!isAustralianWebsiteBlockPage("<title>Provider</title>"));
 }
 
 test "provider filter matching" {

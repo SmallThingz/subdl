@@ -3,12 +3,13 @@
 Subtitle scrapers in Zig with a shared provider API and a single `scrapers` binary.
 
 ![Zig](https://img.shields.io/badge/Zig-0.16.0--dev-f7a41d)
-![Providers](https://img.shields.io/badge/Providers-12-2ea44f)
+![Providers](https://img.shields.io/badge/Active_Providers-8-2ea44f)
 ![Runtime](https://img.shields.io/badge/HTTP-std.http%20(Client)-0366d6)
 
 ## Overview
 
-- 12 provider integrations behind one app layer: `providers_app`
+- 8 currently active providers behind one app layer: `providers_app`
+- 13 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
 - TUI mode available with `--tui` in the default build
@@ -26,16 +27,17 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 |---|---|
 | `subdl_com` | `subdl.com` |
 | `opensubtitles_com` | `opensubtitles.com` |
-| `opensubtitles_org` | `opensubtitles.org` |
-| `moviesubtitles_org` | `moviesubtitles.org` |
-| `moviesubtitlesrt_com` | `moviesubtitlesrt.com` |
-| `podnapisi_net` | `podnapisi.net` |
 | `yifysubtitles_ch` | `yifysubtitles.ch` |
 | `subtitlecat_com` | `subtitlecat.com` |
 | `isubtitles_org` | `isubtitles.org` |
 | `my_subs_co` | `my-subs.co` |
 | `subsource_net` | `subsource.net` |
-| `tvsubtitles_net` | `tvsubtitles.net` |
+| `sub_scene_com` | `sub-scene.com` |
+
+Retained inactive implementations are `opensubtitles_org`, `moviesubtitles_org`,
+`moviesubtitlesrt_com`, `podnapisi_net`, and `tvsubtitles_net`. They stay in
+the live-test matrix so upstream recovery can be detected without advertising a
+known-unusable provider in the CLI/TUI.
 
 ## Quick Start
 
@@ -62,7 +64,7 @@ Install the binary:
 
 ```bash
 zig build install
-./zig-out/bin/scrapers --providers subdl_com,podnapisi_net --query "Inception"
+./zig-out/bin/scrapers --providers subdl_com,subsource_net --query "Inception"
 ./zig-out/bin/scrapers -pnone --query "Inception"
 ```
 

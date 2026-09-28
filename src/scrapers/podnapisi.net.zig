@@ -199,14 +199,15 @@ pub const Scraper = struct {
         else
             try std.fmt.allocPrint(allocator, "{s}/subtitles/search/?keywords={s}&page={d}", .{ site, encoded, page });
 
-        const response = common.fetchBytes(self.client, allocator, url, .{
+        const response = try common.fetchBytes(self.client, allocator, url, .{
             .accept = "text/html",
             .max_attempts = 3,
             .retry_initial_backoff_ms = 1500,
             .allow_non_ok = true,
             .retry_on_429 = true,
-        }) catch return;
-        if (response.status != .ok) return;
+        });
+        if (response.status == .too_many_requests) return error.RateLimited;
+        if (response.status != .ok) return error.UnexpectedHttpStatus;
 
         var parsed = try common.parseHtmlStable(allocator, response.body);
         has_next_page.* = hasNextHtmlSearchPage(&parsed.doc, page) catch false;
