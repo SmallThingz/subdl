@@ -3,13 +3,13 @@
 Subtitle scrapers in Zig with a shared provider API and a single `scrapers` binary.
 
 ![Zig](https://img.shields.io/badge/Zig-0.16.0--dev-f7a41d)
-![Providers](https://img.shields.io/badge/Active_Providers-31-2ea44f)
+![Providers](https://img.shields.io/badge/Active_Providers-32-2ea44f)
 ![Runtime](https://img.shields.io/badge/HTTP-std.http%20(Client)-0366d6)
 
 ## Overview
 
-- 31 currently active providers behind one app layer: `providers_app`
-- 39 provider implementations retained and covered by targeted live tests
+- 32 currently active providers behind one app layer: `providers_app`
+- 40 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
 - TUI mode available with `--tui` in the default build
@@ -56,6 +56,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `justsubtitles_com` | `justsubtitles.com` |
 | `wizdom_xyz` | `wizdom.xyz` |
 | `miraianime_net` | `miraianime.net` |
+| `animesubtitle_ir` | `animesubtitle.ir` |
 
 Retained inactive implementations are `opensubtitles_org`, `moviesubtitles_org`,
 `moviesubtitlesrt_com`, `podnapisi_net`, `tvsubtitles_net`,
@@ -87,6 +88,7 @@ known-unusable provider in the CLI/TUI.
 `justsubtitles_com` is movie-only and exposes server-rendered subtitle ZIPs through the public SubDL CDN.
 `wizdom_xyz` provides Hebrew movie and TV subtitles through the public Wizdom release API.
 `miraianime_net` provides Arabic anime movie and TV subtitle archives.
+`animesubtitle_ir` provides Persian anime movie and TV subtitle archives.
 
 ## Quick Start
 

@@ -132,6 +132,7 @@ Supported canonical provider IDs:
 - `justsubtitles_com`
 - `wizdom_xyz`
 - `miraianime_net`
+- `animesubtitle_ir`
 
 The repository also retains inactive implementations for
 `opensubtitles_org`, `moviesubtitles_org`, `moviesubtitlesrt_com`,
@@ -164,6 +165,7 @@ current upstream/network path cannot complete a search.
 `justsubtitles_com` is movie-only and reads the subtitle rows embedded in the server-rendered Next.js payload; downloads come directly from `dl.subdl.com`.
 `wizdom_xyz` resolves titles through TMDB and downloads Hebrew movie and episode subtitle ZIPs from Wizdom's public API.
 `miraianime_net` resolves anime through MiraiAnime's public WordPress API and downloads Arabic subtitle archives directly from the subtitle library.
+`animesubtitle_ir` uses the site's public WordPress search API and Download Monitor links for Persian anime movie and TV archives.
 
 The parser also accepts dotted or hyphenated site forms such as `subsource.net`.
 

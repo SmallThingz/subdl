@@ -72,6 +72,7 @@ pub const Provider = enum {
     justsubtitles_com,
     wizdom_xyz,
     miraianime_net,
+    animesubtitle_ir,
 };
 
 const provider_values = [_]Provider{
@@ -106,6 +107,7 @@ const provider_values = [_]Provider{
     .justsubtitles_com,
     .wizdom_xyz,
     .miraianime_net,
+    .animesubtitle_ir,
 };
 
 pub fn providers() []const Provider {
@@ -164,6 +166,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .justsubtitles_com => "justsubtitles_com",
         .wizdom_xyz => "wizdom_xyz",
         .miraianime_net => "miraianime_net",
+        .animesubtitle_ir => "animesubtitle_ir",
     };
 }
 
@@ -235,6 +238,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .justsubtitles_com => "JustSubtitles",
         .wizdom_xyz => "Wizdom",
         .miraianime_net => "MiraiAnime",
+        .animesubtitle_ir => "AnimeSubtitle.ir",
     };
 }
 
@@ -279,6 +283,7 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .justsubtitles_com => "https://www.justsubtitles.com",
         .wizdom_xyz => "https://wizdom.xyz",
         .miraianime_net => "https://miraianime.net",
+        .animesubtitle_ir => "https://animesubtitle.ir",
     };
 }
 
@@ -611,6 +616,12 @@ pub const SearchRef = union(Provider) {
         episodes: ?i64,
         page_url: []const u8,
         subtitle_page_url: []const u8,
+    },
+    animesubtitle_ir: struct {
+        title: []const u8,
+        post_id: i64,
+        media_kind: subdl.animesubtitle_ir.MediaKind,
+        page_url: []const u8,
     },
 };
 
@@ -1579,6 +1590,25 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                         .episodes = item.episodes,
                         .page_url = try a.dupe(u8, item.page_url),
                         .subtitle_page_url = try a.dupe(u8, item.subtitle_page_url),
+                    } },
+                });
+            }
+        },
+        .animesubtitle_ir => {
+            var scraper = subdl.animesubtitle_ir.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                try out.append(a, .{
+                    .label = try std.fmt.allocPrint(a, "[{s}] {s} • fa", .{ @tagName(item.media_kind), title }),
+                    .ref = .{ .animesubtitle_ir = .{
+                        .title = title,
+                        .post_id = item.post_id,
+                        .media_kind = item.media_kind,
+                        .page_url = try a.dupe(u8, item.page_url),
                     } },
                 });
             }
@@ -2791,6 +2821,28 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .animesubtitle_ir => |item| {
+            title = try a.dupe(u8, item.title);
+            var scraper = subdl.animesubtitle_ir.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            const query_item: subdl.animesubtitle_ir.SearchItem = .{
+                .title = item.title,
+                .post_id = item.post_id,
+                .media_kind = item.media_kind,
+                .page_url = item.page_url,
+            };
+            var subtitles = try scraper.fetchSubtitlesBySearchItem(query_item);
+            defer subtitles.deinit();
+            for (subtitles.subtitles) |subtitle| {
+                const label = try subtitleLabel(a, subtitle.language_code, subtitle.filename, subtitle.download_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try a.dupe(u8, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
     }
 
     return .{
@@ -2954,6 +3006,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .justsubtitles_com => |item| item.title,
         .wizdom_xyz => |item| item.title,
         .miraianime_net => |item| item.title,
+        .animesubtitle_ir => |item| item.title,
     };
 }
 
@@ -4103,6 +4156,7 @@ fn liveQueryForProvider(provider: Provider) []const u8 {
         .zoom_lk => "Centigrade",
         .wizdom_xyz => "The Matrix",
         .miraianime_net => "Kimi no Na wa",
+        .animesubtitle_ir => "Given Umi e",
         else => "The Matrix",
     };
 }
@@ -4150,6 +4204,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .justsubtitles_com => |item| item.page_url,
         .wizdom_xyz => |item| item.page_url,
         .miraianime_net => |item| item.page_url,
+        .animesubtitle_ir => |item| item.page_url,
     };
 }
 
@@ -4236,6 +4291,7 @@ test "active provider registry excludes retired providers" {
         "justsubtitles_com",
         "wizdom_xyz",
         "miraianime_net",
+        "animesubtitle_ir",
     };
 
     const actual = providers();
@@ -4293,6 +4349,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("justsubtitles.com") == .justsubtitles_com);
     try std.testing.expect(parseProvider("wizdom.xyz") == .wizdom_xyz);
     try std.testing.expect(parseProvider("miraianime.net") == .miraianime_net);
+    try std.testing.expect(parseProvider("animesubtitle.ir") == .animesubtitle_ir);
 }
 
 test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
@@ -4319,7 +4376,8 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("subcentral") == .subcentral_de);
     try std.testing.expect(try resolveProvider("subtitulamos") == .subtitulamos_tv);
     try std.testing.expect(try resolveProvider("feliratok") == .feliratok_eu);
-    try std.testing.expect(try resolveProvider("animesub") == .animesub_info);
+    try std.testing.expect(try resolveProvider("animesub_i") == .animesub_info);
+    try std.testing.expectError(error.AmbiguousProvider, resolveProvider("animesub"));
     try std.testing.expectError(error.UnknownProvider, resolveProvider("subhd"));
     try std.testing.expect(try resolveProvider("fansubs") == .fansubs_ru);
     try std.testing.expect(try resolveProvider("legendei") == .legendei_net);
@@ -4327,6 +4385,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("justsubtitles") == .justsubtitles_com);
     try std.testing.expect(try resolveProvider("wizdom") == .wizdom_xyz);
     try std.testing.expect(try resolveProvider("miraianime") == .miraianime_net);
+    try std.testing.expect(try resolveProvider("animesubtitle") == .animesubtitle_ir);
     try std.testing.expect(try resolveProvider("open") == .opensubtitles_com);
     try std.testing.expectError(error.UnknownProvider, resolveProvider("tvsubtitles"));
     try std.testing.expectError(error.UnknownProvider, resolveProvider("missing"));
@@ -4709,6 +4768,7 @@ fn seriesQueryForProvider(provider: Provider) []const u8 {
         .zoom_lk => "Teen Wolf",
         .wizdom_xyz => "Chernobyl S01E01",
         .miraianime_net => "Death Note",
+        .animesubtitle_ir => "Wind Breaker",
         else => "Chernobyl",
     };
 }
@@ -4820,6 +4880,7 @@ const tui_smoke_providers = [_]Provider{
     .justsubtitles_com,
     .wizdom_xyz,
     .miraianime_net,
+    .animesubtitle_ir,
 };
 
 fn runProvidersSmokeBatch(allocator: std.mem.Allocator, selected: []const Provider) !void {
@@ -5077,6 +5138,10 @@ test "live providers_app tui-path smoke provider: miraianime.net" {
     try runSingleProviderSmokeTest(.miraianime_net);
 }
 
+test "live providers_app tui-path smoke provider: animesubtitle.ir" {
+    try runSingleProviderSmokeTest(.animesubtitle_ir);
+}
+
 test "live series download path provider: subdl.com" {
     try runSingleProviderSeriesTest(.subdl_com);
 }
@@ -5203,4 +5268,8 @@ test "live series download path provider: wizdom.xyz" {
 
 test "live series download path provider: miraianime.net" {
     try runSingleProviderSeriesTest(.miraianime_net);
+}
+
+test "live series download path provider: animesubtitle.ir" {
+    try runSingleProviderSeriesTest(.animesubtitle_ir);
 }
