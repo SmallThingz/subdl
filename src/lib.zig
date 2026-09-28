@@ -35,6 +35,7 @@ pub const subtitri_do_am = subdl.subtitri_do_am;
 pub const prijevodi_online_org = subdl.prijevodi_online_org;
 pub const animekalesi_com = subdl.animekalesi_com;
 pub const subcentral_de = subdl.subcentral_de;
+pub const subtitulamos_tv = subdl.subtitulamos_tv;
 pub const provider_union = subdl.provider_union;
 
 pub const Scraper = subdl.Scraper;

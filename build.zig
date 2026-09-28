@@ -288,6 +288,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "prijevodi-online.org" },
     .{ .name = "animekalesi.com" },
     .{ .name = "subcentral.de" },
+    .{ .name = "subtitulamos.tv" },
 };
 
 fn isAllLiveProviderSelection(raw_filter: []const u8) bool {
