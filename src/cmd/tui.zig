@@ -2042,6 +2042,11 @@ fn cloneSearchRef(allocator: std.mem.Allocator, ref: app.SearchRef) !app.SearchR
             .media_kind = item.media_kind,
             .page_url = try allocator.dupe(u8, item.page_url),
         } },
+        .cc_edatribe_com => |item| .{ .cc_edatribe_com = .{
+            .title = try allocator.dupe(u8, item.title),
+            .media_kind = item.media_kind,
+            .page_url = try allocator.dupe(u8, item.page_url),
+        } },
     };
 }
 

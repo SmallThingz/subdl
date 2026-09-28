@@ -54,6 +54,7 @@ pub const Provider = enum {
     greeksubs_net,
     indexsubtitle_cc,
     sous_titres_eu,
+    cc_edatribe_com,
 };
 
 const provider_values = [_]Provider{
@@ -72,6 +73,7 @@ const provider_values = [_]Provider{
     .greeksubs_net,
     .indexsubtitle_cc,
     .sous_titres_eu,
+    .cc_edatribe_com,
 };
 
 pub fn providers() []const Provider {
@@ -112,6 +114,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .greeksubs_net => "greeksubs_net",
         .indexsubtitle_cc => "indexsubtitle_cc",
         .sous_titres_eu => "sous_titres_eu",
+        .cc_edatribe_com => "cc_edatribe_com",
     };
 }
 
@@ -165,6 +168,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .greeksubs_net => "GreekSubs",
         .indexsubtitle_cc => "IndexSubtitle",
         .sous_titres_eu => "Sous-Titres.eu",
+        .cc_edatribe_com => "Closed Caption Browser",
     };
 }
 
@@ -191,6 +195,7 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .greeksubs_net => "https://greeksubs.net",
         .indexsubtitle_cc => "https://indexsubtitle.cc",
         .sous_titres_eu => "https://www.sous-titres.eu",
+        .cc_edatribe_com => "https://cc.edatribe.com",
     };
 }
 
@@ -390,6 +395,11 @@ pub const SearchRef = union(Provider) {
     sous_titres_eu: struct {
         title: []const u8,
         media_kind: subdl.sous_titres_eu.MediaKind,
+        page_url: []const u8,
+    },
+    cc_edatribe_com: struct {
+        title: []const u8,
+        media_kind: subdl.cc_edatribe_com.MediaKind,
         page_url: []const u8,
     },
 };
@@ -936,6 +946,24 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                 try out.append(a, .{
                     .label = try std.fmt.allocPrint(a, "[{s}] {s}", .{ @tagName(item.media_kind), title }),
                     .ref = .{ .sous_titres_eu = .{
+                        .title = title,
+                        .media_kind = item.media_kind,
+                        .page_url = try a.dupe(u8, item.page_url),
+                    } },
+                });
+            }
+        },
+        .cc_edatribe_com => {
+            var scraper = subdl.cc_edatribe_com.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                try out.append(a, .{
+                    .label = try std.fmt.allocPrint(a, "[{s}] {s}", .{ @tagName(item.media_kind), title }),
+                    .ref = .{ .cc_edatribe_com = .{
                         .title = title,
                         .media_kind = item.media_kind,
                         .page_url = try a.dupe(u8, item.page_url),
@@ -1711,6 +1739,27 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .cc_edatribe_com => |item| {
+            title = try a.dupe(u8, item.title);
+            var scraper = subdl.cc_edatribe_com.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            const query_item: subdl.cc_edatribe_com.SearchItem = .{
+                .title = item.title,
+                .media_kind = item.media_kind,
+                .page_url = item.page_url,
+            };
+            var subtitles = try scraper.fetchSubtitlesBySearchItem(query_item);
+            defer subtitles.deinit();
+            for (subtitles.subtitles) |subtitle| {
+                const label = try subtitleLabel(a, subtitle.language_code, subtitle.filename, subtitle.download_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try a.dupe(u8, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
     }
 
     return .{
@@ -1856,6 +1905,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .greeksubs_net => |item| item.title,
         .indexsubtitle_cc => |item| item.title,
         .sous_titres_eu => |item| item.title,
+        .cc_edatribe_com => |item| item.title,
     };
 }
 
@@ -2958,6 +3008,7 @@ fn liveQueryForProvider(provider: Provider) []const u8 {
         .greeksubtitles_com => "The Matrix 1999",
         .subtitles_ajatt_top => "Spirited Away",
         .greeksubs_net => "Interstellar",
+        .cc_edatribe_com => "Spirited Away",
         else => "The Matrix",
     };
 }
@@ -2987,6 +3038,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .greeksubs_net => |item| item.page_url,
         .indexsubtitle_cc => |item| item.page_url,
         .sous_titres_eu => |item| item.page_url,
+        .cc_edatribe_com => |item| item.page_url,
     };
 }
 
@@ -3057,6 +3109,7 @@ test "active provider registry excludes retired providers" {
         "greeksubs_net",
         "indexsubtitle_cc",
         "sous_titres_eu",
+        "cc_edatribe_com",
     };
 
     const actual = providers();
@@ -3096,6 +3149,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("greeksubs.net") == .greeksubs_net);
     try std.testing.expect(parseProvider("indexsubtitle.cc") == .indexsubtitle_cc);
     try std.testing.expect(parseProvider("sous-titres.eu") == .sous_titres_eu);
+    try std.testing.expect(parseProvider("cc.edatribe.com") == .cc_edatribe_com);
 }
 
 test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
@@ -3114,6 +3168,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("greeksubs") == .greeksubs_net);
     try std.testing.expect(try resolveProvider("indexsubtitle") == .indexsubtitle_cc);
     try std.testing.expect(try resolveProvider("sous_titres") == .sous_titres_eu);
+    try std.testing.expect(try resolveProvider("cc_edatribe") == .cc_edatribe_com);
     try std.testing.expect(try resolveProvider("open") == .opensubtitles_com);
     try std.testing.expectError(error.UnknownProvider, resolveProvider("tvsubtitles"));
     try std.testing.expectError(error.UnknownProvider, resolveProvider("missing"));
@@ -3481,6 +3536,7 @@ fn seriesQueryForProvider(provider: Provider) []const u8 {
         .subsunacs_net => "Game of Thrones 01 01",
         .subtitles_ajatt_top => "Death Note",
         .greeksubs_net => "Game of Thrones",
+        .cc_edatribe_com => "Attack on Titan",
         else => "Chernobyl",
     };
 }
@@ -3574,6 +3630,7 @@ const tui_smoke_providers = [_]Provider{
     .greeksubs_net,
     .indexsubtitle_cc,
     .sous_titres_eu,
+    .cc_edatribe_com,
 };
 
 fn runProvidersSmokeBatch(allocator: std.mem.Allocator, selected: []const Provider) !void {
@@ -3759,6 +3816,10 @@ test "live providers_app tui-path smoke provider: sous-titres.eu" {
     try runSingleProviderSmokeTest(.sous_titres_eu);
 }
 
+test "live providers_app tui-path smoke provider: cc.edatribe.com" {
+    try runSingleProviderSmokeTest(.cc_edatribe_com);
+}
+
 test "live series download path provider: subdl.com" {
     try runSingleProviderSeriesTest(.subdl_com);
 }
@@ -3825,4 +3886,8 @@ test "live series download path provider: indexsubtitle.cc" {
 
 test "live series download path provider: sous-titres.eu" {
     try runSingleProviderSeriesTest(.sous_titres_eu);
+}
+
+test "live series download path provider: cc.edatribe.com" {
+    try runSingleProviderSeriesTest(.cc_edatribe_com);
 }

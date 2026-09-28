@@ -3,13 +3,13 @@
 Subtitle scrapers in Zig with a shared provider API and a single `scrapers` binary.
 
 ![Zig](https://img.shields.io/badge/Zig-0.16.0--dev-f7a41d)
-![Providers](https://img.shields.io/badge/Active_Providers-15-2ea44f)
+![Providers](https://img.shields.io/badge/Active_Providers-16-2ea44f)
 ![Runtime](https://img.shields.io/badge/HTTP-std.http%20(Client)-0366d6)
 
 ## Overview
 
-- 15 currently active providers behind one app layer: `providers_app`
-- 21 provider implementations retained and covered by targeted live tests
+- 16 currently active providers behind one app layer: `providers_app`
+- 22 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
 - TUI mode available with `--tui` in the default build
@@ -40,6 +40,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `greeksubs_net` | `greeksubs.net` |
 | `indexsubtitle_cc` | `indexsubtitle.cc` |
 | `sous_titres_eu` | `sous-titres.eu` |
+| `cc_edatribe_com` | `cc.edatribe.com` |
 
 Retained inactive implementations are `opensubtitles_org`, `moviesubtitles_org`,
 `moviesubtitlesrt_com`, `podnapisi_net`, `tvsubtitles_net`, and
@@ -52,6 +53,7 @@ known-unusable provider in the CLI/TUI.
 `subtis_io` is movie-only and provides Spanish subtitles.
 `greeksubs_net` provides Greek subtitles for movies and TV.
 `sous_titres_eu` provides French subtitles for movies and TV.
+`cc_edatribe_com` provides English anime movie and TV captions.
 
 ## Quick Start
 

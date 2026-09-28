@@ -27,6 +27,7 @@ pub const subtis_io = subdl.subtis_io;
 pub const greeksubs_net = subdl.greeksubs_net;
 pub const indexsubtitle_cc = subdl.indexsubtitle_cc;
 pub const sous_titres_eu = subdl.sous_titres_eu;
+pub const cc_edatribe_com = subdl.cc_edatribe_com;
 pub const provider_union = subdl.provider_union;
 
 pub const Scraper = subdl.Scraper;
