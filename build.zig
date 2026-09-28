@@ -310,7 +310,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "subtitulamos.tv" },
     .{ .name = "feliratok.eu" },
     .{ .name = "animesub.info", .timeout_seconds = 180 },
-    .{ .name = "subhd.tv", .active = false },
+    .{ .name = "subhd.tv" },
     .{ .name = "fansubs.ru" },
     .{ .name = "legendei.net" },
     .{ .name = "zoom.lk" },

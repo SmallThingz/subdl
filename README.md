@@ -3,12 +3,12 @@
 Subtitle scrapers in Zig with a shared provider API and a single `scrapers` binary.
 
 ![Zig](https://img.shields.io/badge/Zig-0.16.0--dev-f7a41d)
-![Providers](https://img.shields.io/badge/Active_Providers-33-2ea44f)
+![Providers](https://img.shields.io/badge/Active_Providers-34-2ea44f)
 ![Runtime](https://img.shields.io/badge/HTTP-std.http%20(Client)-0366d6)
 
 ## Overview
 
-- 33 currently active providers behind one app layer: `providers_app`
+- 34 currently active providers behind one app layer: `providers_app`
 - 41 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
@@ -50,6 +50,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `subtitulamos_tv` | `subtitulamos.tv` |
 | `feliratok_eu` | `feliratok.eu` |
 | `animesub_info` | `animesub.info` |
+| `subhd_tv` | `subhd.tv` |
 | `fansubs_ru` | `fansubs.ru` |
 | `legendei_net` | `legendei.net` |
 | `zoom_lk` | `zoom.lk` |
@@ -62,9 +63,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 Retained inactive implementations are `opensubtitles_org`, `moviesubtitles_org`,
 `moviesubtitlesrt_com`, `podnapisi_net`, `tvsubtitles_net`,
 `subtitrari_noi_ro` while its upstream host is refusing connections,
-`subtis_io` while `api.subt.is` has no DNS A record, and
-`subhd_tv` while SubHD is refusing subtitle downloads with its explicit
-download-frequency throttle. They stay in
+`subtis_io` while `api.subt.is` has no DNS A record. They stay in
 the live-test matrix so upstream recovery can be detected without advertising a
 known-unusable provider in the CLI/TUI.
 
@@ -83,6 +82,7 @@ known-unusable provider in the CLI/TUI.
 `subtitulamos_tv` is TV-only and provides English, Spanish, Portuguese, Catalan, and Galician subtitles.
 `feliratok_eu` is movie-only and provides Hungarian and English subtitles.
 `animesub_info` provides Polish anime movie and TV subtitles.
+`subhd_tv` provides movie and TV subtitles through SubHD's current prepare-download flow.
 `fansubs_ru` provides Russian anime movie and TV subtitles.
 `legendei_net` provides Portuguese movie and TV subtitle archives, with language-specific posts when available.
 `zoom_lk` provides Sinhala movie and TV season subtitle archives.
