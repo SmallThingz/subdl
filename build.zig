@@ -309,7 +309,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "subcentral.de", .timeout_seconds = 120 },
     .{ .name = "subtitulamos.tv" },
     .{ .name = "feliratok.eu" },
-    .{ .name = "animesub.info" },
+    .{ .name = "animesub.info", .timeout_seconds = 180 },
     .{ .name = "subhd.tv", .active = false },
     .{ .name = "fansubs.ru" },
     .{ .name = "legendei.net" },

@@ -2112,6 +2112,8 @@ fn cloneSearchRef(allocator: std.mem.Allocator, ref: app.SearchRef) !app.SearchR
             .season = item.season,
             .episode = item.episode,
             .subtitle_id = try allocator.dupe(u8, item.subtitle_id),
+            .download_hash = try allocator.dupe(u8, item.download_hash),
+            .session_cookie = try allocator.dupe(u8, item.session_cookie),
             .search_query = try allocator.dupe(u8, item.search_query),
             .title_type = try allocator.dupe(u8, item.title_type),
             .page_url = try allocator.dupe(u8, item.page_url),

@@ -15,6 +15,8 @@ pub const SearchItem = struct {
     season: ?i64,
     episode: ?i64,
     subtitle_id: []const u8,
+    download_hash: []const u8,
+    session_cookie: []const u8,
     search_query: []const u8,
     title_type: []const u8,
     page_url: []const u8,
@@ -71,12 +73,20 @@ pub const Scraper = struct {
 
         for ([_][]const u8{ "org", "en", "pl" }) |title_type| {
             const url = try buildSearchUrl(a, trimmed, title_type);
-            const response = try common.fetchBytes(self.client, a, url, .{
-                .accept = "text/html,application/xhtml+xml,*/*",
-                .cache = false,
-                .max_attempts = 3,
-            });
-            try appendSearchRows(a, response.body, trimmed, title_type, url, &seen, &exact, &partial);
+            var response = try fetchRawGet(self.client, a, url);
+            defer response.deinit(a);
+            if (response.status != .ok) continue;
+            try appendSearchRows(
+                a,
+                response.body,
+                trimmed,
+                title_type,
+                url,
+                response.cookie orelse "",
+                &seen,
+                &exact,
+                &partial,
+            );
             if (exact.items.len > 0 and title_type[0] != 'o') break;
         }
 
@@ -106,45 +116,34 @@ pub const Scraper = struct {
 
     pub fn fetchDownloadByToken(self: *Scraper, allocator: Allocator, token: []const u8) !common.HttpResponse {
         const parts = parseDownloadToken(token) orelse return error.InvalidDownloadUrl;
-        const search_url = try buildSearchUrl(allocator, parts.query, parts.title_type);
-        defer allocator.free(search_url);
+        if (parts.download_hash.len > 0 and parts.session_cookie.len > 0) {
+            const response = try postDownload(
+                self.client,
+                allocator,
+                parts.subtitle_id,
+                parts.download_hash,
+                parts.session_cookie,
+                parts.search_url,
+            );
+            if (downloadResponseIsValid(response)) return response;
+            allocator.free(response.body);
+        }
 
-        var search_response = try fetchRawGet(self.client, allocator, search_url);
+        var search_response = try fetchRawGet(self.client, allocator, parts.search_url);
         defer search_response.deinit(allocator);
         if (search_response.status != .ok) return error.UnexpectedHttpStatus;
         const cookie = search_response.cookie orelse return error.SessionExpired;
-
         const hash = findHashForId(search_response.body, parts.subtitle_id) orelse return error.MissingField;
-        const id_encoded = try common.encodeUriComponent(allocator, parts.subtitle_id);
-        defer allocator.free(id_encoded);
-        const hash_encoded = try common.encodeUriComponent(allocator, hash);
-        defer allocator.free(hash_encoded);
-        const button_encoded = try common.encodeUriComponent(allocator, "Pobierz napisy");
-        defer allocator.free(button_encoded);
-        const payload = try std.fmt.allocPrint(
-            allocator,
-            "id={s}&sh={s}&single_file={s}",
-            .{ id_encoded, hash_encoded, button_encoded },
-        );
-        defer allocator.free(payload);
 
-        const response = try common.fetchBytes(self.client, allocator, download_path, .{
-            .method = .POST,
-            .payload = payload,
-            .content_type = "application/x-www-form-urlencoded",
-            .accept = "application/zip,application/octet-stream,*/*",
-            .extra_headers = &[_]std.http.Header{
-                .{ .name = "cookie", .value = cookie },
-                .{ .name = "referer", .value = search_url },
-            },
-            .cache = false,
-            .max_attempts = 2,
-        });
-        if (response.status != .ok) {
-            allocator.free(response.body);
-            return error.UnexpectedHttpStatus;
-        }
-        if (response.body.len < 4 or !std.mem.eql(u8, response.body[0..2], "PK")) {
+        const response = try postDownload(
+            self.client,
+            allocator,
+            parts.subtitle_id,
+            hash,
+            cookie,
+            parts.search_url,
+        );
+        if (!downloadResponseIsValid(response)) {
             allocator.free(response.body);
             return error.UnexpectedResponseType;
         }
@@ -152,12 +151,55 @@ pub const Scraper = struct {
     }
 };
 
+fn postDownload(
+    client: *std.http.Client,
+    allocator: Allocator,
+    subtitle_id: []const u8,
+    hash: []const u8,
+    cookie: []const u8,
+    search_url: []const u8,
+) !common.HttpResponse {
+    const id_encoded = try common.encodeUriComponent(allocator, subtitle_id);
+    defer allocator.free(id_encoded);
+    const hash_encoded = try common.encodeUriComponent(allocator, hash);
+    defer allocator.free(hash_encoded);
+    const button_encoded = try common.encodeUriComponent(allocator, "Pobierz napisy");
+    defer allocator.free(button_encoded);
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "id={s}&sh={s}&single_file={s}",
+        .{ id_encoded, hash_encoded, button_encoded },
+    );
+    defer allocator.free(payload);
+
+    return common.fetchBytes(client, allocator, download_path, .{
+        .method = .POST,
+        .payload = payload,
+        .content_type = "application/x-www-form-urlencoded",
+        .accept = "application/zip,application/octet-stream,*/*",
+        .extra_headers = &[_]std.http.Header{
+            .{ .name = "cookie", .value = cookie },
+            .{ .name = "referer", .value = search_url },
+        },
+        .allow_non_ok = true,
+        .cache = false,
+        .max_attempts = 2,
+    });
+}
+
+fn downloadResponseIsValid(response: common.HttpResponse) bool {
+    return response.status == .ok and
+        response.body.len >= 4 and
+        std.mem.eql(u8, response.body[0..2], "PK");
+}
+
 fn appendSearchRows(
     allocator: Allocator,
     body: []const u8,
     query: []const u8,
     title_type: []const u8,
     search_url: []const u8,
+    session_cookie: []const u8,
     seen: *std.StringHashMapUnmanaged(void),
     exact: *std.ArrayListUnmanaged(SearchItem),
     partial: *std.ArrayListUnmanaged(SearchItem),
@@ -209,6 +251,8 @@ fn appendSearchRows(
             .season = if (media_kind == .tv) season orelse 1 else null,
             .episode = episode,
             .subtitle_id = try allocator.dupe(u8, subtitle_id),
+            .download_hash = try allocator.dupe(u8, hash),
+            .session_cookie = try allocator.dupe(u8, session_cookie),
             .search_query = try allocator.dupe(u8, query),
             .title_type = try allocator.dupe(u8, title_type),
             .page_url = try allocator.dupe(u8, search_url),
@@ -322,29 +366,34 @@ fn buildSearchUrl(allocator: Allocator, query: []const u8, title_type: []const u
 pub fn makeDownloadToken(allocator: Allocator, item: SearchItem) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "{s}{s}|{s}|{s}",
-        .{ download_token_prefix, item.subtitle_id, item.title_type, item.search_query },
+        "{s}{s}|{s}|{s}|{s}",
+        .{ download_token_prefix, item.subtitle_id, item.download_hash, item.session_cookie, item.page_url },
     );
 }
 
 const DownloadToken = struct {
     subtitle_id: []const u8,
-    title_type: []const u8,
-    query: []const u8,
+    download_hash: []const u8,
+    session_cookie: []const u8,
+    search_url: []const u8,
 };
 
 pub fn parseDownloadToken(value: []const u8) ?DownloadToken {
     if (!std.mem.startsWith(u8, value, download_token_prefix)) return null;
     const payload = value[download_token_prefix.len..];
     const a = std.mem.indexOfScalar(u8, payload, '|') orelse return null;
-    const rest = payload[a + 1 ..];
-    const b_rel = std.mem.indexOfScalar(u8, rest, '|') orelse return null;
+    const rest1 = payload[a + 1 ..];
+    const b_rel = std.mem.indexOfScalar(u8, rest1, '|') orelse return null;
     const b = a + 1 + b_rel;
-    if (a == 0 or b <= a + 1 or b + 1 >= payload.len) return null;
+    const rest2 = payload[b + 1 ..];
+    const c_rel = std.mem.indexOfScalar(u8, rest2, '|') orelse return null;
+    const c = b + 1 + c_rel;
+    if (a == 0 or b <= a + 1 or c <= b + 1 or c + 1 >= payload.len) return null;
     return .{
         .subtitle_id = payload[0..a],
-        .title_type = payload[a + 1 .. b],
-        .query = payload[b + 1 ..],
+        .download_hash = payload[a + 1 .. b],
+        .session_cookie = payload[b + 1 .. c],
+        .search_url = payload[c + 1 ..],
     };
 }
 
@@ -438,6 +487,7 @@ test "animesubinfo parses movie and episode rows" {
         "Death Note",
         "org",
         "http://animesub.info/szukaj.php?x",
+        "ansi_sciagnij=test",
         &seen,
         &exact,
         &partial,

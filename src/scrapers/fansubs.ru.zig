@@ -119,28 +119,73 @@ pub const Scraper = struct {
         const payload = try std.fmt.allocPrint(allocator, "srt={s}&x=0&y=0", .{id_encoded});
         defer allocator.free(payload);
 
-        const response = try common.fetchBytes(self.client, allocator, download_url, .{
-            .method = .POST,
-            .payload = payload,
-            .content_type = "application/x-www-form-urlencoded",
-            .accept = "application/octet-stream,application/zip,application/x-rar-compressed,text/plain,*/*",
-            .extra_headers = &[_]std.http.Header{
-                .{ .name = "accept-language", .value = "ru,en;q=0.8" },
-            },
-            .cache = false,
-            .max_attempts = 2,
-        });
-        if (response.status != .ok) {
-            allocator.free(response.body);
-            return error.UnexpectedHttpStatus;
+        var attempt: usize = 0;
+        while (attempt < 3) : (attempt += 1) {
+            const response = fetchDownloadOnce(self.client, allocator, payload) catch |err| {
+                if (attempt + 1 < 3) {
+                    common.sleepMilliseconds(250 * (attempt + 1));
+                    continue;
+                }
+                return err;
+            };
+            if (response.status != .ok) {
+                allocator.free(response.body);
+                return error.UnexpectedHttpStatus;
+            }
+            if (looksLikeHtml(response.body)) {
+                allocator.free(response.body);
+                return error.UnexpectedResponseType;
+            }
+            return response;
         }
-        if (looksLikeHtml(response.body)) {
-            allocator.free(response.body);
-            return error.UnexpectedResponseType;
-        }
-        return response;
+        return error.TruncatedResponse;
     }
 };
+
+fn fetchDownloadOnce(client: *std.http.Client, allocator: Allocator, payload: []const u8) !common.HttpResponse {
+    try common.ensureClientTlsReady(client);
+    const normalized = try common.normalizeUrlForFetch(allocator, download_url);
+    defer allocator.free(normalized);
+    const uri = try std.Uri.parse(normalized);
+
+    var req = try client.request(.POST, uri, .{
+        .headers = .{
+            .user_agent = .{ .override = common.default_user_agent },
+            .accept_encoding = .{ .override = "identity" },
+            .content_type = .{ .override = "application/x-www-form-urlencoded" },
+        },
+        .extra_headers = &[_]std.http.Header{
+            .{ .name = "accept", .value = "application/octet-stream,application/zip,application/x-rar-compressed,text/plain,*/*" },
+            .{ .name = "accept-language", .value = "ru,en;q=0.8" },
+        },
+    });
+    defer req.deinit();
+
+    const mutable_payload = try allocator.dupe(u8, payload);
+    defer allocator.free(mutable_payload);
+    try req.sendBodyComplete(mutable_payload);
+
+    var head_buffer: [24 * 1024]u8 = undefined;
+    var response = try req.receiveHead(&head_buffer);
+    const status = response.head.status;
+    const expected_length = response.head.content_length;
+
+    var transfer_buffer: [16 * 1024]u8 = undefined;
+    const reader = response.reader(&transfer_buffer);
+    var writer = std.Io.Writer.Allocating.init(allocator);
+    defer writer.deinit();
+    _ = try reader.streamRemaining(&writer.writer);
+
+    const body = try allocator.dupe(u8, writer.writer.buffered());
+    errdefer allocator.free(body);
+    if (expected_length) |expected| {
+        if (body.len != expected) {
+            allocator.free(body);
+            return error.TruncatedResponse;
+        }
+    }
+    return .{ .status = status, .body = body };
+}
 
 fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []const u8) !SearchResponse {
     var owned_arena = arena;
