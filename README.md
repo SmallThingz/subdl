@@ -3,12 +3,12 @@
 Subtitle scrapers in Zig with a shared provider API and a single `scrapers` binary.
 
 ![Zig](https://img.shields.io/badge/Zig-0.16.0--dev-f7a41d)
-![Providers](https://img.shields.io/badge/Active_Providers-29-2ea44f)
+![Providers](https://img.shields.io/badge/Active_Providers-30-2ea44f)
 ![Runtime](https://img.shields.io/badge/HTTP-std.http%20(Client)-0366d6)
 
 ## Overview
 
-- 29 currently active providers behind one app layer: `providers_app`
+- 30 currently active providers behind one app layer: `providers_app`
 - 38 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
@@ -34,6 +34,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `subsource_net` | `subsource.net` |
 | `sub_scene_com` | `sub-scene.com` |
 | `gestdown_info` | `gestdown.info` |
+| `greek_subtitles_com` | `greek-subtitles.com` |
 | `subsunacs_net` | `subsunacs.net` |
 | `subtitles_ajatt_top` | `subtitles.ajatt.top` |
 | `greeksubs_net` | `greeksubs.net` |
@@ -56,9 +57,9 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `wizdom_xyz` | `wizdom.xyz` |
 
 Retained inactive implementations are `opensubtitles_org`, `moviesubtitles_org`,
-`moviesubtitlesrt_com`, `podnapisi_net`, `tvsubtitles_net`, and
-`greek_subtitles_com`, `subtitrari_noi_ro` while its upstream host is refusing
-connections, `subtis_io` while `api.subt.is` has no DNS A record, and
+`moviesubtitlesrt_com`, `podnapisi_net`, `tvsubtitles_net`,
+`subtitrari_noi_ro` while its upstream host is refusing connections,
+`subtis_io` while `api.subt.is` has no DNS A record, and
 `subhd_tv` while SubHD is refusing subtitle downloads with its explicit
 download-frequency throttle. They stay in
 the live-test matrix so upstream recovery can be detected without advertising a
@@ -66,6 +67,7 @@ known-unusable provider in the CLI/TUI.
 
 `gestdown_info` is TV-only. `yifysubtitles_ch` is movie-only.
 `subtitles_ajatt_top` focuses on Japanese subtitles for anime TV and movies.
+`greek_subtitles_com` provides Greek subtitle archives for movies and TV.
 `greeksubs_net` provides Greek subtitles for movies and TV.
 `sous_titres_eu` provides French subtitles for movies and TV.
 `cc_edatribe_com` provides English anime movie and TV captions.

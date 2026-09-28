@@ -83,6 +83,7 @@ const provider_values = [_]Provider{
     .subsource_net,
     .sub_scene_com,
     .gestdown_info,
+    .greeksubtitles_com,
     .subsunacs_net,
     .subtitles_ajatt_top,
     .greeksubs_net,
@@ -4145,6 +4146,7 @@ test "active provider registry excludes retired providers" {
         "subsource_net",
         "sub_scene_com",
         "gestdown_info",
+        "greek_subtitles_com",
         "subsunacs_net",
         "subtitles_ajatt_top",
         "greeksubs_net",
@@ -4197,7 +4199,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("sub-scene.com") == .sub_scene_com);
     try std.testing.expect(parseProvider("tvsubtitles.net") == null);
     try std.testing.expect(parseProvider("gestdown.info") == .gestdown_info);
-    try std.testing.expect(parseProvider("greek-subtitles.com") == null);
+    try std.testing.expect(parseProvider("greek-subtitles.com") == .greeksubtitles_com);
     try std.testing.expect(parseProvider("subsunacs.net") == .subsunacs_net);
     try std.testing.expect(parseProvider("subtitles.ajatt.top") == .subtitles_ajatt_top);
     try std.testing.expect(parseProvider("subtis.io") == null);
@@ -4232,7 +4234,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("subsource") == .subsource_net);
     try std.testing.expect(try resolveProvider("sub_scene") == .sub_scene_com);
     try std.testing.expect(try resolveProvider("gestdown") == .gestdown_info);
-    try std.testing.expectError(error.UnknownProvider, resolveProvider("greek_subtitles"));
+    try std.testing.expect(try resolveProvider("greek_subtitles") == .greeksubtitles_com);
     try std.testing.expect(try resolveProvider("subsunacs") == .subsunacs_net);
     try std.testing.expect(try resolveProvider("subtitles_ajatt") == .subtitles_ajatt_top);
     try std.testing.expect(try resolveProvider("greeksubs") == .greeksubs_net);

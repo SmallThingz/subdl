@@ -129,6 +129,7 @@ pub const Scraper = struct {
                 try appendSearchResults(self.client, a, &out, &seen, query_used, options, &auth);
             }
         }
+        rankSearchResults(out.items, query_used);
 
         return .{
             .arena = arena,
@@ -305,6 +306,68 @@ pub const Scraper = struct {
         return if (details.download_url) |url| try allocator.dupe(u8, url) else null;
     }
 };
+
+const RankedQuery = struct {
+    title: []const u8,
+    year: ?i64,
+};
+
+fn parseRankedQuery(raw: []const u8) RankedQuery {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len < 5) return .{ .title = trimmed, .year = null };
+
+    const year_start = trimmed.len - 4;
+    for (trimmed[year_start..]) |c| {
+        if (!std.ascii.isDigit(c)) return .{ .title = trimmed, .year = null };
+    }
+    if (year_start == 0 or !std.ascii.isWhitespace(trimmed[year_start - 1])) {
+        return .{ .title = trimmed, .year = null };
+    }
+    const title = std.mem.trimEnd(u8, trimmed[0 .. year_start - 1], " \t");
+    if (title.len == 0) return .{ .title = trimmed, .year = null };
+    return .{
+        .title = title,
+        .year = std.fmt.parseInt(i64, trimmed[year_start..], 10) catch null,
+    };
+}
+
+fn searchItemRank(item: SearchItem, query: RankedQuery) u16 {
+    var score: u16 = 0;
+    const candidate = std.mem.trim(u8, item.title, " \t\r\n");
+
+    if (std.ascii.eqlIgnoreCase(candidate, query.title)) {
+        score += 1000;
+    } else if (std.ascii.indexOfIgnoreCase(candidate, query.title) != null) {
+        score += 200;
+    }
+
+    if (query.year) |year| {
+        if (item.release_year == year) score += 100;
+    }
+
+    if (item.subtitle_count) |count| {
+        score += @intCast(@min(@as(i64, 50), @max(@as(i64, 0), count)));
+    }
+    return score;
+}
+
+fn rankSearchResults(items: []SearchItem, raw_query: []const u8) void {
+    const query = parseRankedQuery(raw_query);
+    if (query.title.len == 0 or items.len < 2) return;
+
+    // Stable insertion sort: preserve upstream ordering when our title/year rank ties.
+    var i: usize = 1;
+    while (i < items.len) : (i += 1) {
+        var j = i;
+        while (j > 0) {
+            const lhs_rank = searchItemRank(items[j], query);
+            const rhs_rank = searchItemRank(items[j - 1], query);
+            if (lhs_rank <= rhs_rank) break;
+            std.mem.swap(SearchItem, &items[j], &items[j - 1]);
+            j -= 1;
+        }
+    }
+}
 
 fn resolveSearchQuery(client: *std.http.Client, allocator: Allocator, query: []const u8) ![]const u8 {
     const trimmed = std.mem.trim(u8, query, " \t\r\n");
@@ -695,4 +758,54 @@ test "subsource search payload defaults limit when zero" {
         "{\"query\":\"The Matrix\",\"includeSeasons\":false,\"limit\":5000}",
         payload,
     );
+}
+
+test "subsource ranks exact title ahead of containing titles" {
+    var items = [_]SearchItem{
+        .{
+            .id = 1,
+            .title = "Escape The Matrix",
+            .media_type = "tvseries",
+            .link = "/series/escape-the-matrix-2020",
+            .release_year = 2020,
+            .subtitle_count = 10,
+            .seasons = &.{},
+        },
+        .{
+            .id = 2,
+            .title = "The Matrix",
+            .media_type = "movie",
+            .link = "/subtitles/the-matrix-1999",
+            .release_year = 1999,
+            .subtitle_count = 403,
+            .seasons = &.{},
+        },
+    };
+    rankSearchResults(&items, "The Matrix");
+    try std.testing.expectEqual(@as(i64, 2), items[0].id);
+}
+
+test "subsource ranking honors an explicit query year" {
+    var items = [_]SearchItem{
+        .{
+            .id = 1,
+            .title = "The Matrix",
+            .media_type = "movie",
+            .link = "/subtitles/the-matrix-2021",
+            .release_year = 2021,
+            .subtitle_count = 500,
+            .seasons = &.{},
+        },
+        .{
+            .id = 2,
+            .title = "The Matrix",
+            .media_type = "movie",
+            .link = "/subtitles/the-matrix-1999",
+            .release_year = 1999,
+            .subtitle_count = 1,
+            .seasons = &.{},
+        },
+    };
+    rankSearchResults(&items, "The Matrix 1999");
+    try std.testing.expectEqual(@as(i64, 2), items[0].id);
 }
