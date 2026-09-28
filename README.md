@@ -9,7 +9,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 ## Overview
 
 - 28 currently active providers behind one app layer: `providers_app`
-- 35 provider implementations retained and covered by targeted live tests
+- 36 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
 - TUI mode available with `--tui` in the default build
@@ -36,7 +36,6 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `gestdown_info` | `gestdown.info` |
 | `subsunacs_net` | `subsunacs.net` |
 | `subtitles_ajatt_top` | `subtitles.ajatt.top` |
-| `subtis_io` | `subtis.io` |
 | `greeksubs_net` | `greeksubs.net` |
 | `indexsubtitle_cc` | `indexsubtitle.cc` |
 | `sous_titres_eu` | `sous-titres.eu` |
@@ -53,17 +52,17 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `subhd_tv` | `subhd.tv` |
 | `fansubs_ru` | `fansubs.ru` |
 | `legendei_net` | `legendei.net` |
+| `zoom_lk` | `zoom.lk` |
 
 Retained inactive implementations are `opensubtitles_org`, `moviesubtitles_org`,
 `moviesubtitlesrt_com`, `podnapisi_net`, `tvsubtitles_net`, and
-`greek_subtitles_com`, plus `subtitrari_noi_ro` while its upstream host is refusing
-connections. They stay in
+`greek_subtitles_com`, `subtitrari_noi_ro` while its upstream host is refusing
+connections, and `subtis_io` while `api.subt.is` has no DNS A record. They stay in
 the live-test matrix so upstream recovery can be detected without advertising a
 known-unusable provider in the CLI/TUI.
 
 `gestdown_info` is TV-only. `yifysubtitles_ch` is movie-only.
 `subtitles_ajatt_top` focuses on Japanese subtitles for anime TV and movies.
-`subtis_io` is movie-only and provides Spanish subtitles.
 `greeksubs_net` provides Greek subtitles for movies and TV.
 `sous_titres_eu` provides French subtitles for movies and TV.
 `cc_edatribe_com` provides English anime movie and TV captions.
@@ -79,6 +78,7 @@ known-unusable provider in the CLI/TUI.
 `subhd_tv` provides movie and TV subtitles across Chinese, English, and other languages.
 `fansubs_ru` provides Russian anime movie and TV subtitles.
 `legendei_net` provides Portuguese movie and TV subtitle archives, with language-specific posts when available.
+`zoom_lk` provides Sinhala movie and TV season subtitle archives.
 
 ## Quick Start
 

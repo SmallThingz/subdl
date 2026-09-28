@@ -112,7 +112,6 @@ Supported canonical provider IDs:
 - `gestdown_info`
 - `subsunacs_net`
 - `subtitles_ajatt_top`
-- `subtis_io`
 - `greeksubs_net`
 - `indexsubtitle_cc`
 - `sous_titres_eu`
@@ -129,17 +128,18 @@ Supported canonical provider IDs:
 - `subhd_tv`
 - `fansubs_ru`
 - `legendei_net`
+- `zoom_lk`
 
 The repository also retains inactive implementations for
 `opensubtitles_org`, `moviesubtitles_org`, `moviesubtitlesrt_com`,
-`podnapisi_net`, `tvsubtitles_net`, `greek_subtitles_com`, and
-`subtitrari_noi_ro` while its upstream host is refusing connections. Targeted live tests still cover
+`podnapisi_net`, `tvsubtitles_net`, `greek_subtitles_com`,
+`subtitrari_noi_ro` while its upstream host is refusing connections, and
+`subtis_io` while `api.subt.is` has no DNS A record. Targeted live tests still cover
 those modules, but the CLI/TUI registry does not expose them while their
 current upstream/network path cannot complete a search.
 
 `gestdown_info` is TV-only. `yifysubtitles_ch` is movie-only.
 `subtitles_ajatt_top` focuses on Japanese subtitles for anime TV and movies.
-`subtis_io` is movie-only and provides Spanish subtitles.
 `greeksubs_net` provides Greek subtitles for movies and TV.
 `sous_titres_eu` provides French subtitles for movies and TV.
 `cc_edatribe_com` provides English anime movie and TV captions.
@@ -155,6 +155,7 @@ current upstream/network path cannot complete a search.
 `subhd_tv` uses SubHD's current prepare-download token flow and supports movies and TV.
 `fansubs_ru` provides Russian anime movie and TV archives.
 `legendei_net` uses the public WordPress search API and each post's own subtitle download link.
+`zoom_lk` provides Sinhala movie and TV season subtitle archives through the site's public search and `/sub-download` endpoints.
 
 The parser also accepts dotted or hyphenated site forms such as `subsource.net`.
 

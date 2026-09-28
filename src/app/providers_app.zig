@@ -68,6 +68,7 @@ pub const Provider = enum {
     subhd_tv,
     fansubs_ru,
     legendei_net,
+    zoom_lk,
 };
 
 const provider_values = [_]Provider{
@@ -82,7 +83,6 @@ const provider_values = [_]Provider{
     .gestdown_info,
     .subsunacs_net,
     .subtitles_ajatt_top,
-    .subtis_io,
     .greeksubs_net,
     .indexsubtitle_cc,
     .sous_titres_eu,
@@ -99,6 +99,7 @@ const provider_values = [_]Provider{
     .subhd_tv,
     .fansubs_ru,
     .legendei_net,
+    .zoom_lk,
 };
 
 pub fn providers() []const Provider {
@@ -153,6 +154,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .subhd_tv => "subhd_tv",
         .fansubs_ru => "fansubs_ru",
         .legendei_net => "legendei_net",
+        .zoom_lk => "zoom_lk",
     };
 }
 
@@ -220,6 +222,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .subhd_tv => "SubHD",
         .fansubs_ru => "Fansubs.ru",
         .legendei_net => "Legendei",
+        .zoom_lk => "Zoom.LK",
     };
 }
 
@@ -260,6 +263,7 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .subhd_tv => "https://subhd.tv",
         .fansubs_ru => "http://fansubs.ru",
         .legendei_net => "https://legendei.net",
+        .zoom_lk => "https://zoom.lk",
     };
 }
 
@@ -558,6 +562,13 @@ pub const SearchRef = union(Provider) {
         season: ?i64,
         episode: ?i64,
         language_code: []const u8,
+        page_url: []const u8,
+    },
+    zoom_lk: struct {
+        title: []const u8,
+        year: ?i64,
+        media_kind: subdl.zoom_lk.MediaKind,
+        season: ?i64,
         page_url: []const u8,
     },
 };
@@ -1423,6 +1434,32 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                         .season = item.season,
                         .episode = item.episode,
                         .language_code = try a.dupe(u8, item.language_code),
+                        .page_url = try a.dupe(u8, item.page_url),
+                    } },
+                });
+            }
+        },
+        .zoom_lk => {
+            var scraper = subdl.zoom_lk.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                const label = if (item.media_kind == .tv and item.season != null)
+                    try std.fmt.allocPrint(a, "[tv] {s} • S{d:0>2} • si", .{ title, item.season.? })
+                else if (item.year) |year|
+                    try std.fmt.allocPrint(a, "[movie] {s} ({d}) • si", .{ title, year })
+                else
+                    try std.fmt.allocPrint(a, "[movie] {s} • si", .{title});
+                try out.append(a, .{
+                    .label = label,
+                    .ref = .{ .zoom_lk = .{
+                        .title = title,
+                        .year = item.year,
+                        .media_kind = item.media_kind,
+                        .season = item.season,
                         .page_url = try a.dupe(u8, item.page_url),
                     } },
                 });
@@ -2535,6 +2572,29 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .zoom_lk => |item| {
+            title = try a.dupe(u8, item.title);
+            var scraper = subdl.zoom_lk.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            const query_item: subdl.zoom_lk.SearchItem = .{
+                .title = item.title,
+                .year = item.year,
+                .media_kind = item.media_kind,
+                .season = item.season,
+                .page_url = item.page_url,
+            };
+            var subtitles = try scraper.fetchSubtitlesBySearchItem(query_item);
+            defer subtitles.deinit();
+            for (subtitles.subtitles) |subtitle| {
+                const label = try subtitleLabel(a, subtitle.language_code, subtitle.filename, subtitle.download_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try a.dupe(u8, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
     }
 
     return .{
@@ -2694,6 +2754,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .subhd_tv => |item| item.title,
         .fansubs_ru => |item| item.title,
         .legendei_net => |item| item.title,
+        .zoom_lk => |item| item.title,
     };
 }
 
@@ -3840,6 +3901,7 @@ fn liveQueryForProvider(provider: Provider) []const u8 {
         .subhd_tv => "The Matrix",
         .fansubs_ru => "Spirited Away",
         .legendei_net => "The Matrix Resurrections",
+        .zoom_lk => "Centigrade",
         else => "The Matrix",
     };
 }
@@ -3883,6 +3945,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .subhd_tv => |item| item.detail_url,
         .fansubs_ru => |item| item.page_url,
         .legendei_net => |item| item.page_url,
+        .zoom_lk => |item| item.page_url,
     };
 }
 
@@ -3949,7 +4012,6 @@ test "active provider registry excludes retired providers" {
         "gestdown_info",
         "subsunacs_net",
         "subtitles_ajatt_top",
-        "subtis_io",
         "greeksubs_net",
         "indexsubtitle_cc",
         "sous_titres_eu",
@@ -3966,6 +4028,7 @@ test "active provider registry excludes retired providers" {
         "subhd_tv",
         "fansubs_ru",
         "legendei_net",
+        "zoom_lk",
     };
 
     const actual = providers();
@@ -4001,7 +4064,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("greek-subtitles.com") == null);
     try std.testing.expect(parseProvider("subsunacs.net") == .subsunacs_net);
     try std.testing.expect(parseProvider("subtitles.ajatt.top") == .subtitles_ajatt_top);
-    try std.testing.expect(parseProvider("subtis.io") == .subtis_io);
+    try std.testing.expect(parseProvider("subtis.io") == null);
     try std.testing.expect(parseProvider("greeksubs.net") == .greeksubs_net);
     try std.testing.expect(parseProvider("indexsubtitle.cc") == .indexsubtitle_cc);
     try std.testing.expect(parseProvider("sous-titres.eu") == .sous_titres_eu);
@@ -4019,6 +4082,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("subhd.tv") == .subhd_tv);
     try std.testing.expect(parseProvider("fansubs.ru") == .fansubs_ru);
     try std.testing.expect(parseProvider("legendei.net") == .legendei_net);
+    try std.testing.expect(parseProvider("zoom.lk") == .zoom_lk);
 }
 
 test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
@@ -4033,7 +4097,6 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expectError(error.UnknownProvider, resolveProvider("greek_subtitles"));
     try std.testing.expect(try resolveProvider("subsunacs") == .subsunacs_net);
     try std.testing.expect(try resolveProvider("subtitles_ajatt") == .subtitles_ajatt_top);
-    try std.testing.expect(try resolveProvider("subtis") == .subtis_io);
     try std.testing.expect(try resolveProvider("greeksubs") == .greeksubs_net);
     try std.testing.expect(try resolveProvider("indexsubtitle") == .indexsubtitle_cc);
     try std.testing.expect(try resolveProvider("sous_titres") == .sous_titres_eu);
@@ -4050,6 +4113,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("subhd") == .subhd_tv);
     try std.testing.expect(try resolveProvider("fansubs") == .fansubs_ru);
     try std.testing.expect(try resolveProvider("legendei") == .legendei_net);
+    try std.testing.expect(try resolveProvider("zoom") == .zoom_lk);
     try std.testing.expect(try resolveProvider("open") == .opensubtitles_com);
     try std.testing.expectError(error.UnknownProvider, resolveProvider("tvsubtitles"));
     try std.testing.expectError(error.UnknownProvider, resolveProvider("missing"));
@@ -4429,6 +4493,7 @@ fn seriesQueryForProvider(provider: Provider) []const u8 {
         .subhd_tv => "Chernobyl S01E01",
         .fansubs_ru => "Death Note",
         .legendei_net => "Chernobyl S01E01",
+        .zoom_lk => "Teen Wolf",
         else => "Chernobyl",
     };
 }
@@ -4536,6 +4601,7 @@ const tui_smoke_providers = [_]Provider{
     .subhd_tv,
     .fansubs_ru,
     .legendei_net,
+    .zoom_lk,
 };
 
 fn runProvidersSmokeBatch(allocator: std.mem.Allocator, selected: []const Provider) !void {
@@ -4777,6 +4843,10 @@ test "live providers_app tui-path smoke provider: legendei.net" {
     try runSingleProviderSmokeTest(.legendei_net);
 }
 
+test "live providers_app tui-path smoke provider: zoom.lk" {
+    try runSingleProviderSmokeTest(.zoom_lk);
+}
+
 test "live series download path provider: subdl.com" {
     try runSingleProviderSeriesTest(.subdl_com);
 }
@@ -4891,4 +4961,8 @@ test "live series download path provider: fansubs.ru" {
 
 test "live series download path provider: legendei.net" {
     try runSingleProviderSeriesTest(.legendei_net);
+}
+
+test "live series download path provider: zoom.lk" {
+    try runSingleProviderSeriesTest(.zoom_lk);
 }
