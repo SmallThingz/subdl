@@ -2016,6 +2016,11 @@ fn cloneSearchRef(allocator: std.mem.Allocator, ref: app.SearchRef) !app.SearchR
             .page_url = try allocator.dupe(u8, item.page_url),
             .download_page_url = try allocator.dupe(u8, item.download_page_url),
         } },
+        .subtitles_ajatt_top => |item| .{ .subtitles_ajatt_top = .{
+            .title = try allocator.dupe(u8, item.title),
+            .media_kind = item.media_kind,
+            .page_url = try allocator.dupe(u8, item.page_url),
+        } },
     };
 }
 

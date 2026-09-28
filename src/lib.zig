@@ -22,6 +22,7 @@ pub const tvsubtitles_net = subdl.tvsubtitles_net;
 pub const gestdown_info = subdl.gestdown_info;
 pub const greeksubtitles_com = subdl.greeksubtitles_com;
 pub const subsunacs_net = subdl.subsunacs_net;
+pub const subtitles_ajatt_top = subdl.subtitles_ajatt_top;
 pub const provider_union = subdl.provider_union;
 
 pub const Scraper = subdl.Scraper;

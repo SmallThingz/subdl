@@ -112,6 +112,7 @@ Supported canonical provider IDs:
 - `gestdown_info`
 - `greek_subtitles_com`
 - `subsunacs_net`
+- `subtitles_ajatt_top`
 
 The repository also retains inactive implementations for
 `opensubtitles_org`, `moviesubtitles_org`, `moviesubtitlesrt_com`,
@@ -120,6 +121,7 @@ those modules, but the CLI/TUI registry does not expose them while their
 current upstream/network path cannot complete a search.
 
 `gestdown_info` is TV-only. `yifysubtitles_ch` is movie-only.
+`subtitles_ajatt_top` focuses on Japanese subtitles for anime TV and movies.
 
 The parser also accepts dotted or hyphenated site forms such as `subsource.net`.
 

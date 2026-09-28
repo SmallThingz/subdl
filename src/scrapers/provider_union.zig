@@ -16,6 +16,7 @@ pub const tvsubtitles_net = @import("tvsubtitles.net.zig");
 pub const gestdown_info = @import("gestdown.info.zig");
 pub const greeksubtitles_com = @import("greek-subtitles.com.zig");
 pub const subsunacs_net = @import("subsunacs.net.zig");
+pub const subtitles_ajatt_top = @import("subtitles.ajatt.top.zig");
 
 pub const ProviderTag = enum {
     subdl_com,
@@ -34,6 +35,7 @@ pub const ProviderTag = enum {
     gestdown_info,
     greeksubtitles_com,
     subsunacs_net,
+    subtitles_ajatt_top,
 };
 
 pub const SearchItemUnion = union(ProviderTag) {
@@ -53,6 +55,7 @@ pub const SearchItemUnion = union(ProviderTag) {
     gestdown_info: gestdown_info.SearchItem,
     greeksubtitles_com: greeksubtitles_com.SearchItem,
     subsunacs_net: subsunacs_net.SearchItem,
+    subtitles_ajatt_top: subtitles_ajatt_top.SearchItem,
 };
 
 pub const SubtitleUnion = union(ProviderTag) {
@@ -72,6 +75,7 @@ pub const SubtitleUnion = union(ProviderTag) {
     gestdown_info: gestdown_info.SubtitleItem,
     greeksubtitles_com: greeksubtitles_com.SubtitleItem,
     subsunacs_net: subsunacs_net.SubtitleItem,
+    subtitles_ajatt_top: subtitles_ajatt_top.SubtitleItem,
 };
 
 pub const TitleUnion = union(ProviderTag) {
@@ -91,6 +95,7 @@ pub const TitleUnion = union(ProviderTag) {
     gestdown_info: gestdown_info.SearchItem,
     greeksubtitles_com: greeksubtitles_com.SearchItem,
     subsunacs_net: subsunacs_net.SearchItem,
+    subtitles_ajatt_top: subtitles_ajatt_top.SearchItem,
 };
 
 pub fn fromSubdlSearch(allocator: std.mem.Allocator, items: []const subdl_com.SearchItem) ![]SearchItemUnion {
@@ -205,6 +210,13 @@ pub fn fromSubsUnacsSearch(allocator: std.mem.Allocator, items: []const subsunac
     return try out.toOwnedSlice(allocator);
 }
 
+pub fn fromAjattSearch(allocator: std.mem.Allocator, items: []const subtitles_ajatt_top.SearchItem) ![]SearchItemUnion {
+    var out: std.ArrayListUnmanaged(SearchItemUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .subtitles_ajatt_top = item });
+    return try out.toOwnedSlice(allocator);
+}
+
 pub fn fromSubdlSubtitles(allocator: std.mem.Allocator, items: []const subdl_com.SubtitleItem) ![]SubtitleUnion {
     var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
     errdefer out.deinit(allocator);
@@ -314,6 +326,13 @@ pub fn fromSubsUnacsSubtitles(allocator: std.mem.Allocator, items: []const subsu
     var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
     errdefer out.deinit(allocator);
     for (items) |item| try out.append(allocator, .{ .subsunacs_net = item });
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn fromAjattSubtitles(allocator: std.mem.Allocator, items: []const subtitles_ajatt_top.SubtitleItem) ![]SubtitleUnion {
+    var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .subtitles_ajatt_top = item });
     return try out.toOwnedSlice(allocator);
 }
 
