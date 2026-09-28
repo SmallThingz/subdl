@@ -128,6 +128,7 @@ Supported canonical provider IDs:
 - `animesub_info`
 - `subhd_tv`
 - `fansubs_ru`
+- `legendei_net`
 
 The repository also retains inactive implementations for
 `opensubtitles_org`, `moviesubtitles_org`, `moviesubtitlesrt_com`,
@@ -153,6 +154,7 @@ current upstream/network path cannot complete a search.
 `animesub_info` provides Polish anime movie and TV subtitles with fresh download-token replay.
 `subhd_tv` uses SubHD's current prepare-download token flow and supports movies and TV.
 `fansubs_ru` provides Russian anime movie and TV archives.
+`legendei_net` uses the public WordPress search API and each post's own subtitle download link.
 
 The parser also accepts dotted or hyphenated site forms such as `subsource.net`.
 

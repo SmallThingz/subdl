@@ -2132,6 +2132,15 @@ fn cloneSearchRef(allocator: std.mem.Allocator, ref: app.SearchRef) !app.SearchR
             .media_id = try allocator.dupe(u8, item.media_id),
             .page_url = try allocator.dupe(u8, item.page_url),
         } },
+        .legendei_net => |item| .{ .legendei_net = .{
+            .title = try allocator.dupe(u8, item.title),
+            .post_id = item.post_id,
+            .media_kind = item.media_kind,
+            .season = item.season,
+            .episode = item.episode,
+            .language_code = try allocator.dupe(u8, item.language_code),
+            .page_url = try allocator.dupe(u8, item.page_url),
+        } },
     };
 }
 

@@ -293,6 +293,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "animesub.info" },
     .{ .name = "subhd.tv" },
     .{ .name = "fansubs.ru" },
+    .{ .name = "legendei.net" },
 };
 
 fn isAllLiveProviderSelection(raw_filter: []const u8) bool {
