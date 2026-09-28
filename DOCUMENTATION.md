@@ -119,6 +119,7 @@ Supported canonical provider IDs:
 - `cc_edatribe_com`
 - `subtitrari_noi_ro`
 - `titrari_ro`
+- `subs_sab_bz`
 
 The repository also retains inactive implementations for
 `opensubtitles_org`, `moviesubtitles_org`, `moviesubtitlesrt_com`,
@@ -134,6 +135,7 @@ current upstream/network path cannot complete a search.
 `cc_edatribe_com` provides English anime movie and TV captions.
 `subtitrari_noi_ro` provides Romanian subtitles for movies and TV.
 `titrari_ro` provides Romanian and English subtitles for movies and TV.
+`subs_sab_bz` provides English and Bulgarian subtitles for movies and TV.
 
 The parser also accepts dotted or hyphenated site forms such as `subsource.net`.
 

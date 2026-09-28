@@ -24,6 +24,7 @@ pub const sous_titres_eu = @import("sous-titres.eu.zig");
 pub const cc_edatribe_com = @import("cc.edatribe.com.zig");
 pub const subtitrari_noi_ro = @import("subtitrari-noi.ro.zig");
 pub const titrari_ro = @import("titrari.ro.zig");
+pub const subs_sab_bz = @import("subs.sab.bz.zig");
 
 pub const ProviderTag = enum {
     subdl_com,
@@ -50,6 +51,7 @@ pub const ProviderTag = enum {
     cc_edatribe_com,
     subtitrari_noi_ro,
     titrari_ro,
+    subs_sab_bz,
 };
 
 pub const SearchItemUnion = union(ProviderTag) {
@@ -77,6 +79,7 @@ pub const SearchItemUnion = union(ProviderTag) {
     cc_edatribe_com: cc_edatribe_com.SearchItem,
     subtitrari_noi_ro: subtitrari_noi_ro.SearchItem,
     titrari_ro: titrari_ro.SearchItem,
+    subs_sab_bz: subs_sab_bz.SearchItem,
 };
 
 pub const SubtitleUnion = union(ProviderTag) {
@@ -104,6 +107,7 @@ pub const SubtitleUnion = union(ProviderTag) {
     cc_edatribe_com: cc_edatribe_com.SubtitleItem,
     subtitrari_noi_ro: subtitrari_noi_ro.SubtitleItem,
     titrari_ro: titrari_ro.SubtitleItem,
+    subs_sab_bz: subs_sab_bz.SubtitleItem,
 };
 
 pub const TitleUnion = union(ProviderTag) {
@@ -131,6 +135,7 @@ pub const TitleUnion = union(ProviderTag) {
     cc_edatribe_com: cc_edatribe_com.SearchItem,
     subtitrari_noi_ro: subtitrari_noi_ro.SearchItem,
     titrari_ro: titrari_ro.SearchItem,
+    subs_sab_bz: subs_sab_bz.SearchItem,
 };
 
 pub fn fromSubdlSearch(allocator: std.mem.Allocator, items: []const subdl_com.SearchItem) ![]SearchItemUnion {
@@ -301,6 +306,13 @@ pub fn fromTitrariSearch(allocator: std.mem.Allocator, items: []const titrari_ro
     return try out.toOwnedSlice(allocator);
 }
 
+pub fn fromSubsSabSearch(allocator: std.mem.Allocator, items: []const subs_sab_bz.SearchItem) ![]SearchItemUnion {
+    var out: std.ArrayListUnmanaged(SearchItemUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .subs_sab_bz = item });
+    return try out.toOwnedSlice(allocator);
+}
+
 pub fn fromSubdlSubtitles(allocator: std.mem.Allocator, items: []const subdl_com.SubtitleItem) ![]SubtitleUnion {
     var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
     errdefer out.deinit(allocator);
@@ -466,6 +478,13 @@ pub fn fromTitrariSubtitles(allocator: std.mem.Allocator, items: []const titrari
     var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
     errdefer out.deinit(allocator);
     for (items) |item| try out.append(allocator, .{ .titrari_ro = item });
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn fromSubsSabSubtitles(allocator: std.mem.Allocator, items: []const subs_sab_bz.SubtitleItem) ![]SubtitleUnion {
+    var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .subs_sab_bz = item });
     return try out.toOwnedSlice(allocator);
 }
 
