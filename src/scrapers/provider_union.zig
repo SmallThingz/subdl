@@ -18,6 +18,7 @@ pub const greeksubtitles_com = @import("greek-subtitles.com.zig");
 pub const subsunacs_net = @import("subsunacs.net.zig");
 pub const subtitles_ajatt_top = @import("subtitles.ajatt.top.zig");
 pub const subtis_io = @import("subtis.io.zig");
+pub const greeksubs_net = @import("greeksubs.net.zig");
 
 pub const ProviderTag = enum {
     subdl_com,
@@ -38,6 +39,7 @@ pub const ProviderTag = enum {
     subsunacs_net,
     subtitles_ajatt_top,
     subtis_io,
+    greeksubs_net,
 };
 
 pub const SearchItemUnion = union(ProviderTag) {
@@ -59,6 +61,7 @@ pub const SearchItemUnion = union(ProviderTag) {
     subsunacs_net: subsunacs_net.SearchItem,
     subtitles_ajatt_top: subtitles_ajatt_top.SearchItem,
     subtis_io: subtis_io.SearchItem,
+    greeksubs_net: greeksubs_net.SearchItem,
 };
 
 pub const SubtitleUnion = union(ProviderTag) {
@@ -80,6 +83,7 @@ pub const SubtitleUnion = union(ProviderTag) {
     subsunacs_net: subsunacs_net.SubtitleItem,
     subtitles_ajatt_top: subtitles_ajatt_top.SubtitleItem,
     subtis_io: subtis_io.SubtitleItem,
+    greeksubs_net: greeksubs_net.SubtitleItem,
 };
 
 pub const TitleUnion = union(ProviderTag) {
@@ -101,6 +105,7 @@ pub const TitleUnion = union(ProviderTag) {
     subsunacs_net: subsunacs_net.SearchItem,
     subtitles_ajatt_top: subtitles_ajatt_top.SearchItem,
     subtis_io: subtis_io.SearchItem,
+    greeksubs_net: greeksubs_net.SearchItem,
 };
 
 pub fn fromSubdlSearch(allocator: std.mem.Allocator, items: []const subdl_com.SearchItem) ![]SearchItemUnion {
@@ -229,6 +234,13 @@ pub fn fromSubtisSearch(allocator: std.mem.Allocator, items: []const subtis_io.S
     return try out.toOwnedSlice(allocator);
 }
 
+pub fn fromGreekSubsSearch(allocator: std.mem.Allocator, items: []const greeksubs_net.SearchItem) ![]SearchItemUnion {
+    var out: std.ArrayListUnmanaged(SearchItemUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .greeksubs_net = item });
+    return try out.toOwnedSlice(allocator);
+}
+
 pub fn fromSubdlSubtitles(allocator: std.mem.Allocator, items: []const subdl_com.SubtitleItem) ![]SubtitleUnion {
     var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
     errdefer out.deinit(allocator);
@@ -352,6 +364,13 @@ pub fn fromSubtisSubtitles(allocator: std.mem.Allocator, items: []const subtis_i
     var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
     errdefer out.deinit(allocator);
     for (items) |item| try out.append(allocator, .{ .subtis_io = item });
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn fromGreekSubsSubtitles(allocator: std.mem.Allocator, items: []const greeksubs_net.SubtitleItem) ![]SubtitleUnion {
+    var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .greeksubs_net = item });
     return try out.toOwnedSlice(allocator);
 }
 

@@ -21,6 +21,7 @@ pub const greeksubtitles_com = @import("greek-subtitles.com.zig");
 pub const subsunacs_net = @import("subsunacs.net.zig");
 pub const subtitles_ajatt_top = @import("subtitles.ajatt.top.zig");
 pub const subtis_io = @import("subtis.io.zig");
+pub const greeksubs_net = @import("greeksubs.net.zig");
 pub const opensubtitles_com_cf = @import("opensubtitles_com_cf.zig");
 
 pub const provider_union = @import("provider_union.zig");
@@ -62,6 +63,7 @@ test {
     _ = @import("subsunacs.net.zig");
     _ = @import("subtitles.ajatt.top.zig");
     _ = @import("subtis.io.zig");
+    _ = @import("greeksubs.net.zig");
     _ = @import("opensubtitles_com_cf.zig");
     _ = @import("provider_union.zig");
     _ = @import("test_suite.zig");

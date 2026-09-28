@@ -373,7 +373,7 @@ fn fetchBytesViaHttp(client: *std.http.Client, allocator: Allocator, url: []cons
     };
 }
 
-fn ensureClientTlsReady(client: *std.http.Client) !void {
+pub fn ensureClientTlsReady(client: *std.http.Client) !void {
     while (client_init_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) sleepMilliseconds(1);
     defer client_init_lock.store(0, .release);
     if (client.now != null) return;

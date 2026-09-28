@@ -24,6 +24,7 @@ pub const greeksubtitles_com = subdl.greeksubtitles_com;
 pub const subsunacs_net = subdl.subsunacs_net;
 pub const subtitles_ajatt_top = subdl.subtitles_ajatt_top;
 pub const subtis_io = subdl.subtis_io;
+pub const greeksubs_net = subdl.greeksubs_net;
 pub const provider_union = subdl.provider_union;
 
 pub const Scraper = subdl.Scraper;

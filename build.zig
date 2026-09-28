@@ -255,6 +255,7 @@ pub fn build(b: *std.Build) void {
 const LiveProviderTarget = struct {
     name: []const u8,
     captcha: bool = false,
+    timeout_seconds: ?u32 = null,
 };
 
 const live_provider_targets = [_]LiveProviderTarget{
@@ -272,10 +273,11 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "opensubtitles.org" },
     .{ .name = "opensubtitles.com" },
     .{ .name = "gestdown.info" },
-    .{ .name = "greek-subtitles.com" },
+    .{ .name = "greek-subtitles.com", .timeout_seconds = 240 },
     .{ .name = "subsunacs.net" },
     .{ .name = "subtitles.ajatt.top" },
     .{ .name = "subtis.io" },
+    .{ .name = "greeksubs.net" },
 };
 
 fn isAllLiveProviderSelection(raw_filter: []const u8) bool {
@@ -307,6 +309,7 @@ fn makeParallelLiveRunScript(
 
     for (live_provider_targets) |target_info| {
         if (target_info.captcha and !std.mem.eql(u8, include_captcha_arg, "true")) continue;
+        const provider_timeout_seconds = target_info.timeout_seconds orelse timeout_seconds;
         out.print(b.allocator,
             \\echo "[live][runner] START {s}"
             \\
@@ -327,7 +330,7 @@ fn makeParallelLiveRunScript(
             target_info.name,
             target_info.name,
             include_captcha_arg,
-            timeout_seconds,
+            provider_timeout_seconds,
             target_info.name,
             target_info.name,
             target_info.name,

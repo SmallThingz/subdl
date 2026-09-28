@@ -51,6 +51,7 @@ pub const Provider = enum {
     subsunacs_net,
     subtitles_ajatt_top,
     subtis_io,
+    greeksubs_net,
 };
 
 const provider_values = [_]Provider{
@@ -67,6 +68,7 @@ const provider_values = [_]Provider{
     .subsunacs_net,
     .subtitles_ajatt_top,
     .subtis_io,
+    .greeksubs_net,
 };
 
 pub fn providers() []const Provider {
@@ -104,6 +106,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .subsunacs_net => "subsunacs_net",
         .subtitles_ajatt_top => "subtitles_ajatt_top",
         .subtis_io => "subtis_io",
+        .greeksubs_net => "greeksubs_net",
     };
 }
 
@@ -154,6 +157,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .subsunacs_net => "SubsUnacs",
         .subtitles_ajatt_top => "AJATT Subtitles",
         .subtis_io => "Subtis",
+        .greeksubs_net => "GreekSubs",
     };
 }
 
@@ -177,6 +181,7 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .subsunacs_net => "https://subsunacs.net",
         .subtitles_ajatt_top => "https://subtitles.ajatt.top",
         .subtis_io => "https://subtis.io",
+        .greeksubs_net => "https://greeksubs.net",
     };
 }
 
@@ -361,6 +366,12 @@ pub const SearchRef = union(Provider) {
         title: []const u8,
         year: ?i64,
         slug: []const u8,
+        page_url: []const u8,
+    },
+    greeksubs_net: struct {
+        title: []const u8,
+        year: ?i64,
+        media_kind: subdl.greeksubs_net.MediaKind,
         page_url: []const u8,
     },
 };
@@ -851,6 +862,29 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                         .title = title,
                         .year = item.year,
                         .slug = try a.dupe(u8, item.slug),
+                        .page_url = try a.dupe(u8, item.page_url),
+                    } },
+                });
+            }
+        },
+        .greeksubs_net => {
+            var scraper = subdl.greeksubs_net.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                const label = if (item.year) |year|
+                    try std.fmt.allocPrint(a, "[{s}] {s} ({d})", .{ @tagName(item.media_kind), title, year })
+                else
+                    try std.fmt.allocPrint(a, "[{s}] {s}", .{ @tagName(item.media_kind), title });
+                try out.append(a, .{
+                    .label = label,
+                    .ref = .{ .greeksubs_net = .{
+                        .title = title,
+                        .year = item.year,
+                        .media_kind = item.media_kind,
                         .page_url = try a.dupe(u8, item.page_url),
                     } },
                 });
@@ -1561,6 +1595,28 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .greeksubs_net => |item| {
+            title = try a.dupe(u8, item.title);
+            var scraper = subdl.greeksubs_net.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            const query_item: subdl.greeksubs_net.SearchItem = .{
+                .title = item.title,
+                .year = item.year,
+                .media_kind = item.media_kind,
+                .page_url = item.page_url,
+            };
+            var subtitles = try scraper.fetchSubtitlesBySearchItem(query_item);
+            defer subtitles.deinit();
+            for (subtitles.subtitles) |subtitle| {
+                const label = try subtitleLabel(a, subtitle.language_code, subtitle.filename, subtitle.download_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try dupOptional(a, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
     }
 
     return .{
@@ -1703,6 +1759,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .subsunacs_net => |item| item.title,
         .subtitles_ajatt_top => |item| item.title,
         .subtis_io => |item| item.title,
+        .greeksubs_net => |item| item.title,
     };
 }
 
@@ -1732,11 +1789,19 @@ pub fn downloadSubtitleWithProgressAndOptions(
     }
 
     emitDownloadPhase(progress, .resolving_url);
-    const url = try resolveDownloadUrlIfNeeded(allocator, client, source_url);
+    const greeksubs_download = subdl.greeksubs_net.parseDownloadToken(source_url) != null;
+    const url = if (greeksubs_download)
+        try allocator.dupe(u8, source_url)
+    else
+        try resolveDownloadUrlIfNeeded(allocator, client, source_url);
     defer allocator.free(url);
 
     emitDownloadPhase(progress, .downloading_file);
-    const response = try fetchDownloadBytes(client, allocator, url);
+    const response = if (greeksubs_download) blk: {
+        var scraper = subdl.greeksubs_net.Scraper.init(allocator, client);
+        defer scraper.deinit();
+        break :blk try scraper.fetchDownloadByToken(allocator, source_url);
+    } else try fetchDownloadBytes(client, allocator, url);
     defer allocator.free(response.body);
     if (response.status != .ok) return error.UnexpectedHttpStatus;
 
@@ -2791,6 +2856,7 @@ fn liveQueryForProvider(provider: Provider) []const u8 {
         .gestdown_info => "Chernobyl",
         .greeksubtitles_com => "The Matrix 1999",
         .subtitles_ajatt_top => "Spirited Away",
+        .greeksubs_net => "Interstellar",
         else => "The Matrix",
     };
 }
@@ -2817,6 +2883,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .subsunacs_net => |item| item.page_url,
         .subtitles_ajatt_top => |item| item.page_url,
         .subtis_io => |item| item.page_url,
+        .greeksubs_net => |item| item.page_url,
     };
 }
 
@@ -2885,6 +2952,7 @@ test "active provider registry excludes retired providers" {
         "subsunacs_net",
         "subtitles_ajatt_top",
         "subtis_io",
+        "greeksubs_net",
     };
 
     const actual = providers();
@@ -2921,6 +2989,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("subsunacs.net") == .subsunacs_net);
     try std.testing.expect(parseProvider("subtitles.ajatt.top") == .subtitles_ajatt_top);
     try std.testing.expect(parseProvider("subtis.io") == .subtis_io);
+    try std.testing.expect(parseProvider("greeksubs.net") == .greeksubs_net);
 }
 
 test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
@@ -2936,6 +3005,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("subsunacs") == .subsunacs_net);
     try std.testing.expect(try resolveProvider("subtitles_ajatt") == .subtitles_ajatt_top);
     try std.testing.expect(try resolveProvider("subtis") == .subtis_io);
+    try std.testing.expect(try resolveProvider("greeksubs") == .greeksubs_net);
     try std.testing.expect(try resolveProvider("open") == .opensubtitles_com);
     try std.testing.expectError(error.UnknownProvider, resolveProvider("tvsubtitles"));
     try std.testing.expectError(error.UnknownProvider, resolveProvider("missing"));
@@ -3302,6 +3372,7 @@ fn seriesQueryForProvider(provider: Provider) []const u8 {
         .greeksubtitles_com => "Chernobyl S01E01",
         .subsunacs_net => "Game of Thrones 01 01",
         .subtitles_ajatt_top => "Death Note",
+        .greeksubs_net => "Game of Thrones",
         else => "Chernobyl",
     };
 }
@@ -3393,6 +3464,7 @@ const tui_smoke_providers = [_]Provider{
     .subsunacs_net,
     .subtitles_ajatt_top,
     .subtis_io,
+    .greeksubs_net,
 };
 
 fn runProvidersSmokeBatch(allocator: std.mem.Allocator, selected: []const Provider) !void {
@@ -3566,6 +3638,10 @@ test "live providers_app tui-path smoke provider: subtis.io" {
     try runSingleProviderSmokeTest(.subtis_io);
 }
 
+test "live providers_app tui-path smoke provider: greeksubs.net" {
+    try runSingleProviderSmokeTest(.greeksubs_net);
+}
+
 test "live series download path provider: subdl.com" {
     try runSingleProviderSeriesTest(.subdl_com);
 }
@@ -3620,4 +3696,8 @@ test "live series download path provider: subsunacs.net" {
 
 test "live series download path provider: subtitles.ajatt.top" {
     try runSingleProviderSeriesTest(.subtitles_ajatt_top);
+}
+
+test "live series download path provider: greeksubs.net" {
+    try runSingleProviderSeriesTest(.greeksubs_net);
 }
