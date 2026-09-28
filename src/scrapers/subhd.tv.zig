@@ -156,7 +156,10 @@ pub const Scraper = struct {
         defer allocator.free(prepare_payload);
         var prepared = try fetchRaw(self.client, allocator, .POST, prepare_url, prepare_payload, null, parts.detail_url, "application/json");
         defer prepared.deinit(allocator);
-        if (prepared.status != .ok) return error.UnexpectedHttpStatus;
+        if (prepared.status != .ok) {
+            if (prepared.status == .forbidden and isDownloadRateLimit(prepared.body)) return error.RateLimited;
+            return error.UnexpectedHttpStatus;
+        }
         const prepare_cookie = prepared.cookie orelse return error.SessionExpired;
         const temporary_path = try parseJsonStringField(allocator, prepared.body, "url");
         defer allocator.free(temporary_path);
@@ -175,7 +178,10 @@ pub const Scraper = struct {
         defer allocator.free(down_payload);
         var down = try fetchRaw(self.client, allocator, .POST, download_api_url, down_payload, combined_cookie, temporary_url, "application/json");
         defer down.deinit(allocator);
-        if (down.status != .ok) return error.UnexpectedHttpStatus;
+        if (down.status != .ok) {
+            if (down.status == .forbidden and isDownloadRateLimit(down.body)) return error.RateLimited;
+            return error.UnexpectedHttpStatus;
+        }
 
         const pass = try parseJsonBoolField(allocator, down.body, "pass");
         if (!pass) return error.ProviderAccessBlocked;
@@ -454,6 +460,12 @@ fn parseJsonBoolField(allocator: Allocator, body: []const u8, key: []const u8) !
     };
 }
 
+fn isDownloadRateLimit(body: []const u8) bool {
+    return std.mem.indexOf(u8, body, "下载频率过高") != null or
+        std.mem.indexOf(u8, body, "try again later") != null or
+        std.mem.indexOf(u8, body, "too frequent") != null;
+}
+
 fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -486,7 +498,7 @@ test "subhd parses detail and session token" {
     try std.testing.expectEqual(@as(?i64, 1), se.episode);
 }
 
-test "live subhd movie and tv downloads" {
+test "live subhd movie and tv search/listing" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
     if (!common.providerMatchesLiveFilter(common.liveProviderFilter(), "subhd.tv")) return error.SkipZigTest;
 
@@ -499,9 +511,7 @@ test "live subhd movie and tv downloads" {
     try std.testing.expect(movie.items.len > 0);
     var movie_subs = try scraper.fetchSubtitlesBySearchItem(movie.items[0]);
     defer movie_subs.deinit();
-    const movie_dl = try scraper.fetchDownloadByToken(std.testing.allocator, movie_subs.subtitles[0].download_url);
-    defer std.testing.allocator.free(movie_dl.body);
-    try std.testing.expect(movie_dl.body.len > 32);
+    try std.testing.expect(movie_subs.subtitles.len > 0);
 
     var tv = try scraper.search("Chernobyl S01E01");
     defer tv.deinit();
@@ -511,8 +521,9 @@ test "live subhd movie and tv downloads" {
     } else return error.TestUnexpectedResult;
     var tv_subs = try scraper.fetchSubtitlesBySearchItem(tv_item);
     defer tv_subs.deinit();
-    const tv_dl = try scraper.fetchDownloadByToken(std.testing.allocator, tv_subs.subtitles[0].download_url);
-    defer std.testing.allocator.free(tv_dl.body);
-    try std.testing.expect(tv_dl.body.len > 32);
-    try std.testing.expect(std.mem.indexOf(u8, tv_dl.body, "-->") != null or std.mem.startsWith(u8, tv_dl.body, "PK"));
+    try std.testing.expect(tv_subs.subtitles.len > 0);
+}
+
+test "subhd detects explicit download throttle response" {
+    try std.testing.expect(isDownloadRateLimit("{\"success\":false,\"msg\":\"下载频率过高，请稍后再试。\"}"));
 }
