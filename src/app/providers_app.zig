@@ -56,6 +56,7 @@ pub const Provider = enum {
     sous_titres_eu,
     cc_edatribe_com,
     subtitrari_noi_ro,
+    titrari_ro,
 };
 
 const provider_values = [_]Provider{
@@ -76,6 +77,7 @@ const provider_values = [_]Provider{
     .sous_titres_eu,
     .cc_edatribe_com,
     .subtitrari_noi_ro,
+    .titrari_ro,
 };
 
 pub fn providers() []const Provider {
@@ -118,6 +120,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .sous_titres_eu => "sous_titres_eu",
         .cc_edatribe_com => "cc_edatribe_com",
         .subtitrari_noi_ro => "subtitrari_noi_ro",
+        .titrari_ro => "titrari_ro",
     };
 }
 
@@ -173,6 +176,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .sous_titres_eu => "Sous-Titres.eu",
         .cc_edatribe_com => "Closed Caption Browser",
         .subtitrari_noi_ro => "Subtitrari-Noi",
+        .titrari_ro => "Titrari",
     };
 }
 
@@ -201,6 +205,7 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .sous_titres_eu => "https://www.sous-titres.eu",
         .cc_edatribe_com => "https://cc.edatribe.com",
         .subtitrari_noi_ro => "https://www.subtitrari-noi.ro",
+        .titrari_ro => "https://www.titrari.ro",
     };
 }
 
@@ -410,6 +415,15 @@ pub const SearchRef = union(Provider) {
     subtitrari_noi_ro: struct {
         title: []const u8,
         year: ?i64,
+        page_url: []const u8,
+        download_url: []const u8,
+    },
+    titrari_ro: struct {
+        title: []const u8,
+        year: ?i64,
+        media_kind: subdl.titrari_ro.MediaKind,
+        language_code: []const u8,
+        subtitle_id: []const u8,
         page_url: []const u8,
         download_url: []const u8,
     },
@@ -999,6 +1013,32 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                     .ref = .{ .subtitrari_noi_ro = .{
                         .title = title,
                         .year = item.year,
+                        .page_url = try a.dupe(u8, item.page_url),
+                        .download_url = try a.dupe(u8, item.download_url),
+                    } },
+                });
+            }
+        },
+        .titrari_ro => {
+            var scraper = subdl.titrari_ro.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                const label = if (item.year) |year|
+                    try std.fmt.allocPrint(a, "[{s}] {s} ({d}) [{s}]", .{ @tagName(item.media_kind), title, year, item.language_code })
+                else
+                    try std.fmt.allocPrint(a, "[{s}] {s} [{s}]", .{ @tagName(item.media_kind), title, item.language_code });
+                try out.append(a, .{
+                    .label = label,
+                    .ref = .{ .titrari_ro = .{
+                        .title = title,
+                        .year = item.year,
+                        .media_kind = item.media_kind,
+                        .language_code = try a.dupe(u8, item.language_code),
+                        .subtitle_id = try a.dupe(u8, item.subtitle_id),
                         .page_url = try a.dupe(u8, item.page_url),
                         .download_url = try a.dupe(u8, item.download_url),
                     } },
@@ -1816,6 +1856,31 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .titrari_ro => |item| {
+            title = try a.dupe(u8, item.title);
+            var scraper = subdl.titrari_ro.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            const query_item: subdl.titrari_ro.SearchItem = .{
+                .title = item.title,
+                .year = item.year,
+                .media_kind = item.media_kind,
+                .language_code = item.language_code,
+                .subtitle_id = item.subtitle_id,
+                .page_url = item.page_url,
+                .download_url = item.download_url,
+            };
+            var subtitles = try scraper.fetchSubtitlesBySearchItem(query_item);
+            defer subtitles.deinit();
+            for (subtitles.subtitles) |subtitle| {
+                const label = try subtitleLabel(a, subtitle.language_code, subtitle.filename, subtitle.download_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try a.dupe(u8, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
     }
 
     return .{
@@ -1963,6 +2028,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .sous_titres_eu => |item| item.title,
         .cc_edatribe_com => |item| item.title,
         .subtitrari_noi_ro => |item| item.title,
+        .titrari_ro => |item| item.title,
     };
 }
 
@@ -1994,7 +2060,8 @@ pub fn downloadSubtitleWithProgressAndOptions(
     emitDownloadPhase(progress, .resolving_url);
     const greeksubs_download = subdl.greeksubs_net.parseDownloadToken(source_url) != null;
     const indexsubtitle_download = subdl.indexsubtitle_cc.parseDownloadToken(source_url) != null;
-    const url = if (greeksubs_download or indexsubtitle_download)
+    const titrari_download = subdl.titrari_ro.parseDownloadToken(source_url) != null;
+    const url = if (greeksubs_download or indexsubtitle_download or titrari_download)
         try allocator.dupe(u8, source_url)
     else
         try resolveDownloadUrlIfNeeded(allocator, client, source_url);
@@ -2007,6 +2074,10 @@ pub fn downloadSubtitleWithProgressAndOptions(
         break :blk try scraper.fetchDownloadByToken(allocator, source_url);
     } else if (indexsubtitle_download) blk: {
         var scraper = subdl.indexsubtitle_cc.Scraper.init(allocator, client);
+        defer scraper.deinit();
+        break :blk try scraper.fetchDownloadByToken(allocator, source_url);
+    } else if (titrari_download) blk: {
+        var scraper = subdl.titrari_ro.Scraper.init(allocator, client);
         defer scraper.deinit();
         break :blk try scraper.fetchDownloadByToken(allocator, source_url);
     } else try fetchDownloadBytes(client, allocator, url);
@@ -3067,6 +3138,7 @@ fn liveQueryForProvider(provider: Provider) []const u8 {
         .greeksubs_net => "Interstellar",
         .cc_edatribe_com => "Spirited Away",
         .subtitrari_noi_ro => "The Matrix Resurrections",
+        .titrari_ro => "The Matrix Resurrections",
         else => "The Matrix",
     };
 }
@@ -3098,6 +3170,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .sous_titres_eu => |item| item.page_url,
         .cc_edatribe_com => |item| item.page_url,
         .subtitrari_noi_ro => |item| item.page_url,
+        .titrari_ro => |item| item.page_url,
     };
 }
 
@@ -3170,6 +3243,7 @@ test "active provider registry excludes retired providers" {
         "sous_titres_eu",
         "cc_edatribe_com",
         "subtitrari_noi_ro",
+        "titrari_ro",
     };
 
     const actual = providers();
@@ -3211,6 +3285,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("sous-titres.eu") == .sous_titres_eu);
     try std.testing.expect(parseProvider("cc.edatribe.com") == .cc_edatribe_com);
     try std.testing.expect(parseProvider("subtitrari-noi.ro") == .subtitrari_noi_ro);
+    try std.testing.expect(parseProvider("titrari.ro") == .titrari_ro);
 }
 
 test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
@@ -3231,6 +3306,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("sous_titres") == .sous_titres_eu);
     try std.testing.expect(try resolveProvider("cc_edatribe") == .cc_edatribe_com);
     try std.testing.expect(try resolveProvider("subtitrari_noi") == .subtitrari_noi_ro);
+    try std.testing.expect(try resolveProvider("titrari") == .titrari_ro);
     try std.testing.expect(try resolveProvider("open") == .opensubtitles_com);
     try std.testing.expectError(error.UnknownProvider, resolveProvider("tvsubtitles"));
     try std.testing.expectError(error.UnknownProvider, resolveProvider("missing"));
@@ -3600,6 +3676,7 @@ fn seriesQueryForProvider(provider: Provider) []const u8 {
         .greeksubs_net => "Game of Thrones",
         .cc_edatribe_com => "Attack on Titan",
         .subtitrari_noi_ro => "Reacher",
+        .titrari_ro => "Reacher",
         else => "Chernobyl",
     };
 }
@@ -3695,6 +3772,7 @@ const tui_smoke_providers = [_]Provider{
     .sous_titres_eu,
     .cc_edatribe_com,
     .subtitrari_noi_ro,
+    .titrari_ro,
 };
 
 fn runProvidersSmokeBatch(allocator: std.mem.Allocator, selected: []const Provider) !void {
@@ -3888,6 +3966,10 @@ test "live providers_app tui-path smoke provider: subtitrari-noi.ro" {
     try runSingleProviderSmokeTest(.subtitrari_noi_ro);
 }
 
+test "live providers_app tui-path smoke provider: titrari.ro" {
+    try runSingleProviderSmokeTest(.titrari_ro);
+}
+
 test "live series download path provider: subdl.com" {
     try runSingleProviderSeriesTest(.subdl_com);
 }
@@ -3962,4 +4044,8 @@ test "live series download path provider: cc.edatribe.com" {
 
 test "live series download path provider: subtitrari-noi.ro" {
     try runSingleProviderSeriesTest(.subtitrari_noi_ro);
+}
+
+test "live series download path provider: titrari.ro" {
+    try runSingleProviderSeriesTest(.titrari_ro);
 }

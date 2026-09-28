@@ -2053,6 +2053,15 @@ fn cloneSearchRef(allocator: std.mem.Allocator, ref: app.SearchRef) !app.SearchR
             .page_url = try allocator.dupe(u8, item.page_url),
             .download_url = try allocator.dupe(u8, item.download_url),
         } },
+        .titrari_ro => |item| .{ .titrari_ro = .{
+            .title = try allocator.dupe(u8, item.title),
+            .year = item.year,
+            .media_kind = item.media_kind,
+            .language_code = try allocator.dupe(u8, item.language_code),
+            .subtitle_id = try allocator.dupe(u8, item.subtitle_id),
+            .page_url = try allocator.dupe(u8, item.page_url),
+            .download_url = try allocator.dupe(u8, item.download_url),
+        } },
     };
 }
 
