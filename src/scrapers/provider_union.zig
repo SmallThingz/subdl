@@ -26,6 +26,7 @@ pub const subtitrari_noi_ro = @import("subtitrari-noi.ro.zig");
 pub const titrari_ro = @import("titrari.ro.zig");
 pub const subs_sab_bz = @import("subs.sab.bz.zig");
 pub const subtitri_do_am = @import("subtitri.do.am.zig");
+pub const prijevodi_online_org = @import("prijevodi-online.org.zig");
 
 pub const ProviderTag = enum {
     subdl_com,
@@ -54,6 +55,7 @@ pub const ProviderTag = enum {
     titrari_ro,
     subs_sab_bz,
     subtitri_do_am,
+    prijevodi_online_org,
 };
 
 pub const SearchItemUnion = union(ProviderTag) {
@@ -83,6 +85,7 @@ pub const SearchItemUnion = union(ProviderTag) {
     titrari_ro: titrari_ro.SearchItem,
     subs_sab_bz: subs_sab_bz.SearchItem,
     subtitri_do_am: subtitri_do_am.SearchItem,
+    prijevodi_online_org: prijevodi_online_org.SearchItem,
 };
 
 pub const SubtitleUnion = union(ProviderTag) {
@@ -112,6 +115,7 @@ pub const SubtitleUnion = union(ProviderTag) {
     titrari_ro: titrari_ro.SubtitleItem,
     subs_sab_bz: subs_sab_bz.SubtitleItem,
     subtitri_do_am: subtitri_do_am.SubtitleItem,
+    prijevodi_online_org: prijevodi_online_org.SubtitleItem,
 };
 
 pub const TitleUnion = union(ProviderTag) {
@@ -141,6 +145,7 @@ pub const TitleUnion = union(ProviderTag) {
     titrari_ro: titrari_ro.SearchItem,
     subs_sab_bz: subs_sab_bz.SearchItem,
     subtitri_do_am: subtitri_do_am.SearchItem,
+    prijevodi_online_org: prijevodi_online_org.SearchItem,
 };
 
 pub fn fromSubdlSearch(allocator: std.mem.Allocator, items: []const subdl_com.SearchItem) ![]SearchItemUnion {
@@ -325,6 +330,13 @@ pub fn fromSubtitriSearch(allocator: std.mem.Allocator, items: []const subtitri_
     return try out.toOwnedSlice(allocator);
 }
 
+pub fn fromPrijevodiOnlineSearch(allocator: std.mem.Allocator, items: []const prijevodi_online_org.SearchItem) ![]SearchItemUnion {
+    var out: std.ArrayListUnmanaged(SearchItemUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .prijevodi_online_org = item });
+    return try out.toOwnedSlice(allocator);
+}
+
 pub fn fromSubdlSubtitles(allocator: std.mem.Allocator, items: []const subdl_com.SubtitleItem) ![]SubtitleUnion {
     var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
     errdefer out.deinit(allocator);
@@ -504,6 +516,13 @@ pub fn fromSubtitriSubtitles(allocator: std.mem.Allocator, items: []const subtit
     var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
     errdefer out.deinit(allocator);
     for (items) |item| try out.append(allocator, .{ .subtitri_do_am = item });
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn fromPrijevodiOnlineSubtitles(allocator: std.mem.Allocator, items: []const prijevodi_online_org.SubtitleItem) ![]SubtitleUnion {
+    var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .prijevodi_online_org = item });
     return try out.toOwnedSlice(allocator);
 }
 

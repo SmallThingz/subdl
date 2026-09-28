@@ -285,6 +285,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "titrari.ro" },
     .{ .name = "subs.sab.bz" },
     .{ .name = "subtitri.do.am" },
+    .{ .name = "prijevodi-online.org" },
 };
 
 fn isAllLiveProviderSelection(raw_filter: []const u8) bool {

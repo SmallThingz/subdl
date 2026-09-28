@@ -120,6 +120,7 @@ Supported canonical provider IDs:
 - `titrari_ro`
 - `subs_sab_bz`
 - `subtitri_do_am`
+- `prijevodi_online_org`
 
 The repository also retains inactive implementations for
 `opensubtitles_org`, `moviesubtitles_org`, `moviesubtitlesrt_com`,
@@ -137,6 +138,7 @@ current upstream/network path cannot complete a search.
 `titrari_ro` provides Romanian and English subtitles for movies and TV.
 `subs_sab_bz` provides English and Bulgarian subtitles for movies and TV.
 `subtitri_do_am` is movie-only and provides Latvian subtitles.
+`prijevodi_online_org` is TV-only and uses the site's current public JSON API.
 
 The parser also accepts dotted or hyphenated site forms such as `subsource.net`.
 

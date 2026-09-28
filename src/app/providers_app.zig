@@ -59,6 +59,7 @@ pub const Provider = enum {
     titrari_ro,
     subs_sab_bz,
     subtitri_do_am,
+    prijevodi_online_org,
 };
 
 const provider_values = [_]Provider{
@@ -81,6 +82,7 @@ const provider_values = [_]Provider{
     .titrari_ro,
     .subs_sab_bz,
     .subtitri_do_am,
+    .prijevodi_online_org,
 };
 
 pub fn providers() []const Provider {
@@ -126,6 +128,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .titrari_ro => "titrari_ro",
         .subs_sab_bz => "subs_sab_bz",
         .subtitri_do_am => "subtitri_do_am",
+        .prijevodi_online_org => "prijevodi_online_org",
     };
 }
 
@@ -184,6 +187,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .titrari_ro => "Titrari",
         .subs_sab_bz => "Subs.SAB",
         .subtitri_do_am => "Subtitri",
+        .prijevodi_online_org => "Prijevodi Online",
     };
 }
 
@@ -215,6 +219,7 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .titrari_ro => "https://www.titrari.ro",
         .subs_sab_bz => "http://subs.sab.bz",
         .subtitri_do_am => "https://subtitri.do.am",
+        .prijevodi_online_org => "https://www.prijevodi-online.org",
     };
 }
 
@@ -225,7 +230,7 @@ pub fn providerRequiresBrowserSession(provider: Provider) bool {
 
 pub fn providerSupportsMovies(provider: Provider) bool {
     return switch (provider) {
-        .tvsubtitles_net, .gestdown_info => false,
+        .tvsubtitles_net, .gestdown_info, .prijevodi_online_org => false,
         else => true,
     };
 }
@@ -447,6 +452,12 @@ pub const SearchRef = union(Provider) {
     },
     subtitri_do_am: struct {
         title: []const u8,
+        page_url: []const u8,
+    },
+    prijevodi_online_org: struct {
+        title: []const u8,
+        series_id: i64,
+        slug: []const u8,
         page_url: []const u8,
     },
 };
@@ -1105,6 +1116,25 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                     .label = try a.dupe(u8, title),
                     .ref = .{ .subtitri_do_am = .{
                         .title = title,
+                        .page_url = try a.dupe(u8, item.page_url),
+                    } },
+                });
+            }
+        },
+        .prijevodi_online_org => {
+            var scraper = subdl.prijevodi_online_org.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                try out.append(a, .{
+                    .label = try std.fmt.allocPrint(a, "[tv] {s}", .{title}),
+                    .ref = .{ .prijevodi_online_org = .{
+                        .title = title,
+                        .series_id = item.series_id,
+                        .slug = try a.dupe(u8, item.slug),
                         .page_url = try a.dupe(u8, item.page_url),
                     } },
                 });
@@ -1991,6 +2021,32 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .prijevodi_online_org => |item| {
+            title = try a.dupe(u8, item.title);
+            var scraper = subdl.prijevodi_online_org.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            const query_item: subdl.prijevodi_online_org.SearchItem = .{
+                .title = item.title,
+                .series_id = item.series_id,
+                .slug = item.slug,
+                .page_url = item.page_url,
+            };
+            var subtitles = try scraper.fetchSubtitlesBySearchItem(query_item);
+            defer subtitles.deinit();
+            for (subtitles.subtitles) |subtitle| {
+                const label = try std.fmt.allocPrint(
+                    a,
+                    "S{d:0>2}E{d:0>2} • {s} • {s}",
+                    .{ subtitle.season, subtitle.episode, subtitle.language_code, subtitle.filename },
+                );
+                try out.append(a, .{
+                    .label = label,
+                    .language = try a.dupe(u8, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
     }
 
     return .{
@@ -2141,6 +2197,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .titrari_ro => |item| item.title,
         .subs_sab_bz => |item| item.title,
         .subtitri_do_am => |item| item.title,
+        .prijevodi_online_org => |item| item.title,
     };
 }
 
@@ -3258,6 +3315,7 @@ fn liveQueryForProvider(provider: Provider) []const u8 {
         .titrari_ro => "The Matrix Resurrections",
         .subs_sab_bz => "The Matrix",
         .subtitri_do_am => "The Matrix",
+        .prijevodi_online_org => "Chernobyl",
         else => "The Matrix",
     };
 }
@@ -3292,6 +3350,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .titrari_ro => |item| item.page_url,
         .subs_sab_bz => |item| item.page_url,
         .subtitri_do_am => |item| item.page_url,
+        .prijevodi_online_org => |item| item.page_url,
     };
 }
 
@@ -3366,6 +3425,7 @@ test "active provider registry excludes retired providers" {
         "titrari_ro",
         "subs_sab_bz",
         "subtitri_do_am",
+        "prijevodi_online_org",
     };
 
     const actual = providers();
@@ -3410,6 +3470,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("titrari.ro") == .titrari_ro);
     try std.testing.expect(parseProvider("subs.sab.bz") == .subs_sab_bz);
     try std.testing.expect(parseProvider("subtitri.do.am") == .subtitri_do_am);
+    try std.testing.expect(parseProvider("prijevodi-online.org") == .prijevodi_online_org);
 }
 
 test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
@@ -3432,6 +3493,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("titrari") == .titrari_ro);
     try std.testing.expect(try resolveProvider("subs_sab") == .subs_sab_bz);
     try std.testing.expect(try resolveProvider("subtitri") == .subtitri_do_am);
+    try std.testing.expect(try resolveProvider("prijevodi") == .prijevodi_online_org);
     try std.testing.expect(try resolveProvider("open") == .opensubtitles_com);
     try std.testing.expectError(error.UnknownProvider, resolveProvider("tvsubtitles"));
     try std.testing.expectError(error.UnknownProvider, resolveProvider("missing"));
@@ -3803,6 +3865,7 @@ fn seriesQueryForProvider(provider: Provider) []const u8 {
         .subtitrari_noi_ro => "Reacher",
         .titrari_ro => "Reacher",
         .subs_sab_bz => "Reacher",
+        .prijevodi_online_org => "Chernobyl",
         else => "Chernobyl",
     };
 }
@@ -3901,6 +3964,7 @@ const tui_smoke_providers = [_]Provider{
     .titrari_ro,
     .subs_sab_bz,
     .subtitri_do_am,
+    .prijevodi_online_org,
 };
 
 fn runProvidersSmokeBatch(allocator: std.mem.Allocator, selected: []const Provider) !void {
@@ -4106,6 +4170,10 @@ test "live providers_app tui-path smoke provider: subtitri.do.am" {
     try runSingleProviderSmokeTest(.subtitri_do_am);
 }
 
+test "live providers_app tui-path smoke provider: prijevodi-online.org" {
+    try runSingleProviderSmokeTest(.prijevodi_online_org);
+}
+
 test "live series download path provider: subdl.com" {
     try runSingleProviderSeriesTest(.subdl_com);
 }
@@ -4188,4 +4256,8 @@ test "live series download path provider: titrari.ro" {
 
 test "live series download path provider: subs.sab.bz" {
     try runSingleProviderSeriesTest(.subs_sab_bz);
+}
+
+test "live series download path provider: prijevodi-online.org" {
+    try runSingleProviderSeriesTest(.prijevodi_online_org);
 }
