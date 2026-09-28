@@ -443,7 +443,13 @@ Extensive suite for one provider:
 zig build test-live-single -Dlive=extensive -Dlive-providers=subsource.net
 ```
 
-All live providers:
+All providers currently exposed by the CLI/TUI:
+
+```bash
+zig build test-live-active
+```
+
+All retained provider implementations, including inactive recovery probes:
 
 ```bash
 zig build test-live-all

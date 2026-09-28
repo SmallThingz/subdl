@@ -228,9 +228,16 @@ pub fn build(b: *std.Build) void {
     test_live_single_step.dependOn(&run_scrapers_mod_tests_live.step);
 
     const test_live_step = b.step("test-live", "Run live tests using -Dlive, -Dlive-providers, -Dlive-include-captcha");
-    if (live_tests_enabled and live_parallel_on_all and isAllLiveProviderSelection(live_providers)) {
+    if (live_tests_enabled and live_parallel_on_all and
+        (isAllLiveProviderSelection(live_providers) or isActiveLiveProviderSelection(live_providers)))
+    {
         const include_captcha_arg = if (live_include_captcha) "true" else "false";
-        const script = makeParallelLiveRunScript(b, include_captcha_arg, live_timeout_seconds);
+        const script = makeParallelLiveRunScript(
+            b,
+            include_captcha_arg,
+            live_timeout_seconds,
+            isActiveLiveProviderSelection(live_providers),
+        );
         const fanout_cmd = b.addSystemCommand(&.{ "bash", "-lc", script, "_test_bin_" });
         fanout_cmd.setCwd(b.path("."));
         fanout_cmd.addFileArg(scrapers_mod_tests.getEmittedBin());
@@ -250,48 +257,60 @@ pub fn build(b: *std.Build) void {
     });
     live_all_cmd.setCwd(b.path("."));
     test_live_all_step.dependOn(&live_all_cmd.step);
+
+    const test_live_active_step = b.step("test-live-active", "Run all active CLI/TUI providers live");
+    const live_active_cmd = b.addSystemCommand(&.{
+        "zig",
+        "build",
+        "test-live",
+        "-Dlive=all",
+        "-Dlive-providers=active",
+    });
+    live_active_cmd.setCwd(b.path("."));
+    test_live_active_step.dependOn(&live_active_cmd.step);
 }
 
 const LiveProviderTarget = struct {
     name: []const u8,
     captcha: bool = false,
     timeout_seconds: ?u32 = null,
+    active: bool = true,
 };
 
 const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "subdl.com" },
     .{ .name = "isubtitles.org" },
-    .{ .name = "moviesubtitles.org" },
-    .{ .name = "moviesubtitlesrt.com" },
+    .{ .name = "moviesubtitles.org", .active = false },
+    .{ .name = "moviesubtitlesrt.com", .active = false },
     .{ .name = "my-subs.co" },
-    .{ .name = "podnapisi.net" },
+    .{ .name = "podnapisi.net", .active = false },
     .{ .name = "subtitlecat.com" },
     .{ .name = "subsource.net" },
     .{ .name = "sub-scene.com" },
-    .{ .name = "tvsubtitles.net" },
+    .{ .name = "tvsubtitles.net", .active = false },
     .{ .name = "yifysubtitles.ch" },
-    .{ .name = "opensubtitles.org" },
+    .{ .name = "opensubtitles.org", .active = false },
     .{ .name = "opensubtitles.com" },
     .{ .name = "gestdown.info" },
-    .{ .name = "greek-subtitles.com", .timeout_seconds = 240 },
+    .{ .name = "greek-subtitles.com", .timeout_seconds = 240, .active = false },
     .{ .name = "subsunacs.net" },
     .{ .name = "subtitles.ajatt.top" },
-    .{ .name = "subtis.io" },
+    .{ .name = "subtis.io", .active = false },
     .{ .name = "greeksubs.net" },
     .{ .name = "indexsubtitle.cc" },
     .{ .name = "sous-titres.eu" },
     .{ .name = "cc.edatribe.com" },
-    .{ .name = "subtitrari-noi.ro" },
+    .{ .name = "subtitrari-noi.ro", .active = false },
     .{ .name = "titrari.ro" },
     .{ .name = "subs.sab.bz" },
     .{ .name = "subtitri.do.am" },
     .{ .name = "prijevodi-online.org" },
     .{ .name = "animekalesi.com" },
-    .{ .name = "subcentral.de" },
+    .{ .name = "subcentral.de", .timeout_seconds = 120 },
     .{ .name = "subtitulamos.tv" },
     .{ .name = "feliratok.eu" },
     .{ .name = "animesub.info" },
-    .{ .name = "subhd.tv" },
+    .{ .name = "subhd.tv", .active = false },
     .{ .name = "fansubs.ru" },
     .{ .name = "legendei.net" },
     .{ .name = "zoom.lk" },
@@ -307,10 +326,15 @@ fn isAllLiveProviderSelection(raw_filter: []const u8) bool {
     return false;
 }
 
+fn isActiveLiveProviderSelection(raw_filter: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw_filter, " \t\r\n"), "active");
+}
+
 fn makeParallelLiveRunScript(
     b: *std.Build,
     include_captcha_arg: []const u8,
     timeout_seconds: u32,
+    active_only: bool,
 ) []const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(b.allocator);
@@ -327,6 +351,7 @@ fn makeParallelLiveRunScript(
     ) catch @panic("oom");
 
     for (live_provider_targets) |target_info| {
+        if (active_only and !target_info.active) continue;
         if (target_info.captcha and !std.mem.eql(u8, include_captcha_arg, "true")) continue;
         const provider_timeout_seconds = target_info.timeout_seconds orelse timeout_seconds;
         out.print(b.allocator,
