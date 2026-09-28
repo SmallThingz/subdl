@@ -281,6 +281,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "indexsubtitle.cc" },
     .{ .name = "sous-titres.eu" },
     .{ .name = "cc.edatribe.com" },
+    .{ .name = "subtitrari-noi.ro" },
 };
 
 fn isAllLiveProviderSelection(raw_filter: []const u8) bool {

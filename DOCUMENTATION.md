@@ -117,6 +117,7 @@ Supported canonical provider IDs:
 - `indexsubtitle_cc`
 - `sous_titres_eu`
 - `cc_edatribe_com`
+- `subtitrari_noi_ro`
 
 The repository also retains inactive implementations for
 `opensubtitles_org`, `moviesubtitles_org`, `moviesubtitlesrt_com`,
@@ -130,6 +131,7 @@ current upstream/network path cannot complete a search.
 `greeksubs_net` provides Greek subtitles for movies and TV.
 `sous_titres_eu` provides French subtitles for movies and TV.
 `cc_edatribe_com` provides English anime movie and TV captions.
+`subtitrari_noi_ro` provides Romanian subtitles for movies and TV.
 
 The parser also accepts dotted or hyphenated site forms such as `subsource.net`.
 
