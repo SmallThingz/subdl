@@ -129,6 +129,7 @@ Supported canonical provider IDs:
 - `legendei_net`
 - `zoom_lk`
 - `justsubtitles_com`
+- `wizdom_xyz`
 
 The repository also retains inactive implementations for
 `opensubtitles_org`, `moviesubtitles_org`, `moviesubtitlesrt_com`,
@@ -158,6 +159,7 @@ current upstream/network path cannot complete a search.
 `legendei_net` uses the public WordPress search API and each post's own subtitle download link.
 `zoom_lk` provides Sinhala movie and TV season subtitle archives through the site's public search and `/sub-download` endpoints.
 `justsubtitles_com` is movie-only and reads the subtitle rows embedded in the server-rendered Next.js payload; downloads come directly from `dl.subdl.com`.
+`wizdom_xyz` resolves titles through TMDB and downloads Hebrew movie and episode subtitle ZIPs from Wizdom's public API.
 
 The parser also accepts dotted or hyphenated site forms such as `subsource.net`.
 

@@ -296,6 +296,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "legendei.net" },
     .{ .name = "zoom.lk" },
     .{ .name = "justsubtitles.com" },
+    .{ .name = "wizdom.xyz" },
 };
 
 fn isAllLiveProviderSelection(raw_filter: []const u8) bool {

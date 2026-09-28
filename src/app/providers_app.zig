@@ -70,6 +70,7 @@ pub const Provider = enum {
     legendei_net,
     zoom_lk,
     justsubtitles_com,
+    wizdom_xyz,
 };
 
 const provider_values = [_]Provider{
@@ -101,6 +102,7 @@ const provider_values = [_]Provider{
     .legendei_net,
     .zoom_lk,
     .justsubtitles_com,
+    .wizdom_xyz,
 };
 
 pub fn providers() []const Provider {
@@ -157,6 +159,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .legendei_net => "legendei_net",
         .zoom_lk => "zoom_lk",
         .justsubtitles_com => "justsubtitles_com",
+        .wizdom_xyz => "wizdom_xyz",
     };
 }
 
@@ -226,6 +229,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .legendei_net => "Legendei",
         .zoom_lk => "Zoom.LK",
         .justsubtitles_com => "JustSubtitles",
+        .wizdom_xyz => "Wizdom",
     };
 }
 
@@ -268,6 +272,7 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .legendei_net => "https://legendei.net",
         .zoom_lk => "https://zoom.lk",
         .justsubtitles_com => "https://www.justsubtitles.com",
+        .wizdom_xyz => "https://wizdom.xyz",
     };
 }
 
@@ -579,6 +584,15 @@ pub const SearchRef = union(Provider) {
         title: []const u8,
         year: ?i64,
         movie_id: i64,
+        page_url: []const u8,
+    },
+    wizdom_xyz: struct {
+        title: []const u8,
+        year: ?i64,
+        media_kind: subdl.wizdom_xyz.MediaKind,
+        imdb_id: []const u8,
+        season: ?i64,
+        episode: ?i64,
         page_url: []const u8,
     },
 };
@@ -1493,6 +1507,32 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                         .title = title,
                         .year = item.year,
                         .movie_id = item.movie_id,
+                        .page_url = try a.dupe(u8, item.page_url),
+                    } },
+                });
+            }
+        },
+        .wizdom_xyz => {
+            var scraper = subdl.wizdom_xyz.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                const label = if (item.year) |year|
+                    try std.fmt.allocPrint(a, "[{s}] {s} ({d})", .{ @tagName(item.media_kind), title, year })
+                else
+                    try std.fmt.allocPrint(a, "[{s}] {s}", .{ @tagName(item.media_kind), title });
+                try out.append(a, .{
+                    .label = label,
+                    .ref = .{ .wizdom_xyz = .{
+                        .title = title,
+                        .year = item.year,
+                        .media_kind = item.media_kind,
+                        .imdb_id = try a.dupe(u8, item.imdb_id),
+                        .season = item.season,
+                        .episode = item.episode,
                         .page_url = try a.dupe(u8, item.page_url),
                     } },
                 });
@@ -2650,6 +2690,35 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .wizdom_xyz => |item| {
+            title = try a.dupe(u8, item.title);
+            var scraper = subdl.wizdom_xyz.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            const query_item: subdl.wizdom_xyz.SearchItem = .{
+                .title = item.title,
+                .year = item.year,
+                .media_kind = item.media_kind,
+                .imdb_id = item.imdb_id,
+                .season = item.season,
+                .episode = item.episode,
+                .page_url = item.page_url,
+            };
+            var subtitles = try scraper.fetchSubtitlesBySearchItem(query_item);
+            defer subtitles.deinit();
+            for (subtitles.subtitles) |subtitle| {
+                const prefix = if (subtitle.season != null and subtitle.episode != null)
+                    try std.fmt.allocPrint(a, "S{d:0>2}E{d:0>2} • ", .{ subtitle.season.?, subtitle.episode.? })
+                else
+                    try a.dupe(u8, "");
+                const label = try std.fmt.allocPrint(a, "{s}{s} • {s}", .{ prefix, subtitle.language_code, subtitle.release_info });
+                try out.append(a, .{
+                    .label = label,
+                    .language = try a.dupe(u8, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
     }
 
     return .{
@@ -2811,6 +2880,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .legendei_net => |item| item.title,
         .zoom_lk => |item| item.title,
         .justsubtitles_com => |item| item.title,
+        .wizdom_xyz => |item| item.title,
     };
 }
 
@@ -3958,6 +4028,7 @@ fn liveQueryForProvider(provider: Provider) []const u8 {
         .fansubs_ru => "Spirited Away",
         .legendei_net => "The Matrix Resurrections",
         .zoom_lk => "Centigrade",
+        .wizdom_xyz => "The Matrix",
         else => "The Matrix",
     };
 }
@@ -4003,6 +4074,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .legendei_net => |item| item.page_url,
         .zoom_lk => |item| item.page_url,
         .justsubtitles_com => |item| item.page_url,
+        .wizdom_xyz => |item| item.page_url,
     };
 }
 
@@ -4086,6 +4158,7 @@ test "active provider registry excludes retired providers" {
         "legendei_net",
         "zoom_lk",
         "justsubtitles_com",
+        "wizdom_xyz",
     };
 
     const actual = providers();
@@ -4141,6 +4214,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("legendei.net") == .legendei_net);
     try std.testing.expect(parseProvider("zoom.lk") == .zoom_lk);
     try std.testing.expect(parseProvider("justsubtitles.com") == .justsubtitles_com);
+    try std.testing.expect(parseProvider("wizdom.xyz") == .wizdom_xyz);
 }
 
 test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
@@ -4173,6 +4247,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("legendei") == .legendei_net);
     try std.testing.expect(try resolveProvider("zoom") == .zoom_lk);
     try std.testing.expect(try resolveProvider("justsubtitles") == .justsubtitles_com);
+    try std.testing.expect(try resolveProvider("wizdom") == .wizdom_xyz);
     try std.testing.expect(try resolveProvider("open") == .opensubtitles_com);
     try std.testing.expectError(error.UnknownProvider, resolveProvider("tvsubtitles"));
     try std.testing.expectError(error.UnknownProvider, resolveProvider("missing"));
@@ -4553,6 +4628,7 @@ fn seriesQueryForProvider(provider: Provider) []const u8 {
         .fansubs_ru => "Death Note",
         .legendei_net => "Chernobyl S01E01",
         .zoom_lk => "Teen Wolf",
+        .wizdom_xyz => "Chernobyl S01E01",
         else => "Chernobyl",
     };
 }
@@ -4662,6 +4738,7 @@ const tui_smoke_providers = [_]Provider{
     .legendei_net,
     .zoom_lk,
     .justsubtitles_com,
+    .wizdom_xyz,
 };
 
 fn runProvidersSmokeBatch(allocator: std.mem.Allocator, selected: []const Provider) !void {
@@ -4911,6 +4988,10 @@ test "live providers_app tui-path smoke provider: justsubtitles.com" {
     try runSingleProviderSmokeTest(.justsubtitles_com);
 }
 
+test "live providers_app tui-path smoke provider: wizdom.xyz" {
+    try runSingleProviderSmokeTest(.wizdom_xyz);
+}
+
 test "live series download path provider: subdl.com" {
     try runSingleProviderSeriesTest(.subdl_com);
 }
@@ -5029,4 +5110,8 @@ test "live series download path provider: legendei.net" {
 
 test "live series download path provider: zoom.lk" {
     try runSingleProviderSeriesTest(.zoom_lk);
+}
+
+test "live series download path provider: wizdom.xyz" {
+    try runSingleProviderSeriesTest(.wizdom_xyz);
 }
