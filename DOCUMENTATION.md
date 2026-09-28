@@ -117,13 +117,14 @@ Supported canonical provider IDs:
 - `indexsubtitle_cc`
 - `sous_titres_eu`
 - `cc_edatribe_com`
-- `subtitrari_noi_ro`
 - `titrari_ro`
 - `subs_sab_bz`
+- `subtitri_do_am`
 
 The repository also retains inactive implementations for
 `opensubtitles_org`, `moviesubtitles_org`, `moviesubtitlesrt_com`,
-`podnapisi_net`, `tvsubtitles_net`, and `greek_subtitles_com`. Targeted live tests still cover
+`podnapisi_net`, `tvsubtitles_net`, `greek_subtitles_com`, and
+`subtitrari_noi_ro` while its upstream host is refusing connections. Targeted live tests still cover
 those modules, but the CLI/TUI registry does not expose them while their
 current upstream/network path cannot complete a search.
 
@@ -133,9 +134,9 @@ current upstream/network path cannot complete a search.
 `greeksubs_net` provides Greek subtitles for movies and TV.
 `sous_titres_eu` provides French subtitles for movies and TV.
 `cc_edatribe_com` provides English anime movie and TV captions.
-`subtitrari_noi_ro` provides Romanian subtitles for movies and TV.
 `titrari_ro` provides Romanian and English subtitles for movies and TV.
 `subs_sab_bz` provides English and Bulgarian subtitles for movies and TV.
+`subtitri_do_am` is movie-only and provides Latvian subtitles.
 
 The parser also accepts dotted or hyphenated site forms such as `subsource.net`.
 

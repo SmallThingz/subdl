@@ -31,6 +31,7 @@ pub const cc_edatribe_com = subdl.cc_edatribe_com;
 pub const subtitrari_noi_ro = subdl.subtitrari_noi_ro;
 pub const titrari_ro = subdl.titrari_ro;
 pub const subs_sab_bz = subdl.subs_sab_bz;
+pub const subtitri_do_am = subdl.subtitri_do_am;
 pub const provider_union = subdl.provider_union;
 
 pub const Scraper = subdl.Scraper;

@@ -9,7 +9,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 ## Overview
 
 - 19 currently active providers behind one app layer: `providers_app`
-- 25 provider implementations retained and covered by targeted live tests
+- 26 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
 - TUI mode available with `--tui` in the default build
@@ -41,13 +41,14 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `indexsubtitle_cc` | `indexsubtitle.cc` |
 | `sous_titres_eu` | `sous-titres.eu` |
 | `cc_edatribe_com` | `cc.edatribe.com` |
-| `subtitrari_noi_ro` | `subtitrari-noi.ro` |
 | `titrari_ro` | `titrari.ro` |
 | `subs_sab_bz` | `subs.sab.bz` |
+| `subtitri_do_am` | `subtitri.do.am` |
 
 Retained inactive implementations are `opensubtitles_org`, `moviesubtitles_org`,
 `moviesubtitlesrt_com`, `podnapisi_net`, `tvsubtitles_net`, and
-`greek_subtitles_com`. They stay in
+`greek_subtitles_com`, plus `subtitrari_noi_ro` while its upstream host is refusing
+connections. They stay in
 the live-test matrix so upstream recovery can be detected without advertising a
 known-unusable provider in the CLI/TUI.
 
@@ -57,9 +58,9 @@ known-unusable provider in the CLI/TUI.
 `greeksubs_net` provides Greek subtitles for movies and TV.
 `sous_titres_eu` provides French subtitles for movies and TV.
 `cc_edatribe_com` provides English anime movie and TV captions.
-`subtitrari_noi_ro` provides Romanian subtitles for movies and TV.
 `titrari_ro` provides Romanian and English subtitles for movies and TV.
 `subs_sab_bz` provides English and Bulgarian subtitles for movies and TV.
+`subtitri_do_am` is movie-only and provides Latvian subtitles.
 
 ## Quick Start
 
