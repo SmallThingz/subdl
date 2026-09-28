@@ -318,6 +318,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "wizdom.xyz" },
     .{ .name = "miraianime.net" },
     .{ .name = "animesubtitle.ir" },
+    .{ .name = "grupahatak.pl" },
 };
 
 fn isAllLiveProviderSelection(raw_filter: []const u8) bool {

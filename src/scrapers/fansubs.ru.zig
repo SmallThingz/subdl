@@ -177,7 +177,6 @@ fn fetchDownloadOnce(client: *std.http.Client, allocator: Allocator, payload: []
     _ = try reader.streamRemaining(&writer.writer);
 
     const body = try allocator.dupe(u8, writer.writer.buffered());
-    errdefer allocator.free(body);
     if (expected_length) |expected| {
         if (body.len != expected) {
             allocator.free(body);

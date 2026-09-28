@@ -73,6 +73,7 @@ pub const Provider = enum {
     wizdom_xyz,
     miraianime_net,
     animesubtitle_ir,
+    grupahatak_pl,
 };
 
 const provider_values = [_]Provider{
@@ -108,6 +109,7 @@ const provider_values = [_]Provider{
     .wizdom_xyz,
     .miraianime_net,
     .animesubtitle_ir,
+    .grupahatak_pl,
 };
 
 pub fn providers() []const Provider {
@@ -167,6 +169,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .wizdom_xyz => "wizdom_xyz",
         .miraianime_net => "miraianime_net",
         .animesubtitle_ir => "animesubtitle_ir",
+        .grupahatak_pl => "grupahatak_pl",
     };
 }
 
@@ -239,6 +242,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .wizdom_xyz => "Wizdom",
         .miraianime_net => "MiraiAnime",
         .animesubtitle_ir => "AnimeSubtitle.ir",
+        .grupahatak_pl => "GrupaHatak",
     };
 }
 
@@ -284,6 +288,7 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .wizdom_xyz => "https://wizdom.xyz",
         .miraianime_net => "https://miraianime.net",
         .animesubtitle_ir => "https://animesubtitle.ir",
+        .grupahatak_pl => "https://grupahatak.pl",
     };
 }
 
@@ -294,7 +299,7 @@ pub fn providerRequiresBrowserSession(provider: Provider) bool {
 
 pub fn providerSupportsMovies(provider: Provider) bool {
     return switch (provider) {
-        .tvsubtitles_net, .gestdown_info, .prijevodi_online_org, .animekalesi_com, .subcentral_de, .subtitulamos_tv => false,
+        .tvsubtitles_net, .gestdown_info, .prijevodi_online_org, .animekalesi_com, .subcentral_de, .subtitulamos_tv, .grupahatak_pl => false,
         else => true,
     };
 }
@@ -621,6 +626,10 @@ pub const SearchRef = union(Provider) {
         title: []const u8,
         post_id: i64,
         media_kind: subdl.animesubtitle_ir.MediaKind,
+        page_url: []const u8,
+    },
+    grupahatak_pl: struct {
+        title: []const u8,
         page_url: []const u8,
     },
 };
@@ -1608,6 +1617,23 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                         .title = title,
                         .post_id = item.post_id,
                         .media_kind = item.media_kind,
+                        .page_url = try a.dupe(u8, item.page_url),
+                    } },
+                });
+            }
+        },
+        .grupahatak_pl => {
+            var scraper = subdl.grupahatak_pl.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                try out.append(a, .{
+                    .label = try std.fmt.allocPrint(a, "[tv] {s} • pl", .{title}),
+                    .ref = .{ .grupahatak_pl = .{
+                        .title = title,
                         .page_url = try a.dupe(u8, item.page_url),
                     } },
                 });
@@ -2843,6 +2869,30 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .grupahatak_pl => |item| {
+            title = try a.dupe(u8, item.title);
+            var scraper = subdl.grupahatak_pl.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            const query_item: subdl.grupahatak_pl.SearchItem = .{
+                .title = item.title,
+                .page_url = item.page_url,
+            };
+            var subtitles = try scraper.fetchSubtitlesBySearchItem(query_item);
+            defer subtitles.deinit();
+            for (subtitles.subtitles) |subtitle| {
+                const label = try std.fmt.allocPrint(
+                    a,
+                    "S{d:0>2}E{d:0>2} • {s} • {s}",
+                    .{ subtitle.season, subtitle.episode, subtitle.language_code, subtitle.filename },
+                );
+                try out.append(a, .{
+                    .label = label,
+                    .language = try a.dupe(u8, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
     }
 
     return .{
@@ -3007,6 +3057,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .wizdom_xyz => |item| item.title,
         .miraianime_net => |item| item.title,
         .animesubtitle_ir => |item| item.title,
+        .grupahatak_pl => |item| item.title,
     };
 }
 
@@ -3044,7 +3095,8 @@ pub fn downloadSubtitleWithProgressAndOptions(
     const animesub_download = subdl.animesub_info.parseDownloadToken(source_url) != null;
     const subhd_download = subdl.subhd_tv.parseDownloadToken(source_url) != null;
     const fansubs_download = subdl.fansubs_ru.parseDownloadToken(source_url) != null;
-    const url = if (greeksubs_download or indexsubtitle_download or titrari_download or subs_sab_download or animekalesi_download or animesub_download or subhd_download or fansubs_download)
+    const grupahatak_download = subdl.grupahatak_pl.parseDownloadToken(source_url) != null;
+    const url = if (greeksubs_download or indexsubtitle_download or titrari_download or subs_sab_download or animekalesi_download or animesub_download or subhd_download or fansubs_download or grupahatak_download)
         try allocator.dupe(u8, source_url)
     else
         try resolveDownloadUrlIfNeeded(allocator, client, source_url);
@@ -3081,6 +3133,10 @@ pub fn downloadSubtitleWithProgressAndOptions(
         break :blk try scraper.fetchDownloadByToken(allocator, source_url);
     } else if (fansubs_download) blk: {
         var scraper = subdl.fansubs_ru.Scraper.init(allocator, client);
+        defer scraper.deinit();
+        break :blk try scraper.fetchDownloadByToken(allocator, source_url);
+    } else if (grupahatak_download) blk: {
+        var scraper = subdl.grupahatak_pl.Scraper.init(allocator, client);
         defer scraper.deinit();
         break :blk try scraper.fetchDownloadByToken(allocator, source_url);
     } else try fetchDownloadBytes(client, allocator, url);
@@ -4157,6 +4213,7 @@ fn liveQueryForProvider(provider: Provider) []const u8 {
         .wizdom_xyz => "The Matrix",
         .miraianime_net => "Kimi no Na wa",
         .animesubtitle_ir => "Given Umi e",
+        .grupahatak_pl => "Teen Wolf",
         else => "The Matrix",
     };
 }
@@ -4205,6 +4262,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .wizdom_xyz => |item| item.page_url,
         .miraianime_net => |item| item.page_url,
         .animesubtitle_ir => |item| item.page_url,
+        .grupahatak_pl => |item| item.page_url,
     };
 }
 
@@ -4292,6 +4350,7 @@ test "active provider registry excludes retired providers" {
         "wizdom_xyz",
         "miraianime_net",
         "animesubtitle_ir",
+        "grupahatak_pl",
     };
 
     const actual = providers();
@@ -4350,6 +4409,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("wizdom.xyz") == .wizdom_xyz);
     try std.testing.expect(parseProvider("miraianime.net") == .miraianime_net);
     try std.testing.expect(parseProvider("animesubtitle.ir") == .animesubtitle_ir);
+    try std.testing.expect(parseProvider("grupahatak.pl") == .grupahatak_pl);
 }
 
 test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
@@ -4386,6 +4446,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("wizdom") == .wizdom_xyz);
     try std.testing.expect(try resolveProvider("miraianime") == .miraianime_net);
     try std.testing.expect(try resolveProvider("animesubtitle") == .animesubtitle_ir);
+    try std.testing.expect(try resolveProvider("grupahatak") == .grupahatak_pl);
     try std.testing.expect(try resolveProvider("open") == .opensubtitles_com);
     try std.testing.expectError(error.UnknownProvider, resolveProvider("tvsubtitles"));
     try std.testing.expectError(error.UnknownProvider, resolveProvider("missing"));
@@ -4769,6 +4830,7 @@ fn seriesQueryForProvider(provider: Provider) []const u8 {
         .wizdom_xyz => "Chernobyl S01E01",
         .miraianime_net => "Death Note",
         .animesubtitle_ir => "Wind Breaker",
+        .grupahatak_pl => "Teen Wolf",
         else => "Chernobyl",
     };
 }
@@ -4881,6 +4943,7 @@ const tui_smoke_providers = [_]Provider{
     .wizdom_xyz,
     .miraianime_net,
     .animesubtitle_ir,
+    .grupahatak_pl,
 };
 
 fn runProvidersSmokeBatch(allocator: std.mem.Allocator, selected: []const Provider) !void {
@@ -5142,6 +5205,10 @@ test "live providers_app tui-path smoke provider: animesubtitle.ir" {
     try runSingleProviderSmokeTest(.animesubtitle_ir);
 }
 
+test "live providers_app tui-path smoke provider: grupahatak.pl" {
+    try runSingleProviderSmokeTest(.grupahatak_pl);
+}
+
 test "live series download path provider: subdl.com" {
     try runSingleProviderSeriesTest(.subdl_com);
 }
@@ -5272,4 +5339,8 @@ test "live series download path provider: miraianime.net" {
 
 test "live series download path provider: animesubtitle.ir" {
     try runSingleProviderSeriesTest(.animesubtitle_ir);
+}
+
+test "live series download path provider: grupahatak.pl" {
+    try runSingleProviderSeriesTest(.grupahatak_pl);
 }
