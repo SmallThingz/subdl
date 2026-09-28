@@ -152,7 +152,7 @@ Examples:
 ```bash
 zig build run -- --query "The Matrix"
 zig build run -- --providers subdl_com,subsource_net --query "Inception" --title-index 1 --subtitle-index 0
-zig build run -- -p subdl --query "Breaking Bad" --out-dir /tmp/subtitles
+zig build run -- -p subdl --query "Breaking Bad" --out-dir .tmp/subtitles
 zig build run -- -pnone --query "The Matrix"
 zig build -Denable-unarr=true run -- --providers subsource --query "The Matrix" --extract
 ./zig-out/bin/scrapers --providers isubtitles_org --query "Interstellar"
@@ -184,27 +184,27 @@ Key behaviors:
 - `Enter` with one selected provider opens that provider, even if a different provider is highlighted.
 - `Enter` with multiple selected providers opens a combined search tab across the selected providers.
 - `my_subs_co` does not expose pagination in the TUI
-- `tvsubtitles_net` does not expose pagination in the TUI
 - `[` and `]` only navigate pages for providers that actually support pagination
 
 ## Pagination Behavior
 
-Search pagination supported:
+Search pagination in the active provider registry:
 
-- `opensubtitles_org`
-- `moviesubtitlesrt_com`
-- `podnapisi_net`
 - `isubtitles_org`
 
-Subtitles pagination supported:
+The retained inactive implementations `opensubtitles_org`,
+`moviesubtitlesrt_com`, and `podnapisi_net` also implement paginated search.
 
-- `opensubtitles_org`
+Subtitles pagination in the active provider registry:
+
 - `isubtitles_org`
+
+The retained inactive `opensubtitles_org` implementation also implements
+subtitle pagination.
 
 No pagination:
 
 - `my_subs_co`
-- `tvsubtitles_net`
 - providers not listed above
 
 For non-paginated providers:
@@ -291,7 +291,7 @@ pub fn main(init: std.process.Init) !void {
     var page1 = try scrapers.providers_app.searchPage(
         init.gpa,
         &client,
-        .opensubtitles_org,
+        .isubtitles_org,
         "The Office",
         1,
     );
@@ -302,7 +302,7 @@ pub fn main(init: std.process.Init) !void {
     var page2 = try scrapers.providers_app.searchPage(
         init.gpa,
         &client,
-        .opensubtitles_org,
+        .isubtitles_org,
         "The Office",
         2,
     );
