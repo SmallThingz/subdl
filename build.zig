@@ -278,6 +278,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "subtitles.ajatt.top" },
     .{ .name = "subtis.io" },
     .{ .name = "greeksubs.net" },
+    .{ .name = "indexsubtitle.cc" },
 };
 
 fn isAllLiveProviderSelection(raw_filter: []const u8) bool {

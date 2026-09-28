@@ -110,15 +110,15 @@ Supported canonical provider IDs:
 - `subsource_net`
 - `sub_scene_com`
 - `gestdown_info`
-- `greek_subtitles_com`
 - `subsunacs_net`
 - `subtitles_ajatt_top`
 - `subtis_io`
 - `greeksubs_net`
+- `indexsubtitle_cc`
 
 The repository also retains inactive implementations for
 `opensubtitles_org`, `moviesubtitles_org`, `moviesubtitlesrt_com`,
-`podnapisi_net`, and `tvsubtitles_net`. Targeted live tests still cover
+`podnapisi_net`, `tvsubtitles_net`, and `greek_subtitles_com`. Targeted live tests still cover
 those modules, but the CLI/TUI registry does not expose them while their
 current upstream/network path cannot complete a search.
 

@@ -9,7 +9,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 ## Overview
 
 - 14 currently active providers behind one app layer: `providers_app`
-- 19 provider implementations retained and covered by targeted live tests
+- 20 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
 - TUI mode available with `--tui` in the default build
@@ -34,14 +34,15 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `subsource_net` | `subsource.net` |
 | `sub_scene_com` | `sub-scene.com` |
 | `gestdown_info` | `gestdown.info` |
-| `greek_subtitles_com` | `gr.greek-subtitles.com` |
 | `subsunacs_net` | `subsunacs.net` |
 | `subtitles_ajatt_top` | `subtitles.ajatt.top` |
 | `subtis_io` | `subtis.io` |
 | `greeksubs_net` | `greeksubs.net` |
+| `indexsubtitle_cc` | `indexsubtitle.cc` |
 
 Retained inactive implementations are `opensubtitles_org`, `moviesubtitles_org`,
-`moviesubtitlesrt_com`, `podnapisi_net`, and `tvsubtitles_net`. They stay in
+`moviesubtitlesrt_com`, `podnapisi_net`, `tvsubtitles_net`, and
+`greek_subtitles_com`. They stay in
 the live-test matrix so upstream recovery can be detected without advertising a
 known-unusable provider in the CLI/TUI.
 

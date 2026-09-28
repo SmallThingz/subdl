@@ -52,6 +52,7 @@ pub const Provider = enum {
     subtitles_ajatt_top,
     subtis_io,
     greeksubs_net,
+    indexsubtitle_cc,
 };
 
 const provider_values = [_]Provider{
@@ -64,11 +65,11 @@ const provider_values = [_]Provider{
     .subsource_net,
     .sub_scene_com,
     .gestdown_info,
-    .greeksubtitles_com,
     .subsunacs_net,
     .subtitles_ajatt_top,
     .subtis_io,
     .greeksubs_net,
+    .indexsubtitle_cc,
 };
 
 pub fn providers() []const Provider {
@@ -107,6 +108,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .subtitles_ajatt_top => "subtitles_ajatt_top",
         .subtis_io => "subtis_io",
         .greeksubs_net => "greeksubs_net",
+        .indexsubtitle_cc => "indexsubtitle_cc",
     };
 }
 
@@ -158,6 +160,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .subtitles_ajatt_top => "AJATT Subtitles",
         .subtis_io => "Subtis",
         .greeksubs_net => "GreekSubs",
+        .indexsubtitle_cc => "IndexSubtitle",
     };
 }
 
@@ -182,6 +185,7 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .subtitles_ajatt_top => "https://subtitles.ajatt.top",
         .subtis_io => "https://subtis.io",
         .greeksubs_net => "https://greeksubs.net",
+        .indexsubtitle_cc => "https://indexsubtitle.cc",
     };
 }
 
@@ -372,6 +376,10 @@ pub const SearchRef = union(Provider) {
         title: []const u8,
         year: ?i64,
         media_kind: subdl.greeksubs_net.MediaKind,
+        page_url: []const u8,
+    },
+    indexsubtitle_cc: struct {
+        title: []const u8,
         page_url: []const u8,
     },
 };
@@ -885,6 +893,23 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                         .title = title,
                         .year = item.year,
                         .media_kind = item.media_kind,
+                        .page_url = try a.dupe(u8, item.page_url),
+                    } },
+                });
+            }
+        },
+        .indexsubtitle_cc => {
+            var scraper = subdl.indexsubtitle_cc.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                try out.append(a, .{
+                    .label = try a.dupe(u8, title),
+                    .ref = .{ .indexsubtitle_cc = .{
+                        .title = title,
                         .page_url = try a.dupe(u8, item.page_url),
                     } },
                 });
@@ -1617,6 +1642,26 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .indexsubtitle_cc => |item| {
+            title = try a.dupe(u8, item.title);
+            var scraper = subdl.indexsubtitle_cc.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            const query_item: subdl.indexsubtitle_cc.SearchItem = .{
+                .title = item.title,
+                .page_url = item.page_url,
+            };
+            var subtitles = try scraper.fetchSubtitlesBySearchItem(query_item);
+            defer subtitles.deinit();
+            for (subtitles.subtitles) |subtitle| {
+                const label = try subtitleLabel(a, subtitle.language, subtitle.title, subtitle.download_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try a.dupe(u8, subtitle.language),
+                    .filename = try a.dupe(u8, subtitle.title),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
     }
 
     return .{
@@ -1760,6 +1805,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .subtitles_ajatt_top => |item| item.title,
         .subtis_io => |item| item.title,
         .greeksubs_net => |item| item.title,
+        .indexsubtitle_cc => |item| item.title,
     };
 }
 
@@ -1790,7 +1836,8 @@ pub fn downloadSubtitleWithProgressAndOptions(
 
     emitDownloadPhase(progress, .resolving_url);
     const greeksubs_download = subdl.greeksubs_net.parseDownloadToken(source_url) != null;
-    const url = if (greeksubs_download)
+    const indexsubtitle_download = subdl.indexsubtitle_cc.parseDownloadToken(source_url) != null;
+    const url = if (greeksubs_download or indexsubtitle_download)
         try allocator.dupe(u8, source_url)
     else
         try resolveDownloadUrlIfNeeded(allocator, client, source_url);
@@ -1799,6 +1846,10 @@ pub fn downloadSubtitleWithProgressAndOptions(
     emitDownloadPhase(progress, .downloading_file);
     const response = if (greeksubs_download) blk: {
         var scraper = subdl.greeksubs_net.Scraper.init(allocator, client);
+        defer scraper.deinit();
+        break :blk try scraper.fetchDownloadByToken(allocator, source_url);
+    } else if (indexsubtitle_download) blk: {
+        var scraper = subdl.indexsubtitle_cc.Scraper.init(allocator, client);
         defer scraper.deinit();
         break :blk try scraper.fetchDownloadByToken(allocator, source_url);
     } else try fetchDownloadBytes(client, allocator, url);
@@ -2884,6 +2935,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .subtitles_ajatt_top => |item| item.page_url,
         .subtis_io => |item| item.page_url,
         .greeksubs_net => |item| item.page_url,
+        .indexsubtitle_cc => |item| item.page_url,
     };
 }
 
@@ -2948,11 +3000,11 @@ test "active provider registry excludes retired providers" {
         "subsource_net",
         "sub_scene_com",
         "gestdown_info",
-        "greek_subtitles_com",
         "subsunacs_net",
         "subtitles_ajatt_top",
         "subtis_io",
         "greeksubs_net",
+        "indexsubtitle_cc",
     };
 
     const actual = providers();
@@ -2985,11 +3037,12 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("sub-scene.com") == .sub_scene_com);
     try std.testing.expect(parseProvider("tvsubtitles.net") == null);
     try std.testing.expect(parseProvider("gestdown.info") == .gestdown_info);
-    try std.testing.expect(parseProvider("greek-subtitles.com") == .greeksubtitles_com);
+    try std.testing.expect(parseProvider("greek-subtitles.com") == null);
     try std.testing.expect(parseProvider("subsunacs.net") == .subsunacs_net);
     try std.testing.expect(parseProvider("subtitles.ajatt.top") == .subtitles_ajatt_top);
     try std.testing.expect(parseProvider("subtis.io") == .subtis_io);
     try std.testing.expect(parseProvider("greeksubs.net") == .greeksubs_net);
+    try std.testing.expect(parseProvider("indexsubtitle.cc") == .indexsubtitle_cc);
 }
 
 test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
@@ -3001,11 +3054,12 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("subsource") == .subsource_net);
     try std.testing.expect(try resolveProvider("sub_scene") == .sub_scene_com);
     try std.testing.expect(try resolveProvider("gestdown") == .gestdown_info);
-    try std.testing.expect(try resolveProvider("greek_subtitles") == .greeksubtitles_com);
+    try std.testing.expectError(error.UnknownProvider, resolveProvider("greek_subtitles"));
     try std.testing.expect(try resolveProvider("subsunacs") == .subsunacs_net);
     try std.testing.expect(try resolveProvider("subtitles_ajatt") == .subtitles_ajatt_top);
     try std.testing.expect(try resolveProvider("subtis") == .subtis_io);
     try std.testing.expect(try resolveProvider("greeksubs") == .greeksubs_net);
+    try std.testing.expect(try resolveProvider("indexsubtitle") == .indexsubtitle_cc);
     try std.testing.expect(try resolveProvider("open") == .opensubtitles_com);
     try std.testing.expectError(error.UnknownProvider, resolveProvider("tvsubtitles"));
     try std.testing.expectError(error.UnknownProvider, resolveProvider("missing"));
@@ -3460,11 +3514,11 @@ const tui_smoke_providers = [_]Provider{
     .subsource_net,
     .sub_scene_com,
     .gestdown_info,
-    .greeksubtitles_com,
     .subsunacs_net,
     .subtitles_ajatt_top,
     .subtis_io,
     .greeksubs_net,
+    .indexsubtitle_cc,
 };
 
 fn runProvidersSmokeBatch(allocator: std.mem.Allocator, selected: []const Provider) !void {
@@ -3642,6 +3696,10 @@ test "live providers_app tui-path smoke provider: greeksubs.net" {
     try runSingleProviderSmokeTest(.greeksubs_net);
 }
 
+test "live providers_app tui-path smoke provider: indexsubtitle.cc" {
+    try runSingleProviderSmokeTest(.indexsubtitle_cc);
+}
+
 test "live series download path provider: subdl.com" {
     try runSingleProviderSeriesTest(.subdl_com);
 }
@@ -3700,4 +3758,8 @@ test "live series download path provider: subtitles.ajatt.top" {
 
 test "live series download path provider: greeksubs.net" {
     try runSingleProviderSeriesTest(.greeksubs_net);
+}
+
+test "live series download path provider: indexsubtitle.cc" {
+    try runSingleProviderSeriesTest(.indexsubtitle_cc);
 }
