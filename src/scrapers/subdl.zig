@@ -39,6 +39,7 @@ pub const subhd_tv = @import("subhd.tv.zig");
 pub const fansubs_ru = @import("fansubs.ru.zig");
 pub const legendei_net = @import("legendei.net.zig");
 pub const zoom_lk = @import("zoom.lk.zig");
+pub const justsubtitles_com = @import("justsubtitles.com.zig");
 pub const opensubtitles_com_cf = @import("opensubtitles_com_cf.zig");
 
 pub const provider_union = @import("provider_union.zig");
@@ -98,6 +99,7 @@ test {
     _ = @import("fansubs.ru.zig");
     _ = @import("legendei.net.zig");
     _ = @import("zoom.lk.zig");
+    _ = @import("justsubtitles.com.zig");
     _ = @import("opensubtitles_com_cf.zig");
     _ = @import("provider_union.zig");
     _ = @import("test_suite.zig");

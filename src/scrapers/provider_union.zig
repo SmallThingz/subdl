@@ -36,6 +36,7 @@ pub const subhd_tv = @import("subhd.tv.zig");
 pub const fansubs_ru = @import("fansubs.ru.zig");
 pub const legendei_net = @import("legendei.net.zig");
 pub const zoom_lk = @import("zoom.lk.zig");
+pub const justsubtitles_com = @import("justsubtitles.com.zig");
 
 pub const ProviderTag = enum {
     subdl_com,
@@ -74,6 +75,7 @@ pub const ProviderTag = enum {
     fansubs_ru,
     legendei_net,
     zoom_lk,
+    justsubtitles_com,
 };
 
 pub const SearchItemUnion = union(ProviderTag) {
@@ -113,6 +115,7 @@ pub const SearchItemUnion = union(ProviderTag) {
     fansubs_ru: fansubs_ru.SearchItem,
     legendei_net: legendei_net.SearchItem,
     zoom_lk: zoom_lk.SearchItem,
+    justsubtitles_com: justsubtitles_com.SearchItem,
 };
 
 pub const SubtitleUnion = union(ProviderTag) {
@@ -152,6 +155,7 @@ pub const SubtitleUnion = union(ProviderTag) {
     fansubs_ru: fansubs_ru.SubtitleItem,
     legendei_net: legendei_net.SubtitleItem,
     zoom_lk: zoom_lk.SubtitleItem,
+    justsubtitles_com: justsubtitles_com.SubtitleItem,
 };
 
 pub const TitleUnion = union(ProviderTag) {
@@ -191,6 +195,7 @@ pub const TitleUnion = union(ProviderTag) {
     fansubs_ru: fansubs_ru.SearchItem,
     legendei_net: legendei_net.SearchItem,
     zoom_lk: zoom_lk.SearchItem,
+    justsubtitles_com: justsubtitles_com.SearchItem,
 };
 
 pub fn fromSubdlSearch(allocator: std.mem.Allocator, items: []const subdl_com.SearchItem) ![]SearchItemUnion {
@@ -445,6 +450,13 @@ pub fn fromZoomSearch(allocator: std.mem.Allocator, items: []const zoom_lk.Searc
     return try out.toOwnedSlice(allocator);
 }
 
+pub fn fromJustSubtitlesSearch(allocator: std.mem.Allocator, items: []const justsubtitles_com.SearchItem) ![]SearchItemUnion {
+    var out: std.ArrayListUnmanaged(SearchItemUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .justsubtitles_com = item });
+    return try out.toOwnedSlice(allocator);
+}
+
 pub fn fromSubdlSubtitles(allocator: std.mem.Allocator, items: []const subdl_com.SubtitleItem) ![]SubtitleUnion {
     var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
     errdefer out.deinit(allocator);
@@ -694,6 +706,13 @@ pub fn fromZoomSubtitles(allocator: std.mem.Allocator, items: []const zoom_lk.Su
     var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
     errdefer out.deinit(allocator);
     for (items) |item| try out.append(allocator, .{ .zoom_lk = item });
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn fromJustSubtitlesSubtitles(allocator: std.mem.Allocator, items: []const justsubtitles_com.SubtitleItem) ![]SubtitleUnion {
+    var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .justsubtitles_com = item });
     return try out.toOwnedSlice(allocator);
 }
 

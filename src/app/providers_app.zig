@@ -69,6 +69,7 @@ pub const Provider = enum {
     fansubs_ru,
     legendei_net,
     zoom_lk,
+    justsubtitles_com,
 };
 
 const provider_values = [_]Provider{
@@ -99,6 +100,7 @@ const provider_values = [_]Provider{
     .fansubs_ru,
     .legendei_net,
     .zoom_lk,
+    .justsubtitles_com,
 };
 
 pub fn providers() []const Provider {
@@ -154,6 +156,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .fansubs_ru => "fansubs_ru",
         .legendei_net => "legendei_net",
         .zoom_lk => "zoom_lk",
+        .justsubtitles_com => "justsubtitles_com",
     };
 }
 
@@ -222,6 +225,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .fansubs_ru => "Fansubs.ru",
         .legendei_net => "Legendei",
         .zoom_lk => "Zoom.LK",
+        .justsubtitles_com => "JustSubtitles",
     };
 }
 
@@ -263,6 +267,7 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .fansubs_ru => "http://fansubs.ru",
         .legendei_net => "https://legendei.net",
         .zoom_lk => "https://zoom.lk",
+        .justsubtitles_com => "https://www.justsubtitles.com",
     };
 }
 
@@ -280,7 +285,7 @@ pub fn providerSupportsMovies(provider: Provider) bool {
 
 pub fn providerSupportsTv(provider: Provider) bool {
     return switch (provider) {
-        .moviesubtitles_org, .moviesubtitlesrt_com, .yifysubtitles_ch, .subtis_io, .subtitri_do_am, .feliratok_eu => false,
+        .moviesubtitles_org, .moviesubtitlesrt_com, .yifysubtitles_ch, .subtis_io, .subtitri_do_am, .feliratok_eu, .justsubtitles_com => false,
         else => true,
     };
 }
@@ -568,6 +573,12 @@ pub const SearchRef = union(Provider) {
         year: ?i64,
         media_kind: subdl.zoom_lk.MediaKind,
         season: ?i64,
+        page_url: []const u8,
+    },
+    justsubtitles_com: struct {
+        title: []const u8,
+        year: ?i64,
+        movie_id: i64,
         page_url: []const u8,
     },
 };
@@ -1459,6 +1470,29 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                         .year = item.year,
                         .media_kind = item.media_kind,
                         .season = item.season,
+                        .page_url = try a.dupe(u8, item.page_url),
+                    } },
+                });
+            }
+        },
+        .justsubtitles_com => {
+            var scraper = subdl.justsubtitles_com.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                const label = if (item.year) |year|
+                    try std.fmt.allocPrint(a, "{s} ({d})", .{ title, year })
+                else
+                    try a.dupe(u8, title);
+                try out.append(a, .{
+                    .label = label,
+                    .ref = .{ .justsubtitles_com = .{
+                        .title = title,
+                        .year = item.year,
+                        .movie_id = item.movie_id,
                         .page_url = try a.dupe(u8, item.page_url),
                     } },
                 });
@@ -2594,6 +2628,28 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .justsubtitles_com => |item| {
+            title = try a.dupe(u8, item.title);
+            var scraper = subdl.justsubtitles_com.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            const query_item: subdl.justsubtitles_com.SearchItem = .{
+                .title = item.title,
+                .year = item.year,
+                .movie_id = item.movie_id,
+                .page_url = item.page_url,
+            };
+            var subtitles = try scraper.fetchSubtitlesBySearchItem(query_item);
+            defer subtitles.deinit();
+            for (subtitles.subtitles) |subtitle| {
+                const label = try subtitleLabel(a, subtitle.language_code, subtitle.release_name, subtitle.download_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try a.dupe(u8, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
     }
 
     return .{
@@ -2754,6 +2810,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .fansubs_ru => |item| item.title,
         .legendei_net => |item| item.title,
         .zoom_lk => |item| item.title,
+        .justsubtitles_com => |item| item.title,
     };
 }
 
@@ -3945,6 +4002,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .fansubs_ru => |item| item.page_url,
         .legendei_net => |item| item.page_url,
         .zoom_lk => |item| item.page_url,
+        .justsubtitles_com => |item| item.page_url,
     };
 }
 
@@ -4027,6 +4085,7 @@ test "active provider registry excludes retired providers" {
         "fansubs_ru",
         "legendei_net",
         "zoom_lk",
+        "justsubtitles_com",
     };
 
     const actual = providers();
@@ -4081,6 +4140,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("fansubs.ru") == .fansubs_ru);
     try std.testing.expect(parseProvider("legendei.net") == .legendei_net);
     try std.testing.expect(parseProvider("zoom.lk") == .zoom_lk);
+    try std.testing.expect(parseProvider("justsubtitles.com") == .justsubtitles_com);
 }
 
 test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
@@ -4112,6 +4172,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("fansubs") == .fansubs_ru);
     try std.testing.expect(try resolveProvider("legendei") == .legendei_net);
     try std.testing.expect(try resolveProvider("zoom") == .zoom_lk);
+    try std.testing.expect(try resolveProvider("justsubtitles") == .justsubtitles_com);
     try std.testing.expect(try resolveProvider("open") == .opensubtitles_com);
     try std.testing.expectError(error.UnknownProvider, resolveProvider("tvsubtitles"));
     try std.testing.expectError(error.UnknownProvider, resolveProvider("missing"));
@@ -4600,6 +4661,7 @@ const tui_smoke_providers = [_]Provider{
     .fansubs_ru,
     .legendei_net,
     .zoom_lk,
+    .justsubtitles_com,
 };
 
 fn runProvidersSmokeBatch(allocator: std.mem.Allocator, selected: []const Provider) !void {
@@ -4843,6 +4905,10 @@ test "live providers_app tui-path smoke provider: legendei.net" {
 
 test "live providers_app tui-path smoke provider: zoom.lk" {
     try runSingleProviderSmokeTest(.zoom_lk);
+}
+
+test "live providers_app tui-path smoke provider: justsubtitles.com" {
+    try runSingleProviderSmokeTest(.justsubtitles_com);
 }
 
 test "live series download path provider: subdl.com" {

@@ -128,6 +128,7 @@ Supported canonical provider IDs:
 - `fansubs_ru`
 - `legendei_net`
 - `zoom_lk`
+- `justsubtitles_com`
 
 The repository also retains inactive implementations for
 `opensubtitles_org`, `moviesubtitles_org`, `moviesubtitlesrt_com`,
@@ -156,6 +157,7 @@ current upstream/network path cannot complete a search.
 `fansubs_ru` provides Russian anime movie and TV archives.
 `legendei_net` uses the public WordPress search API and each post's own subtitle download link.
 `zoom_lk` provides Sinhala movie and TV season subtitle archives through the site's public search and `/sub-download` endpoints.
+`justsubtitles_com` is movie-only and reads the subtitle rows embedded in the server-rendered Next.js payload; downloads come directly from `dl.subdl.com`.
 
 The parser also accepts dotted or hyphenated site forms such as `subsource.net`.
 
