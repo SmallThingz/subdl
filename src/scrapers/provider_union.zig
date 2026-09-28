@@ -30,6 +30,7 @@ pub const prijevodi_online_org = @import("prijevodi-online.org.zig");
 pub const animekalesi_com = @import("animekalesi.com.zig");
 pub const subcentral_de = @import("subcentral.de.zig");
 pub const subtitulamos_tv = @import("subtitulamos.tv.zig");
+pub const feliratok_eu = @import("feliratok.eu.zig");
 
 pub const ProviderTag = enum {
     subdl_com,
@@ -62,6 +63,7 @@ pub const ProviderTag = enum {
     animekalesi_com,
     subcentral_de,
     subtitulamos_tv,
+    feliratok_eu,
 };
 
 pub const SearchItemUnion = union(ProviderTag) {
@@ -95,6 +97,7 @@ pub const SearchItemUnion = union(ProviderTag) {
     animekalesi_com: animekalesi_com.SearchItem,
     subcentral_de: subcentral_de.SearchItem,
     subtitulamos_tv: subtitulamos_tv.SearchItem,
+    feliratok_eu: feliratok_eu.SearchItem,
 };
 
 pub const SubtitleUnion = union(ProviderTag) {
@@ -128,6 +131,7 @@ pub const SubtitleUnion = union(ProviderTag) {
     animekalesi_com: animekalesi_com.SubtitleItem,
     subcentral_de: subcentral_de.SubtitleItem,
     subtitulamos_tv: subtitulamos_tv.SubtitleItem,
+    feliratok_eu: feliratok_eu.SubtitleItem,
 };
 
 pub const TitleUnion = union(ProviderTag) {
@@ -161,6 +165,7 @@ pub const TitleUnion = union(ProviderTag) {
     animekalesi_com: animekalesi_com.SearchItem,
     subcentral_de: subcentral_de.SearchItem,
     subtitulamos_tv: subtitulamos_tv.SearchItem,
+    feliratok_eu: feliratok_eu.SearchItem,
 };
 
 pub fn fromSubdlSearch(allocator: std.mem.Allocator, items: []const subdl_com.SearchItem) ![]SearchItemUnion {
@@ -373,6 +378,13 @@ pub fn fromSubtitulamosSearch(allocator: std.mem.Allocator, items: []const subti
     return try out.toOwnedSlice(allocator);
 }
 
+pub fn fromFeliratokSearch(allocator: std.mem.Allocator, items: []const feliratok_eu.SearchItem) ![]SearchItemUnion {
+    var out: std.ArrayListUnmanaged(SearchItemUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .feliratok_eu = item });
+    return try out.toOwnedSlice(allocator);
+}
+
 pub fn fromSubdlSubtitles(allocator: std.mem.Allocator, items: []const subdl_com.SubtitleItem) ![]SubtitleUnion {
     var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
     errdefer out.deinit(allocator);
@@ -580,6 +592,13 @@ pub fn fromSubtitulamosSubtitles(allocator: std.mem.Allocator, items: []const su
     var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
     errdefer out.deinit(allocator);
     for (items) |item| try out.append(allocator, .{ .subtitulamos_tv = item });
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn fromFeliratokSubtitles(allocator: std.mem.Allocator, items: []const feliratok_eu.SubtitleItem) ![]SubtitleUnion {
+    var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .feliratok_eu = item });
     return try out.toOwnedSlice(allocator);
 }
 

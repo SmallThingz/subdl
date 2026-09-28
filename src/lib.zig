@@ -36,6 +36,7 @@ pub const prijevodi_online_org = subdl.prijevodi_online_org;
 pub const animekalesi_com = subdl.animekalesi_com;
 pub const subcentral_de = subdl.subcentral_de;
 pub const subtitulamos_tv = subdl.subtitulamos_tv;
+pub const feliratok_eu = subdl.feliratok_eu;
 pub const provider_union = subdl.provider_union;
 
 pub const Scraper = subdl.Scraper;
