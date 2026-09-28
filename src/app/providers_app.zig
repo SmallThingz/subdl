@@ -64,6 +64,7 @@ pub const Provider = enum {
     subcentral_de,
     subtitulamos_tv,
     feliratok_eu,
+    animesub_info,
 };
 
 const provider_values = [_]Provider{
@@ -91,6 +92,7 @@ const provider_values = [_]Provider{
     .subcentral_de,
     .subtitulamos_tv,
     .feliratok_eu,
+    .animesub_info,
 };
 
 pub fn providers() []const Provider {
@@ -141,6 +143,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .subcentral_de => "subcentral_de",
         .subtitulamos_tv => "subtitulamos_tv",
         .feliratok_eu => "feliratok_eu",
+        .animesub_info => "animesub_info",
     };
 }
 
@@ -204,6 +207,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .subcentral_de => "SubCentral",
         .subtitulamos_tv => "Subtitulamos",
         .feliratok_eu => "SuperSubtitles",
+        .animesub_info => "AnimeSub.info",
     };
 }
 
@@ -240,6 +244,7 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .subcentral_de => "https://www.subcentral.de",
         .subtitulamos_tv => "https://www.subtitulamos.tv",
         .feliratok_eu => "https://feliratok.eu",
+        .animesub_info => "http://animesub.info",
     };
 }
 
@@ -504,6 +509,16 @@ pub const SearchRef = union(Provider) {
         filename: []const u8,
         page_url: []const u8,
         download_url: []const u8,
+    },
+    animesub_info: struct {
+        title: []const u8,
+        media_kind: subdl.animesub_info.MediaKind,
+        season: ?i64,
+        episode: ?i64,
+        subtitle_id: []const u8,
+        search_query: []const u8,
+        title_type: []const u8,
+        page_url: []const u8,
     },
 };
 
@@ -1262,6 +1277,37 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                         .filename = try a.dupe(u8, item.filename),
                         .page_url = try a.dupe(u8, item.page_url),
                         .download_url = try a.dupe(u8, item.download_url),
+                    } },
+                });
+            }
+        },
+        .animesub_info => {
+            var scraper = subdl.animesub_info.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                const label = if (item.media_kind == .tv and item.episode != null)
+                    try std.fmt.allocPrint(
+                        a,
+                        "[tv] {s} • S{d:0>2}E{d:0>2}",
+                        .{ title, item.season orelse 1, item.episode.? },
+                    )
+                else
+                    try std.fmt.allocPrint(a, "[movie] {s}", .{title});
+                try out.append(a, .{
+                    .label = label,
+                    .ref = .{ .animesub_info = .{
+                        .title = title,
+                        .media_kind = item.media_kind,
+                        .season = item.season,
+                        .episode = item.episode,
+                        .subtitle_id = try a.dupe(u8, item.subtitle_id),
+                        .search_query = try a.dupe(u8, item.search_query),
+                        .title_type = try a.dupe(u8, item.title_type),
+                        .page_url = try a.dupe(u8, item.page_url),
                     } },
                 });
             }
@@ -2274,6 +2320,32 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .animesub_info => |item| {
+            title = try a.dupe(u8, item.title);
+            var scraper = subdl.animesub_info.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            const query_item: subdl.animesub_info.SearchItem = .{
+                .title = item.title,
+                .media_kind = item.media_kind,
+                .season = item.season,
+                .episode = item.episode,
+                .subtitle_id = item.subtitle_id,
+                .search_query = item.search_query,
+                .title_type = item.title_type,
+                .page_url = item.page_url,
+            };
+            var subtitles = try scraper.fetchSubtitlesBySearchItem(query_item);
+            defer subtitles.deinit();
+            for (subtitles.subtitles) |subtitle| {
+                const label = try subtitleLabel(a, subtitle.language_code, subtitle.filename, subtitle.download_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try a.dupe(u8, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
     }
 
     return .{
@@ -2429,6 +2501,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .subcentral_de => |item| item.title,
         .subtitulamos_tv => |item| item.title,
         .feliratok_eu => |item| item.title,
+        .animesub_info => |item| item.title,
     };
 }
 
@@ -2463,7 +2536,8 @@ pub fn downloadSubtitleWithProgressAndOptions(
     const titrari_download = subdl.titrari_ro.parseDownloadToken(source_url) != null;
     const subs_sab_download = subdl.subs_sab_bz.parseDownloadToken(source_url) != null;
     const animekalesi_download = subdl.animekalesi_com.parseDownloadToken(source_url) != null;
-    const url = if (greeksubs_download or indexsubtitle_download or titrari_download or subs_sab_download or animekalesi_download)
+    const animesub_download = subdl.animesub_info.parseDownloadToken(source_url) != null;
+    const url = if (greeksubs_download or indexsubtitle_download or titrari_download or subs_sab_download or animekalesi_download or animesub_download)
         try allocator.dupe(u8, source_url)
     else
         try resolveDownloadUrlIfNeeded(allocator, client, source_url);
@@ -2488,6 +2562,10 @@ pub fn downloadSubtitleWithProgressAndOptions(
         break :blk try scraper.fetchDownloadByToken(allocator, source_url);
     } else if (animekalesi_download) blk: {
         var scraper = subdl.animekalesi_com.Scraper.init(allocator, client);
+        defer scraper.deinit();
+        break :blk try scraper.fetchDownloadByToken(allocator, source_url);
+    } else if (animesub_download) blk: {
+        var scraper = subdl.animesub_info.Scraper.init(allocator, client);
         defer scraper.deinit();
         break :blk try scraper.fetchDownloadByToken(allocator, source_url);
     } else try fetchDownloadBytes(client, allocator, url);
@@ -3556,6 +3634,7 @@ fn liveQueryForProvider(provider: Provider) []const u8 {
         .subcentral_de => "Breaking Bad",
         .subtitulamos_tv => "Chernobyl",
         .feliratok_eu => "The Matrix",
+        .animesub_info => "Spirited Away",
         else => "The Matrix",
     };
 }
@@ -3595,6 +3674,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .subcentral_de => |item| item.thread_url,
         .subtitulamos_tv => |item| item.page_url,
         .feliratok_eu => |item| item.page_url,
+        .animesub_info => |item| item.page_url,
     };
 }
 
@@ -3674,6 +3754,7 @@ test "active provider registry excludes retired providers" {
         "subcentral_de",
         "subtitulamos_tv",
         "feliratok_eu",
+        "animesub_info",
     };
 
     const actual = providers();
@@ -3723,6 +3804,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("subcentral.de") == .subcentral_de);
     try std.testing.expect(parseProvider("subtitulamos.tv") == .subtitulamos_tv);
     try std.testing.expect(parseProvider("feliratok.eu") == .feliratok_eu);
+    try std.testing.expect(parseProvider("animesub.info") == .animesub_info);
 }
 
 test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
@@ -3750,6 +3832,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("subcentral") == .subcentral_de);
     try std.testing.expect(try resolveProvider("subtitulamos") == .subtitulamos_tv);
     try std.testing.expect(try resolveProvider("feliratok") == .feliratok_eu);
+    try std.testing.expect(try resolveProvider("animesub") == .animesub_info);
     try std.testing.expect(try resolveProvider("open") == .opensubtitles_com);
     try std.testing.expectError(error.UnknownProvider, resolveProvider("tvsubtitles"));
     try std.testing.expectError(error.UnknownProvider, resolveProvider("missing"));
@@ -4125,6 +4208,7 @@ fn seriesQueryForProvider(provider: Provider) []const u8 {
         .animekalesi_com => "Death Note",
         .subcentral_de => "Breaking Bad",
         .subtitulamos_tv => "Chernobyl",
+        .animesub_info => "Death Note",
         else => "Chernobyl",
     };
 }
@@ -4228,6 +4312,7 @@ const tui_smoke_providers = [_]Provider{
     .subcentral_de,
     .subtitulamos_tv,
     .feliratok_eu,
+    .animesub_info,
 };
 
 fn runProvidersSmokeBatch(allocator: std.mem.Allocator, selected: []const Provider) !void {
@@ -4453,6 +4538,10 @@ test "live providers_app tui-path smoke provider: feliratok.eu" {
     try runSingleProviderSmokeTest(.feliratok_eu);
 }
 
+test "live providers_app tui-path smoke provider: animesub.info" {
+    try runSingleProviderSmokeTest(.animesub_info);
+}
+
 test "live series download path provider: subdl.com" {
     try runSingleProviderSeriesTest(.subdl_com);
 }
@@ -4551,4 +4640,8 @@ test "live series download path provider: subcentral.de" {
 
 test "live series download path provider: subtitulamos.tv" {
     try runSingleProviderSeriesTest(.subtitulamos_tv);
+}
+
+test "live series download path provider: animesub.info" {
+    try runSingleProviderSeriesTest(.animesub_info);
 }
