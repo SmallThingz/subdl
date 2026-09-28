@@ -44,6 +44,7 @@ pub const legendei_net = subdl.legendei_net;
 pub const zoom_lk = subdl.zoom_lk;
 pub const justsubtitles_com = subdl.justsubtitles_com;
 pub const wizdom_xyz = subdl.wizdom_xyz;
+pub const miraianime_net = subdl.miraianime_net;
 pub const provider_union = subdl.provider_union;
 
 pub const Scraper = subdl.Scraper;

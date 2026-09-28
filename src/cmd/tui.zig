@@ -2165,6 +2165,15 @@ fn cloneSearchRef(allocator: std.mem.Allocator, ref: app.SearchRef) !app.SearchR
             .episode = item.episode,
             .page_url = try allocator.dupe(u8, item.page_url),
         } },
+        .miraianime_net => |item| .{ .miraianime_net = .{
+            .title = try allocator.dupe(u8, item.title),
+            .english_title = try dupOptionalLocal(allocator, item.english_title),
+            .anime_id = item.anime_id,
+            .media_kind = item.media_kind,
+            .episodes = item.episodes,
+            .page_url = try allocator.dupe(u8, item.page_url),
+            .subtitle_page_url = try allocator.dupe(u8, item.subtitle_page_url),
+        } },
     };
 }
 

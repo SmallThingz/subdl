@@ -38,6 +38,7 @@ pub const legendei_net = @import("legendei.net.zig");
 pub const zoom_lk = @import("zoom.lk.zig");
 pub const justsubtitles_com = @import("justsubtitles.com.zig");
 pub const wizdom_xyz = @import("wizdom.xyz.zig");
+pub const miraianime_net = @import("miraianime.net.zig");
 
 pub const ProviderTag = enum {
     subdl_com,
@@ -78,6 +79,7 @@ pub const ProviderTag = enum {
     zoom_lk,
     justsubtitles_com,
     wizdom_xyz,
+    miraianime_net,
 };
 
 pub const SearchItemUnion = union(ProviderTag) {
@@ -119,6 +121,7 @@ pub const SearchItemUnion = union(ProviderTag) {
     zoom_lk: zoom_lk.SearchItem,
     justsubtitles_com: justsubtitles_com.SearchItem,
     wizdom_xyz: wizdom_xyz.SearchItem,
+    miraianime_net: miraianime_net.SearchItem,
 };
 
 pub const SubtitleUnion = union(ProviderTag) {
@@ -160,6 +163,7 @@ pub const SubtitleUnion = union(ProviderTag) {
     zoom_lk: zoom_lk.SubtitleItem,
     justsubtitles_com: justsubtitles_com.SubtitleItem,
     wizdom_xyz: wizdom_xyz.SubtitleItem,
+    miraianime_net: miraianime_net.SubtitleItem,
 };
 
 pub const TitleUnion = union(ProviderTag) {
@@ -201,6 +205,7 @@ pub const TitleUnion = union(ProviderTag) {
     zoom_lk: zoom_lk.SearchItem,
     justsubtitles_com: justsubtitles_com.SearchItem,
     wizdom_xyz: wizdom_xyz.SearchItem,
+    miraianime_net: miraianime_net.SearchItem,
 };
 
 pub fn fromSubdlSearch(allocator: std.mem.Allocator, items: []const subdl_com.SearchItem) ![]SearchItemUnion {
@@ -469,6 +474,13 @@ pub fn fromWizdomSearch(allocator: std.mem.Allocator, items: []const wizdom_xyz.
     return try out.toOwnedSlice(allocator);
 }
 
+pub fn fromMiraiAnimeSearch(allocator: std.mem.Allocator, items: []const miraianime_net.SearchItem) ![]SearchItemUnion {
+    var out: std.ArrayListUnmanaged(SearchItemUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .miraianime_net = item });
+    return try out.toOwnedSlice(allocator);
+}
+
 pub fn fromSubdlSubtitles(allocator: std.mem.Allocator, items: []const subdl_com.SubtitleItem) ![]SubtitleUnion {
     var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
     errdefer out.deinit(allocator);
@@ -732,6 +744,13 @@ pub fn fromWizdomSubtitles(allocator: std.mem.Allocator, items: []const wizdom_x
     var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
     errdefer out.deinit(allocator);
     for (items) |item| try out.append(allocator, .{ .wizdom_xyz = item });
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn fromMiraiAnimeSubtitles(allocator: std.mem.Allocator, items: []const miraianime_net.SubtitleItem) ![]SubtitleUnion {
+    var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .miraianime_net = item });
     return try out.toOwnedSlice(allocator);
 }
 
