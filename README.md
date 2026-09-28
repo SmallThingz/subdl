@@ -3,13 +3,13 @@
 Subtitle scrapers in Zig with a shared provider API and a single `scrapers` binary.
 
 ![Zig](https://img.shields.io/badge/Zig-0.16.0--dev-f7a41d)
-![Providers](https://img.shields.io/badge/Active_Providers-12-2ea44f)
+![Providers](https://img.shields.io/badge/Active_Providers-13-2ea44f)
 ![Runtime](https://img.shields.io/badge/HTTP-std.http%20(Client)-0366d6)
 
 ## Overview
 
-- 12 currently active providers behind one app layer: `providers_app`
-- 17 provider implementations retained and covered by targeted live tests
+- 13 currently active providers behind one app layer: `providers_app`
+- 18 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
 - TUI mode available with `--tui` in the default build
@@ -37,6 +37,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `greek_subtitles_com` | `gr.greek-subtitles.com` |
 | `subsunacs_net` | `subsunacs.net` |
 | `subtitles_ajatt_top` | `subtitles.ajatt.top` |
+| `subtis_io` | `subtis.io` |
 
 Retained inactive implementations are `opensubtitles_org`, `moviesubtitles_org`,
 `moviesubtitlesrt_com`, `podnapisi_net`, and `tvsubtitles_net`. They stay in
@@ -45,6 +46,7 @@ known-unusable provider in the CLI/TUI.
 
 `gestdown_info` is TV-only. `yifysubtitles_ch` is movie-only.
 `subtitles_ajatt_top` focuses on Japanese subtitles for anime TV and movies.
+`subtis_io` is movie-only and provides Spanish subtitles.
 
 ## Quick Start
 

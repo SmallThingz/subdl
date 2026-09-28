@@ -2021,6 +2021,12 @@ fn cloneSearchRef(allocator: std.mem.Allocator, ref: app.SearchRef) !app.SearchR
             .media_kind = item.media_kind,
             .page_url = try allocator.dupe(u8, item.page_url),
         } },
+        .subtis_io => |item| .{ .subtis_io = .{
+            .title = try allocator.dupe(u8, item.title),
+            .year = item.year,
+            .slug = try allocator.dupe(u8, item.slug),
+            .page_url = try allocator.dupe(u8, item.page_url),
+        } },
     };
 }
 
