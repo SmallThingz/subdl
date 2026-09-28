@@ -96,7 +96,6 @@ const provider_values = [_]Provider{
     .subtitulamos_tv,
     .feliratok_eu,
     .animesub_info,
-    .subhd_tv,
     .fansubs_ru,
     .legendei_net,
     .zoom_lk,
@@ -4025,7 +4024,6 @@ test "active provider registry excludes retired providers" {
         "subtitulamos_tv",
         "feliratok_eu",
         "animesub_info",
-        "subhd_tv",
         "fansubs_ru",
         "legendei_net",
         "zoom_lk",
@@ -4079,7 +4077,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("subtitulamos.tv") == .subtitulamos_tv);
     try std.testing.expect(parseProvider("feliratok.eu") == .feliratok_eu);
     try std.testing.expect(parseProvider("animesub.info") == .animesub_info);
-    try std.testing.expect(parseProvider("subhd.tv") == .subhd_tv);
+    try std.testing.expect(parseProvider("subhd.tv") == null);
     try std.testing.expect(parseProvider("fansubs.ru") == .fansubs_ru);
     try std.testing.expect(parseProvider("legendei.net") == .legendei_net);
     try std.testing.expect(parseProvider("zoom.lk") == .zoom_lk);
@@ -4110,7 +4108,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("subtitulamos") == .subtitulamos_tv);
     try std.testing.expect(try resolveProvider("feliratok") == .feliratok_eu);
     try std.testing.expect(try resolveProvider("animesub") == .animesub_info);
-    try std.testing.expect(try resolveProvider("subhd") == .subhd_tv);
+    try std.testing.expectError(error.UnknownProvider, resolveProvider("subhd"));
     try std.testing.expect(try resolveProvider("fansubs") == .fansubs_ru);
     try std.testing.expect(try resolveProvider("legendei") == .legendei_net);
     try std.testing.expect(try resolveProvider("zoom") == .zoom_lk);
