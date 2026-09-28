@@ -35,6 +35,7 @@ pub const subcentral_de = @import("subcentral.de.zig");
 pub const subtitulamos_tv = @import("subtitulamos.tv.zig");
 pub const feliratok_eu = @import("feliratok.eu.zig");
 pub const animesub_info = @import("animesub.info.zig");
+pub const subhd_tv = @import("subhd.tv.zig");
 pub const opensubtitles_com_cf = @import("opensubtitles_com_cf.zig");
 
 pub const provider_union = @import("provider_union.zig");
@@ -90,6 +91,7 @@ test {
     _ = @import("subtitulamos.tv.zig");
     _ = @import("feliratok.eu.zig");
     _ = @import("animesub.info.zig");
+    _ = @import("subhd.tv.zig");
     _ = @import("opensubtitles_com_cf.zig");
     _ = @import("provider_union.zig");
     _ = @import("test_suite.zig");

@@ -126,6 +126,7 @@ Supported canonical provider IDs:
 - `subtitulamos_tv`
 - `feliratok_eu`
 - `animesub_info`
+- `subhd_tv`
 
 The repository also retains inactive implementations for
 `opensubtitles_org`, `moviesubtitles_org`, `moviesubtitlesrt_com`,
@@ -149,6 +150,7 @@ current upstream/network path cannot complete a search.
 `subtitulamos_tv` is TV-only and provides direct episode subtitle files in English, Spanish, Portuguese, Catalan, and Galician.
 `feliratok_eu` is movie-only and provides direct Hungarian and English subtitle files.
 `animesub_info` provides Polish anime movie and TV subtitles with fresh download-token replay.
+`subhd_tv` uses SubHD's current prepare-download token flow and supports movies and TV.
 
 The parser also accepts dotted or hyphenated site forms such as `subsource.net`.
 
