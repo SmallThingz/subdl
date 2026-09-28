@@ -61,6 +61,7 @@ pub const Provider = enum {
     subtitri_do_am,
     prijevodi_online_org,
     animekalesi_com,
+    subcentral_de,
 };
 
 const provider_values = [_]Provider{
@@ -85,6 +86,7 @@ const provider_values = [_]Provider{
     .subtitri_do_am,
     .prijevodi_online_org,
     .animekalesi_com,
+    .subcentral_de,
 };
 
 pub fn providers() []const Provider {
@@ -132,6 +134,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .subtitri_do_am => "subtitri_do_am",
         .prijevodi_online_org => "prijevodi_online_org",
         .animekalesi_com => "animekalesi_com",
+        .subcentral_de => "subcentral_de",
     };
 }
 
@@ -192,6 +195,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .subtitri_do_am => "Subtitri",
         .prijevodi_online_org => "Prijevodi Online",
         .animekalesi_com => "AnimeKalesi",
+        .subcentral_de => "SubCentral",
     };
 }
 
@@ -225,6 +229,7 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .subtitri_do_am => "https://subtitri.do.am",
         .prijevodi_online_org => "https://www.prijevodi-online.org",
         .animekalesi_com => "https://animekalesi.com",
+        .subcentral_de => "https://www.subcentral.de",
     };
 }
 
@@ -235,7 +240,7 @@ pub fn providerRequiresBrowserSession(provider: Provider) bool {
 
 pub fn providerSupportsMovies(provider: Provider) bool {
     return switch (provider) {
-        .tvsubtitles_net, .gestdown_info, .prijevodi_online_org, .animekalesi_com => false,
+        .tvsubtitles_net, .gestdown_info, .prijevodi_online_org, .animekalesi_com, .subcentral_de => false,
         else => true,
     };
 }
@@ -468,6 +473,12 @@ pub const SearchRef = union(Provider) {
     animekalesi_com: struct {
         title: []const u8,
         page_url: []const u8,
+    },
+    subcentral_de: struct {
+        title: []const u8,
+        season: i64,
+        board_url: []const u8,
+        thread_url: []const u8,
     },
 };
 
@@ -1162,6 +1173,25 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                     .ref = .{ .animekalesi_com = .{
                         .title = title,
                         .page_url = try a.dupe(u8, item.page_url),
+                    } },
+                });
+            }
+        },
+        .subcentral_de => {
+            var scraper = subdl.subcentral_de.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                try out.append(a, .{
+                    .label = try std.fmt.allocPrint(a, "[tv] {s} • S{d}", .{ title, item.season }),
+                    .ref = .{ .subcentral_de = .{
+                        .title = title,
+                        .season = item.season,
+                        .board_url = try a.dupe(u8, item.board_url),
+                        .thread_url = try a.dupe(u8, item.thread_url),
                     } },
                 });
             }
@@ -2097,6 +2127,32 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .subcentral_de => |item| {
+            title = try a.dupe(u8, item.title);
+            var scraper = subdl.subcentral_de.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            const query_item: subdl.subcentral_de.SearchItem = .{
+                .title = item.title,
+                .season = item.season,
+                .board_url = item.board_url,
+                .thread_url = item.thread_url,
+            };
+            var subtitles = try scraper.fetchSubtitlesBySearchItem(query_item);
+            defer subtitles.deinit();
+            for (subtitles.subtitles) |subtitle| {
+                const label = try std.fmt.allocPrint(
+                    a,
+                    "S{d:0>2}E{d:0>2} • {s} • {s}",
+                    .{ item.season, subtitle.episode, subtitle.language_code, subtitle.filename },
+                );
+                try out.append(a, .{
+                    .label = label,
+                    .language = try a.dupe(u8, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
     }
 
     return .{
@@ -2249,6 +2305,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .subtitri_do_am => |item| item.title,
         .prijevodi_online_org => |item| item.title,
         .animekalesi_com => |item| item.title,
+        .subcentral_de => |item| item.title,
     };
 }
 
@@ -3373,6 +3430,7 @@ fn liveQueryForProvider(provider: Provider) []const u8 {
         .subtitri_do_am => "The Matrix",
         .prijevodi_online_org => "Chernobyl",
         .animekalesi_com => "Death Note",
+        .subcentral_de => "Breaking Bad",
         else => "The Matrix",
     };
 }
@@ -3409,6 +3467,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .subtitri_do_am => |item| item.page_url,
         .prijevodi_online_org => |item| item.page_url,
         .animekalesi_com => |item| item.page_url,
+        .subcentral_de => |item| item.thread_url,
     };
 }
 
@@ -3485,6 +3544,7 @@ test "active provider registry excludes retired providers" {
         "subtitri_do_am",
         "prijevodi_online_org",
         "animekalesi_com",
+        "subcentral_de",
     };
 
     const actual = providers();
@@ -3531,6 +3591,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("subtitri.do.am") == .subtitri_do_am);
     try std.testing.expect(parseProvider("prijevodi-online.org") == .prijevodi_online_org);
     try std.testing.expect(parseProvider("animekalesi.com") == .animekalesi_com);
+    try std.testing.expect(parseProvider("subcentral.de") == .subcentral_de);
 }
 
 test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
@@ -3555,6 +3616,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("subtitri") == .subtitri_do_am);
     try std.testing.expect(try resolveProvider("prijevodi") == .prijevodi_online_org);
     try std.testing.expect(try resolveProvider("animekalesi") == .animekalesi_com);
+    try std.testing.expect(try resolveProvider("subcentral") == .subcentral_de);
     try std.testing.expect(try resolveProvider("open") == .opensubtitles_com);
     try std.testing.expectError(error.UnknownProvider, resolveProvider("tvsubtitles"));
     try std.testing.expectError(error.UnknownProvider, resolveProvider("missing"));
@@ -3928,6 +3990,7 @@ fn seriesQueryForProvider(provider: Provider) []const u8 {
         .subs_sab_bz => "Reacher",
         .prijevodi_online_org => "Chernobyl",
         .animekalesi_com => "Death Note",
+        .subcentral_de => "Breaking Bad",
         else => "Chernobyl",
     };
 }
@@ -4028,6 +4091,7 @@ const tui_smoke_providers = [_]Provider{
     .subtitri_do_am,
     .prijevodi_online_org,
     .animekalesi_com,
+    .subcentral_de,
 };
 
 fn runProvidersSmokeBatch(allocator: std.mem.Allocator, selected: []const Provider) !void {
@@ -4241,6 +4305,10 @@ test "live providers_app tui-path smoke provider: animekalesi.com" {
     try runSingleProviderSmokeTest(.animekalesi_com);
 }
 
+test "live providers_app tui-path smoke provider: subcentral.de" {
+    try runSingleProviderSmokeTest(.subcentral_de);
+}
+
 test "live series download path provider: subdl.com" {
     try runSingleProviderSeriesTest(.subdl_com);
 }
@@ -4331,4 +4399,8 @@ test "live series download path provider: prijevodi-online.org" {
 
 test "live series download path provider: animekalesi.com" {
     try runSingleProviderSeriesTest(.animekalesi_com);
+}
+
+test "live series download path provider: subcentral.de" {
+    try runSingleProviderSeriesTest(.subcentral_de);
 }

@@ -3,13 +3,13 @@
 Subtitle scrapers in Zig with a shared provider API and a single `scrapers` binary.
 
 ![Zig](https://img.shields.io/badge/Zig-0.16.0--dev-f7a41d)
-![Providers](https://img.shields.io/badge/Active_Providers-21-2ea44f)
+![Providers](https://img.shields.io/badge/Active_Providers-22-2ea44f)
 ![Runtime](https://img.shields.io/badge/HTTP-std.http%20(Client)-0366d6)
 
 ## Overview
 
-- 21 currently active providers behind one app layer: `providers_app`
-- 28 provider implementations retained and covered by targeted live tests
+- 22 currently active providers behind one app layer: `providers_app`
+- 29 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
 - TUI mode available with `--tui` in the default build
@@ -46,6 +46,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `subtitri_do_am` | `subtitri.do.am` |
 | `prijevodi_online_org` | `prijevodi-online.org` |
 | `animekalesi_com` | `animekalesi.com` |
+| `subcentral_de` | `subcentral.de` |
 
 Retained inactive implementations are `opensubtitles_org`, `moviesubtitles_org`,
 `moviesubtitlesrt_com`, `podnapisi_net`, `tvsubtitles_net`, and
@@ -65,6 +66,7 @@ known-unusable provider in the CLI/TUI.
 `subtitri_do_am` is movie-only and provides Latvian subtitles.
 `prijevodi_online_org` is TV-only and provides Croatian, Serbian, Bosnian, Montenegrin, and related subtitle variants.
 `animekalesi_com` is TV-only and provides Turkish anime subtitles.
+`subcentral_de` is TV-only and provides German and English series subtitles.
 
 ## Quick Start
 

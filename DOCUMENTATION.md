@@ -122,6 +122,7 @@ Supported canonical provider IDs:
 - `subtitri_do_am`
 - `prijevodi_online_org`
 - `animekalesi_com`
+- `subcentral_de`
 
 The repository also retains inactive implementations for
 `opensubtitles_org`, `moviesubtitles_org`, `moviesubtitlesrt_com`,
@@ -141,6 +142,7 @@ current upstream/network path cannot complete a search.
 `subtitri_do_am` is movie-only and provides Latvian subtitles.
 `prijevodi_online_org` is TV-only and uses the site's current public JSON API.
 `animekalesi_com` is TV-only and provides Turkish anime subtitles through the site's session-bound download flow.
+`subcentral_de` is TV-only and provides German and English series subtitles.
 
 The parser also accepts dotted or hyphenated site forms such as `subsource.net`.
 

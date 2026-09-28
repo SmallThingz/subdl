@@ -31,6 +31,7 @@ pub const subs_sab_bz = @import("subs.sab.bz.zig");
 pub const subtitri_do_am = @import("subtitri.do.am.zig");
 pub const prijevodi_online_org = @import("prijevodi-online.org.zig");
 pub const animekalesi_com = @import("animekalesi.com.zig");
+pub const subcentral_de = @import("subcentral.de.zig");
 pub const opensubtitles_com_cf = @import("opensubtitles_com_cf.zig");
 
 pub const provider_union = @import("provider_union.zig");
@@ -82,6 +83,7 @@ test {
     _ = @import("subtitri.do.am.zig");
     _ = @import("prijevodi-online.org.zig");
     _ = @import("animekalesi.com.zig");
+    _ = @import("subcentral.de.zig");
     _ = @import("opensubtitles_com_cf.zig");
     _ = @import("provider_union.zig");
     _ = @import("test_suite.zig");
