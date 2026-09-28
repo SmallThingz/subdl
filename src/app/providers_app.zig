@@ -66,6 +66,7 @@ pub const Provider = enum {
     feliratok_eu,
     animesub_info,
     subhd_tv,
+    fansubs_ru,
 };
 
 const provider_values = [_]Provider{
@@ -95,6 +96,7 @@ const provider_values = [_]Provider{
     .feliratok_eu,
     .animesub_info,
     .subhd_tv,
+    .fansubs_ru,
 };
 
 pub fn providers() []const Provider {
@@ -147,6 +149,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .feliratok_eu => "feliratok_eu",
         .animesub_info => "animesub_info",
         .subhd_tv => "subhd_tv",
+        .fansubs_ru => "fansubs_ru",
     };
 }
 
@@ -212,6 +215,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .feliratok_eu => "SuperSubtitles",
         .animesub_info => "AnimeSub.info",
         .subhd_tv => "SubHD",
+        .fansubs_ru => "Fansubs.ru",
     };
 }
 
@@ -250,6 +254,7 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .feliratok_eu => "https://feliratok.eu",
         .animesub_info => "http://animesub.info",
         .subhd_tv => "https://subhd.tv",
+        .fansubs_ru => "http://fansubs.ru",
     };
 }
 
@@ -535,6 +540,11 @@ pub const SearchRef = union(Provider) {
         subtitle_id: []const u8,
         filename: []const u8,
         detail_url: []const u8,
+    },
+    fansubs_ru: struct {
+        title: []const u8,
+        media_id: []const u8,
+        page_url: []const u8,
     },
 };
 
@@ -1356,6 +1366,24 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                         .subtitle_id = try a.dupe(u8, item.subtitle_id),
                         .filename = try a.dupe(u8, item.filename),
                         .detail_url = try a.dupe(u8, item.detail_url),
+                    } },
+                });
+            }
+        },
+        .fansubs_ru => {
+            var scraper = subdl.fansubs_ru.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                try out.append(a, .{
+                    .label = title,
+                    .ref = .{ .fansubs_ru = .{
+                        .title = title,
+                        .media_id = try a.dupe(u8, item.media_id),
+                        .page_url = try a.dupe(u8, item.page_url),
                     } },
                 });
             }
@@ -2421,6 +2449,27 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .fansubs_ru => |item| {
+            title = try a.dupe(u8, item.title);
+            var scraper = subdl.fansubs_ru.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            const query_item: subdl.fansubs_ru.SearchItem = .{
+                .title = item.title,
+                .media_id = item.media_id,
+                .page_url = item.page_url,
+            };
+            var subtitles = try scraper.fetchSubtitlesBySearchItem(query_item);
+            defer subtitles.deinit();
+            for (subtitles.subtitles) |subtitle| {
+                const label = try subtitleLabel(a, subtitle.language_code, subtitle.filename, subtitle.download_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try a.dupe(u8, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
     }
 
     return .{
@@ -2578,6 +2627,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .feliratok_eu => |item| item.title,
         .animesub_info => |item| item.title,
         .subhd_tv => |item| item.title,
+        .fansubs_ru => |item| item.title,
     };
 }
 
@@ -2614,7 +2664,8 @@ pub fn downloadSubtitleWithProgressAndOptions(
     const animekalesi_download = subdl.animekalesi_com.parseDownloadToken(source_url) != null;
     const animesub_download = subdl.animesub_info.parseDownloadToken(source_url) != null;
     const subhd_download = subdl.subhd_tv.parseDownloadToken(source_url) != null;
-    const url = if (greeksubs_download or indexsubtitle_download or titrari_download or subs_sab_download or animekalesi_download or animesub_download or subhd_download)
+    const fansubs_download = subdl.fansubs_ru.parseDownloadToken(source_url) != null;
+    const url = if (greeksubs_download or indexsubtitle_download or titrari_download or subs_sab_download or animekalesi_download or animesub_download or subhd_download or fansubs_download)
         try allocator.dupe(u8, source_url)
     else
         try resolveDownloadUrlIfNeeded(allocator, client, source_url);
@@ -2647,6 +2698,10 @@ pub fn downloadSubtitleWithProgressAndOptions(
         break :blk try scraper.fetchDownloadByToken(allocator, source_url);
     } else if (subhd_download) blk: {
         var scraper = subdl.subhd_tv.Scraper.init(allocator, client);
+        defer scraper.deinit();
+        break :blk try scraper.fetchDownloadByToken(allocator, source_url);
+    } else if (fansubs_download) blk: {
+        var scraper = subdl.fansubs_ru.Scraper.init(allocator, client);
         defer scraper.deinit();
         break :blk try scraper.fetchDownloadByToken(allocator, source_url);
     } else try fetchDownloadBytes(client, allocator, url);
@@ -3717,6 +3772,7 @@ fn liveQueryForProvider(provider: Provider) []const u8 {
         .feliratok_eu => "The Matrix",
         .animesub_info => "Spirited Away",
         .subhd_tv => "The Matrix",
+        .fansubs_ru => "Spirited Away",
         else => "The Matrix",
     };
 }
@@ -3758,6 +3814,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .feliratok_eu => |item| item.page_url,
         .animesub_info => |item| item.page_url,
         .subhd_tv => |item| item.detail_url,
+        .fansubs_ru => |item| item.page_url,
     };
 }
 
@@ -3839,6 +3896,7 @@ test "active provider registry excludes retired providers" {
         "feliratok_eu",
         "animesub_info",
         "subhd_tv",
+        "fansubs_ru",
     };
 
     const actual = providers();
@@ -3890,6 +3948,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("feliratok.eu") == .feliratok_eu);
     try std.testing.expect(parseProvider("animesub.info") == .animesub_info);
     try std.testing.expect(parseProvider("subhd.tv") == .subhd_tv);
+    try std.testing.expect(parseProvider("fansubs.ru") == .fansubs_ru);
 }
 
 test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
@@ -3919,6 +3978,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("feliratok") == .feliratok_eu);
     try std.testing.expect(try resolveProvider("animesub") == .animesub_info);
     try std.testing.expect(try resolveProvider("subhd") == .subhd_tv);
+    try std.testing.expect(try resolveProvider("fansubs") == .fansubs_ru);
     try std.testing.expect(try resolveProvider("open") == .opensubtitles_com);
     try std.testing.expectError(error.UnknownProvider, resolveProvider("tvsubtitles"));
     try std.testing.expectError(error.UnknownProvider, resolveProvider("missing"));
@@ -4296,6 +4356,7 @@ fn seriesQueryForProvider(provider: Provider) []const u8 {
         .subtitulamos_tv => "Chernobyl",
         .animesub_info => "Death Note",
         .subhd_tv => "Chernobyl S01E01",
+        .fansubs_ru => "Death Note",
         else => "Chernobyl",
     };
 }
@@ -4401,6 +4462,7 @@ const tui_smoke_providers = [_]Provider{
     .feliratok_eu,
     .animesub_info,
     .subhd_tv,
+    .fansubs_ru,
 };
 
 fn runProvidersSmokeBatch(allocator: std.mem.Allocator, selected: []const Provider) !void {
@@ -4634,6 +4696,10 @@ test "live providers_app tui-path smoke provider: subhd.tv" {
     try runSingleProviderSmokeTest(.subhd_tv);
 }
 
+test "live providers_app tui-path smoke provider: fansubs.ru" {
+    try runSingleProviderSmokeTest(.fansubs_ru);
+}
+
 test "live series download path provider: subdl.com" {
     try runSingleProviderSeriesTest(.subdl_com);
 }
@@ -4740,4 +4806,8 @@ test "live series download path provider: animesub.info" {
 
 test "live series download path provider: subhd.tv" {
     try runSingleProviderSeriesTest(.subhd_tv);
+}
+
+test "live series download path provider: fansubs.ru" {
+    try runSingleProviderSeriesTest(.fansubs_ru);
 }

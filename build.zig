@@ -292,6 +292,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "feliratok.eu" },
     .{ .name = "animesub.info" },
     .{ .name = "subhd.tv" },
+    .{ .name = "fansubs.ru" },
 };
 
 fn isAllLiveProviderSelection(raw_filter: []const u8) bool {
