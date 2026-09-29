@@ -27,6 +27,7 @@ pub const sous_titres_eu = @import("sous-titres.eu.zig");
 pub const cc_edatribe_com = @import("cc.edatribe.com.zig");
 pub const subtitrari_noi_ro = @import("subtitrari-noi.ro.zig");
 pub const subs_ro = @import("subs.ro.zig");
+pub const subs4free_info = @import("subs4free.info.zig");
 pub const subtitri_nekur_net = @import("subtitri.nekur.net.zig");
 pub const subsynchro_com = @import("subsynchro.com.zig");
 pub const titrari_ro = @import("titrari.ro.zig");

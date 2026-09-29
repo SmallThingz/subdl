@@ -3,13 +3,13 @@
 Subtitle scrapers in Zig with a shared provider API and a single `scrapers` binary.
 
 ![Zig](https://img.shields.io/badge/Zig-0.16.0--dev-f7a41d)
-![Providers](https://img.shields.io/badge/Active_Providers-36-2ea44f)
+![Providers](https://img.shields.io/badge/Active_Providers-37-2ea44f)
 ![Runtime](https://img.shields.io/badge/HTTP-std.http%20(Client)-0366d6)
 
 ## Overview
 
-- 36 currently active providers behind one app layer: `providers_app`
-- 45 provider implementations retained and covered by targeted live tests
+- 37 currently active providers behind one app layer: `providers_app`
+- 46 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
 - TUI mode available with `--tui` in the default build
@@ -41,6 +41,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `sous_titres_eu` | `sous-titres.eu` |
 | `cc_edatribe_com` | `cc.edatribe.com` |
 | `subs_ro` | `subs.ro` |
+| `subs4free_info` | `subs4free.info` |
 | `subtitri_nekur_net` | `subtitri.nekur.net` |
 | `subsynchro_com` | `subsynchro.com` |
 | `titrari_ro` | `titrari.ro` |
@@ -78,6 +79,7 @@ known-unusable provider in the CLI/TUI.
 `sous_titres_eu` provides French subtitles for movies and TV.
 `cc_edatribe_com` provides English anime movie and TV captions.
 `subs_ro` provides Romanian and English subtitles for movies and TV.
+`subs4free_info` is movie-only and provides Greek and English subtitles through a session-bound archive download flow.
 `subtitri_nekur_net` provides Latvian movie subtitles.
 `subsynchro_com` is movie-only and provides French subtitles.
 `titrari_ro` provides Romanian and English subtitles for movies and TV.

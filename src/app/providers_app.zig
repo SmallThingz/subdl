@@ -57,6 +57,7 @@ pub const Provider = enum {
     cc_edatribe_com,
     subtitrari_noi_ro,
     subs_ro,
+    subs4free_info,
     subtitri_nekur_net,
     subsynchro_com,
     titrari_ro,
@@ -97,6 +98,7 @@ const provider_values = [_]Provider{
     .sous_titres_eu,
     .cc_edatribe_com,
     .subs_ro,
+    .subs4free_info,
     .subtitri_nekur_net,
     .subsynchro_com,
     .titrari_ro,
@@ -160,6 +162,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .cc_edatribe_com => "cc_edatribe_com",
         .subtitrari_noi_ro => "subtitrari_noi_ro",
         .subs_ro => "subs_ro",
+        .subs4free_info => "subs4free_info",
         .subtitri_nekur_net => "subtitri_nekur_net",
         .subsynchro_com => "subsynchro_com",
         .titrari_ro => "titrari_ro",
@@ -237,6 +240,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .cc_edatribe_com => "Closed Caption Browser",
         .subtitrari_noi_ro => "Subtitrari-Noi",
         .subs_ro => "Subs.ro",
+        .subs4free_info => "Subs4Free",
         .subtitri_nekur_net => "Nekur",
         .subsynchro_com => "Subsynchro",
         .titrari_ro => "Titrari",
@@ -287,6 +291,7 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .cc_edatribe_com => "https://cc.edatribe.com",
         .subtitrari_noi_ro => "https://www.subtitrari-noi.ro",
         .subs_ro => "https://subs.ro",
+        .subs4free_info => "https://www.subs4free.info",
         .subtitri_nekur_net => "https://subtitri.nekur.net",
         .subsynchro_com => "http://www.subsynchro.com",
         .titrari_ro => "https://www.titrari.ro",
@@ -325,7 +330,7 @@ pub fn providerSupportsMovies(provider: Provider) bool {
 
 pub fn providerSupportsTv(provider: Provider) bool {
     return switch (provider) {
-        .moviesubtitles_org, .moviesubtitlesrt_com, .yifysubtitles_ch, .subtis_io, .subtitri_do_am, .subtitri_nekur_net, .subsynchro_com, .feliratok_eu, .justsubtitles_com => false,
+        .moviesubtitles_org, .moviesubtitlesrt_com, .yifysubtitles_ch, .subtis_io, .subtitri_do_am, .subtitri_nekur_net, .subsynchro_com, .subs4free_info, .feliratok_eu, .justsubtitles_com => false,
         else => true,
     };
 }
@@ -528,6 +533,13 @@ pub const SearchRef = union(Provider) {
         release: []const u8,
         page_url: []const u8,
         download_url: []const u8,
+    },
+    subs4free_info: struct {
+        title: []const u8,
+        year: ?i64,
+        language_code: []const u8,
+        release: []const u8,
+        page_url: []const u8,
     },
     subtitri_nekur_net: struct {
         title: []const u8,
@@ -1295,6 +1307,30 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                         .release = try a.dupe(u8, item.release),
                         .page_url = try a.dupe(u8, item.page_url),
                         .download_url = try a.dupe(u8, item.download_url),
+                    } },
+                });
+            }
+        },
+        .subs4free_info => {
+            var scraper = subdl.subs4free_info.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                const label = if (item.year) |year|
+                    try std.fmt.allocPrint(a, "{s} ({d}) [{s}] {s}", .{ title, year, item.language_code, item.release })
+                else
+                    try std.fmt.allocPrint(a, "{s} [{s}] {s}", .{ title, item.language_code, item.release });
+                try out.append(a, .{
+                    .label = label,
+                    .ref = .{ .subs4free_info = .{
+                        .title = title,
+                        .year = item.year,
+                        .language_code = try a.dupe(u8, item.language_code),
+                        .release = try a.dupe(u8, item.release),
+                        .page_url = try a.dupe(u8, item.page_url),
                     } },
                 });
             }
@@ -2622,6 +2658,29 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .subs4free_info => |item| {
+            title = try a.dupe(u8, item.title);
+            var scraper = subdl.subs4free_info.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            const query_item: subdl.subs4free_info.SearchItem = .{
+                .title = item.title,
+                .year = item.year,
+                .language_code = item.language_code,
+                .release = item.release,
+                .page_url = item.page_url,
+            };
+            var subtitles = try scraper.fetchSubtitlesBySearchItem(query_item);
+            defer subtitles.deinit();
+            for (subtitles.subtitles) |subtitle| {
+                const label = try subtitleLabel(a, subtitle.language_code, subtitle.filename, subtitle.download_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try a.dupe(u8, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
         .subtitri_nekur_net => |item| {
             title = try a.dupe(u8, item.title);
             var scraper = subdl.subtitri_nekur_net.Scraper.init(allocator, client);
@@ -3282,6 +3341,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .cc_edatribe_com => |item| item.title,
         .subtitrari_noi_ro => |item| item.title,
         .subs_ro => |item| item.title,
+        .subs4free_info => |item| item.title,
         .subtitri_nekur_net => |item| item.title,
         .subsynchro_com => |item| item.title,
         .titrari_ro => |item| item.title,
@@ -3341,7 +3401,8 @@ pub fn downloadSubtitleWithProgressAndOptions(
     const subhd_download = subdl.subhd_tv.parseDownloadToken(source_url) != null;
     const fansubs_download = subdl.fansubs_ru.parseDownloadToken(source_url) != null;
     const grupahatak_download = subdl.grupahatak_pl.parseDownloadToken(source_url) != null;
-    const url = if (greeksubs_download or indexsubtitle_download or titrari_download or subs_sab_download or animekalesi_download or animesub_download or subhd_download or fansubs_download or grupahatak_download)
+    const subs4free_download = subdl.subs4free_info.parseDownloadToken(source_url) != null;
+    const url = if (greeksubs_download or indexsubtitle_download or titrari_download or subs_sab_download or animekalesi_download or animesub_download or subhd_download or fansubs_download or grupahatak_download or subs4free_download)
         try allocator.dupe(u8, source_url)
     else
         try resolveDownloadUrlIfNeeded(allocator, client, source_url);
@@ -3382,6 +3443,10 @@ pub fn downloadSubtitleWithProgressAndOptions(
         break :blk try scraper.fetchDownloadByToken(allocator, source_url);
     } else if (grupahatak_download) blk: {
         var scraper = subdl.grupahatak_pl.Scraper.init(allocator, client);
+        defer scraper.deinit();
+        break :blk try scraper.fetchDownloadByToken(allocator, source_url);
+    } else if (subs4free_download) blk: {
+        var scraper = subdl.subs4free_info.Scraper.init(allocator, client);
         defer scraper.deinit();
         break :blk try scraper.fetchDownloadByToken(allocator, source_url);
     } else try fetchDownloadBytes(client, allocator, url);
@@ -4477,6 +4542,7 @@ fn liveQueryForProvider(provider: Provider) []const u8 {
         .cc_edatribe_com => "Spirited Away",
         .subtitrari_noi_ro => "The Matrix Resurrections",
         .subs_ro => "The Matrix",
+        .subs4free_info => "The Matrix",
         .subtitri_nekur_net => "The Matrix",
         .subsynchro_com => "Inception",
         .titrari_ro => "The Matrix Resurrections",
@@ -4529,6 +4595,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .cc_edatribe_com => |item| item.page_url,
         .subtitrari_noi_ro => |item| item.page_url,
         .subs_ro => |item| item.page_url,
+        .subs4free_info => |item| item.page_url,
         .subtitri_nekur_net => |item| item.page_url,
         .subsynchro_com => |item| item.page_url,
         .titrari_ro => |item| item.page_url,
@@ -4621,6 +4688,7 @@ test "active provider registry excludes retired providers" {
         "sous_titres_eu",
         "cc_edatribe_com",
         "subs_ro",
+        "subs4free_info",
         "subtitri_nekur_net",
         "subsynchro_com",
         "titrari_ro",
@@ -4683,6 +4751,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("cc.edatribe.com") == .cc_edatribe_com);
     try std.testing.expect(parseProvider("subtitrari-noi.ro") == null);
     try std.testing.expect(parseProvider("subs.ro") == .subs_ro);
+    try std.testing.expect(parseProvider("subs4free.info") == .subs4free_info);
     try std.testing.expect(parseProvider("subtitri.nekur.net") == .subtitri_nekur_net);
     try std.testing.expect(parseProvider("subsynchro.com") == .subsynchro_com);
     try std.testing.expect(parseProvider("titrari.ro") == .titrari_ro);
@@ -4723,6 +4792,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("sous_titres") == .sous_titres_eu);
     try std.testing.expect(try resolveProvider("cc_edatribe") == .cc_edatribe_com);
     try std.testing.expect(try resolveProvider("subs_ro") == .subs_ro);
+    try std.testing.expect(try resolveProvider("subs4free") == .subs4free_info);
     try std.testing.expect(try resolveProvider("subtitri_nekur") == .subtitri_nekur_net);
     try std.testing.expect(try resolveProvider("subsynchro") == .subsynchro_com);
     try std.testing.expect(try resolveProvider("titrari") == .titrari_ro);
@@ -5227,6 +5297,7 @@ const tui_smoke_providers = [_]Provider{
     .sous_titres_eu,
     .cc_edatribe_com,
     .subs_ro,
+    .subs4free_info,
     .subtitri_nekur_net,
     .subsynchro_com,
     .subtitrari_noi_ro,
@@ -5444,6 +5515,10 @@ test "live providers_app tui-path smoke provider: subtitrari-noi.ro" {
 
 test "live providers_app tui-path smoke provider: subs.ro" {
     try runSingleProviderSmokeTest(.subs_ro);
+}
+
+test "live providers_app tui-path smoke provider: subs4free.info" {
+    try runSingleProviderSmokeTest(.subs4free_info);
 }
 
 test "live providers_app tui-path smoke provider: subtitri.nekur.net" {

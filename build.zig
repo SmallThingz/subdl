@@ -303,6 +303,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "cc.edatribe.com" },
     .{ .name = "subtitrari-noi.ro", .active = false },
     .{ .name = "subs.ro", .serial = true },
+    .{ .name = "subs4free.info", .serial = true },
     .{ .name = "subtitri.nekur.net" },
     .{ .name = "subsynchro.com", .serial = true },
     .{ .name = "titrari.ro" },

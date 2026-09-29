@@ -30,6 +30,7 @@ pub const sous_titres_eu = subdl.sous_titres_eu;
 pub const cc_edatribe_com = subdl.cc_edatribe_com;
 pub const subtitrari_noi_ro = subdl.subtitrari_noi_ro;
 pub const subs_ro = subdl.subs_ro;
+pub const subs4free_info = subdl.subs4free_info;
 pub const subtitri_nekur_net = subdl.subtitri_nekur_net;
 pub const subsynchro_com = subdl.subsynchro_com;
 pub const titrari_ro = subdl.titrari_ro;

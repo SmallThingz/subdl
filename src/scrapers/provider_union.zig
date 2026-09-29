@@ -24,6 +24,7 @@ pub const sous_titres_eu = @import("sous-titres.eu.zig");
 pub const cc_edatribe_com = @import("cc.edatribe.com.zig");
 pub const subtitrari_noi_ro = @import("subtitrari-noi.ro.zig");
 pub const subs_ro = @import("subs.ro.zig");
+pub const subs4free_info = @import("subs4free.info.zig");
 pub const subtitri_nekur_net = @import("subtitri.nekur.net.zig");
 pub const subsynchro_com = @import("subsynchro.com.zig");
 pub const titrari_ro = @import("titrari.ro.zig");
@@ -71,6 +72,7 @@ pub const ProviderTag = enum {
     cc_edatribe_com,
     subtitrari_noi_ro,
     subs_ro,
+    subs4free_info,
     subtitri_nekur_net,
     subsynchro_com,
     titrari_ro,
@@ -119,6 +121,7 @@ pub const SearchItemUnion = union(ProviderTag) {
     cc_edatribe_com: cc_edatribe_com.SearchItem,
     subtitrari_noi_ro: subtitrari_noi_ro.SearchItem,
     subs_ro: subs_ro.SearchItem,
+    subs4free_info: subs4free_info.SearchItem,
     subtitri_nekur_net: subtitri_nekur_net.SearchItem,
     subsynchro_com: subsynchro_com.SearchItem,
     titrari_ro: titrari_ro.SearchItem,
@@ -167,6 +170,7 @@ pub const SubtitleUnion = union(ProviderTag) {
     cc_edatribe_com: cc_edatribe_com.SubtitleItem,
     subtitrari_noi_ro: subtitrari_noi_ro.SubtitleItem,
     subs_ro: subs_ro.SubtitleItem,
+    subs4free_info: subs4free_info.SubtitleItem,
     subtitri_nekur_net: subtitri_nekur_net.SubtitleItem,
     subsynchro_com: subsynchro_com.SubtitleItem,
     titrari_ro: titrari_ro.SubtitleItem,
@@ -215,6 +219,7 @@ pub const TitleUnion = union(ProviderTag) {
     cc_edatribe_com: cc_edatribe_com.SearchItem,
     subtitrari_noi_ro: subtitrari_noi_ro.SearchItem,
     subs_ro: subs_ro.SearchItem,
+    subs4free_info: subs4free_info.SearchItem,
     subtitri_nekur_net: subtitri_nekur_net.SearchItem,
     subsynchro_com: subsynchro_com.SearchItem,
     titrari_ro: titrari_ro.SearchItem,
@@ -403,6 +408,13 @@ pub fn fromSubsRoSearch(allocator: std.mem.Allocator, items: []const subs_ro.Sea
     var out: std.ArrayListUnmanaged(SearchItemUnion) = .empty;
     errdefer out.deinit(allocator);
     for (items) |item| try out.append(allocator, .{ .subs_ro = item });
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn fromSubs4FreeSearch(allocator: std.mem.Allocator, items: []const subs4free_info.SearchItem) ![]SearchItemUnion {
+    var out: std.ArrayListUnmanaged(SearchItemUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .subs4free_info = item });
     return try out.toOwnedSlice(allocator);
 }
 
@@ -718,6 +730,13 @@ pub fn fromSubsRoSubtitles(allocator: std.mem.Allocator, items: []const subs_ro.
     var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
     errdefer out.deinit(allocator);
     for (items) |item| try out.append(allocator, .{ .subs_ro = item });
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn fromSubs4FreeSubtitles(allocator: std.mem.Allocator, items: []const subs4free_info.SubtitleItem) ![]SubtitleUnion {
+    var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .subs4free_info = item });
     return try out.toOwnedSlice(allocator);
 }
 
