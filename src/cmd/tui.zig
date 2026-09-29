@@ -5439,20 +5439,16 @@ fn printFitted(
 
     if (text_class == .simple_ascii) {
         if (display_text.len <= max_width) {
-            const segs = [_]vaxis.Segment{.{ .text = display_text, .style = style }};
-            _ = win.print(&segs, .{ .row_offset = row, .col_offset = col, .wrap = .none });
+            writeAsciiCells(win, row, col, display_text, style);
             return;
         }
         if (max_width <= 3) {
-            const segs = [_]vaxis.Segment{.{ .text = display_text[0..max_width], .style = style }};
-            _ = win.print(&segs, .{ .row_offset = row, .col_offset = col, .wrap = .none });
+            writeAsciiCells(win, row, col, display_text[0..max_width], style);
             return;
         }
-        const segs = [_]vaxis.Segment{
-            .{ .text = display_text[0 .. max_width - 3], .style = style },
-            .{ .text = "...", .style = style },
-        };
-        _ = win.print(&segs, .{ .row_offset = row, .col_offset = col, .wrap = .none });
+        const prefix = display_text[0 .. max_width - 3];
+        writeAsciiCells(win, row, col, prefix, style);
+        writeAsciiCells(win, row, col + @as(u16, @intCast(prefix.len)), "...", style);
         return;
     }
 
@@ -5478,6 +5474,29 @@ fn printFitted(
         .{ .text = "...", .style = style },
     };
     _ = win.print(&segs, .{ .row_offset = row, .col_offset = col, .wrap = .none });
+}
+
+const ascii_graphemes = blk: {
+    var table: [128][1]u8 = undefined;
+    for (0..table.len) |idx| table[idx][0] = @intCast(idx);
+    break :blk table;
+};
+
+fn writeAsciiCells(win: anytype, row: u16, col: u16, text: []const u8, style: vaxis.Style) void {
+    var x = col;
+    for (text) |byte| {
+        std.debug.assert(byte < 0x80);
+        if (x >= win.width) break;
+        win.writeCell(x, row, .{
+            .char = .{
+                .grapheme = ascii_graphemes[byte][0..1],
+                .width = 1,
+            },
+            .style = style,
+            .wrapped = x + 1 >= win.width,
+        });
+        x += 1;
+    }
 }
 
 const DisplayTextClass = enum {
