@@ -6,7 +6,6 @@ const site = "https://subhd.tv";
 const prepare_url = site ++ "/api/sub/prepare-download";
 const download_api_url = site ++ "/api/sub/down";
 pub const download_token_prefix = "subhd-session:";
-const max_candidates: usize = 12;
 
 pub const MediaKind = enum { movie, tv };
 
@@ -82,57 +81,34 @@ pub const Scraper = struct {
             .max_attempts = 2,
         });
 
-        const detail_urls = try parseDetailUrls(a, response.body);
-        var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
-        var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
-        const wanted = try normalizeTitle(a, stripEpisodeTag(trimmed));
-
-        for (detail_urls[0..@min(detail_urls.len, max_candidates)]) |detail_url| {
-            const detail_response = common.fetchBytes(self.client, a, detail_url, .{
-                .accept = "text/html,application/xhtml+xml,*/*",
-                .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = search_url }},
-                .cache = false,
-                .max_attempts = 2,
-            }) catch continue;
-            const detail = parseDetail(detail_response.body) catch continue;
-            if (detail == null) continue;
-            const d = detail.?;
-
-            const season_episode = parseSeasonEpisode(d.release_info);
-            const media_kind: MediaKind = if (season_episode.episode != null) .tv else .movie;
-            const normalized_title = try normalizeTitle(a, d.title);
-            const item: SearchItem = .{
-                .title = try a.dupe(u8, d.title),
-                .release_info = try a.dupe(u8, d.release_info),
-                .media_kind = media_kind,
-                .season = season_episode.season,
-                .episode = season_episode.episode,
-                .language_code = try a.dupe(u8, d.language_code),
-                .subtitle_id = try a.dupe(u8, d.subtitle_id),
-                .filename = try a.dupe(u8, d.filename),
-                .detail_url = try a.dupe(u8, detail_url),
-            };
-            if (std.mem.eql(u8, normalized_title, wanted))
-                try exact.append(a, item)
-            else
-                try partial.append(a, item);
-        }
-
-        var items: std.ArrayListUnmanaged(SearchItem) = .empty;
-        try items.appendSlice(a, exact.items);
-        try items.appendSlice(a, partial.items);
-        return .{ .arena = arena, .items = try items.toOwnedSlice(a) };
+        const items = try parseSearchItems(a, response.body, trimmed);
+        return .{ .arena = arena, .items = items };
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+
+        var language_code = item.language_code;
+        var filename = item.filename;
+        const detail_response = common.fetchBytes(self.client, a, item.detail_url, .{
+            .accept = "text/html,application/xhtml+xml,*/*",
+            .cache = false,
+            .max_attempts = 2,
+        }) catch null;
+        if (detail_response) |detail_http| {
+            if (parseDetail(detail_http.body) catch null) |detail| {
+                language_code = detail.language_code;
+                filename = detail.filename;
+            }
+        }
+
         const subtitles = try a.alloc(SubtitleItem, 1);
         subtitles[0] = .{
-            .language_code = try a.dupe(u8, item.language_code),
-            .filename = try a.dupe(u8, item.filename),
-            .download_url = try makeDownloadToken(a, item.subtitle_id, item.detail_url, item.filename),
+            .language_code = try a.dupe(u8, language_code),
+            .filename = try a.dupe(u8, filename),
+            .download_url = try makeDownloadToken(a, item.subtitle_id, item.detail_url, filename),
         };
         return .{
             .arena = arena,
@@ -144,13 +120,17 @@ pub const Scraper = struct {
     pub fn fetchDownloadByToken(self: *Scraper, allocator: Allocator, token: []const u8) !common.HttpResponse {
         const parts = parseDownloadToken(token) orelse return error.InvalidDownloadUrl;
 
-        const detail = try common.fetchBytes(self.client, allocator, parts.detail_url, .{
-            .accept = "text/html,application/xhtml+xml,*/*",
-            .cache = false,
-            .max_attempts = 2,
-        });
-        defer allocator.free(detail.body);
-        if (detail.status != .ok) return error.UnexpectedHttpStatus;
+        if (try directCdnUrlFromFilename(allocator, parts.filename)) |cdn_url| {
+            defer allocator.free(cdn_url);
+            const direct = try common.fetchBytes(self.client, allocator, cdn_url, .{
+                .accept = "application/octet-stream,text/plain,application/zip,*/*",
+                .allow_non_ok = true,
+                .cache = false,
+                .max_attempts = 1,
+            });
+            if (direct.status == .ok and direct.body.len > 0 and !looksLikeHtml(direct.body)) return direct;
+            allocator.free(direct.body);
+        }
 
         const prepare_payload = try std.fmt.allocPrint(allocator, "{{\"sid\":\"{s}\"}}", .{parts.subtitle_id});
         defer allocator.free(prepare_payload);
@@ -197,6 +177,139 @@ pub const Scraper = struct {
         });
     }
 };
+
+fn directCdnUrlFromFilename(allocator: Allocator, filename: []const u8) !?[]u8 {
+    const basename = std.fs.path.basename(filename);
+    const dot = std.mem.lastIndexOfScalar(u8, basename, '.') orelse return null;
+    if (dot < 13 or dot + 1 >= basename.len) return null;
+    const stem = basename[0..dot];
+    for (stem) |c| if (!std.ascii.isDigit(c)) return null;
+
+    const millis = std.fmt.parseInt(u64, stem, 10) catch return null;
+    const seconds = millis / 1000;
+    const year_day = (std.time.epoch.EpochSeconds{ .secs = seconds }).getEpochDay().calculateYearDay();
+    const month = year_day.calculateMonthDay().month.numeric();
+    if (year_day.year < 2000 or year_day.year > 2200) return null;
+
+    return try std.fmt.allocPrint(
+        allocator,
+        "https://dl.subhd.me/{d}/{d:0>2}/{s}",
+        .{ year_day.year, month, basename },
+    );
+}
+
+fn looksLikeHtml(body: []const u8) bool {
+    const head = std.mem.trimStart(u8, body[0..@min(body.len, 1024)], " \t\r\n");
+    return std.ascii.startsWithIgnoreCase(head, "<!doctype html") or
+        std.ascii.startsWithIgnoreCase(head, "<html") or
+        std.mem.indexOf(u8, head, "<body") != null;
+}
+
+fn parseSearchItems(allocator: Allocator, body: []const u8, query: []const u8) ![]const SearchItem {
+    const wanted_title = std.mem.trim(u8, stripEpisodeTag(query), " \t\r\n");
+    const wanted = try normalizeTitle(allocator, wanted_title);
+    const requested_episode = parseSeasonEpisode(query);
+
+    var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
+    var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
+    var seen = std.StringHashMapUnmanaged(void).empty;
+
+    const card_marker = "<div class=\"bg-white shadow-sm rounded-3 mb-4\">";
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, body, cursor, card_marker)) |start| {
+        const next = std.mem.indexOfPos(u8, body, start + card_marker.len, card_marker) orelse body.len;
+        const card = body[start..next];
+        cursor = next;
+
+        const subtitle_id = detailIdFromCard(card) orelse continue;
+        if (seen.contains(subtitle_id)) continue;
+        try seen.put(allocator, try allocator.dupe(u8, subtitle_id), {});
+
+        const release_info = anchorTextAfter(card, "view-text text-secondary") orelse continue;
+        const poster_alt = attributeAfter(card, "<img", "alt");
+        const result_title = if (poster_alt) |alt|
+            asciiTitleSuffix(alt)
+        else
+            wanted_title;
+        const normalized_title = try normalizeTitle(allocator, result_title);
+        if (normalized_title.len == 0) continue;
+        if (std.mem.indexOf(u8, normalized_title, wanted) == null and
+            std.mem.indexOf(u8, wanted, normalized_title) == null)
+        {
+            continue;
+        }
+
+        const release_episode = parseSeasonEpisode(release_info);
+        const season = release_episode.season orelse requested_episode.season;
+        const episode = release_episode.episode orelse requested_episode.episode;
+        const media_kind: MediaKind = if (episode != null) .tv else .movie;
+        const extension = searchCardExtension(card);
+        const detail_url = try std.fmt.allocPrint(allocator, "{s}/a/{s}", .{ site, subtitle_id });
+        const item: SearchItem = .{
+            .title = try allocator.dupe(u8, result_title),
+            .release_info = try allocator.dupe(u8, std.mem.trim(u8, release_info, " \t\r\n")),
+            .media_kind = media_kind,
+            .season = season,
+            .episode = episode,
+            .language_code = try allocator.dupe(u8, preferredLanguageCode(card)),
+            .subtitle_id = try allocator.dupe(u8, subtitle_id),
+            .filename = try std.fmt.allocPrint(allocator, "subhd-{s}.{s}", .{ subtitle_id, extension }),
+            .detail_url = detail_url,
+        };
+
+        const exact_title = std.mem.eql(u8, normalized_title, wanted);
+        const exact_episode = requested_episode.episode == null or
+            (episode != null and episode.? == requested_episode.episode.? and
+                (requested_episode.season == null or season == requested_episode.season));
+        if (exact_title and exact_episode)
+            try exact.append(allocator, item)
+        else
+            try partial.append(allocator, item);
+    }
+
+    var items: std.ArrayListUnmanaged(SearchItem) = .empty;
+    try items.appendSlice(allocator, exact.items);
+    try items.appendSlice(allocator, partial.items);
+    return items.toOwnedSlice(allocator);
+}
+
+fn detailIdFromCard(card: []const u8) ?[]const u8 {
+    for ([_][]const u8{ "href='/a/", "href=\"/a/" }) |marker| {
+        const pos = std.mem.indexOf(u8, card, marker) orelse continue;
+        const start = pos + marker.len;
+        var end = start;
+        while (end < card.len and std.ascii.isAlphanumeric(card[end])) : (end += 1) {}
+        if (end > start) return card[start..end];
+    }
+    return null;
+}
+
+fn anchorTextAfter(body: []const u8, marker: []const u8) ?[]const u8 {
+    const marker_pos = std.mem.indexOf(u8, body, marker) orelse return null;
+    const anchor_pos = std.mem.indexOfPos(u8, body, marker_pos + marker.len, "<a ") orelse return null;
+    const open_end = std.mem.indexOfPos(u8, body, anchor_pos, ">") orelse return null;
+    const close = std.mem.indexOfPos(u8, body, open_end + 1, "</a>") orelse return null;
+    return std.mem.trim(u8, body[open_end + 1 .. close], " \t\r\n");
+}
+
+fn asciiTitleSuffix(value: []const u8) []const u8 {
+    var last_non_ascii: ?usize = null;
+    for (value, 0..) |c, idx| {
+        if (c >= 0x80) last_non_ascii = idx;
+    }
+    const suffix = if (last_non_ascii) |idx| value[idx + 1 ..] else value;
+    const trimmed = std.mem.trim(u8, suffix, " \t\r\n-–—/");
+    return if (trimmed.len > 0) trimmed else std.mem.trim(u8, value, " \t\r\n");
+}
+
+fn searchCardExtension(card: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, card, ">ASS<") != null) return "ass";
+    if (std.mem.indexOf(u8, card, ">SSA<") != null) return "ssa";
+    if (std.mem.indexOf(u8, card, ">VTT<") != null) return "vtt";
+    if (std.mem.indexOf(u8, card, ">SUB<") != null) return "sub";
+    if (std.mem.indexOf(u8, card, ">ZIP<") != null) return "zip";
+    return "srt";
+}
 
 fn parseDetailUrls(allocator: Allocator, body: []const u8) ![]const []const u8 {
     var out: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -526,4 +639,11 @@ test "live subhd movie and tv search/listing" {
 
 test "subhd detects explicit download throttle response" {
     try std.testing.expect(isDownloadRateLimit("{\"success\":false,\"msg\":\"下载频率过高，请稍后再试。\"}"));
+}
+
+test "subhd derives public CDN path from timestamp filename" {
+    const allocator = std.testing.allocator;
+    const url = (try directCdnUrlFromFilename(allocator, "1772600046334.srt")).?;
+    defer allocator.free(url);
+    try std.testing.expectEqualStrings("https://dl.subhd.me/2026/03/1772600046334.srt", url);
 }
