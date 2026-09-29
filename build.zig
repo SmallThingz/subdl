@@ -275,6 +275,7 @@ const LiveProviderTarget = struct {
     captcha: bool = false,
     timeout_seconds: ?u32 = null,
     active: bool = true,
+    serial: bool = false,
 };
 
 const live_provider_targets = [_]LiveProviderTarget{
@@ -297,7 +298,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "subtitles.ajatt.top" },
     .{ .name = "subtis.io", .active = false },
     .{ .name = "greeksubs.net" },
-    .{ .name = "indexsubtitle.cc" },
+    .{ .name = "indexsubtitle.cc", .serial = true },
     .{ .name = "sous-titres.eu" },
     .{ .name = "cc.edatribe.com" },
     .{ .name = "subtitrari-noi.ro", .active = false },
@@ -310,7 +311,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "subtitulamos.tv" },
     .{ .name = "feliratok.eu" },
     .{ .name = "animesub.info", .timeout_seconds = 180 },
-    .{ .name = "subhd.tv" },
+    .{ .name = "subhd.tv", .serial = true },
     .{ .name = "fansubs.ru" },
     .{ .name = "legendei.net" },
     .{ .name = "zoom.lk" },
@@ -356,6 +357,7 @@ fn makeParallelLiveRunScript(
     for (live_provider_targets) |target_info| {
         if (active_only and !target_info.active) continue;
         if (target_info.captcha and !std.mem.eql(u8, include_captcha_arg, "true")) continue;
+        if (target_info.serial) continue;
         const provider_timeout_seconds = target_info.timeout_seconds orelse timeout_seconds;
         out.print(b.allocator,
             \\echo "[live][runner] START {s}"
@@ -426,6 +428,36 @@ fn makeParallelLiveRunScript(
         \\  fi
         \\done
         \\wait "$monitor_pid" 2>/dev/null || true
+        \\
+    ) catch @panic("oom");
+
+    for (live_provider_targets) |target_info| {
+        if (!target_info.serial) continue;
+        if (active_only and !target_info.active) continue;
+        if (target_info.captcha and !std.mem.eql(u8, include_captcha_arg, "true")) continue;
+        const provider_timeout_seconds = target_info.timeout_seconds orelse timeout_seconds;
+        out.print(b.allocator,
+            \\echo "[live][runner] START {s} mode=serial"
+            \\set +e
+            \\SCRAPERS_LIVE_PROVIDER_FILTER="{s}" SCRAPERS_LIVE_INCLUDE_CAPTCHA="{s}" timeout --signal=TERM --kill-after=5s {d}s "$test_bin" 2>&1 | sed -u 's/^/[live][{s}] /'
+            \\rc=${{PIPESTATUS[0]}}
+            \\set -e
+            \\echo "[live][runner] END {s} rc=$rc mode=serial"
+            \\if [[ "$rc" != "0" ]]; then
+            \\  overall_rc=1
+            \\fi
+            \\
+        , .{
+            target_info.name,
+            target_info.name,
+            include_captcha_arg,
+            provider_timeout_seconds,
+            target_info.name,
+            target_info.name,
+        }) catch @panic("oom");
+    }
+
+    out.appendSlice(b.allocator,
         \\echo "[live][runner] SUMMARY rc=$overall_rc"
         \\exit "$overall_rc"
         \\
