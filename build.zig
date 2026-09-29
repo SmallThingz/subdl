@@ -3,7 +3,13 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize_opt = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode");
-    const optimize = optimize_opt orelse .Debug;
+    // The primary artifact is an interactive terminal app. Debug mode makes
+    // libvaxis walk and compare the full terminal grid with safety checks on
+    // every navigation frame, which is visibly sluggish even for modest lists.
+    // Keep Debug available explicitly via -Doptimize=Debug, but make normal
+    // run/install builds use the performance mode users actually experience.
+    const optimize = optimize_opt orelse .ReleaseFast;
+    const test_optimize = optimize_opt orelse .Debug;
     const all_targets_optimize = optimize_opt orelse .ReleaseFast;
     const strip_opt = b.option(bool, "strip", "Strip debug symbols from binaries");
     const strip = strip_opt orelse false;
@@ -65,7 +71,7 @@ pub fn build(b: *std.Build) void {
         enable_alldriver,
         enable_unarr,
     );
-    const subdl_mod = b.addModule("subdl", .{
+    _ = b.addModule("subdl", .{
         .root_source_file = b.path("src/scrapers/subdl.zig"),
         .target = target,
         .optimize = optimize,
@@ -198,14 +204,55 @@ pub fn build(b: *std.Build) void {
         all_targets_step.dependOn(&install_cross.step);
     }
 
+    const test_modules = createTargetModuleSet(
+        b,
+        target,
+        test_optimize,
+        false,
+        single_threaded,
+        omit_frame_pointer,
+        error_tracing,
+        pic,
+        build_options_mod,
+        true,
+        enable_tui,
+        enable_alldriver,
+        enable_unarr,
+    );
+    const test_subdl_mod = b.createModule(.{
+        .root_source_file = b.path("src/scrapers/subdl.zig"),
+        .target = target,
+        .optimize = test_optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "htmlparser", .module = test_modules.htmlparser_compat },
+            .{ .name = "alldriver", .module = test_modules.alldriver },
+            .{ .name = "build_options", .module = build_options_mod },
+            .{ .name = "runtime_alloc", .module = test_modules.runtime_alloc },
+            .{ .name = "runtime_io", .module = test_modules.runtime_io },
+        },
+    });
+    const test_app_mod = b.createModule(.{
+        .root_source_file = b.path("src/cmd/main.zig"),
+        .target = target,
+        .optimize = test_optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "scrapers", .module = test_modules.scrapers },
+            .{ .name = "runtime_alloc", .module = test_modules.runtime_alloc },
+            .{ .name = "runtime_io", .module = test_modules.runtime_io },
+            .{ .name = "tui_backend", .module = test_modules.tui_backend },
+        },
+    });
+
     const subdl_mod_tests = b.addTest(.{
-        .root_module = subdl_mod,
+        .root_module = test_subdl_mod,
         .use_llvm = llvm,
     });
     const run_subdl_mod_tests = b.addRunArtifact(subdl_mod_tests);
 
     const scrapers_mod_tests = b.addTest(.{
-        .root_module = scrapers_mod,
+        .root_module = test_modules.scrapers,
         .use_llvm = llvm,
     });
     const run_scrapers_mod_tests = b.addRunArtifact(scrapers_mod_tests);
@@ -214,7 +261,7 @@ pub fn build(b: *std.Build) void {
     run_scrapers_mod_tests_live.stdio = .inherit;
 
     const app_tests = b.addTest(.{
-        .root_module = app_exe.root_module,
+        .root_module = test_app_mod,
         .use_llvm = llvm,
     });
     const run_app_tests = b.addRunArtifact(app_tests);

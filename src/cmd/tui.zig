@@ -308,6 +308,9 @@ const SearchBundle = struct {
     searches: std.ArrayListUnmanaged(app.SearchResponse) = .empty,
     hits: std.ArrayListUnmanaged(CombinedSearchHit) = .empty,
     labels: [][]u8 = &.{},
+    display_query_norm: ?[]u8 = null,
+    display_hit_count: usize = 0,
+    display_order: []usize = &.{},
     live_count: usize = 0,
     cache_count: usize = 0,
     failed_count: usize = 0,
@@ -316,6 +319,8 @@ const SearchBundle = struct {
 
     fn deinit(self: *SearchBundle, allocator: std.mem.Allocator) void {
         allocator.free(self.query_norm);
+        if (self.display_query_norm) |query| allocator.free(query);
+        if (self.display_order.len > 0) allocator.free(self.display_order);
         for (self.searches.items) |*search| search.deinit();
         self.searches.deinit(allocator);
         self.hits.deinit(allocator);
@@ -848,7 +853,7 @@ fn runTui(ui: *Ui) !void {
                             else => {},
                         };
                     } else if (results) |*bundle| {
-                        const visible_count = queryVisibleHitCount(bundle, query_norm_view);
+                        const visible_count = bundle.display_order.len;
                         if (mouse.type == .press and visible_count > 0) switch (mouse.button) {
                             .wheel_down => {
                                 scrollSelection(&selected_result, visible_count, .forward, list_mouse_wheel_step);
@@ -949,8 +954,7 @@ fn runTui(ui: *Ui) !void {
                     if (focus == .results) {
                         if (key.matches(vaxis.Key.enter, .{})) {
                             if (results) |*bundle| {
-                                const visible_order = try buildQueryHitOrder(ui.allocator, bundle, query_norm_view);
-                                defer ui.allocator.free(visible_order);
+                                const visible_order = bundle.display_order;
                                 if (selected_result < visible_order.len) {
                                     switch (try openSearchResult(ui, bundle, visible_order[selected_result], &state)) {
                                         .back, .to_query => focus = .results,
@@ -962,7 +966,7 @@ fn runTui(ui: *Ui) !void {
                         }
                         if (key.matches(vaxis.Key.down, .{})) {
                             if (results) |*bundle| {
-                                const visible_count = queryVisibleHitCount(bundle, query_norm_view);
+                                const visible_count = bundle.display_order.len;
                                 if (selected_result + 1 < visible_count) selected_result += 1;
                             }
                             continue;
@@ -973,7 +977,7 @@ fn runTui(ui: *Ui) !void {
                         }
                         if (key.matches(vaxis.Key.page_down, .{})) {
                             if (results) |*bundle| {
-                                const visible_count = queryVisibleHitCount(bundle, query_norm_view);
+                                const visible_count = bundle.display_order.len;
                                 if (visible_count > 0) selected_result = @min(visible_count - 1, selected_result + queryPageSize(ui));
                             }
                             continue;
@@ -984,7 +988,7 @@ fn runTui(ui: *Ui) !void {
                         }
                         if (key.matches(vaxis.Key.end, .{})) {
                             if (results) |*bundle| {
-                                const visible_count = queryVisibleHitCount(bundle, query_norm_view);
+                                const visible_count = bundle.display_order.len;
                                 selected_result = visible_count -| 1;
                             }
                             continue;
@@ -1064,7 +1068,7 @@ fn runTui(ui: *Ui) !void {
             if (focus == .downloads and state.settings.download_cache_enabled) {
                 applyWheelDelta(&selected_download, state.download_entries.len, batch.wheel_delta, list_mouse_wheel_step);
             } else if (results) |*bundle| {
-                const visible_count = queryVisibleHitCount(bundle, query_norm_view);
+                const visible_count = bundle.display_order.len;
                 applyWheelDelta(&selected_result, visible_count, batch.wheel_delta, list_mouse_wheel_step);
                 if (visible_count > 0) focus = .results;
             }
@@ -2485,10 +2489,10 @@ fn executeQuerySearchIncremental(
                     if (info_open.*) continue;
                     if (mouseWheelDelta(mouse)) |delta| {
                         wheel_delta += delta;
-                    } else if (mouse.type == .press and bundle.hits.items.len > 0) switch (mouse.button) {
+                    } else if (mouse.type == .press and bundle.display_order.len > 0) switch (mouse.button) {
                         .left => {
                             const win = ui.vx.window();
-                            if (mouseRowIndex(mouse, 4, win.height, result_scroll.*, bundle.hits.items.len)) |row_idx| {
+                            if (mouseRowIndex(mouse, 4, win.height, result_scroll.*, bundle.display_order.len)) |row_idx| {
                                 selected_result.* = row_idx;
                             }
                         },
@@ -2528,33 +2532,32 @@ fn executeQuerySearchIncremental(
                         info_open.* = !info_open.*;
                         continue;
                     }
-                    if (bundle.hits.items.len > 0 and key.matches(vaxis.Key.down, .{})) {
-                        selected_result.* = @min(bundle.hits.items.len - 1, selected_result.* + 1);
+                    if (bundle.display_order.len > 0 and key.matches(vaxis.Key.down, .{})) {
+                        selected_result.* = @min(bundle.display_order.len - 1, selected_result.* + 1);
                         continue;
                     }
-                    if (bundle.hits.items.len > 0 and key.matches(vaxis.Key.up, .{})) {
+                    if (bundle.display_order.len > 0 and key.matches(vaxis.Key.up, .{})) {
                         selected_result.* = selected_result.* -| 1;
                         continue;
                     }
-                    if (bundle.hits.items.len > 0 and key.matches(vaxis.Key.page_down, .{})) {
-                        selected_result.* = @min(bundle.hits.items.len - 1, selected_result.* + queryPageSize(ui));
+                    if (bundle.display_order.len > 0 and key.matches(vaxis.Key.page_down, .{})) {
+                        selected_result.* = @min(bundle.display_order.len - 1, selected_result.* + queryPageSize(ui));
                         continue;
                     }
                     if (key.matches(vaxis.Key.page_up, .{})) {
                         selected_result.* = selected_result.* -| queryPageSize(ui);
                         continue;
                     }
-                    if (bundle.hits.items.len > 0 and key.matches(vaxis.Key.end, .{})) {
-                        selected_result.* = bundle.hits.items.len - 1;
+                    if (bundle.display_order.len > 0 and key.matches(vaxis.Key.end, .{})) {
+                        selected_result.* = bundle.display_order.len - 1;
                         continue;
                     }
                     if (key.matches(vaxis.Key.home, .{})) {
                         selected_result.* = 0;
                         continue;
                     }
-                    if (bundle.hits.items.len > 0 and key.matches(vaxis.Key.enter, .{})) {
-                        const visible_order = try buildQueryHitOrder(ui.allocator, &bundle, normalizeQueryView(query_display));
-                        defer ui.allocator.free(visible_order);
+                    if (bundle.display_order.len > 0 and key.matches(vaxis.Key.enter, .{})) {
+                        const visible_order = bundle.display_order;
                         if (selected_result.* >= visible_order.len) continue;
                         switch (try openSearchResult(ui, &bundle, visible_order[selected_result.*], state)) {
                             .back, .to_query => {},
@@ -2571,11 +2574,11 @@ fn executeQuerySearchIncremental(
             }
         }
         if (wheel_delta != 0) {
-            applyWheelDelta(selected_result, bundle.hits.items.len, wheel_delta, list_mouse_wheel_step);
+            applyWheelDelta(selected_result, bundle.display_order.len, wheel_delta, list_mouse_wheel_step);
             dirty = true;
         }
         if (dirty) {
-            clampSelection(selected_result, bundle.hits.items.len);
+            clampSelection(selected_result, bundle.display_order.len);
             try renderQueryHome(ui, state, query_display, cursor_pos, if (bundle.hits.items.len > 0) .results else .query, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
         }
         try runtime_io.get().sleep(.fromMilliseconds(search_poll_interval_ms), .awake);
@@ -2680,6 +2683,76 @@ fn buildQueryHitOrder(
     };
     std.mem.sort(usize, out, Ctx{ .bundle = bundle, .query = query_norm }, Ctx.less);
     return out;
+}
+
+fn ensureQueryHitOrder(
+    allocator: std.mem.Allocator,
+    bundle: *SearchBundle,
+    query_norm: []const u8,
+) ![]const usize {
+    if (bundle.display_query_norm) |cached_query| {
+        if (bundle.display_hit_count == bundle.hits.items.len and
+            std.mem.eql(u8, cached_query, query_norm))
+        {
+            return bundle.display_order;
+        }
+    }
+
+    const new_order = try buildQueryHitOrder(allocator, bundle, query_norm);
+    errdefer allocator.free(new_order);
+    const new_query = try allocator.dupe(u8, query_norm);
+    errdefer allocator.free(new_query);
+
+    if (bundle.display_query_norm) |cached_query| allocator.free(cached_query);
+    if (bundle.display_order.len > 0) allocator.free(bundle.display_order);
+    bundle.display_query_norm = new_query;
+    bundle.display_hit_count = bundle.hits.items.len;
+    bundle.display_order = new_order;
+    return bundle.display_order;
+}
+
+test "query display order cache reuses stable hit sets and invalidates on changes" {
+    const allocator = std.testing.allocator;
+    var response_arena = std.heap.ArenaAllocator.init(allocator);
+    const a = response_arena.allocator();
+    const items = try a.alloc(app.SearchChoice, 3);
+    items[0] = .{
+        .label = "Matrix Revolutions (2003)",
+        .ref = .{ .subdl_com = .{ .title = "Matrix Revolutions", .media_type = .movie, .link = "https://example.test/0" } },
+    };
+    items[1] = .{
+        .label = "The Matrix (1999)",
+        .ref = .{ .subdl_com = .{ .title = "The Matrix", .media_type = .movie, .link = "https://example.test/1" } },
+    };
+    items[2] = .{
+        .label = "Matrix Reloaded (2003)",
+        .ref = .{ .subdl_com = .{ .title = "Matrix Reloaded", .media_type = .movie, .link = "https://example.test/2" } },
+    };
+
+    var bundle: SearchBundle = .{ .query_norm = try allocator.dupe(u8, "matrix") };
+    defer bundle.deinit(allocator);
+    try bundle.searches.append(allocator, .{
+        .arena = response_arena,
+        .provider = .subdl_com,
+        .items = items,
+    });
+    try bundle.hits.append(allocator, .{ .provider = .subdl_com, .response_index = 0, .item_index = 0 });
+    try bundle.hits.append(allocator, .{ .provider = .subdl_com, .response_index = 0, .item_index = 1 });
+
+    const first = try ensureQueryHitOrder(allocator, &bundle, "matrix");
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, first);
+    const cached_ptr = first.ptr;
+    const second = try ensureQueryHitOrder(allocator, &bundle, "matrix");
+    try std.testing.expectEqual(cached_ptr, second.ptr);
+
+    try bundle.hits.append(allocator, .{ .provider = .subdl_com, .response_index = 0, .item_index = 2 });
+    const expanded = try ensureQueryHitOrder(allocator, &bundle, "matrix");
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 1 }, expanded);
+    try std.testing.expectEqual(@as(usize, 3), bundle.display_hit_count);
+
+    const narrowed = try ensureQueryHitOrder(allocator, &bundle, "the matrix");
+    try std.testing.expectEqualSlices(usize, &.{1}, narrowed);
+    try std.testing.expectEqualStrings("the matrix", bundle.display_query_norm.?);
 }
 
 fn queryHitScore(bundle: *const SearchBundle, hit_idx: usize, query_norm: []const u8) u32 {
@@ -2835,6 +2908,7 @@ fn editSettingsPopup(
     defer ttl_input.deinit(ui.allocator);
     var ttl_cursor: usize = 0;
     var ttl_error: ?[]const u8 = null;
+    var redraw_background = true;
     info_open.* = false;
     language_selected = if (state.settings.language_filter_enabled)
         (singleEnabledIndex(&state.settings.languages_enabled) orelse 0) + 1
@@ -2848,14 +2922,20 @@ fn editSettingsPopup(
         ensureVisible(provider_selected, &provider_scroll, page_size);
         ensureVisible(language_selected, &language_scroll, page_size);
 
-        try renderQueryHome(ui, state, query, cursor_pos, focus, query_dirty, results, selected_result, result_scroll, selected_download, download_scroll, false, false);
+        if (redraw_background) {
+            try renderQueryHome(ui, state, query, cursor_pos, focus, query_dirty, results, selected_result, result_scroll, selected_download, download_scroll, false, false);
+            redraw_background = false;
+        }
         try renderSettingsPopup(ui, win, state, panel, main_selected, provider_selected, language_selected, provider_scroll, language_scroll, ttl_input.items, ttl_cursor, ttl_error);
         try ui.render();
 
         const batch = try readEventBatch(ui, try ui.loop.nextEvent());
         for (batch.slice()) |event| {
             switch (event) {
-                .winsize => |ws| try ui.resize(ws),
+                .winsize => |ws| {
+                    try ui.resize(ws);
+                    redraw_background = true;
+                },
                 .mouse => |mouse| {
                     if (mouse.type != .press) continue;
                     const win_now = ui.vx.window();
@@ -2882,6 +2962,7 @@ fn editSettingsPopup(
                                         state.settings.providers_enabled[idx] = !state.settings.providers_enabled[idx];
                                         if (countEnabledFlags(&state.settings.providers_enabled) == 0) state.settings.providers_enabled[idx] = true;
                                         try saveTuiRuntimeState(ui.allocator, state);
+                                        redraw_background = true;
                                     }
                                 },
                                 else => {},
@@ -2902,6 +2983,7 @@ fn editSettingsPopup(
                                             state.settings.languages_enabled = languageSelectionOnly(idx - 1);
                                         }
                                         try saveTuiRuntimeState(ui.allocator, state);
+                                        redraw_background = true;
                                     }
                                 },
                                 else => {},
@@ -2949,6 +3031,7 @@ fn editSettingsPopup(
                             }
                             applyRuntimeCacheSettings(state);
                             try saveTuiRuntimeState(ui.allocator, state);
+                            redraw_background = true;
                         },
                         .providers => {
                             if (key.matches(vaxis.Key.escape, .{})) {
@@ -2967,6 +3050,7 @@ fn editSettingsPopup(
                                 state.settings.providers_enabled[provider_selected] = !state.settings.providers_enabled[provider_selected];
                                 if (countEnabledFlags(&state.settings.providers_enabled) == 0) state.settings.providers_enabled[provider_selected] = true;
                                 try saveTuiRuntimeState(ui.allocator, state);
+                                redraw_background = true;
                                 continue;
                             }
                         },
@@ -2992,6 +3076,7 @@ fn editSettingsPopup(
                                     state.settings.languages_enabled = languageSelectionOnly(language_selected - 1);
                                 }
                                 try saveTuiRuntimeState(ui.allocator, state);
+                                redraw_background = true;
                                 continue;
                             }
                         },
@@ -3009,6 +3094,7 @@ fn editSettingsPopup(
                                 state.settings.cache_ttl_seconds = ttl;
                                 applyRuntimeCacheSettings(state);
                                 try saveTuiRuntimeState(ui.allocator, state);
+                                redraw_background = true;
                                 panel = .main;
                                 ttl_error = null;
                                 continue;
@@ -3129,7 +3215,8 @@ fn renderSettingsPopup(
                 if (row >= row_end) break;
                 const checked = if (state.settings.providers_enabled[idx]) "on " else "off";
                 const style = if (idx == provider_selected) ui.styleSelected() else vaxis.Style{};
-                const line = try frameFmt(ui, "{s}  {s}", .{ checked, app.providerName(provider) });
+                var line_buf: [128]u8 = undefined;
+                const line = std.fmt.bufPrint(&line_buf, "{s}  {s}", .{ checked, app.providerName(provider) }) catch app.providerName(provider);
                 try printFitted(ui, win, row, x + 2, if (idx == provider_selected) "›" else " ", style, 1);
                 try printFitted(ui, win, row, x + 4, line, style, width -| 6);
                 row += 1;
@@ -3148,11 +3235,12 @@ fn renderSettingsPopup(
                     state.settings.language_filter_enabled and state.settings.languages_enabled[idx - 1];
                 const checked = if (selected) "on " else "off";
                 const style = if (idx == language_selected) ui.styleSelected() else vaxis.Style{};
+                var line_buf: [192]u8 = undefined;
                 const line = if (idx == 0)
-                    try frameFmt(ui, "{s}  off  No language filter", .{checked})
+                    std.fmt.bufPrint(&line_buf, "{s}  off  No language filter", .{checked}) catch "No language filter"
                 else blk: {
                     const lang = language_options[idx - 1];
-                    break :blk try frameFmt(ui, "{s}  {s}  {s}", .{ checked, lang.code, lang.name });
+                    break :blk std.fmt.bufPrint(&line_buf, "{s}  {s}  {s}", .{ checked, lang.code, lang.name }) catch lang.name;
                 };
                 try printFitted(ui, win, row, x + 2, if (idx == language_selected) "›" else " ", style, 1);
                 try printFitted(ui, win, row, x + 4, line, style, width -| 6);
@@ -3284,7 +3372,7 @@ fn renderQueryHome(
         }
     } else if (results) |bundle| {
         const query_norm = normalizeQueryView(query);
-        const visible_order = try buildQueryHitOrder(ui.frameAllocator(), bundle, query_norm);
+        const visible_order = try ensureQueryHitOrder(ui.allocator, bundle, query_norm);
         clampSelection(selected_result, visible_order.len);
         const page_size: usize = if (list_bottom > list_top) @intCast(list_bottom - list_top) else 1;
         ensureVisible(selected_result.*, scroll, page_size);
@@ -3304,7 +3392,8 @@ fn renderQueryHome(
             try printFitted(ui, win, row, 4, title, style, title_width);
             if (win.width > 48) {
                 const tag_col: u16 = @intCast(@min(@as(usize, 4) + title_width + 2, @as(usize, win.width - 1)));
-                const tag_line = try frameFmt(ui, "{s}  {s}", .{ provider_tag, source_tag });
+                var tag_buf: [128]u8 = undefined;
+                const tag_line = std.fmt.bufPrint(&tag_buf, "{s}  {s}", .{ provider_tag, source_tag }) catch provider_tag;
                 try printFitted(ui, win, row, tag_col, tag_line, if (hit.source == .live) ui.styleAccent() else ui.styleMuted(), if (win.width > tag_col) @intCast(win.width - tag_col - 1) else 0);
             }
             row += 1;
@@ -5339,11 +5428,15 @@ fn printFitted(
 ) !void {
     if (max_width == 0) return;
 
-    var display_text = try ui.frameAllocator().dupe(u8, text);
-    if (needsUtfSanitizeForDisplay(display_text)) display_text = try sanitizeUtf8ForDisplay(ui.frameAllocator(), display_text);
-    std.debug.assert(std.unicode.utf8ValidateSlice(display_text));
+    var display_text = text;
+    var text_class = classifyDisplayText(display_text);
+    if (text_class == .needs_sanitize) {
+        display_text = try sanitizeUtf8ForDisplay(ui.frameAllocator(), display_text);
+        text_class = classifyDisplayText(display_text);
+        std.debug.assert(text_class != .needs_sanitize);
+    }
 
-    if (isSimpleAsciiDisplay(display_text)) {
+    if (text_class == .simple_ascii) {
         if (display_text.len <= max_width) {
             const segs = [_]vaxis.Segment{.{ .text = display_text, .style = style }};
             _ = win.print(&segs, .{ .row_offset = row, .col_offset = col, .wrap = .none });
@@ -5386,19 +5479,30 @@ fn printFitted(
     _ = win.print(&segs, .{ .row_offset = row, .col_offset = col, .wrap = .none });
 }
 
-fn isSimpleAsciiDisplay(text: []const u8) bool {
-    for (text) |byte| {
-        if (byte < 0x20 or byte >= 0x7f) return false;
-    }
-    return true;
-}
+const DisplayTextClass = enum {
+    simple_ascii,
+    valid_utf8,
+    needs_sanitize,
+};
 
-fn needsUtfSanitizeForDisplay(text: []const u8) bool {
-    if (!std.unicode.utf8ValidateSlice(text)) return true;
-    for (text) |b| {
-        if ((b < 0x20 and b != '\n' and b != '\r' and b != '\t') or b == 0x7F) return true;
+fn classifyDisplayText(text: []const u8) DisplayTextClass {
+    var simple_ascii = true;
+    var has_non_ascii = false;
+    for (text) |byte| {
+        if (byte < 0x20) {
+            if (byte != '\n' and byte != '\r' and byte != '\t') return .needs_sanitize;
+            simple_ascii = false;
+            continue;
+        }
+        if (byte == 0x7f) return .needs_sanitize;
+        if (byte >= 0x80) {
+            simple_ascii = false;
+            has_non_ascii = true;
+        }
     }
-    return false;
+    if (simple_ascii) return .simple_ascii;
+    if (has_non_ascii and !std.unicode.utf8ValidateSlice(text)) return .needs_sanitize;
+    return .valid_utf8;
 }
 
 fn sanitizeUtf8ForDisplay(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
