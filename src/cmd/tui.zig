@@ -269,6 +269,11 @@ const PersistentSearchState = struct {
     cache_entries: []const QueryCacheEntry,
 };
 
+const PersistentSettingsState = struct {
+    version: u32,
+    settings: TuiSettings,
+};
+
 const PersistentKeywordState = struct {
     version: u32,
     keywords: []const KeywordEntry,
@@ -282,6 +287,7 @@ const TuiRuntimeState = struct {
     download_entries: [][]u8 = &.{},
     arena_stale_mutations: usize = 0,
     state_path: []u8,
+    settings_path: []u8,
     keyword_path: []u8,
     cache_root_path: []u8,
 
@@ -290,6 +296,7 @@ const TuiRuntimeState = struct {
         self.keywords.deinit(allocator);
         if (self.download_entries.len > 0) freeOwnedStrings(allocator, self.download_entries);
         allocator.free(self.state_path);
+        allocator.free(self.settings_path);
         allocator.free(self.keyword_path);
         allocator.free(self.cache_root_path);
         self.arena.deinit();
@@ -1748,6 +1755,7 @@ fn deinitSubtitlesPageCache(allocator: std.mem.Allocator, pages: *std.ArrayListU
 const persistent_version = 10;
 const default_cache_ttl_seconds: i64 = 12 * 60 * 60;
 const search_state_magic = "subdl-tui-search-state-v1\n";
+const settings_state_magic = "subdl-tui-settings-v1\n";
 const keyword_state_magic = "subdl-tui-keywords-v1\n";
 
 fn defaultTuiSettings() TuiSettings {
@@ -1768,6 +1776,8 @@ fn loadTuiRuntimeState(allocator: std.mem.Allocator, environ_map: *std.process.E
 
     const state_path = try tuiCachePath(allocator, environ_map, "state.oneserial");
     errdefer allocator.free(state_path);
+    const settings_path = try tuiCachePath(allocator, environ_map, "settings.oneserial");
+    errdefer allocator.free(settings_path);
     const keyword_path = try tuiCachePath(allocator, environ_map, "keywords.oneserial");
     errdefer allocator.free(keyword_path);
     const cache_root_path = try tuiCachePath(allocator, environ_map, "cache");
@@ -1777,6 +1787,7 @@ fn loadTuiRuntimeState(allocator: std.mem.Allocator, environ_map: *std.process.E
         .arena = arena,
         .settings = defaultTuiSettings(),
         .state_path = state_path,
+        .settings_path = settings_path,
         .keyword_path = keyword_path,
         .cache_root_path = cache_root_path,
     };
@@ -1786,6 +1797,12 @@ fn loadTuiRuntimeState(allocator: std.mem.Allocator, environ_map: *std.process.E
         if (loaded.version == persistent_version) {
             out.settings = sanitizeSettings(loaded.settings);
             try out.cache_entries.appendSlice(allocator, loaded.cache_entries);
+        }
+    }
+
+    if (try loadPersistentSettingsState(out.arena.allocator(), settings_path)) |loaded| {
+        if (loaded.version == persistent_version) {
+            out.settings = sanitizeSettings(loaded.settings);
         }
     }
 
@@ -1844,6 +1861,18 @@ fn loadPersistentKeywordState(allocator: std.mem.Allocator, path: []const u8) !?
     return untrusted.toOwned(allocator) catch null;
 }
 
+fn loadPersistentSettingsState(allocator: std.mem.Allocator, path: []const u8) !?PersistentSettingsState {
+    const data = std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return null,
+    };
+    defer allocator.free(data);
+    if (!std.mem.startsWith(u8, data, settings_state_magic)) return null;
+    const body = data[settings_state_magic.len..];
+    const untrusted = oneserial.Untrusted(PersistentSettingsState, .{}).init(body);
+    return untrusted.toOwned(allocator) catch null;
+}
+
 fn saveTuiRuntimeState(allocator: std.mem.Allocator, state: *const TuiRuntimeState) !void {
     const persist: PersistentSearchState = .{
         .version = persistent_version,
@@ -1859,6 +1888,14 @@ fn saveKeywordRuntimeState(allocator: std.mem.Allocator, state: *const TuiRuntim
         .keywords = state.keywords.items,
     };
     try saveOneSerial(PersistentKeywordState, allocator, state.keyword_path, keyword_state_magic, &persist);
+}
+
+fn saveTuiSettingsState(allocator: std.mem.Allocator, state: *const TuiRuntimeState) !void {
+    const persist: PersistentSettingsState = .{
+        .version = persistent_version,
+        .settings = state.settings,
+    };
+    try saveOneSerial(PersistentSettingsState, allocator, state.settings_path, settings_state_magic, &persist);
 }
 
 fn saveOneSerial(comptime T: type, allocator: std.mem.Allocator, path: []const u8, magic: []const u8, value: *const T) !void {
@@ -2910,6 +2947,7 @@ fn editSettingsPopup(
     var ttl_cursor: usize = 0;
     var ttl_error: ?[]const u8 = null;
     var redraw_background = true;
+    var settings_dirty = false;
     info_open.* = false;
     language_selected = if (state.settings.language_filter_enabled)
         (singleEnabledIndex(&state.settings.languages_enabled) orelse 0) + 1
@@ -2962,7 +3000,7 @@ fn editSettingsPopup(
                                         provider_selected = idx;
                                         state.settings.providers_enabled[idx] = !state.settings.providers_enabled[idx];
                                         if (countEnabledFlags(&state.settings.providers_enabled) == 0) state.settings.providers_enabled[idx] = true;
-                                        try saveTuiRuntimeState(ui.allocator, state);
+                                        settings_dirty = true;
                                         redraw_background = true;
                                     }
                                 },
@@ -2983,7 +3021,7 @@ fn editSettingsPopup(
                                             state.settings.language_filter_enabled = true;
                                             state.settings.languages_enabled = languageSelectionOnly(idx - 1);
                                         }
-                                        try saveTuiRuntimeState(ui.allocator, state);
+                                        settings_dirty = true;
                                         redraw_background = true;
                                     }
                                 },
@@ -2995,7 +3033,10 @@ fn editSettingsPopup(
                 },
                 .key_press => |key| {
                     if (key.isModifier()) continue;
-                    if (key.matches('d', .{ .ctrl = true })) return error.TuiQuit;
+                    if (key.matches('d', .{ .ctrl = true })) {
+                        if (settings_dirty) try saveTuiSettingsState(ui.allocator, state);
+                        return error.TuiQuit;
+                    }
                     switch (panel) {
                         .main => {
                             const item_count: usize = 7;
@@ -3009,10 +3050,16 @@ fn editSettingsPopup(
                                 continue;
                             }
                             if (!key.matches(vaxis.Key.enter, .{})) continue;
+                            var persist_settings = false;
+                            var apply_cache_settings = false;
                             switch (settingsMainAction(state.settings, main_selected)) {
                                 0 => panel = .providers,
                                 1 => panel = .languages,
-                                2 => state.settings.cache_enabled = !state.settings.cache_enabled,
+                                2 => {
+                                    state.settings.cache_enabled = !state.settings.cache_enabled;
+                                    persist_settings = true;
+                                    apply_cache_settings = true;
+                                },
                                 3 => {
                                     ttl_input.clearRetainingCapacity();
                                     const text = try cacheTtlInputText(ui.allocator, state.settings.cache_ttl_seconds);
@@ -3022,20 +3069,32 @@ fn editSettingsPopup(
                                     ttl_error = null;
                                     panel = .cache_ttl;
                                 },
-                                4 => state.settings.download_cache_enabled = !state.settings.download_cache_enabled,
-                                5 => state.settings.keyword_cache_enabled = !state.settings.keyword_cache_enabled,
+                                4 => {
+                                    state.settings.download_cache_enabled = !state.settings.download_cache_enabled;
+                                    persist_settings = true;
+                                },
+                                5 => {
+                                    state.settings.keyword_cache_enabled = !state.settings.keyword_cache_enabled;
+                                    persist_settings = true;
+                                },
                                 6 => {
                                     state.keywords.clearRetainingCapacity();
                                     try saveKeywordRuntimeState(ui.allocator, state);
                                 },
                                 else => {},
                             }
-                            applyRuntimeCacheSettings(state);
-                            try saveTuiRuntimeState(ui.allocator, state);
-                            redraw_background = true;
+                            if (apply_cache_settings) applyRuntimeCacheSettings(state);
+                            if (persist_settings) {
+                                try saveTuiSettingsState(ui.allocator, state);
+                                redraw_background = true;
+                            }
                         },
                         .providers => {
                             if (key.matches(vaxis.Key.escape, .{})) {
+                                if (settings_dirty) {
+                                    try saveTuiSettingsState(ui.allocator, state);
+                                    settings_dirty = false;
+                                }
                                 panel = .main;
                                 continue;
                             }
@@ -3050,7 +3109,7 @@ fn editSettingsPopup(
                             if (key.matches(vaxis.Key.enter, .{}) or key.matches(vaxis.Key.space, .{})) {
                                 state.settings.providers_enabled[provider_selected] = !state.settings.providers_enabled[provider_selected];
                                 if (countEnabledFlags(&state.settings.providers_enabled) == 0) state.settings.providers_enabled[provider_selected] = true;
-                                try saveTuiRuntimeState(ui.allocator, state);
+                                settings_dirty = true;
                                 redraw_background = true;
                                 continue;
                             }
@@ -3058,6 +3117,10 @@ fn editSettingsPopup(
                         .languages => {
                             const language_items = languageCount() + 1;
                             if (key.matches(vaxis.Key.escape, .{})) {
+                                if (settings_dirty) {
+                                    try saveTuiSettingsState(ui.allocator, state);
+                                    settings_dirty = false;
+                                }
                                 panel = .main;
                                 continue;
                             }
@@ -3076,7 +3139,7 @@ fn editSettingsPopup(
                                     state.settings.language_filter_enabled = true;
                                     state.settings.languages_enabled = languageSelectionOnly(language_selected - 1);
                                 }
-                                try saveTuiRuntimeState(ui.allocator, state);
+                                settings_dirty = true;
                                 redraw_background = true;
                                 continue;
                             }
@@ -3094,7 +3157,7 @@ fn editSettingsPopup(
                                 };
                                 state.settings.cache_ttl_seconds = ttl;
                                 applyRuntimeCacheSettings(state);
-                                try saveTuiRuntimeState(ui.allocator, state);
+                                try saveTuiSettingsState(ui.allocator, state);
                                 redraw_background = true;
                                 panel = .main;
                                 ttl_error = null;
@@ -5693,6 +5756,7 @@ test "runtime cache replacement stays bounded and compacts stale arena data" {
         .arena = std.heap.ArenaAllocator.init(allocator),
         .settings = defaultTuiSettings(),
         .state_path = try allocator.dupe(u8, "state.test"),
+        .settings_path = try allocator.dupe(u8, "settings.test"),
         .keyword_path = try allocator.dupe(u8, "keywords.test"),
         .cache_root_path = try allocator.dupe(u8, "cache.test"),
     };
@@ -5751,6 +5815,7 @@ test "download cache refresh discovers new files and exports the selected entry"
         .arena = std.heap.ArenaAllocator.init(allocator),
         .settings = defaultTuiSettings(),
         .state_path = try std.fmt.allocPrint(allocator, "{s}/state.oneserial", .{cache_root}),
+        .settings_path = try std.fmt.allocPrint(allocator, "{s}/settings.oneserial", .{cache_root}),
         .keyword_path = try std.fmt.allocPrint(allocator, "{s}/keywords.oneserial", .{cache_root}),
         .cache_root_path = try allocator.dupe(u8, cache_root),
     };
@@ -5816,6 +5881,88 @@ test "keyword state serializes through oneserial" {
     try std.testing.expectEqual(@as(usize, 2), decoded.keywords.len);
     try std.testing.expectEqualStrings("matrix", decoded.keywords[0].query);
     try std.testing.expectEqual(@as(u32, 2), decoded.keywords[0].use_count);
+}
+
+test "settings persist independently from search cache state" {
+    const allocator = std.testing.allocator;
+    const unique = scrapers.common.compatNanoTimestamp();
+    const test_root = try std.fmt.allocPrint(allocator, ".zig-cache/tui-settings-state-test-{d}", .{unique});
+    defer allocator.free(test_root);
+    defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
+
+    var state: TuiRuntimeState = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .settings = defaultTuiSettings(),
+        .state_path = try std.fmt.allocPrint(allocator, "{s}/state.oneserial", .{test_root}),
+        .settings_path = try std.fmt.allocPrint(allocator, "{s}/settings.oneserial", .{test_root}),
+        .keyword_path = try std.fmt.allocPrint(allocator, "{s}/keywords.oneserial", .{test_root}),
+        .cache_root_path = try std.fmt.allocPrint(allocator, "{s}/cache", .{test_root}),
+    };
+    defer state.deinit(allocator);
+
+    state.settings.cache_enabled = false;
+    state.settings.download_cache_enabled = false;
+    state.settings.keyword_cache_enabled = false;
+    state.settings.language_filter_enabled = false;
+    state.settings.providers_enabled[0] = false;
+    try saveTuiSettingsState(allocator, &state);
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), state.settings_path, allocator, .limited(4096));
+    defer allocator.free(bytes);
+    try std.testing.expect(bytes.len < 1024);
+    try std.testing.expect(std.mem.startsWith(u8, bytes, settings_state_magic));
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    const loaded = (try loadPersistentSettingsState(decode_arena.allocator(), state.settings_path)).?;
+    try std.testing.expectEqual(@as(u32, persistent_version), loaded.version);
+    try std.testing.expect(!loaded.settings.cache_enabled);
+    try std.testing.expect(!loaded.settings.download_cache_enabled);
+    try std.testing.expect(!loaded.settings.keyword_cache_enabled);
+    try std.testing.expect(!loaded.settings.language_filter_enabled);
+    try std.testing.expect(!loaded.settings.providers_enabled[0]);
+}
+
+test "independent settings override legacy settings embedded in search state" {
+    const allocator = std.testing.allocator;
+    const unique = scrapers.common.compatNanoTimestamp();
+    const test_root = try std.fmt.allocPrint(allocator, ".zig-cache/tui-settings-precedence-test-{d}", .{unique});
+    defer allocator.free(test_root);
+    defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
+
+    const state_path = try std.fmt.allocPrint(allocator, "{s}/subdl/state.oneserial", .{test_root});
+    defer allocator.free(state_path);
+    const settings_path = try std.fmt.allocPrint(allocator, "{s}/subdl/settings.oneserial", .{test_root});
+    defer allocator.free(settings_path);
+
+    var legacy_settings = defaultTuiSettings();
+    legacy_settings.cache_enabled = true;
+    legacy_settings.providers_enabled[0] = true;
+    const legacy_state: PersistentSearchState = .{
+        .version = persistent_version,
+        .settings = legacy_settings,
+        .cache_entries = &.{},
+    };
+    try saveOneSerial(PersistentSearchState, allocator, state_path, search_state_magic, &legacy_state);
+
+    var current_settings = legacy_settings;
+    current_settings.cache_enabled = false;
+    current_settings.providers_enabled[0] = false;
+    const current_state: PersistentSettingsState = .{
+        .version = persistent_version,
+        .settings = current_settings,
+    };
+    try saveOneSerial(PersistentSettingsState, allocator, settings_path, settings_state_magic, &current_state);
+
+    var env_map = try std.testing.environ.createMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("XDG_CACHE_HOME", test_root);
+
+    var loaded = try loadTuiRuntimeState(allocator, &env_map);
+    defer loaded.deinit(allocator);
+    try std.testing.expect(!loaded.settings.cache_enabled);
+    try std.testing.expect(!loaded.settings.providers_enabled[0]);
+    try std.testing.expectEqual(@as(usize, 0), loaded.cache_entries.items.len);
 }
 
 fn subtitleSortName(mode: SubtitleSort) []const u8 {
