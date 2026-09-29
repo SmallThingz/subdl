@@ -47,6 +47,7 @@ pub const wizdom_xyz = subdl.wizdom_xyz;
 pub const miraianime_net = subdl.miraianime_net;
 pub const animesubtitle_ir = subdl.animesubtitle_ir;
 pub const grupahatak_pl = subdl.grupahatak_pl;
+pub const jimaku_cc = subdl.jimaku_cc;
 pub const provider_union = subdl.provider_union;
 
 pub const Scraper = subdl.Scraper;

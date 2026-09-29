@@ -41,6 +41,7 @@ pub const wizdom_xyz = @import("wizdom.xyz.zig");
 pub const miraianime_net = @import("miraianime.net.zig");
 pub const animesubtitle_ir = @import("animesubtitle.ir.zig");
 pub const grupahatak_pl = @import("grupahatak.pl.zig");
+pub const jimaku_cc = @import("jimaku.cc.zig");
 
 pub const ProviderTag = enum {
     subdl_com,
@@ -84,6 +85,7 @@ pub const ProviderTag = enum {
     miraianime_net,
     animesubtitle_ir,
     grupahatak_pl,
+    jimaku_cc,
 };
 
 pub const SearchItemUnion = union(ProviderTag) {
@@ -128,6 +130,7 @@ pub const SearchItemUnion = union(ProviderTag) {
     miraianime_net: miraianime_net.SearchItem,
     animesubtitle_ir: animesubtitle_ir.SearchItem,
     grupahatak_pl: grupahatak_pl.SearchItem,
+    jimaku_cc: jimaku_cc.SearchItem,
 };
 
 pub const SubtitleUnion = union(ProviderTag) {
@@ -172,6 +175,7 @@ pub const SubtitleUnion = union(ProviderTag) {
     miraianime_net: miraianime_net.SubtitleItem,
     animesubtitle_ir: animesubtitle_ir.SubtitleItem,
     grupahatak_pl: grupahatak_pl.SubtitleItem,
+    jimaku_cc: jimaku_cc.SubtitleItem,
 };
 
 pub const TitleUnion = union(ProviderTag) {
@@ -216,6 +220,7 @@ pub const TitleUnion = union(ProviderTag) {
     miraianime_net: miraianime_net.SearchItem,
     animesubtitle_ir: animesubtitle_ir.SearchItem,
     grupahatak_pl: grupahatak_pl.SearchItem,
+    jimaku_cc: jimaku_cc.SearchItem,
 };
 
 pub fn fromSubdlSearch(allocator: std.mem.Allocator, items: []const subdl_com.SearchItem) ![]SearchItemUnion {
@@ -505,6 +510,13 @@ pub fn fromGrupaHatakSearch(allocator: std.mem.Allocator, items: []const grupaha
     return try out.toOwnedSlice(allocator);
 }
 
+pub fn fromJimakuSearch(allocator: std.mem.Allocator, items: []const jimaku_cc.SearchItem) ![]SearchItemUnion {
+    var out: std.ArrayListUnmanaged(SearchItemUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .jimaku_cc = item });
+    return try out.toOwnedSlice(allocator);
+}
+
 pub fn fromSubdlSubtitles(allocator: std.mem.Allocator, items: []const subdl_com.SubtitleItem) ![]SubtitleUnion {
     var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
     errdefer out.deinit(allocator);
@@ -789,6 +801,13 @@ pub fn fromGrupaHatakSubtitles(allocator: std.mem.Allocator, items: []const grup
     var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
     errdefer out.deinit(allocator);
     for (items) |item| try out.append(allocator, .{ .grupahatak_pl = item });
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn fromJimakuSubtitles(allocator: std.mem.Allocator, items: []const jimaku_cc.SubtitleItem) ![]SubtitleUnion {
+    var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .jimaku_cc = item });
     return try out.toOwnedSlice(allocator);
 }
 

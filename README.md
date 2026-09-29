@@ -3,13 +3,13 @@
 Subtitle scrapers in Zig with a shared provider API and a single `scrapers` binary.
 
 ![Zig](https://img.shields.io/badge/Zig-0.16.0--dev-f7a41d)
-![Providers](https://img.shields.io/badge/Active_Providers-34-2ea44f)
+![Providers](https://img.shields.io/badge/Active_Providers-35-2ea44f)
 ![Runtime](https://img.shields.io/badge/HTTP-std.http%20(Client)-0366d6)
 
 ## Overview
 
-- 34 currently active providers behind one app layer: `providers_app`
-- 41 provider implementations retained and covered by targeted live tests
+- 35 currently active providers behind one app layer: `providers_app`
+- 42 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
 - TUI mode available with `--tui` in the default build
@@ -59,6 +59,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `miraianime_net` | `miraianime.net` |
 | `animesubtitle_ir` | `animesubtitle.ir` |
 | `grupahatak_pl` | `grupahatak.pl` |
+| `jimaku_cc` | `jimaku.cc` |
 
 Retained inactive implementations are `opensubtitles_org`, `moviesubtitles_org`,
 `moviesubtitlesrt_com`, `podnapisi_net`, `tvsubtitles_net`,
@@ -91,6 +92,7 @@ known-unusable provider in the CLI/TUI.
 `miraianime_net` provides Arabic anime movie and TV subtitle archives.
 `animesubtitle_ir` provides Persian anime movie and TV subtitle archives.
 `grupahatak_pl` is TV-only and provides Polish episode subtitle ZIPs.
+`jimaku_cc` provides direct Japanese anime movie and TV subtitle files.
 
 ## Quick Start
 

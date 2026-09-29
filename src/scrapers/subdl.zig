@@ -44,6 +44,7 @@ pub const wizdom_xyz = @import("wizdom.xyz.zig");
 pub const miraianime_net = @import("miraianime.net.zig");
 pub const animesubtitle_ir = @import("animesubtitle.ir.zig");
 pub const grupahatak_pl = @import("grupahatak.pl.zig");
+pub const jimaku_cc = @import("jimaku.cc.zig");
 pub const opensubtitles_com_cf = @import("opensubtitles_com_cf.zig");
 
 pub const provider_union = @import("provider_union.zig");
@@ -108,6 +109,7 @@ test {
     _ = @import("miraianime.net.zig");
     _ = @import("animesubtitle.ir.zig");
     _ = @import("grupahatak.pl.zig");
+    _ = @import("jimaku.cc.zig");
     _ = @import("opensubtitles_com_cf.zig");
     _ = @import("provider_union.zig");
     _ = @import("test_suite.zig");

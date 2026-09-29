@@ -2184,6 +2184,14 @@ fn cloneSearchRef(allocator: std.mem.Allocator, ref: app.SearchRef) !app.SearchR
             .title = try allocator.dupe(u8, item.title),
             .page_url = try allocator.dupe(u8, item.page_url),
         } },
+        .jimaku_cc => |item| .{ .jimaku_cc = .{
+            .title = try allocator.dupe(u8, item.title),
+            .english_name = try dupOptionalLocal(allocator, item.english_name),
+            .japanese_name = try dupOptionalLocal(allocator, item.japanese_name),
+            .media_kind = item.media_kind,
+            .entry_id = item.entry_id,
+            .page_url = try allocator.dupe(u8, item.page_url),
+        } },
     };
 }
 

@@ -74,6 +74,7 @@ pub const Provider = enum {
     miraianime_net,
     animesubtitle_ir,
     grupahatak_pl,
+    jimaku_cc,
 };
 
 const provider_values = [_]Provider{
@@ -111,6 +112,7 @@ const provider_values = [_]Provider{
     .miraianime_net,
     .animesubtitle_ir,
     .grupahatak_pl,
+    .jimaku_cc,
 };
 
 pub fn providers() []const Provider {
@@ -171,6 +173,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .miraianime_net => "miraianime_net",
         .animesubtitle_ir => "animesubtitle_ir",
         .grupahatak_pl => "grupahatak_pl",
+        .jimaku_cc => "jimaku_cc",
     };
 }
 
@@ -244,6 +247,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .miraianime_net => "MiraiAnime",
         .animesubtitle_ir => "AnimeSubtitle.ir",
         .grupahatak_pl => "GrupaHatak",
+        .jimaku_cc => "Jimaku",
     };
 }
 
@@ -290,6 +294,7 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .miraianime_net => "https://miraianime.net",
         .animesubtitle_ir => "https://animesubtitle.ir",
         .grupahatak_pl => "https://grupahatak.pl",
+        .jimaku_cc => "https://jimaku.cc",
     };
 }
 
@@ -631,6 +636,14 @@ pub const SearchRef = union(Provider) {
     },
     grupahatak_pl: struct {
         title: []const u8,
+        page_url: []const u8,
+    },
+    jimaku_cc: struct {
+        title: []const u8,
+        english_name: ?[]const u8,
+        japanese_name: ?[]const u8,
+        media_kind: subdl.jimaku_cc.MediaKind,
+        entry_id: i64,
         page_url: []const u8,
     },
 };
@@ -1635,6 +1648,31 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                     .label = try std.fmt.allocPrint(a, "[tv] {s} • pl", .{title}),
                     .ref = .{ .grupahatak_pl = .{
                         .title = title,
+                        .page_url = try a.dupe(u8, item.page_url),
+                    } },
+                });
+            }
+        },
+        .jimaku_cc => {
+            var scraper = subdl.jimaku_cc.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                const display = if (item.english_name) |english|
+                    try std.fmt.allocPrint(a, "[{s}] {s} / {s} • ja", .{ @tagName(item.media_kind), title, english })
+                else
+                    try std.fmt.allocPrint(a, "[{s}] {s} • ja", .{ @tagName(item.media_kind), title });
+                try out.append(a, .{
+                    .label = display,
+                    .ref = .{ .jimaku_cc = .{
+                        .title = title,
+                        .english_name = if (item.english_name) |value| try a.dupe(u8, value) else null,
+                        .japanese_name = if (item.japanese_name) |value| try a.dupe(u8, value) else null,
+                        .media_kind = item.media_kind,
+                        .entry_id = item.entry_id,
                         .page_url = try a.dupe(u8, item.page_url),
                     } },
                 });
@@ -2894,6 +2932,30 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .jimaku_cc => |item| {
+            title = try a.dupe(u8, item.english_name orelse item.title);
+            var scraper = subdl.jimaku_cc.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            const query_item: subdl.jimaku_cc.SearchItem = .{
+                .title = item.title,
+                .english_name = item.english_name,
+                .japanese_name = item.japanese_name,
+                .media_kind = item.media_kind,
+                .entry_id = item.entry_id,
+                .page_url = item.page_url,
+            };
+            var subtitles = try scraper.fetchSubtitlesBySearchItem(query_item);
+            defer subtitles.deinit();
+            for (subtitles.subtitles) |subtitle| {
+                const label = try subtitleLabel(a, subtitle.language_code, subtitle.filename, subtitle.download_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try a.dupe(u8, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
     }
 
     return .{
@@ -3059,6 +3121,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .miraianime_net => |item| item.title,
         .animesubtitle_ir => |item| item.title,
         .grupahatak_pl => |item| item.title,
+        .jimaku_cc => |item| item.english_name orelse item.title,
     };
 }
 
@@ -4215,6 +4278,7 @@ fn liveQueryForProvider(provider: Provider) []const u8 {
         .miraianime_net => "Kimi no Na wa",
         .animesubtitle_ir => "Given Umi e",
         .grupahatak_pl => "Teen Wolf",
+        .jimaku_cc => "Kimi no Na wa",
         else => "The Matrix",
     };
 }
@@ -4264,6 +4328,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .miraianime_net => |item| item.page_url,
         .animesubtitle_ir => |item| item.page_url,
         .grupahatak_pl => |item| item.page_url,
+        .jimaku_cc => |item| item.page_url,
     };
 }
 
@@ -4353,6 +4418,7 @@ test "active provider registry excludes retired providers" {
         "miraianime_net",
         "animesubtitle_ir",
         "grupahatak_pl",
+        "jimaku_cc",
     };
 
     const actual = providers();
@@ -4412,6 +4478,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("miraianime.net") == .miraianime_net);
     try std.testing.expect(parseProvider("animesubtitle.ir") == .animesubtitle_ir);
     try std.testing.expect(parseProvider("grupahatak.pl") == .grupahatak_pl);
+    try std.testing.expect(parseProvider("jimaku.cc") == .jimaku_cc);
 }
 
 test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
@@ -4449,6 +4516,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("miraianime") == .miraianime_net);
     try std.testing.expect(try resolveProvider("animesubtitle") == .animesubtitle_ir);
     try std.testing.expect(try resolveProvider("grupahatak") == .grupahatak_pl);
+    try std.testing.expect(try resolveProvider("jimaku") == .jimaku_cc);
     try std.testing.expect(try resolveProvider("open") == .opensubtitles_com);
     try std.testing.expectError(error.UnknownProvider, resolveProvider("tvsubtitles"));
     try std.testing.expectError(error.UnknownProvider, resolveProvider("missing"));
@@ -4833,6 +4901,7 @@ fn seriesQueryForProvider(provider: Provider) []const u8 {
         .miraianime_net => "Death Note",
         .animesubtitle_ir => "Wind Breaker",
         .grupahatak_pl => "Teen Wolf",
+        .jimaku_cc => "86 Eighty Six",
         else => "Chernobyl",
     };
 }
@@ -4946,6 +5015,7 @@ const tui_smoke_providers = [_]Provider{
     .miraianime_net,
     .animesubtitle_ir,
     .grupahatak_pl,
+    .jimaku_cc,
 };
 
 fn runProvidersSmokeBatch(allocator: std.mem.Allocator, selected: []const Provider) !void {
@@ -5211,6 +5281,10 @@ test "live providers_app tui-path smoke provider: grupahatak.pl" {
     try runSingleProviderSmokeTest(.grupahatak_pl);
 }
 
+test "live providers_app tui-path smoke provider: jimaku.cc" {
+    try runSingleProviderSmokeTest(.jimaku_cc);
+}
+
 test "live series download path provider: subdl.com" {
     try runSingleProviderSeriesTest(.subdl_com);
 }
@@ -5345,4 +5419,8 @@ test "live series download path provider: animesubtitle.ir" {
 
 test "live series download path provider: grupahatak.pl" {
     try runSingleProviderSeriesTest(.grupahatak_pl);
+}
+
+test "live series download path provider: jimaku.cc" {
+    try runSingleProviderSeriesTest(.jimaku_cc);
 }
