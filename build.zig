@@ -304,6 +304,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "subtitrari-noi.ro", .active = false },
     .{ .name = "subs.ro" },
     .{ .name = "subtitri.nekur.net" },
+    .{ .name = "subsynchro.com" },
     .{ .name = "titrari.ro" },
     .{ .name = "subs.sab.bz" },
     .{ .name = "subtitri.do.am" },

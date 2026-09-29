@@ -2172,6 +2172,11 @@ fn cloneSearchRef(allocator: std.mem.Allocator, ref: app.SearchRef) !app.SearchR
             .page_url = try allocator.dupe(u8, item.page_url),
             .download_url = try allocator.dupe(u8, item.download_url),
         } },
+        .subsynchro_com => |item| .{ .subsynchro_com = .{
+            .title = try allocator.dupe(u8, item.title),
+            .year = item.year,
+            .page_url = try allocator.dupe(u8, item.page_url),
+        } },
         .titrari_ro => |item| .{ .titrari_ro = .{
             .title = try allocator.dupe(u8, item.title),
             .year = item.year,

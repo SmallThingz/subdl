@@ -31,6 +31,7 @@ pub const cc_edatribe_com = subdl.cc_edatribe_com;
 pub const subtitrari_noi_ro = subdl.subtitrari_noi_ro;
 pub const subs_ro = subdl.subs_ro;
 pub const subtitri_nekur_net = subdl.subtitri_nekur_net;
+pub const subsynchro_com = subdl.subsynchro_com;
 pub const titrari_ro = subdl.titrari_ro;
 pub const subs_sab_bz = subdl.subs_sab_bz;
 pub const subtitri_do_am = subdl.subtitri_do_am;

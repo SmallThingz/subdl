@@ -28,6 +28,7 @@ pub const cc_edatribe_com = @import("cc.edatribe.com.zig");
 pub const subtitrari_noi_ro = @import("subtitrari-noi.ro.zig");
 pub const subs_ro = @import("subs.ro.zig");
 pub const subtitri_nekur_net = @import("subtitri.nekur.net.zig");
+pub const subsynchro_com = @import("subsynchro.com.zig");
 pub const titrari_ro = @import("titrari.ro.zig");
 pub const subs_sab_bz = @import("subs.sab.bz.zig");
 pub const subtitri_do_am = @import("subtitri.do.am.zig");
@@ -95,6 +96,7 @@ test {
     _ = @import("subtitrari-noi.ro.zig");
     _ = @import("subs.ro.zig");
     _ = @import("subtitri.nekur.net.zig");
+    _ = @import("subsynchro.com.zig");
     _ = @import("titrari.ro.zig");
     _ = @import("subs.sab.bz.zig");
     _ = @import("subtitri.do.am.zig");
