@@ -883,10 +883,14 @@ fn runTui(ui: *Ui) !void {
                     }
                 },
                 .key_press => |key| {
-                    switch (handleGlobalKey(ui, key, true)) {
+                    switch (handleGlobalKey(ui, key)) {
                         .none => {},
                         .consumed => continue,
-                        .to_query => {},
+                        .to_query => {
+                            info_open = false;
+                            focus = .query;
+                            continue;
+                        },
                         .quit => return,
                     }
 
@@ -1098,7 +1102,7 @@ fn runProviderFirstTui(ui: *Ui) !void {
         const provider_choice = try vaxisSelect(
             ui,
             "Subtitle Downloader",
-            "Space toggles providers. Enter opens highlighted enabled provider. Esc quits.",
+            "Space selects providers. Enter searches checked providers; if none are checked, it uses the highlighted provider. Esc quits.",
             provider_names,
             provider_default,
             null,
@@ -4416,10 +4420,10 @@ fn vaxisInput(
             switch (event) {
                 .winsize => |ws| try ui.resize(ws),
                 .key_press => |key| {
-                    switch (handleGlobalKey(ui, key, true)) {
+                    switch (handleGlobalKey(ui, key)) {
                         .none => {},
                         .consumed => continue,
-                        .to_query => {},
+                        .to_query => return .back,
                         .quit => return .quit,
                     }
 
@@ -4573,13 +4577,13 @@ fn vaxisSelect(
 
         const can_page = if (page_nav) |pn| pn.enabled else false;
         const help_line = if (filter_mode)
-            "type Enter/Esc BS"
+            "F1 info · type Enter/Esc BS"
         else if (provider_toggles != null)
-            "j/k Space toggle Enter open Esc"
+            "F1 info · j/k Space select Enter search Esc"
         else if (can_page)
-            "j/k Enter / [ ] Esc"
+            "F1 info · j/k Enter / [ ] Esc"
         else
-            "j/k Enter / Esc";
+            "F1 info · j/k Enter / Esc";
 
         var count_buf: [128]u8 = undefined;
         const count_line = if (can_page)
@@ -4618,7 +4622,7 @@ fn vaxisSelect(
                 l3,
                 l4,
                 l5,
-                "close: m/?/Esc",
+                "close: F1/m/?/Esc",
             };
             try renderOverlayMenu(ui, win, "Menu", &lines);
         }
@@ -4630,13 +4634,13 @@ fn vaxisSelect(
             switch (event) {
                 .winsize => |ws| try ui.resize(ws),
                 .key_press => |key| {
-                    switch (handleGlobalKey(ui, key, false)) {
+                    switch (handleGlobalKey(ui, key)) {
                         .none => {},
                         .consumed => continue,
                         .to_query => return .to_query,
                         .quit => return .quit,
                     }
-                    if (key.matches('m', .{}) or key.matches('?', .{})) {
+                    if (key.matches(vaxis.Key.f1, .{}) or key.matches('m', .{}) or key.matches('?', .{})) {
                         info_menu_open = !info_menu_open;
                         continue;
                     }
@@ -4873,11 +4877,11 @@ fn vaxisSelectSubtitle(
 
         const can_page = if (page_nav) |pn| pn.enabled else false;
         const help_line = if (filter_mode)
-            "type Enter/Esc BS"
+            "F1 info · type Enter/Esc BS"
         else if (can_page)
-            "j/k Enter s / [ ] Esc"
+            "F1 info · j/k Enter s / [ ] Esc"
         else
-            "j/k Enter s / Esc";
+            "F1 info · j/k Enter s / Esc";
 
         var count_buf: [128]u8 = undefined;
         const count_line = if (can_page)
@@ -4914,7 +4918,7 @@ fn vaxisSelectSubtitle(
                 l3,
                 l4,
                 l5,
-                "close: m/?/Esc",
+                "close: F1/m/?/Esc",
             };
             try renderOverlayMenu(ui, win, "Menu", &lines);
         }
@@ -4926,13 +4930,13 @@ fn vaxisSelectSubtitle(
             switch (event) {
                 .winsize => |ws| try ui.resize(ws),
                 .key_press => |key| {
-                    switch (handleGlobalKey(ui, key, false)) {
+                    switch (handleGlobalKey(ui, key)) {
                         .none => {},
                         .consumed => continue,
                         .to_query => return .to_query,
                         .quit => return .quit,
                     }
-                    if (key.matches('m', .{}) or key.matches('?', .{})) {
+                    if (key.matches(vaxis.Key.f1, .{}) or key.matches('m', .{}) or key.matches('?', .{})) {
                         info_menu_open = !info_menu_open;
                         continue;
                     }
@@ -5075,7 +5079,7 @@ fn vaxisConfirm(ui: *Ui, title: []const u8, lines: []const []const u8) !ConfirmR
             switch (event) {
                 .winsize => |ws| try ui.resize(ws),
                 .key_press => |key| {
-                    switch (handleGlobalKey(ui, key, false)) {
+                    switch (handleGlobalKey(ui, key)) {
                         .none => {},
                         .consumed => continue,
                         .to_query => return .to_query,
@@ -5119,7 +5123,7 @@ fn vaxisMessage(
             switch (event) {
                 .winsize => |ws| try ui.resize(ws),
                 .key_press => |key| {
-                    switch (handleGlobalKey(ui, key, false)) {
+                    switch (handleGlobalKey(ui, key)) {
                         .none => {},
                         .consumed => continue,
                         .to_query => return .to_query,
@@ -5145,7 +5149,6 @@ const BottomBarConfig = struct {
 const BarLayout = struct {
     // Centralized bar text so future tweaks are one-place edits.
     pub const separator = "  •  ";
-    pub const menu_hint = "m:info";
     pub const confirm_key = "F2";
     pub const theme_key = "F3";
     pub const quit_hint = "^D";
@@ -5179,8 +5182,8 @@ fn renderCompactBottomLine(ui: *Ui, win: anytype, left: []const u8) !void {
     const confirm_text = if (ui.skip_confirm) "off" else "on";
     const status = try frameFmt(
         ui,
-        "{s} {s}:{s} {s}:{s} {s}",
-        .{ BarLayout.menu_hint, BarLayout.confirm_key, confirm_text, BarLayout.theme_key, ui.theme().name, BarLayout.quit_hint },
+        "{s}:{s} {s}:{s} {s}",
+        .{ BarLayout.confirm_key, confirm_text, BarLayout.theme_key, ui.theme().name, BarLayout.quit_hint },
     );
     const line = try frameFmt(ui, "{s}{s}{s}", .{ left, BarLayout.separator, status });
     try printFitted(ui, win, row, 1, line, ui.styleMuted(), width);
@@ -5271,12 +5274,10 @@ const KeyAction = enum {
     quit,
 };
 
-fn handleGlobalKey(ui: *Ui, key: vaxis.Key, is_query_screen: bool) KeyAction {
+fn handleGlobalKey(ui: *Ui, key: vaxis.Key) KeyAction {
     if (key.isModifier()) return .consumed;
     if (key.matches('d', .{ .ctrl = true })) return .quit;
-    if (key.matches('c', .{ .ctrl = true })) {
-        return if (is_query_screen) .quit else .to_query;
-    }
+    if (key.matches('c', .{ .ctrl = true })) return .to_query;
     if (key.matches(vaxis.Key.f2, .{})) {
         ui.toggleConfirm();
         return .consumed;
