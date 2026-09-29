@@ -58,6 +58,7 @@ pub const Provider = enum {
     subtitrari_noi_ro,
     subs_ro,
     subs4free_info,
+    tsukihime_org,
     subtitri_nekur_net,
     subsynchro_com,
     titrari_ro,
@@ -99,6 +100,7 @@ const provider_values = [_]Provider{
     .cc_edatribe_com,
     .subs_ro,
     .subs4free_info,
+    .tsukihime_org,
     .subtitri_nekur_net,
     .subsynchro_com,
     .titrari_ro,
@@ -163,6 +165,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .subtitrari_noi_ro => "subtitrari_noi_ro",
         .subs_ro => "subs_ro",
         .subs4free_info => "subs4free_info",
+        .tsukihime_org => "tsukihime_org",
         .subtitri_nekur_net => "subtitri_nekur_net",
         .subsynchro_com => "subsynchro_com",
         .titrari_ro => "titrari_ro",
@@ -241,6 +244,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .subtitrari_noi_ro => "Subtitrari-Noi",
         .subs_ro => "Subs.ro",
         .subs4free_info => "Subs4Free",
+        .tsukihime_org => "TsukiHime",
         .subtitri_nekur_net => "Nekur",
         .subsynchro_com => "Subsynchro",
         .titrari_ro => "Titrari",
@@ -292,6 +296,7 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .subtitrari_noi_ro => "https://www.subtitrari-noi.ro",
         .subs_ro => "https://subs.ro",
         .subs4free_info => "https://www.subs4free.info",
+        .tsukihime_org => "https://tsukihime.org",
         .subtitri_nekur_net => "https://subtitri.nekur.net",
         .subsynchro_com => "http://www.subsynchro.com",
         .titrari_ro => "https://www.titrari.ro",
@@ -538,6 +543,16 @@ pub const SearchRef = union(Provider) {
         title: []const u8,
         year: ?i64,
         language_code: []const u8,
+        release: []const u8,
+        page_url: []const u8,
+    },
+    tsukihime_org: struct {
+        title: []const u8,
+        year: ?i64,
+        media_kind: subdl.tsukihime_org.MediaKind,
+        torrent_id: i64,
+        season: ?u16,
+        episode: ?u16,
         release: []const u8,
         page_url: []const u8,
     },
@@ -1329,6 +1344,35 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                         .title = title,
                         .year = item.year,
                         .language_code = try a.dupe(u8, item.language_code),
+                        .release = try a.dupe(u8, item.release),
+                        .page_url = try a.dupe(u8, item.page_url),
+                    } },
+                });
+            }
+        },
+        .tsukihime_org => {
+            var scraper = subdl.tsukihime_org.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                const label = if (item.episode) |episode|
+                    try std.fmt.allocPrint(a, "[{s}] {s} • E{d:0>2} • {s}", .{ @tagName(item.media_kind), title, episode, item.release })
+                else if (item.year) |year|
+                    try std.fmt.allocPrint(a, "[{s}] {s} ({d}) • {s}", .{ @tagName(item.media_kind), title, year, item.release })
+                else
+                    try std.fmt.allocPrint(a, "[{s}] {s} • {s}", .{ @tagName(item.media_kind), title, item.release });
+                try out.append(a, .{
+                    .label = label,
+                    .ref = .{ .tsukihime_org = .{
+                        .title = title,
+                        .year = item.year,
+                        .media_kind = item.media_kind,
+                        .torrent_id = item.torrent_id,
+                        .season = item.season,
+                        .episode = item.episode,
                         .release = try a.dupe(u8, item.release),
                         .page_url = try a.dupe(u8, item.page_url),
                     } },
@@ -2681,6 +2725,32 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .tsukihime_org => |item| {
+            title = try a.dupe(u8, item.title);
+            var scraper = subdl.tsukihime_org.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            const query_item: subdl.tsukihime_org.SearchItem = .{
+                .title = item.title,
+                .year = item.year,
+                .media_kind = item.media_kind,
+                .torrent_id = item.torrent_id,
+                .season = item.season,
+                .episode = item.episode,
+                .release = item.release,
+                .page_url = item.page_url,
+            };
+            var subtitles = try scraper.fetchSubtitlesBySearchItem(query_item);
+            defer subtitles.deinit();
+            for (subtitles.subtitles) |subtitle| {
+                const label = try subtitleLabel(a, subtitle.language_code, subtitle.filename, subtitle.download_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try a.dupe(u8, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
         .subtitri_nekur_net => |item| {
             title = try a.dupe(u8, item.title);
             var scraper = subdl.subtitri_nekur_net.Scraper.init(allocator, client);
@@ -3342,6 +3412,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .subtitrari_noi_ro => |item| item.title,
         .subs_ro => |item| item.title,
         .subs4free_info => |item| item.title,
+        .tsukihime_org => |item| item.title,
         .subtitri_nekur_net => |item| item.title,
         .subsynchro_com => |item| item.title,
         .titrari_ro => |item| item.title,
@@ -3402,7 +3473,8 @@ pub fn downloadSubtitleWithProgressAndOptions(
     const fansubs_download = subdl.fansubs_ru.parseDownloadToken(source_url) != null;
     const grupahatak_download = subdl.grupahatak_pl.parseDownloadToken(source_url) != null;
     const subs4free_download = subdl.subs4free_info.parseDownloadToken(source_url) != null;
-    const url = if (greeksubs_download or indexsubtitle_download or titrari_download or subs_sab_download or animekalesi_download or animesub_download or subhd_download or fansubs_download or grupahatak_download or subs4free_download)
+    const tsukihime_download = subdl.tsukihime_org.parseDownloadToken(source_url) != null;
+    const url = if (greeksubs_download or indexsubtitle_download or titrari_download or subs_sab_download or animekalesi_download or animesub_download or subhd_download or fansubs_download or grupahatak_download or subs4free_download or tsukihime_download)
         try allocator.dupe(u8, source_url)
     else
         try resolveDownloadUrlIfNeeded(allocator, client, source_url);
@@ -3447,6 +3519,10 @@ pub fn downloadSubtitleWithProgressAndOptions(
         break :blk try scraper.fetchDownloadByToken(allocator, source_url);
     } else if (subs4free_download) blk: {
         var scraper = subdl.subs4free_info.Scraper.init(allocator, client);
+        defer scraper.deinit();
+        break :blk try scraper.fetchDownloadByToken(allocator, source_url);
+    } else if (tsukihime_download) blk: {
+        var scraper = subdl.tsukihime_org.Scraper.init(allocator, client);
         defer scraper.deinit();
         break :blk try scraper.fetchDownloadByToken(allocator, source_url);
     } else try fetchDownloadBytes(client, allocator, url);
@@ -4543,6 +4619,7 @@ fn liveQueryForProvider(provider: Provider) []const u8 {
         .subtitrari_noi_ro => "The Matrix Resurrections",
         .subs_ro => "The Matrix",
         .subs4free_info => "The Matrix",
+        .tsukihime_org => "Akira",
         .subtitri_nekur_net => "The Matrix",
         .subsynchro_com => "Inception",
         .titrari_ro => "The Matrix Resurrections",
@@ -4596,6 +4673,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .subtitrari_noi_ro => |item| item.page_url,
         .subs_ro => |item| item.page_url,
         .subs4free_info => |item| item.page_url,
+        .tsukihime_org => |item| item.page_url,
         .subtitri_nekur_net => |item| item.page_url,
         .subsynchro_com => |item| item.page_url,
         .titrari_ro => |item| item.page_url,
@@ -4689,6 +4767,7 @@ test "active provider registry excludes retired providers" {
         "cc_edatribe_com",
         "subs_ro",
         "subs4free_info",
+        "tsukihime_org",
         "subtitri_nekur_net",
         "subsynchro_com",
         "titrari_ro",
@@ -4752,6 +4831,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("subtitrari-noi.ro") == null);
     try std.testing.expect(parseProvider("subs.ro") == .subs_ro);
     try std.testing.expect(parseProvider("subs4free.info") == .subs4free_info);
+    try std.testing.expect(parseProvider("tsukihime.org") == .tsukihime_org);
     try std.testing.expect(parseProvider("subtitri.nekur.net") == .subtitri_nekur_net);
     try std.testing.expect(parseProvider("subsynchro.com") == .subsynchro_com);
     try std.testing.expect(parseProvider("titrari.ro") == .titrari_ro);
@@ -4793,6 +4873,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("cc_edatribe") == .cc_edatribe_com);
     try std.testing.expect(try resolveProvider("subs_ro") == .subs_ro);
     try std.testing.expect(try resolveProvider("subs4free") == .subs4free_info);
+    try std.testing.expect(try resolveProvider("tsukihime") == .tsukihime_org);
     try std.testing.expect(try resolveProvider("subtitri_nekur") == .subtitri_nekur_net);
     try std.testing.expect(try resolveProvider("subsynchro") == .subsynchro_com);
     try std.testing.expect(try resolveProvider("titrari") == .titrari_ro);
@@ -5186,6 +5267,7 @@ fn seriesQueryForProvider(provider: Provider) []const u8 {
         .cc_edatribe_com => "Attack on Titan",
         .subtitrari_noi_ro => "Reacher",
         .subs_ro => "Chernobyl",
+        .tsukihime_org => "Death Note S01E01",
         .titrari_ro => "Reacher",
         .subs_sab_bz => "Reacher",
         .prijevodi_online_org => "Chernobyl",
@@ -5298,6 +5380,7 @@ const tui_smoke_providers = [_]Provider{
     .cc_edatribe_com,
     .subs_ro,
     .subs4free_info,
+    .tsukihime_org,
     .subtitri_nekur_net,
     .subsynchro_com,
     .subtitrari_noi_ro,
@@ -5521,6 +5604,10 @@ test "live providers_app tui-path smoke provider: subs4free.info" {
     try runSingleProviderSmokeTest(.subs4free_info);
 }
 
+test "live providers_app tui-path smoke provider: tsukihime.org" {
+    try runSingleProviderSmokeTest(.tsukihime_org);
+}
+
 test "live providers_app tui-path smoke provider: subtitri.nekur.net" {
     try runSingleProviderSmokeTest(.subtitri_nekur_net);
 }
@@ -5679,6 +5766,10 @@ test "live series download path provider: cc.edatribe.com" {
 
 test "live series download path provider: subtitrari-noi.ro" {
     try runSingleProviderSeriesTest(.subtitrari_noi_ro);
+}
+
+test "live series download path provider: tsukihime.org" {
+    try runSingleProviderSeriesTest(.tsukihime_org);
 }
 
 test "live series download path provider: subs.ro" {

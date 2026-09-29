@@ -25,6 +25,7 @@ pub const cc_edatribe_com = @import("cc.edatribe.com.zig");
 pub const subtitrari_noi_ro = @import("subtitrari-noi.ro.zig");
 pub const subs_ro = @import("subs.ro.zig");
 pub const subs4free_info = @import("subs4free.info.zig");
+pub const tsukihime_org = @import("tsukihime.org.zig");
 pub const subtitri_nekur_net = @import("subtitri.nekur.net.zig");
 pub const subsynchro_com = @import("subsynchro.com.zig");
 pub const titrari_ro = @import("titrari.ro.zig");
@@ -73,6 +74,7 @@ pub const ProviderTag = enum {
     subtitrari_noi_ro,
     subs_ro,
     subs4free_info,
+    tsukihime_org,
     subtitri_nekur_net,
     subsynchro_com,
     titrari_ro,
@@ -122,6 +124,7 @@ pub const SearchItemUnion = union(ProviderTag) {
     subtitrari_noi_ro: subtitrari_noi_ro.SearchItem,
     subs_ro: subs_ro.SearchItem,
     subs4free_info: subs4free_info.SearchItem,
+    tsukihime_org: tsukihime_org.SearchItem,
     subtitri_nekur_net: subtitri_nekur_net.SearchItem,
     subsynchro_com: subsynchro_com.SearchItem,
     titrari_ro: titrari_ro.SearchItem,
@@ -171,6 +174,7 @@ pub const SubtitleUnion = union(ProviderTag) {
     subtitrari_noi_ro: subtitrari_noi_ro.SubtitleItem,
     subs_ro: subs_ro.SubtitleItem,
     subs4free_info: subs4free_info.SubtitleItem,
+    tsukihime_org: tsukihime_org.SubtitleItem,
     subtitri_nekur_net: subtitri_nekur_net.SubtitleItem,
     subsynchro_com: subsynchro_com.SubtitleItem,
     titrari_ro: titrari_ro.SubtitleItem,
@@ -220,6 +224,7 @@ pub const TitleUnion = union(ProviderTag) {
     subtitrari_noi_ro: subtitrari_noi_ro.SearchItem,
     subs_ro: subs_ro.SearchItem,
     subs4free_info: subs4free_info.SearchItem,
+    tsukihime_org: tsukihime_org.SearchItem,
     subtitri_nekur_net: subtitri_nekur_net.SearchItem,
     subsynchro_com: subsynchro_com.SearchItem,
     titrari_ro: titrari_ro.SearchItem,
@@ -415,6 +420,13 @@ pub fn fromSubs4FreeSearch(allocator: std.mem.Allocator, items: []const subs4fre
     var out: std.ArrayListUnmanaged(SearchItemUnion) = .empty;
     errdefer out.deinit(allocator);
     for (items) |item| try out.append(allocator, .{ .subs4free_info = item });
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn fromTsukiHimeSearch(allocator: std.mem.Allocator, items: []const tsukihime_org.SearchItem) ![]SearchItemUnion {
+    var out: std.ArrayListUnmanaged(SearchItemUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .tsukihime_org = item });
     return try out.toOwnedSlice(allocator);
 }
 
@@ -737,6 +749,13 @@ pub fn fromSubs4FreeSubtitles(allocator: std.mem.Allocator, items: []const subs4
     var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
     errdefer out.deinit(allocator);
     for (items) |item| try out.append(allocator, .{ .subs4free_info = item });
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn fromTsukiHimeSubtitles(allocator: std.mem.Allocator, items: []const tsukihime_org.SubtitleItem) ![]SubtitleUnion {
+    var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .tsukihime_org = item });
     return try out.toOwnedSlice(allocator);
 }
 
