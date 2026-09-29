@@ -320,6 +320,7 @@ const SearchBundle = struct {
     display_order: []usize = &.{},
     live_count: usize = 0,
     cache_count: usize = 0,
+    cache_changed: bool = false,
     failed_count: usize = 0,
     pending_count: usize = 0,
     searching: bool = false,
@@ -1025,7 +1026,7 @@ fn runTui(ui: *Ui) !void {
                         selected_result = 0;
                         result_scroll = 0;
                         focus = .results;
-                        try saveTuiRuntimeState(ui.allocator, &state);
+                        if (results.?.cache_changed) try saveTuiRuntimeState(ui.allocator, &state);
                         try saveKeywordRuntimeState(ui.allocator, &state);
                         continue;
                     }
@@ -2439,6 +2440,7 @@ fn executeQuerySearch(ui: *Ui, state: *TuiRuntimeState, query_norm: []const u8) 
             continue;
         };
         try upsertCacheEntry(ui.allocator, state, provider, query_norm, 1, now, search_result);
+        bundle.cache_changed = true;
         try bundle.searches.append(ui.allocator, search_result);
         for (bundle.searches.items[response_index].items, 0..) |_, item_index| {
             try bundle.hits.append(ui.allocator, .{ .provider = provider, .response_index = response_index, .item_index = item_index, .source = .live });
@@ -2543,6 +2545,7 @@ fn executeQuerySearchIncremental(
             };
             const response_index = bundle.searches.items.len;
             try upsertCacheEntry(ui.allocator, state, tasks[idx].provider, query_norm, 1, scrapers.common.compatUnixTimestamp(), search_result);
+            bundle.cache_changed = true;
             try bundle.searches.append(ui.allocator, search_result);
             for (bundle.searches.items[response_index].items, 0..) |_, item_index| {
                 try bundle.hits.append(ui.allocator, .{ .provider = tasks[idx].provider, .response_index = response_index, .item_index = item_index, .source = .live });
