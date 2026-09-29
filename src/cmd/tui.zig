@@ -2645,43 +2645,44 @@ fn formatHomeTopLine(
     return buf[0..pos];
 }
 
-fn queryVisibleHitCount(bundle: *const SearchBundle, query_norm: []const u8) usize {
-    if (query_norm.len == 0) return bundle.hits.items.len;
-    var count: usize = 0;
-    for (bundle.hits.items, 0..) |_, idx| {
-        if (queryHitScore(bundle, idx, query_norm) > 0) count += 1;
-    }
-    return if (count == 0) bundle.hits.items.len else count;
-}
-
 fn buildQueryHitOrder(
     allocator: std.mem.Allocator,
     bundle: *const SearchBundle,
     query_norm: []const u8,
 ) ![]usize {
-    const match_count = queryVisibleHitCount(bundle, query_norm);
-    const include_all = query_norm.len == 0 or match_count == bundle.hits.items.len;
-    const out = try allocator.alloc(usize, match_count);
+    const hit_count = bundle.hits.items.len;
+    if (hit_count == 0) return allocator.alloc(usize, 0);
+
+    const scores = try allocator.alloc(u32, hit_count);
+    defer allocator.free(scores);
+    var match_count: usize = 0;
+    for (scores, 0..) |*score, idx| {
+        score.* = queryHitScore(bundle, idx, query_norm);
+        if (score.* > 0) match_count += 1;
+    }
+
+    const include_all = query_norm.len == 0 or match_count == 0;
+    const visible_count = if (include_all) hit_count else match_count;
+    const out = try allocator.alloc(usize, visible_count);
     var out_len: usize = 0;
     for (bundle.hits.items, 0..) |_, idx| {
-        if (include_all or queryHitScore(bundle, idx, query_norm) > 0) {
+        if (include_all or scores[idx] > 0) {
             out[out_len] = idx;
             out_len += 1;
         }
     }
 
     const Ctx = struct {
-        bundle: *const SearchBundle,
-        query: []const u8,
+        scores: []const u32,
 
         fn less(ctx: @This(), lhs: usize, rhs: usize) bool {
-            const lhs_score = queryHitScore(ctx.bundle, lhs, ctx.query);
-            const rhs_score = queryHitScore(ctx.bundle, rhs, ctx.query);
+            const lhs_score = ctx.scores[lhs];
+            const rhs_score = ctx.scores[rhs];
             if (lhs_score != rhs_score) return lhs_score > rhs_score;
             return lhs < rhs;
         }
     };
-    std.mem.sort(usize, out, Ctx{ .bundle = bundle, .query = query_norm }, Ctx.less);
+    std.mem.sort(usize, out, Ctx{ .scores = scores }, Ctx.less);
     return out;
 }
 
