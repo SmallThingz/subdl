@@ -2618,7 +2618,7 @@ fn executeQuerySearchIncremental(
             clampSelection(selected_result, bundle.display_order.len);
             try renderQueryHome(ui, state, query_display, cursor_pos, if (bundle.hits.items.len > 0) .results else .query, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
         }
-        try runtime_io.get().sleep(.fromMilliseconds(search_poll_interval_ms), .awake);
+        try runtime_io.get().sleep(.fromMilliseconds(if (dirty) search_active_poll_interval_ms else search_poll_interval_ms), .awake);
     }
 
     try search_group.await(runtime_io.get());
@@ -5272,6 +5272,7 @@ fn countEnabledFlags(flags: []const bool) usize {
 }
 
 const list_mouse_wheel_step: usize = 3;
+const search_active_poll_interval_ms: u64 = 1;
 const search_poll_interval_ms: u64 = 8;
 const max_events_per_frame: usize = 512;
 
