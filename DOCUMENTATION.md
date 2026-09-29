@@ -110,7 +110,6 @@ Supported canonical provider IDs:
 - `subsource_net`
 - `sub_scene_com`
 - `gestdown_info`
-- `greek_subtitles_com`
 - `subsunacs_net`
 - `subtitles_ajatt_top`
 - `greeksubs_net`
@@ -139,7 +138,8 @@ Supported canonical provider IDs:
 
 The repository also retains inactive implementations for
 `opensubtitles_org`, `moviesubtitles_org`, `moviesubtitlesrt_com`,
-`podnapisi_net`, `tvsubtitles_net`, `subtitrari_noi_ro` while its
+`podnapisi_net`, `tvsubtitles_net`, `greek_subtitles_com` while its
+movie search is currently unreliable, `subtitrari_noi_ro` while its
 upstream host is refusing connections,
 `subtis_io` while `api.subt.is` has no DNS A record. Targeted live tests still cover
 those modules, but the CLI/TUI registry does not expose them while their
@@ -147,7 +147,6 @@ current upstream/network path cannot complete a search.
 
 `gestdown_info` is TV-only. `yifysubtitles_ch` is movie-only.
 `subtitles_ajatt_top` focuses on Japanese subtitles for anime TV and movies.
-`greek_subtitles_com` provides Greek subtitle archives for movies and TV.
 `greeksubs_net` provides Greek subtitles for movies and TV.
 `sous_titres_eu` provides French subtitles for movies and TV.
 `cc_edatribe_com` provides English anime movie and TV captions.

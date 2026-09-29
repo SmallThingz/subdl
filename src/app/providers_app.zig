@@ -87,7 +87,6 @@ const provider_values = [_]Provider{
     .subsource_net,
     .sub_scene_com,
     .gestdown_info,
-    .greeksubtitles_com,
     .subsunacs_net,
     .subtitles_ajatt_top,
     .greeksubs_net,
@@ -3206,10 +3205,12 @@ pub fn downloadSubtitleWithProgressAndOptions(
     } else try fetchDownloadBytes(client, allocator, url);
     defer allocator.free(response.body);
     if (response.status != .ok) return error.UnexpectedHttpStatus;
+    const body = response.body;
+    const bytes_written = body.len;
 
     const preferred_name = try preferredSubtitleDownloadName(allocator, subtitle, url);
     defer allocator.free(preferred_name);
-    const archive_kind = detectArchiveKind(preferred_name, url, response.body);
+    const archive_kind = detectArchiveKind(preferred_name, url, body);
     const raw_name = try ensureFilenameExtension(allocator, preferred_name, url, archive_kind, ".srt");
     defer allocator.free(raw_name);
 
@@ -3220,12 +3221,12 @@ pub fn downloadSubtitleWithProgressAndOptions(
 
     const output_path = try nextAvailableOutputPath(allocator, out_dir, safe_name);
     errdefer allocator.free(output_path);
-    try std.Io.Dir.cwd().writeFile(runtime_io.get(), .{ .sub_path = output_path, .data = response.body });
+    try std.Io.Dir.cwd().writeFile(runtime_io.get(), .{ .sub_path = output_path, .data = body });
 
     if (archive_kind == .none) {
         return .{
             .file_path = output_path,
-            .bytes_written = response.body.len,
+            .bytes_written = bytes_written,
             .source_url = source_url,
         };
     }
@@ -3237,13 +3238,17 @@ pub fn downloadSubtitleWithProgressAndOptions(
         return .{
             .file_path = output_path,
             .archive_path = archive_copy,
-            .bytes_written = response.body.len,
+            .bytes_written = bytes_written,
             .source_url = source_url,
         };
     }
 
     emitDownloadPhase(progress, .extracting_archive);
-    const extracted_files = try extractArchiveFiles(allocator, response.body, archive_kind, out_dir, output_path);
+    const extracted_files = if (archive_kind == .zip)
+        extractZipArchiveFiles(allocator, out_dir, output_path) catch
+            try extractArchiveFiles(allocator, body, archive_kind, out_dir, output_path)
+    else
+        try extractArchiveFiles(allocator, body, archive_kind, out_dir, output_path);
     errdefer {
         for (extracted_files) |path| allocator.free(path);
         allocator.free(extracted_files);
@@ -3253,7 +3258,7 @@ pub fn downloadSubtitleWithProgressAndOptions(
         .file_path = output_path,
         .archive_path = archive_copy,
         .extracted_files = extracted_files,
-        .bytes_written = response.body.len,
+        .bytes_written = bytes_written,
         .source_url = source_url,
     };
 }
@@ -3870,8 +3875,9 @@ fn extractArchiveFiles(
     out_dir: []const u8,
     archive_path: []const u8,
 ) ![]const []const u8 {
+    _ = archive_path;
     if (comptime !unarr.enabled) {
-        return extractArchiveFilesWithStd(allocator, archive_kind, out_dir, archive_path);
+        return error.ArchiveExtractionUnavailable;
     }
 
     const archive_format: unarr.Format = switch (archive_kind) {
@@ -3921,41 +3927,34 @@ fn extractArchiveFiles(
     return try extracted.toOwnedSlice(allocator);
 }
 
-const extractArchiveFilesWithStd = if (!unarr.enabled)
-    struct {
-        fn call(
-            allocator: Allocator,
-            archive_kind: ArchiveKind,
-            out_dir: []const u8,
-            archive_path: []const u8,
-        ) ![]const []const u8 {
-            if (archive_kind != .zip) return error.ArchiveExtractionUnavailable;
+fn extractZipArchiveFiles(
+    allocator: Allocator,
+    out_dir: []const u8,
+    archive_path: []const u8,
+) ![]const []const u8 {
+    const extract_dir_name = try extractionDirBaseName(allocator, archive_path);
+    defer allocator.free(extract_dir_name);
+    const extract_dir_path = try nextAvailableOutputPath(allocator, out_dir, extract_dir_name);
+    errdefer allocator.free(extract_dir_path);
 
-            const extract_dir_name = try extractionDirBaseName(allocator, archive_path);
-            defer allocator.free(extract_dir_name);
-            const extract_dir_path = try nextAvailableOutputPath(allocator, out_dir, extract_dir_name);
-            errdefer allocator.free(extract_dir_path);
+    try std.Io.Dir.cwd().createDirPath(runtime_io.get(), extract_dir_path);
+    var dest_dir = try std.Io.Dir.cwd().openDir(runtime_io.get(), extract_dir_path, .{ .iterate = true });
+    defer dest_dir.close(runtime_io.get());
 
-            try std.Io.Dir.cwd().createDirPath(runtime_io.get(), extract_dir_path);
-            var dest_dir = try std.Io.Dir.cwd().openDir(runtime_io.get(), extract_dir_path, .{ .iterate = true });
-            defer dest_dir.close(runtime_io.get());
+    var archive_file = try std.Io.Dir.cwd().openFile(runtime_io.get(), archive_path, .{});
+    defer archive_file.close(runtime_io.get());
+    var file_buf: [64 * 1024]u8 = undefined;
+    var file_reader = archive_file.reader(runtime_io.get(), &file_buf);
 
-            var archive_file = try std.Io.Dir.cwd().openFile(runtime_io.get(), archive_path, .{});
-            defer archive_file.close(runtime_io.get());
-            var file_buf: [16 * 1024]u8 = undefined;
-            var file_reader = archive_file.reader(runtime_io.get(), &file_buf);
-
-            std.zip.extract(dest_dir, &file_reader, .{ .allow_backslashes = true }) catch return error.ArchiveExtractionFailed;
-            const files = try collectExtractedFilesRecursive(allocator, extract_dir_path);
-            allocator.free(extract_dir_path);
-            if (files.len == 0) {
-                allocator.free(files);
-                return error.ArchiveExtractionFailed;
-            }
-            return files;
-        }
-    }.call
-else {};
+    std.zip.extract(dest_dir, &file_reader, .{ .allow_backslashes = true }) catch return error.ArchiveExtractionFailed;
+    const files = try collectExtractedFilesRecursive(allocator, extract_dir_path);
+    allocator.free(extract_dir_path);
+    if (files.len == 0) {
+        allocator.free(files);
+        return error.ArchiveExtractionFailed;
+    }
+    return files;
+}
 
 fn extractionDirBaseName(allocator: Allocator, archive_path: []const u8) ![]u8 {
     const base = pathBaseNameLocal(archive_path);
@@ -3986,7 +3985,23 @@ fn collectExtractedFilesRecursiveInner(
     defer dir.close(runtime_io.get());
     var it = dir.iterate();
     while (try it.next(runtime_io.get())) |entry| {
-        const path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        var renamed_name: ?[]u8 = null;
+        defer if (renamed_name) |name| allocator.free(name);
+
+        const entry_name = if (archiveExtractedNameNeedsSanitizing(entry.name)) blk: {
+            const sanitized = try sanitizeFilename(allocator, entry.name);
+            defer allocator.free(sanitized);
+            const candidate_path = try nextAvailableOutputPath(allocator, dir_path, sanitized);
+            defer allocator.free(candidate_path);
+            const candidate_name = pathBaseNameLocal(candidate_path);
+            const owned_name = try allocator.dupe(u8, candidate_name);
+            errdefer allocator.free(owned_name);
+            try dir.rename(entry.name, dir, owned_name, runtime_io.get());
+            renamed_name = owned_name;
+            break :blk owned_name;
+        } else entry.name;
+
+        const path = try std.fs.path.join(allocator, &.{ dir_path, entry_name });
         errdefer allocator.free(path);
         switch (entry.kind) {
             .file => try out.append(allocator, path),
@@ -3997,6 +4012,21 @@ fn collectExtractedFilesRecursiveInner(
             else => allocator.free(path),
         }
     }
+}
+
+fn archiveExtractedNameNeedsSanitizing(name: []const u8) bool {
+    if (!std.unicode.utf8ValidateSlice(name)) return true;
+
+    var i: usize = 0;
+    while (i < name.len) {
+        const seq_len_raw = std.unicode.utf8ByteSequenceLength(name[i]) catch return true;
+        const seq_len: usize = @intCast(seq_len_raw);
+        if (i + seq_len > name.len) return true;
+        const cp = std.unicode.utf8Decode(name[i .. i + seq_len]) catch return true;
+        if (cp == 0xFFFD) return true;
+        i += seq_len;
+    }
+    return false;
 }
 
 fn archiveEntryOutputName(allocator: Allocator, entry_name: []const u8, entry_num: usize) ![]u8 {
@@ -4196,7 +4226,10 @@ fn sanitizeFilename(allocator: Allocator, input: []const u8) ![]u8 {
     errdefer allocator.free(owned);
 
     const trimmed = std.mem.trim(u8, owned, " .");
-    if (trimmed.len == 0) return try allocator.dupe(u8, "subtitle.bin");
+    if (trimmed.len == 0) {
+        allocator.free(owned);
+        return try allocator.dupe(u8, "subtitle.bin");
+    }
     if (trimmed.len == owned.len) return owned;
 
     const duped = try allocator.dupe(u8, trimmed);
@@ -4393,7 +4426,6 @@ test "active provider registry excludes retired providers" {
         "subsource_net",
         "sub_scene_com",
         "gestdown_info",
-        "greek_subtitles_com",
         "subsunacs_net",
         "subtitles_ajatt_top",
         "greeksubs_net",
@@ -4451,7 +4483,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("sub-scene.com") == .sub_scene_com);
     try std.testing.expect(parseProvider("tvsubtitles.net") == null);
     try std.testing.expect(parseProvider("gestdown.info") == .gestdown_info);
-    try std.testing.expect(parseProvider("greek-subtitles.com") == .greeksubtitles_com);
+    try std.testing.expect(parseProvider("greek-subtitles.com") == null);
     try std.testing.expect(parseProvider("subsunacs.net") == .subsunacs_net);
     try std.testing.expect(parseProvider("subtitles.ajatt.top") == .subtitles_ajatt_top);
     try std.testing.expect(parseProvider("subtis.io") == null);
@@ -4490,7 +4522,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("subsource") == .subsource_net);
     try std.testing.expect(try resolveProvider("sub_scene") == .sub_scene_com);
     try std.testing.expect(try resolveProvider("gestdown") == .gestdown_info);
-    try std.testing.expect(try resolveProvider("greek_subtitles") == .greeksubtitles_com);
+    try std.testing.expectError(error.UnknownProvider, resolveProvider("greek_subtitles"));
     try std.testing.expect(try resolveProvider("subsunacs") == .subsunacs_net);
     try std.testing.expect(try resolveProvider("subtitles_ajatt") == .subtitles_ajatt_top);
     try std.testing.expect(try resolveProvider("greeksubs") == .greeksubs_net);

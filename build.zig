@@ -293,7 +293,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "opensubtitles.org", .active = false },
     .{ .name = "opensubtitles.com" },
     .{ .name = "gestdown.info" },
-    .{ .name = "greek-subtitles.com", .timeout_seconds = 240 },
+    .{ .name = "greek-subtitles.com", .timeout_seconds = 240, .active = false },
     .{ .name = "subsunacs.net" },
     .{ .name = "subtitles.ajatt.top" },
     .{ .name = "subtis.io", .active = false },
