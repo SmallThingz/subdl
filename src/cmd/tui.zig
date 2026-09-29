@@ -363,6 +363,7 @@ const IncrementalSearchWork = struct {
     tasks: []ProviderSearchTask,
     consumed: []bool,
     query: []u8,
+    task_count: usize = 0,
 };
 
 const SubtitlesTask = struct {
@@ -2589,6 +2590,7 @@ fn executeQuerySearchIncremental(
         };
         try search_group.concurrent(runtime_io.get(), providerSearchTaskMain, .{&tasks[task_count]});
         task_count += 1;
+        search_work.task_count = task_count;
         bundle.pending_count += 1;
     }
 
@@ -2824,7 +2826,12 @@ fn createIncrementalSearchWork(query: []const u8) !*IncrementalSearchWork {
 
 fn releaseIncrementalSearchWork(work: *IncrementalSearchWork) void {
     const allocator = std.heap.page_allocator;
-    cleanupUnconsumedProviderTasks(work.tasks, work.consumed);
+    std.debug.assert(work.task_count <= work.tasks.len);
+    std.debug.assert(work.task_count <= work.consumed.len);
+    cleanupUnconsumedProviderTasks(
+        work.tasks[0..work.task_count],
+        work.consumed[0..work.task_count],
+    );
     allocator.free(work.query);
     allocator.free(work.consumed);
     allocator.free(work.tasks);
@@ -6199,6 +6206,16 @@ test "search cache key isolates language scope" {
     try std.testing.expect(!std.mem.eql(u8, english, spanish));
     try std.testing.expect(!std.mem.eql(u8, english, unfiltered));
     try std.testing.expect(!std.mem.eql(u8, spanish, unfiltered));
+}
+
+test "incremental search work only releases initialized task slots" {
+    const work = try createIncrementalSearchWork("matrix");
+    work.tasks[0] = .{
+        .provider = .subdl_com,
+        .query = work.query,
+    };
+    work.task_count = 1;
+    releaseIncrementalSearchWork(work);
 }
 
 test "settings persist independently from search cache state" {
