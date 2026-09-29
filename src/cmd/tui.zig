@@ -2528,6 +2528,8 @@ fn executeQuerySearchIncremental(
 
     while (bundle.pending_count > 0) {
         var dirty = false;
+        var cache_response_indices: [app.providerCount()]usize = undefined;
+        var cache_response_count: usize = 0;
         var idx: usize = 0;
         while (idx < task_count) : (idx += 1) {
             if (consumed[idx]) continue;
@@ -2544,13 +2546,13 @@ fn executeQuerySearchIncremental(
                 continue;
             };
             const response_index = bundle.searches.items.len;
-            try upsertCacheEntry(ui.allocator, state, tasks[idx].provider, query_norm, 1, scrapers.common.compatUnixTimestamp(), search_result);
-            bundle.cache_changed = true;
             try bundle.searches.append(ui.allocator, search_result);
             for (bundle.searches.items[response_index].items, 0..) |_, item_index| {
                 try bundle.hits.append(ui.allocator, .{ .provider = tasks[idx].provider, .response_index = response_index, .item_index = item_index, .source = .live });
             }
             bundle.live_count += 1;
+            cache_response_indices[cache_response_count] = response_index;
+            cache_response_count += 1;
         }
 
         var wheel_delta: i32 = 0;
@@ -2653,6 +2655,19 @@ fn executeQuerySearchIncremental(
         if (dirty) {
             clampSelection(selected_result, bundle.display_order.len);
             try renderQueryHome(ui, state, query_display, cursor_pos, if (bundle.hits.items.len > 0) .results else .query, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
+        }
+        for (cache_response_indices[0..cache_response_count]) |response_index| {
+            const response = bundle.searches.items[response_index];
+            try upsertCacheEntry(
+                ui.allocator,
+                state,
+                response.provider,
+                query_norm,
+                1,
+                scrapers.common.compatUnixTimestamp(),
+                response,
+            );
+            bundle.cache_changed = true;
         }
         try runtime_io.get().sleep(.fromMilliseconds(if (dirty) search_active_poll_interval_ms else search_poll_interval_ms), .awake);
     }
