@@ -109,7 +109,6 @@ const provider_values = [_]Provider{
     .justsubtitles_com,
     .wizdom_xyz,
     .miraianime_net,
-    .animesubtitle_ir,
     .grupahatak_pl,
     .jimaku_cc,
 };
@@ -4448,7 +4447,6 @@ test "active provider registry excludes retired providers" {
         "justsubtitles_com",
         "wizdom_xyz",
         "miraianime_net",
-        "animesubtitle_ir",
         "grupahatak_pl",
         "jimaku_cc",
     };
@@ -4508,7 +4506,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("justsubtitles.com") == .justsubtitles_com);
     try std.testing.expect(parseProvider("wizdom.xyz") == .wizdom_xyz);
     try std.testing.expect(parseProvider("miraianime.net") == .miraianime_net);
-    try std.testing.expect(parseProvider("animesubtitle.ir") == .animesubtitle_ir);
+    try std.testing.expect(parseProvider("animesubtitle.ir") == null);
     try std.testing.expect(parseProvider("grupahatak.pl") == .grupahatak_pl);
     try std.testing.expect(parseProvider("jimaku.cc") == .jimaku_cc);
 }
@@ -4538,7 +4536,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("subtitulamos") == .subtitulamos_tv);
     try std.testing.expect(try resolveProvider("feliratok") == .feliratok_eu);
     try std.testing.expect(try resolveProvider("animesub_i") == .animesub_info);
-    try std.testing.expectError(error.AmbiguousProvider, resolveProvider("animesub"));
+    try std.testing.expectError(error.AmbiguousProvider, resolveProvider("sub"));
     try std.testing.expect(try resolveProvider("subhd") == .subhd_tv);
     try std.testing.expect(try resolveProvider("fansubs") == .fansubs_ru);
     try std.testing.expect(try resolveProvider("legendei") == .legendei_net);
@@ -4546,7 +4544,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("justsubtitles") == .justsubtitles_com);
     try std.testing.expect(try resolveProvider("wizdom") == .wizdom_xyz);
     try std.testing.expect(try resolveProvider("miraianime") == .miraianime_net);
-    try std.testing.expect(try resolveProvider("animesubtitle") == .animesubtitle_ir);
+    try std.testing.expectError(error.UnknownProvider, resolveProvider("animesubtitle"));
     try std.testing.expect(try resolveProvider("grupahatak") == .grupahatak_pl);
     try std.testing.expect(try resolveProvider("jimaku") == .jimaku_cc);
     try std.testing.expect(try resolveProvider("open") == .opensubtitles_com);

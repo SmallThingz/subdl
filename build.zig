@@ -280,7 +280,7 @@ const LiveProviderTarget = struct {
 
 const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "subdl.com" },
-    .{ .name = "isubtitles.org" },
+    .{ .name = "isubtitles.org", .timeout_seconds = 120 },
     .{ .name = "moviesubtitles.org", .active = false },
     .{ .name = "moviesubtitlesrt.com", .active = false },
     .{ .name = "my-subs.co" },
@@ -318,7 +318,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "justsubtitles.com" },
     .{ .name = "wizdom.xyz" },
     .{ .name = "miraianime.net" },
-    .{ .name = "animesubtitle.ir" },
+    .{ .name = "animesubtitle.ir", .active = false },
     .{ .name = "grupahatak.pl" },
     .{ .name = "jimaku.cc" },
 };

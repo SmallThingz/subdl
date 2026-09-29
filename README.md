@@ -3,12 +3,12 @@
 Subtitle scrapers in Zig with a shared provider API and a single `scrapers` binary.
 
 ![Zig](https://img.shields.io/badge/Zig-0.16.0--dev-f7a41d)
-![Providers](https://img.shields.io/badge/Active_Providers-34-2ea44f)
+![Providers](https://img.shields.io/badge/Active_Providers-33-2ea44f)
 ![Runtime](https://img.shields.io/badge/HTTP-std.http%20(Client)-0366d6)
 
 ## Overview
 
-- 34 currently active providers behind one app layer: `providers_app`
+- 33 currently active providers behind one app layer: `providers_app`
 - 42 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
@@ -56,7 +56,6 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `justsubtitles_com` | `justsubtitles.com` |
 | `wizdom_xyz` | `wizdom.xyz` |
 | `miraianime_net` | `miraianime.net` |
-| `animesubtitle_ir` | `animesubtitle.ir` |
 | `grupahatak_pl` | `grupahatak.pl` |
 | `jimaku_cc` | `jimaku.cc` |
 
@@ -64,7 +63,9 @@ Retained inactive implementations are `opensubtitles_org`, `moviesubtitles_org`,
 `moviesubtitlesrt_com`, `podnapisi_net`, `tvsubtitles_net`,
 `greek_subtitles_com` while its movie search is currently unreliable,
 `subtitrari_noi_ro` while its upstream host is refusing connections,
-`subtis_io` while `api.subt.is` has no DNS A record. They stay in
+`subtis_io` while `api.subt.is` has no DNS A record, and
+`animesubtitle_ir` while both its WordPress REST and HTML title-search paths
+return upstream HTTP 500 responses. They stay in
 the live-test matrix so upstream recovery can be detected without advertising a
 known-unusable provider in the CLI/TUI.
 
@@ -89,7 +90,6 @@ known-unusable provider in the CLI/TUI.
 `justsubtitles_com` is movie-only and exposes server-rendered subtitle ZIPs through the public SubDL CDN.
 `wizdom_xyz` provides Hebrew movie and TV subtitles through the public Wizdom release API.
 `miraianime_net` provides Arabic anime movie and TV subtitle archives.
-`animesubtitle_ir` provides Persian anime movie and TV subtitle archives.
 `grupahatak_pl` is TV-only and provides Polish episode subtitle ZIPs.
 `jimaku_cc` provides direct Japanese anime movie and TV subtitle files.
 
