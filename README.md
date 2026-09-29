@@ -3,13 +3,13 @@
 Subtitle scrapers in Zig with a shared provider API and a single `scrapers` binary.
 
 ![Zig](https://img.shields.io/badge/Zig-0.16.0--dev-f7a41d)
-![Providers](https://img.shields.io/badge/Active_Providers-33-2ea44f)
+![Providers](https://img.shields.io/badge/Active_Providers-34-2ea44f)
 ![Runtime](https://img.shields.io/badge/HTTP-std.http%20(Client)-0366d6)
 
 ## Overview
 
-- 33 currently active providers behind one app layer: `providers_app`
-- 42 provider implementations retained and covered by targeted live tests
+- 34 currently active providers behind one app layer: `providers_app`
+- 43 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
 - TUI mode available with `--tui` in the default build
@@ -40,6 +40,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `indexsubtitle_cc` | `indexsubtitle.cc` |
 | `sous_titres_eu` | `sous-titres.eu` |
 | `cc_edatribe_com` | `cc.edatribe.com` |
+| `subs_ro` | `subs.ro` |
 | `titrari_ro` | `titrari.ro` |
 | `subs_sab_bz` | `subs.sab.bz` |
 | `subtitri_do_am` | `subtitri.do.am` |
@@ -62,7 +63,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 Retained inactive implementations are `opensubtitles_org`, `moviesubtitles_org`,
 `moviesubtitlesrt_com`, `podnapisi_net`, `tvsubtitles_net`,
 `greek_subtitles_com` while its movie search is currently unreliable,
-`subtitrari_noi_ro` while its upstream host is refusing connections,
+`subtitrari_noi_ro` while its upstream host is intermittently refusing connections,
 `subtis_io` while `api.subt.is` has no DNS A record, and
 `animesubtitle_ir` while both its WordPress REST and HTML title-search paths
 return upstream HTTP 500 responses. They stay in
@@ -74,6 +75,7 @@ known-unusable provider in the CLI/TUI.
 `greeksubs_net` provides Greek subtitles for movies and TV.
 `sous_titres_eu` provides French subtitles for movies and TV.
 `cc_edatribe_com` provides English anime movie and TV captions.
+`subs_ro` provides Romanian and English subtitles for movies and TV.
 `titrari_ro` provides Romanian and English subtitles for movies and TV.
 `subs_sab_bz` provides English and Bulgarian subtitles for movies and TV.
 `subtitri_do_am` is movie-only and provides Latvian subtitles.
