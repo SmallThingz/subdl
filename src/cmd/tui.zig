@@ -357,6 +357,13 @@ const ProviderSearchTask = struct {
     result: ?app.SearchResponse = null,
 };
 
+const IncrementalSearchWork = struct {
+    group: *std.Io.Group,
+    tasks: []ProviderSearchTask,
+    consumed: []bool,
+    query: []u8,
+};
+
 const SubtitlesTask = struct {
     ref: app.SearchRef,
     page: usize = 1,
@@ -398,6 +405,7 @@ const Ui = struct {
     context_owned: ?[]u8 = null,
     active_provider: ?app.Provider = null,
     provider_enabled: [app.providerCount()]bool = app.providerSelectionNone(),
+    search_reapers: std.ArrayListUnmanaged(std.Io.Future(void)) = .empty,
 
     fn writer(self: *Ui) *std.Io.Writer {
         return self.tty.writer();
@@ -415,6 +423,28 @@ const Ui = struct {
 
     fn frameAllocator(self: *Ui) std.mem.Allocator {
         return self.frame_arena.allocator();
+    }
+
+    fn reapSearchWork(self: *Ui, work: *IncrementalSearchWork) bool {
+        if (comptime builtin.single_threaded) return false;
+        var future = std.Io.concurrent(
+            runtime_io.get(),
+            cancelIncrementalSearchWork,
+            .{work},
+        ) catch return false;
+        self.search_reapers.append(self.allocator, future) catch {
+            future.await(runtime_io.get());
+            return true;
+        };
+        return true;
+    }
+
+    fn awaitSearchReapers(self: *Ui) void {
+        for (self.search_reapers.items) |*future| {
+            future.await(runtime_io.get());
+        }
+        self.search_reapers.deinit(self.allocator);
+        self.search_reapers = .empty;
     }
 
     fn theme(self: *Ui) Theme {
@@ -503,6 +533,7 @@ pub fn main(init: std.process.Init) !void {
         .frame_arena = std.heap.ArenaAllocator.init(allocator),
     };
     defer ui.frame_arena.deinit();
+    defer ui.awaitSearchReapers();
 
     try runTui(&ui);
 }
@@ -912,7 +943,10 @@ fn runTui(ui: *Ui) !void {
                     if (key.matches(vaxis.Key.escape, .{})) {
                         const current_query_norm = normalizeQueryView(query.items);
                         const current_query_dirty = !std.mem.eql(u8, current_query_norm, last_searched_norm);
-                        try editSettingsPopup(ui, &state, query.items, cursor_pos, focus, current_query_dirty, if (results) |*b| b else null, &selected_result, &result_scroll, &selected_download, &download_scroll, &info_open);
+                        editSettingsPopup(ui, &state, query.items, cursor_pos, focus, current_query_dirty, if (results) |*b| b else null, &selected_result, &result_scroll, &selected_download, &download_scroll, &info_open) catch |err| switch (err) {
+                            error.TuiQuit => return,
+                            else => return err,
+                        };
                         continue;
                     }
 
@@ -970,7 +1004,8 @@ fn runTui(ui: *Ui) !void {
                                 const visible_order = bundle.display_order;
                                 if (selected_result < visible_order.len) {
                                     switch (try openSearchResult(ui, bundle, visible_order[selected_result], &state)) {
-                                        .back, .to_query => focus = .results,
+                                        .back => focus = .results,
+                                        .to_query => focus = .query,
                                         .quit => return,
                                     }
                                 }
@@ -1020,15 +1055,16 @@ fn runTui(ui: *Ui) !void {
                         const owned_query = try ui.allocator.dupe(u8, current_query_norm);
                         defer ui.allocator.free(owned_query);
                         try rememberKeyword(ui.allocator, &state, owned_query);
-                        results = executeQuerySearchIncremental(ui, &state, owned_query, query.items, cursor_pos, &selected_result, &result_scroll, &info_open) catch |err| switch (err) {
+                        const search_outcome = executeQuerySearchIncremental(ui, &state, owned_query, query.items, cursor_pos, &selected_result, &result_scroll, &info_open) catch |err| switch (err) {
                             error.TuiQuit => return,
                             else => return err,
                         };
+                        results = search_outcome.bundle;
                         ui.allocator.free(last_searched_norm);
                         last_searched_norm = try ui.allocator.dupe(u8, owned_query);
                         selected_result = 0;
                         result_scroll = 0;
-                        focus = .results;
+                        focus = search_outcome.focus;
                         if (results.?.cache_changed) try saveTuiRuntimeState(ui.allocator, &state);
                         try saveKeywordRuntimeState(ui.allocator, &state);
                         continue;
@@ -2455,6 +2491,11 @@ fn executeQuerySearch(ui: *Ui, state: *TuiRuntimeState, query_norm: []const u8) 
     return bundle;
 }
 
+const IncrementalSearchOutcome = struct {
+    bundle: SearchBundle,
+    focus: QueryFocus,
+};
+
 fn executeQuerySearchIncremental(
     ui: *Ui,
     state: *TuiRuntimeState,
@@ -2464,7 +2505,7 @@ fn executeQuerySearchIncremental(
     selected_result: *usize,
     result_scroll: *usize,
     info_open: *bool,
-) !SearchBundle {
+) !IncrementalSearchOutcome {
     var bundle: SearchBundle = .{
         .query_norm = try ui.allocator.dupe(u8, query_norm),
         .searching = true,
@@ -2473,14 +2514,15 @@ fn executeQuerySearchIncremental(
     var selected_download: usize = 0;
     var download_scroll: usize = 0;
 
-    var tasks = try ui.allocator.alloc(ProviderSearchTask, app.providerCount());
-    defer ui.allocator.free(tasks);
-    var consumed = try ui.allocator.alloc(bool, app.providerCount());
-    defer ui.allocator.free(consumed);
-    @memset(consumed, false);
-    var search_group: std.Io.Group = .init;
-
-    defer search_group.cancel(runtime_io.get());
+    const search_work = try createIncrementalSearchWork(query_norm);
+    var search_work_owned = true;
+    defer if (search_work_owned) {
+        search_work.group.cancel(runtime_io.get());
+        releaseIncrementalSearchWork(search_work);
+    };
+    const tasks = search_work.tasks;
+    const consumed = search_work.consumed;
+    const search_group = search_work.group;
 
     var task_count: usize = 0;
     const language_code = primaryLanguageCode(state.settings);
@@ -2504,7 +2546,7 @@ fn executeQuerySearchIncremental(
         }
         tasks[task_count] = .{
             .provider = provider,
-            .query = query_norm,
+            .query = search_work.query,
             .language_code = language_code,
             .page = 1,
         };
@@ -2580,14 +2622,15 @@ fn executeQuerySearchIncremental(
                 .key_press => |key| {
                     if (key.isModifier()) continue;
                     if (key.matches('d', .{ .ctrl = true })) {
-                        search_group.cancel(runtime_io.get());
-                        cleanupUnconsumedProviderTasks(tasks[0..task_count], consumed[0..task_count]);
                         return error.TuiQuit;
                     }
                     if (key.matches('c', .{ .ctrl = true })) {
-                        search_group.cancel(runtime_io.get());
-                        cleanupUnconsumedProviderTasks(tasks[0..task_count], consumed[0..task_count]);
-                        return bundle;
+                        bundle.searching = false;
+                        bundle.pending_count = 0;
+                        if (ui.reapSearchWork(search_work)) {
+                            search_work_owned = false;
+                        }
+                        return .{ .bundle = bundle, .focus = .query };
                     }
                     if (key.matches(vaxis.Key.escape, .{})) {
                         try editSettingsPopup(
@@ -2638,10 +2681,16 @@ fn executeQuerySearchIncremental(
                         const visible_order = bundle.display_order;
                         if (selected_result.* >= visible_order.len) continue;
                         switch (try openSearchResult(ui, &bundle, visible_order[selected_result.*], state)) {
-                            .back, .to_query => {},
+                            .back => {},
+                            .to_query => {
+                                bundle.searching = false;
+                                bundle.pending_count = 0;
+                                if (ui.reapSearchWork(search_work)) {
+                                    search_work_owned = false;
+                                }
+                                return .{ .bundle = bundle, .focus = .query };
+                            },
                             .quit => {
-                                search_group.cancel(runtime_io.get());
-                                cleanupUnconsumedProviderTasks(tasks[0..task_count], consumed[0..task_count]);
                                 return error.TuiQuit;
                             },
                         }
@@ -2678,7 +2727,10 @@ fn executeQuerySearchIncremental(
     try search_group.await(runtime_io.get());
     bundle.searching = false;
     try renderQueryHome(ui, state, query_display, cursor_pos, if (bundle.hits.items.len > 0) .results else .query, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
-    return bundle;
+    return .{
+        .bundle = bundle,
+        .focus = if (bundle.hits.items.len > 0) .results else .query,
+    };
 }
 
 fn cleanupUnconsumedProviderTasks(tasks: []ProviderSearchTask, consumed: []const bool) void {
@@ -2686,6 +2738,44 @@ fn cleanupUnconsumedProviderTasks(tasks: []ProviderSearchTask, consumed: []const
         if (consumed[idx]) continue;
         if (task.result) |*result| result.deinit();
     }
+}
+
+fn createIncrementalSearchWork(query: []const u8) !*IncrementalSearchWork {
+    const allocator = std.heap.page_allocator;
+    const work = try allocator.create(IncrementalSearchWork);
+    errdefer allocator.destroy(work);
+    const group = try allocator.create(std.Io.Group);
+    errdefer allocator.destroy(group);
+    group.* = .init;
+    const tasks = try allocator.alloc(ProviderSearchTask, app.providerCount());
+    errdefer allocator.free(tasks);
+    const consumed = try allocator.alloc(bool, app.providerCount());
+    errdefer allocator.free(consumed);
+    @memset(consumed, false);
+    const query_copy = try allocator.dupe(u8, query);
+    errdefer allocator.free(query_copy);
+    work.* = .{
+        .group = group,
+        .tasks = tasks,
+        .consumed = consumed,
+        .query = query_copy,
+    };
+    return work;
+}
+
+fn releaseIncrementalSearchWork(work: *IncrementalSearchWork) void {
+    const allocator = std.heap.page_allocator;
+    cleanupUnconsumedProviderTasks(work.tasks, work.consumed);
+    allocator.free(work.query);
+    allocator.free(work.consumed);
+    allocator.free(work.tasks);
+    allocator.destroy(work.group);
+    allocator.destroy(work);
+}
+
+fn cancelIncrementalSearchWork(work: *IncrementalSearchWork) void {
+    work.group.cancel(runtime_io.get());
+    releaseIncrementalSearchWork(work);
 }
 
 fn queryPageSize(ui: *Ui) usize {
@@ -3508,6 +3598,33 @@ fn renderQueryHome(
         clampSelection(selected_result, visible_order.len);
         const page_size: usize = if (list_bottom > list_top) @intCast(list_bottom - list_top) else 1;
         ensureVisible(selected_result.*, scroll, page_size);
+        if (visible_order.len == 0) {
+            var message_buf: [160]u8 = undefined;
+            const message = if (bundle.searching and bundle.pending_count > 0)
+                std.fmt.bufPrint(
+                    &message_buf,
+                    "Searching… {d} provider{s} remaining.",
+                    .{ bundle.pending_count, if (bundle.pending_count == 1) "" else "s" },
+                ) catch "Searching…"
+            else if (bundle.failed_count > 0)
+                "No results. Some providers failed; edit the query/settings and search again."
+            else
+                "No results. Edit the query or provider/language settings and search again.";
+            try printFitted(
+                ui,
+                win,
+                list_top,
+                4,
+                message,
+                if (bundle.searching and bundle.pending_count > 0)
+                    ui.styleAccent()
+                else if (bundle.failed_count > 0)
+                    ui.styleWarn()
+                else
+                    ui.styleMuted(),
+                if (win.width > 8) @intCast(win.width - 8) else 0,
+            );
+        }
         var row = list_top;
         var i = scroll.*;
         while (i < visible_order.len and row < list_bottom) : (i += 1) {
@@ -5349,10 +5466,10 @@ fn countEnabledFlags(flags: []const bool) usize {
 const list_mouse_wheel_step: usize = 3;
 const search_active_poll_interval_ms: u64 = 1;
 const search_poll_interval_ms: u64 = 8;
-const max_events_per_frame: usize = 512;
+const event_batch_capacity: usize = 1;
 
 const EventBatch = struct {
-    items: [max_events_per_frame]Event = undefined,
+    items: [event_batch_capacity]Event = undefined,
     len: usize = 0,
     wheel_delta: i32 = 0,
 
@@ -5376,15 +5493,14 @@ const EventBatch = struct {
 };
 
 fn readEventBatch(ui: *Ui, first: Event) !EventBatch {
+    _ = ui;
     var batch: EventBatch = .{};
     batch.collect(first);
-
-    try ui.loop.queue.lock();
-    defer ui.loop.queue.unlock();
-    while (batch.len < max_events_per_frame) {
-        const event = ui.loop.queue.drain() orelse break;
-        batch.collect(event);
-    }
+    // Do not eagerly drain keyboard events. Many TUI handlers intentionally
+    // return or change screens on Enter/Esc/Ctrl+C; draining ahead would drop
+    // any immediately-following keystrokes from the same terminal burst.
+    // Rendering is sub-millisecond in optimized builds, so one event per frame
+    // keeps input lossless without sacrificing navigation responsiveness.
     return batch;
 }
 
