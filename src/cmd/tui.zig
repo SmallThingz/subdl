@@ -324,6 +324,7 @@ const SearchBundle = struct {
     failed_count: usize = 0,
     pending_count: usize = 0,
     searching: bool = false,
+    canceled: bool = false,
 
     fn deinit(self: *SearchBundle, allocator: std.mem.Allocator) void {
         allocator.free(self.query_norm);
@@ -1076,7 +1077,10 @@ fn runTui(ui: *Ui) !void {
                             last_searched_norm = try ui.allocator.dupe(u8, "");
                         } else {
                             results = search_outcome.bundle;
-                            last_searched_norm = try ui.allocator.dupe(u8, owned_query);
+                            last_searched_norm = try ui.allocator.dupe(
+                                u8,
+                                if (search_outcome.mark_query_dirty) "" else owned_query,
+                            );
                         }
                         selected_result = 0;
                         result_scroll = 0;
@@ -2524,6 +2528,7 @@ const IncrementalSearchOutcome = struct {
     bundle: SearchBundle,
     focus: QueryFocus,
     discard_results: bool = false,
+    mark_query_dirty: bool = false,
 };
 
 fn executeQuerySearchIncremental(
@@ -2659,10 +2664,15 @@ fn executeQuerySearchIncremental(
                     if (key.matches('c', .{ .ctrl = true })) {
                         bundle.searching = false;
                         bundle.pending_count = 0;
+                        bundle.canceled = true;
                         if (ui.reapSearchWork(search_work)) {
                             search_work_owned = false;
                         }
-                        return .{ .bundle = bundle, .focus = .query };
+                        return .{
+                            .bundle = bundle,
+                            .focus = .query,
+                            .mark_query_dirty = true,
+                        };
                     }
                     if (key.matches(vaxis.Key.escape, .{})) {
                         const search_settings_changed = try editSettingsPopup(
@@ -2729,10 +2739,15 @@ fn executeQuerySearchIncremental(
                             .to_query => {
                                 bundle.searching = false;
                                 bundle.pending_count = 0;
+                                bundle.canceled = true;
                                 if (ui.reapSearchWork(search_work)) {
                                     search_work_owned = false;
                                 }
-                                return .{ .bundle = bundle, .focus = .query };
+                                return .{
+                                    .bundle = bundle,
+                                    .focus = .query,
+                                    .mark_query_dirty = true,
+                                };
                             },
                             .quit => {
                                 return error.TuiQuit;
@@ -2866,6 +2881,7 @@ fn formatHomeTopLine(
         if (bundle.cache_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} cached", .{bundle.cache_count})).len;
         if (bundle.failed_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} failed", .{bundle.failed_count})).len;
         if (bundle.pending_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} pending", .{bundle.pending_count})).len;
+        if (bundle.canceled) pos += (try std.fmt.bufPrint(buf[pos..], " · canceled", .{})).len;
     }
     return buf[0..pos];
 }
@@ -3657,6 +3673,8 @@ fn renderQueryHome(
                     "Searching… {d} provider{s} remaining.",
                     .{ bundle.pending_count, if (bundle.pending_count == 1) "" else "s" },
                 ) catch "Searching…"
+            else if (bundle.canceled)
+                "Search canceled. Press Enter to search again."
             else if (bundle.failed_count > 0)
                 "No results. Some providers failed; edit the query/settings and search again."
             else
@@ -3669,6 +3687,8 @@ fn renderQueryHome(
                 message,
                 if (bundle.searching and bundle.pending_count > 0)
                     ui.styleAccent()
+                else if (bundle.canceled)
+                    ui.styleWarn()
                 else if (bundle.failed_count > 0)
                     ui.styleWarn()
                 else
