@@ -2856,9 +2856,18 @@ fn cleanSearchTitle(label: []const u8) []const u8 {
     while (std.mem.startsWith(u8, text, "[")) {
         const end = std.mem.indexOfScalar(u8, text, ']') orelse break;
         if (end > 24) break;
+        if (!isSearchMetadataTag(text[1..end])) break;
         text = std.mem.trim(u8, text[end + 1 ..], " \t");
     }
     return text;
+}
+
+fn isSearchMetadataTag(tag: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(tag, "movie") or std.ascii.eqlIgnoreCase(tag, "tv")) return true;
+    for (language_options) |language| {
+        if (std.ascii.eqlIgnoreCase(tag, language.code)) return true;
+    }
+    return false;
 }
 
 fn formatHomeTopLine(
@@ -2951,6 +2960,14 @@ fn ensureQueryHitOrder(
     bundle.display_hit_count = bundle.hits.items.len;
     bundle.display_order = new_order;
     return bundle.display_order;
+}
+
+test "search title cleanup strips only known metadata prefixes" {
+    try std.testing.expectEqualStrings("The Matrix (1999)", cleanSearchTitle("[movie] The Matrix (1999)"));
+    try std.testing.expectEqualStrings("The Matrix", cleanSearchTitle("[en] The Matrix"));
+    try std.testing.expectEqualStrings("[REC] (2007)", cleanSearchTitle("[REC] (2007)"));
+    try std.testing.expectEqualStrings("[REC] 2", cleanSearchTitle("[REC] 2"));
+    try std.testing.expectEqualStrings("[REC]", cleanSearchTitle("[tv] [en] [REC]"));
 }
 
 test "query display order cache reuses stable hit sets and invalidates on changes" {
