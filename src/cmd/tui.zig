@@ -856,7 +856,7 @@ fn runTui(ui: *Ui) !void {
                             .wheel_up => scrollSelection(&selected_download, download_count, .backward, list_mouse_wheel_step),
                             .left => {
                                 const win = ui.vx.window();
-                                if (mouseRowIndex(mouse, 4, win.height, download_scroll, download_count)) |row_idx| selected_download = row_idx;
+                                if (mouseRowIndex(mouse, 4, homeListBottom(win.height), download_scroll, download_count)) |row_idx| selected_download = row_idx;
                             },
                             else => {},
                         };
@@ -873,7 +873,7 @@ fn runTui(ui: *Ui) !void {
                             },
                             .left => {
                                 const win = ui.vx.window();
-                                if (mouseRowIndex(mouse, 4, win.height, result_scroll, visible_count)) |row_idx| {
+                                if (mouseRowIndex(mouse, 4, homeListBottom(win.height), result_scroll, visible_count)) |row_idx| {
                                     selected_result = row_idx;
                                     focus = .results;
                                 }
@@ -901,7 +901,6 @@ fn runTui(ui: *Ui) !void {
                         info_open = true;
                         continue;
                     }
-                    if (key.matches(vaxis.Key.f2, .{})) continue;
                     if (key.matches(vaxis.Key.tab, .{})) {
                         focus = nextQueryFocus(focus, results != null and results.?.hits.items.len > 0, state.settings.download_cache_enabled and state.download_entries.len > 0);
                         continue;
@@ -1140,13 +1139,13 @@ fn runProviderFirstTui(ui: *Ui) !void {
             const query_hint = std.fmt.bufPrint(
                 &hint_buf,
                 "Provider: {s}. Enter search query. Esc returns to providers.",
-                .{app.providerName(provider)},
+                .{app.providerDisplayName(provider)},
             ) catch "Enter search query. Esc returns to providers.";
 
             const query_context = try std.fmt.allocPrint(
                 ui.allocator,
                 "Provider: {s} • URL: {s}",
-                .{ app.providerName(provider), provider_url },
+                .{ app.providerDisplayName(provider), provider_url },
             );
             defer ui.allocator.free(query_context);
             setContext(ui, query_context);
@@ -1169,13 +1168,13 @@ fn runProviderFirstTui(ui: *Ui) !void {
                         try std.fmt.allocPrint(
                             ui.allocator,
                             "provider={s} query={s} page={d}",
-                            .{ app.providerName(provider), query, search_page_current },
+                            .{ app.providerDisplayName(provider), query, search_page_current },
                         )
                     else
                         try std.fmt.allocPrint(
                             ui.allocator,
                             "provider={s} query={s}",
-                            .{ app.providerName(provider), query },
+                            .{ app.providerDisplayName(provider), query },
                         );
                     defer ui.allocator.free(search_detail);
 
@@ -1272,13 +1271,13 @@ fn runProviderFirstTui(ui: *Ui) !void {
                     try std.fmt.allocPrint(
                         ui.allocator,
                         "Provider: {s} • Search base URL: {s} • page={d}",
-                        .{ app.providerName(provider), provider_url, search_page_current },
+                        .{ app.providerDisplayName(provider), provider_url, search_page_current },
                     )
                 else
                     try std.fmt.allocPrint(
                         ui.allocator,
                         "Provider: {s} • Search base URL: {s}",
-                        .{ app.providerName(provider), provider_url },
+                        .{ app.providerDisplayName(provider), provider_url },
                     );
                 defer ui.allocator.free(title_context);
                 setContext(ui, title_context);
@@ -1618,7 +1617,7 @@ fn runProviderFirstTui(ui: *Ui) !void {
 
                     if (!ui.skip_confirm) {
                         var provider_buf: [224]u8 = undefined;
-                        const provider_line = std.fmt.bufPrint(&provider_buf, "Provider: {s}", .{app.providerName(provider)}) catch "Provider: (overflow)";
+                        const provider_line = std.fmt.bufPrint(&provider_buf, "Provider: {s}", .{app.providerDisplayName(provider)}) catch "Provider: (overflow)";
 
                         const display_title = if (subtitles.title.len > 0) subtitles.title else app.titleFromRef(selected_title.ref);
                         var title_buf: [320]u8 = undefined;
@@ -2405,7 +2404,7 @@ fn executeQuerySearch(ui: *Ui, state: *TuiRuntimeState, query_norm: []const u8) 
             continue;
         }
 
-        const detail = try std.fmt.allocPrint(ui.allocator, "provider={s} query={s}", .{ app.providerName(provider), query_norm });
+        const detail = try std.fmt.allocPrint(ui.allocator, "provider={s} query={s}", .{ app.providerDisplayName(provider), query_norm });
         defer ui.allocator.free(detail);
         const context = try std.fmt.allocPrint(ui.allocator, "Search URL: {s}", .{providerHomeUrl(provider)});
         defer ui.allocator.free(context);
@@ -2567,7 +2566,7 @@ fn executeQuerySearchIncremental(
                     } else if (mouse.type == .press and bundle.display_order.len > 0) switch (mouse.button) {
                         .left => {
                             const win = ui.vx.window();
-                            if (mouseRowIndex(mouse, 4, win.height, result_scroll.*, bundle.display_order.len)) |row_idx| {
+                            if (mouseRowIndex(mouse, 4, homeListBottom(win.height), result_scroll.*, bundle.display_order.len)) |row_idx| {
                                 selected_result.* = row_idx;
                             }
                         },
@@ -3084,9 +3083,23 @@ fn editSettingsPopup(
                 },
                 .key_press => |key| {
                     if (key.isModifier()) continue;
+                    if (key.matches(vaxis.Key.f2, .{})) {
+                        ui.toggleConfirm();
+                        redraw_background = true;
+                        continue;
+                    }
+                    if (key.matches(vaxis.Key.f3, .{})) {
+                        ui.toggleTheme();
+                        redraw_background = true;
+                        continue;
+                    }
                     if (key.matches('d', .{ .ctrl = true })) {
                         if (settings_dirty) try saveTuiSettingsState(ui.allocator, state);
                         return error.TuiQuit;
+                    }
+                    if (key.matches('c', .{ .ctrl = true })) {
+                        if (settings_dirty) try saveTuiSettingsState(ui.allocator, state);
+                        return;
                     }
                     switch (panel) {
                         .main => {
@@ -3322,23 +3335,23 @@ fn renderSettingsPopup(
             }
         },
         .providers => {
-            try printFitted(ui, win, y + 2, x + 2, "Enter toggles provider. Esc returns.", ui.styleMuted(), width -| 4);
+            try printFitted(ui, win, y + 2, x + 2, "Enter/Space toggles. Esc/Ctrl+C returns.", ui.styleMuted(), width -| 4);
             var row = row_start;
             var idx = provider_scroll;
             while (idx < app.providerCount() and row < row_end) : (idx += 1) {
                 const provider = app.providers()[idx];
                 if (row >= row_end) break;
-                const checked = if (state.settings.providers_enabled[idx]) "on " else "off";
+                const checked = if (state.settings.providers_enabled[idx]) "[x]" else "[ ]";
                 const style = if (idx == provider_selected) ui.styleSelected() else vaxis.Style{};
                 var line_buf: [128]u8 = undefined;
-                const line = std.fmt.bufPrint(&line_buf, "{s}  {s}", .{ checked, app.providerName(provider) }) catch app.providerName(provider);
+                const line = std.fmt.bufPrint(&line_buf, "{s}  {s}", .{ checked, app.providerDisplayName(provider) }) catch app.providerDisplayName(provider);
                 try printFitted(ui, win, row, x + 2, if (idx == provider_selected) "›" else " ", style, 1);
                 try printFitted(ui, win, row, x + 4, line, style, width -| 6);
                 row += 1;
             }
         },
         .languages => {
-            try printFitted(ui, win, y + 2, x + 2, "Enter chooses primary language. Esc returns.", ui.styleMuted(), width -| 4);
+            try printFitted(ui, win, y + 2, x + 2, "Enter/Space chooses. Esc/Ctrl+C returns.", ui.styleMuted(), width -| 4);
             var row = row_start;
             var idx = language_scroll;
             const language_items = language_options.len + 1;
@@ -3348,11 +3361,11 @@ fn renderSettingsPopup(
                     !state.settings.language_filter_enabled
                 else
                     state.settings.language_filter_enabled and state.settings.languages_enabled[idx - 1];
-                const checked = if (selected) "on " else "off";
+                const checked = if (selected) "[x]" else "[ ]";
                 const style = if (idx == language_selected) ui.styleSelected() else vaxis.Style{};
                 var line_buf: [192]u8 = undefined;
                 const line = if (idx == 0)
-                    std.fmt.bufPrint(&line_buf, "{s}  off  No language filter", .{checked}) catch "No language filter"
+                    std.fmt.bufPrint(&line_buf, "{s}  No language filter", .{checked}) catch "No language filter"
                 else blk: {
                     const lang = language_options[idx - 1];
                     break :blk std.fmt.bufPrint(&line_buf, "{s}  {s}  {s}", .{ checked, lang.code, lang.name }) catch lang.name;
@@ -3465,7 +3478,7 @@ fn renderQueryHome(
     }
 
     const list_top = box_y + 3;
-    const list_bottom: u16 = win.height;
+    const list_bottom = homeListBottom(win.height);
 
     if (focus == .downloads and state.settings.download_cache_enabled) {
         const entries = state.download_entries;
@@ -3528,6 +3541,13 @@ fn renderQueryHome(
         }
     }
 
+    const footer = switch (focus) {
+        .query => "Enter search · ↑/↓ history · Tab focus",
+        .results => "↑/↓ select · Enter open · Tab focus",
+        .downloads => "↑/↓ select · Enter export · Tab focus",
+    };
+    try renderCompactBottomLine(ui, win, footer);
+
     if (info_open) {
         const lines = [_][]const u8{
             "Enter search/open",
@@ -3541,6 +3561,10 @@ fn renderQueryHome(
     }
 
     if (flush) try ui.render();
+}
+
+fn homeListBottom(height: u16) u16 {
+    return height -| 1;
 }
 
 fn renderBox(ui: *Ui, win: anytype, x: u16, y: u16, width: u16, height: u16, style: vaxis.Style) !void {
@@ -3590,7 +3614,7 @@ fn buildCombinedSearchLabelsWithSource(
             .live => "live",
             .cache => "cache",
         };
-        out[idx] = try std.fmt.allocPrint(allocator, "[{s}] [{s}] {s}", .{ app.providerName(hit.provider), source, item.label });
+        out[idx] = try std.fmt.allocPrint(allocator, "[{s}] [{s}] {s}", .{ app.providerDisplayName(hit.provider), source, item.label });
         initialized += 1;
     }
     return out;
@@ -3620,9 +3644,9 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
                 try ui.allocator.dupe(u8, selected_title.label);
             defer ui.allocator.free(detail);
             const context = if (supports_subtitles_pagination)
-                try std.fmt.allocPrint(ui.allocator, "Provider: {s} • Title URL: {s} • page={d}", .{ app.providerName(selected_provider), title_ref_url, subtitle_page_current })
+                try std.fmt.allocPrint(ui.allocator, "Provider: {s} • Title URL: {s} • page={d}", .{ app.providerDisplayName(selected_provider), title_ref_url, subtitle_page_current })
             else
-                try std.fmt.allocPrint(ui.allocator, "Provider: {s} • Title URL: {s}", .{ app.providerName(selected_provider), title_ref_url });
+                try std.fmt.allocPrint(ui.allocator, "Provider: {s} • Title URL: {s}", .{ app.providerDisplayName(selected_provider), title_ref_url });
             defer ui.allocator.free(context);
             setContext(ui, context);
 
@@ -3706,7 +3730,7 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
         const download_url_display = if (isSubtitlecatTranslateToken(selected_subtitle.download_url)) "subtitlecat translate request" else download_url;
         if (!ui.skip_confirm) {
             const lines = [_][]const u8{
-                try frameFmt(ui, "Provider: {s}", .{app.providerName(selected_provider)}),
+                try frameFmt(ui, "Provider: {s}", .{app.providerDisplayName(selected_provider)}),
                 try frameFmt(ui, "Title: {s}", .{if (subtitles.title.len > 0) subtitles.title else app.titleFromRef(selected_title.ref)}),
                 try frameFmt(ui, "Subtitle: {s}", .{selected_subtitle.label}),
                 try frameFmt(ui, "URL: {s}", .{download_url_display}),
@@ -3810,9 +3834,9 @@ fn runCombinedSearch(ui: *Ui, provider_enabled: []const bool) !SelectResult {
         for (app.providers()) |provider| {
             if (!provider_enabled[app.providerIndex(provider)]) continue;
 
-            const detail = try std.fmt.allocPrint(ui.allocator, "provider={s} query={s}", .{ app.providerName(provider), query });
+            const detail = try std.fmt.allocPrint(ui.allocator, "provider={s} query={s}", .{ app.providerDisplayName(provider), query });
             defer ui.allocator.free(detail);
-            const context = try std.fmt.allocPrint(ui.allocator, "Combined search • provider: {s}", .{app.providerName(provider)});
+            const context = try std.fmt.allocPrint(ui.allocator, "Combined search • provider: {s}", .{app.providerDisplayName(provider)});
             defer ui.allocator.free(context);
             setContext(ui, context);
 
@@ -3894,7 +3918,7 @@ fn runCombinedSearch(ui: *Ui, provider_enabled: []const bool) !SelectResult {
             const title_ref_url = app.searchRefUrl(selected_title.ref);
             const detail = try std.fmt.allocPrint(ui.allocator, "{s}", .{selected_title.label});
             defer ui.allocator.free(detail);
-            const context = try std.fmt.allocPrint(ui.allocator, "Provider: {s} • Title URL: {s}", .{ app.providerName(selected_provider), title_ref_url });
+            const context = try std.fmt.allocPrint(ui.allocator, "Provider: {s} • Title URL: {s}", .{ app.providerDisplayName(selected_provider), title_ref_url });
             defer ui.allocator.free(context);
             setContext(ui, context);
 
@@ -3977,7 +4001,7 @@ fn runCombinedSearch(ui: *Ui, provider_enabled: []const bool) !SelectResult {
 
                 if (!ui.skip_confirm) {
                     var provider_buf: [224]u8 = undefined;
-                    const provider_line = std.fmt.bufPrint(&provider_buf, "Provider: {s}", .{app.providerName(selected_provider)}) catch "Provider: (overflow)";
+                    const provider_line = std.fmt.bufPrint(&provider_buf, "Provider: {s}", .{app.providerDisplayName(selected_provider)}) catch "Provider: (overflow)";
                     const display_title = if (subtitles.title.len > 0) subtitles.title else app.titleFromRef(selected_title.ref);
                     var title_buf: [320]u8 = undefined;
                     const title_line = std.fmt.bufPrint(&title_buf, "Title: {s}", .{display_title}) catch "Title: (overflow)";
@@ -4074,7 +4098,7 @@ fn buildCombinedSearchLabels(
 
     for (hits, 0..) |hit, idx| {
         const item = searches[hit.response_index].items[hit.item_index];
-        out[idx] = try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ app.providerName(hit.provider), item.label });
+        out[idx] = try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ app.providerDisplayName(hit.provider), item.label });
         initialized += 1;
     }
 
@@ -4088,7 +4112,7 @@ fn buildProviderNames(allocator: std.mem.Allocator) ![][]u8 {
     var initialized: usize = 0;
     errdefer freeInitializedStrings(allocator, out, initialized);
     for (values, 0..) |provider, idx| {
-        out[idx] = try std.fmt.allocPrint(allocator, "{s}", .{app.providerName(provider)});
+        out[idx] = try std.fmt.allocPrint(allocator, "{s}", .{app.providerDisplayName(provider)});
         initialized += 1;
     }
 
@@ -5191,7 +5215,7 @@ fn renderProviderPanel(ui: *Ui, win: anytype, col: u16, width: u16) !void {
         const line = try frameFmt(
             ui,
             "{s} {s} {s} {s}",
-            .{ marker, checkbox, app.providerName(provider), caps },
+            .{ marker, checkbox, app.providerDisplayName(provider), caps },
         );
         const style = if (active)
             ui.styleSelected()
@@ -5253,7 +5277,6 @@ fn handleGlobalKey(ui: *Ui, key: vaxis.Key, is_query_screen: bool) KeyAction {
     if (key.matches('c', .{ .ctrl = true })) {
         return if (is_query_screen) .quit else .to_query;
     }
-    if (is_query_screen and key.matches(vaxis.Key.f2, .{})) return .none;
     if (key.matches(vaxis.Key.f2, .{})) {
         ui.toggleConfirm();
         return .consumed;
