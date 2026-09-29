@@ -279,6 +279,8 @@ const TuiRuntimeState = struct {
     settings: TuiSettings,
     cache_entries: std.ArrayListUnmanaged(QueryCacheEntry) = .empty,
     keywords: std.ArrayListUnmanaged(KeywordEntry) = .empty,
+    download_entries: [][]u8 = &.{},
+    arena_stale_mutations: usize = 0,
     state_path: []u8,
     keyword_path: []u8,
     cache_root_path: []u8,
@@ -286,6 +288,7 @@ const TuiRuntimeState = struct {
     fn deinit(self: *TuiRuntimeState, allocator: std.mem.Allocator) void {
         self.cache_entries.deinit(allocator);
         self.keywords.deinit(allocator);
+        if (self.download_entries.len > 0) freeOwnedStrings(allocator, self.download_entries);
         allocator.free(self.state_path);
         allocator.free(self.keyword_path);
         allocator.free(self.cache_root_path);
@@ -834,7 +837,7 @@ fn runTui(ui: *Ui) !void {
                 .mouse => |mouse| {
                     if (info_open) continue;
                     if (focus == .downloads and state.settings.download_cache_enabled) {
-                        const download_count = cachedDownloadCount(state.cache_root_path);
+                        const download_count = state.download_entries.len;
                         if (mouse.type == .press and download_count > 0) switch (mouse.button) {
                             .wheel_down => scrollSelection(&selected_download, download_count, .forward, list_mouse_wheel_step),
                             .wheel_up => scrollSelection(&selected_download, download_count, .backward, list_mouse_wheel_step),
@@ -887,7 +890,7 @@ fn runTui(ui: *Ui) !void {
                     }
                     if (key.matches(vaxis.Key.f2, .{})) continue;
                     if (key.matches(vaxis.Key.tab, .{})) {
-                        focus = nextQueryFocus(focus, results != null and results.?.hits.items.len > 0, state.settings.download_cache_enabled and cachedDownloadCount(state.cache_root_path) > 0);
+                        focus = nextQueryFocus(focus, results != null and results.?.hits.items.len > 0, state.settings.download_cache_enabled and state.download_entries.len > 0);
                         continue;
                     }
                     if (key.matches(vaxis.Key.escape, .{})) {
@@ -896,7 +899,7 @@ fn runTui(ui: *Ui) !void {
                     }
 
                     if (focus == .downloads and state.settings.download_cache_enabled) {
-                        const download_count = cachedDownloadCount(state.cache_root_path);
+                        const download_count = state.download_entries.len;
                         if (key.matches(vaxis.Key.enter, .{}) and download_count > 0) {
                             const input = try vaxisInput(ui, "Export Download", "Destination directory", "Directory", 240);
                             const out_dir = switch (input) {
@@ -906,7 +909,8 @@ fn runTui(ui: *Ui) !void {
                             };
                             defer ui.allocator.free(out_dir);
                             const trimmed_dir = std.mem.trim(u8, out_dir, " \t\r\n");
-                            const exported = try exportCachedDownloadByIndex(ui.allocator, state.cache_root_path, selected_download, if (trimmed_dir.len == 0) "downloads" else trimmed_dir);
+                            if (selected_download >= state.download_entries.len) continue;
+                            const exported = try exportCachedDownloadEntry(ui.allocator, state.cache_root_path, state.download_entries[selected_download], if (trimmed_dir.len == 0) "downloads" else trimmed_dir);
                             defer ui.allocator.free(exported);
                             const msg = try vaxisMessage(ui, "Exported", exported, "Press any key to continue.", ui.styleAccent());
                             switch (msg) {
@@ -948,7 +952,7 @@ fn runTui(ui: *Ui) !void {
                                 const visible_order = try buildQueryHitOrder(ui.allocator, bundle, query_norm_view);
                                 defer ui.allocator.free(visible_order);
                                 if (selected_result < visible_order.len) {
-                                    switch (try openSearchResult(ui, bundle, visible_order[selected_result], state.settings, state.cache_root_path)) {
+                                    switch (try openSearchResult(ui, bundle, visible_order[selected_result], &state)) {
                                         .back, .to_query => focus = .results,
                                         .quit => return,
                                     }
@@ -1058,7 +1062,7 @@ fn runTui(ui: *Ui) !void {
         }
         if (batch.wheel_delta != 0 and !info_open) {
             if (focus == .downloads and state.settings.download_cache_enabled) {
-                applyWheelDelta(&selected_download, cachedDownloadCount(state.cache_root_path), batch.wheel_delta, list_mouse_wheel_step);
+                applyWheelDelta(&selected_download, state.download_entries.len, batch.wheel_delta, list_mouse_wheel_step);
             } else if (results) |*bundle| {
                 const visible_count = queryVisibleHitCount(bundle, query_norm_view);
                 applyWheelDelta(&selected_result, visible_count, batch.wheel_delta, list_mouse_wheel_step);
@@ -1787,6 +1791,12 @@ fn loadTuiRuntimeState(allocator: std.mem.Allocator, environ_map: *std.process.E
         }
     }
 
+    trimRuntimeStateBounds(&out);
+    // Repack deserialized state once so temporary decoding allocations and
+    // entries evicted by the bounds above do not remain pinned for the TUI lifetime.
+    try compactRuntimeArena(allocator, &out);
+    out.download_entries = try cachedDownloadLabels(allocator, cache_root_path);
+
     return out;
 }
 
@@ -1851,11 +1861,13 @@ fn saveOneSerial(comptime T: type, allocator: std.mem.Allocator, path: []const u
     try ensureParentDir(path);
     const encoded = try oneserial.serializeAlloc(T, .{}, value, allocator);
     defer allocator.free(encoded);
-    var file_data: std.ArrayListUnmanaged(u8) = .empty;
-    defer file_data.deinit(allocator);
-    try file_data.appendSlice(allocator, magic);
-    try file_data.appendSlice(allocator, encoded);
-    try std.Io.Dir.cwd().writeFile(runtime_io.get(), .{ .sub_path = path, .data = file_data.items });
+    var file = try std.Io.Dir.cwd().createFile(runtime_io.get(), path, .{});
+    defer file.close(runtime_io.get());
+    var buffer: [16 * 1024]u8 = undefined;
+    var writer = file.writer(runtime_io.get(), &buffer);
+    try writer.interface.writeAll(magic);
+    try writer.interface.writeAll(encoded);
+    try writer.interface.flush();
 }
 
 fn ensureParentDir(path: []const u8) !void {
@@ -1895,9 +1907,91 @@ fn findCacheEntry(state: *const TuiRuntimeState, provider: app.Provider, query_n
     return null;
 }
 
+const max_query_cache_entries: usize = 512;
+const max_keyword_entries: usize = 128;
+const arena_compact_after_stale_mutations: usize = 32;
+
+fn trimRuntimeStateBounds(state: *TuiRuntimeState) void {
+    while (state.cache_entries.items.len > max_query_cache_entries) {
+        const idx = oldestCacheEntryIndex(state.cache_entries.items) orelse break;
+        _ = state.cache_entries.orderedRemove(idx);
+    }
+    while (state.keywords.items.len > max_keyword_entries) {
+        var oldest: usize = 0;
+        for (state.keywords.items[1..], 1..) |entry, idx| {
+            if (entry.used_at_unix < state.keywords.items[oldest].used_at_unix) oldest = idx;
+        }
+        _ = state.keywords.orderedRemove(oldest);
+    }
+}
+
+fn compactRuntimeArena(allocator: std.mem.Allocator, state: *TuiRuntimeState) !void {
+    var next_arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer next_arena.deinit();
+    const a = next_arena.allocator();
+
+    const cache_copy = try allocator.alloc(QueryCacheEntry, state.cache_entries.items.len);
+    defer allocator.free(cache_copy);
+    for (state.cache_entries.items, 0..) |entry, idx| {
+        cache_copy[idx] = .{
+            .provider = entry.provider,
+            .query_norm = try a.dupe(u8, entry.query_norm),
+            .page = entry.page,
+            .fetched_at_unix = entry.fetched_at_unix,
+            .response = try cloneCachedSearchResponse(a, entry.response),
+        };
+    }
+
+    const keyword_copy = try allocator.alloc(KeywordEntry, state.keywords.items.len);
+    defer allocator.free(keyword_copy);
+    for (state.keywords.items, 0..) |entry, idx| {
+        keyword_copy[idx] = .{
+            .query = try a.dupe(u8, entry.query),
+            .used_at_unix = entry.used_at_unix,
+            .use_count = entry.use_count,
+        };
+    }
+
+    state.arena.deinit();
+    state.arena = next_arena;
+    @memcpy(state.cache_entries.items, cache_copy);
+    @memcpy(state.keywords.items, keyword_copy);
+    state.arena_stale_mutations = 0;
+}
+
+fn cloneCachedSearchResponse(allocator: std.mem.Allocator, response: CachedSearchResponse) !CachedSearchResponse {
+    const items = try allocator.alloc(app.SearchChoice, response.items.len);
+    for (response.items, 0..) |item, idx| {
+        items[idx] = try cloneSearchChoice(allocator, item);
+    }
+    return .{
+        .provider = response.provider,
+        .items = items,
+        .page = response.page,
+        .has_prev_page = response.has_prev_page,
+        .has_next_page = response.has_next_page,
+    };
+}
+
+fn oldestCacheEntryIndex(entries: []const QueryCacheEntry) ?usize {
+    if (entries.len == 0) return null;
+    var oldest: usize = 0;
+    for (entries[1..], 1..) |entry, idx| {
+        if (entry.fetched_at_unix < entries[oldest].fetched_at_unix) oldest = idx;
+    }
+    return oldest;
+}
+
 fn upsertCacheEntry(allocator: std.mem.Allocator, state: *TuiRuntimeState, provider: app.Provider, query_norm: []const u8, page: u32, fetched_at_unix: i64, response: app.SearchResponse) !void {
     if (!state.settings.cache_enabled) return;
     const a = state.arena.allocator();
+    var existing_idx: ?usize = null;
+    for (state.cache_entries.items, 0..) |existing, idx| {
+        if (existing.provider == provider and existing.page == page and std.mem.eql(u8, existing.query_norm, query_norm)) {
+            existing_idx = idx;
+            break;
+        }
+    }
     const cached_response = try cachedResponseFromSearch(a, response);
     const query_copy = try a.dupe(u8, query_norm);
     const entry: QueryCacheEntry = .{
@@ -1907,13 +2001,21 @@ fn upsertCacheEntry(allocator: std.mem.Allocator, state: *TuiRuntimeState, provi
         .fetched_at_unix = fetched_at_unix,
         .response = cached_response,
     };
-    for (state.cache_entries.items, 0..) |existing, idx| {
-        if (existing.provider == provider and existing.page == page and std.mem.eql(u8, existing.query_norm, query_norm)) {
-            state.cache_entries.items[idx] = entry;
-            return;
-        }
+    if (existing_idx) |idx| {
+        state.cache_entries.items[idx] = entry;
+        state.arena_stale_mutations += 1;
+    } else {
+        try state.cache_entries.append(allocator, entry);
     }
-    try state.cache_entries.append(allocator, entry);
+
+    while (state.cache_entries.items.len > max_query_cache_entries) {
+        const idx = oldestCacheEntryIndex(state.cache_entries.items) orelse break;
+        _ = state.cache_entries.orderedRemove(idx);
+        state.arena_stale_mutations += 1;
+    }
+    if (state.arena_stale_mutations >= arena_compact_after_stale_mutations) {
+        try compactRuntimeArena(allocator, state);
+    }
 }
 
 fn cachedResponseFromSearch(allocator: std.mem.Allocator, response: app.SearchResponse) !CachedSearchResponse {
@@ -2307,13 +2409,17 @@ fn executeQuerySearchIncremental(
         bundle.pending_count += 1;
     }
 
+    try renderQueryHome(ui, state, query_display, cursor_pos, .query, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
+
     while (bundle.pending_count > 0) {
+        var dirty = false;
         var idx: usize = 0;
         while (idx < task_count) : (idx += 1) {
             if (consumed[idx]) continue;
             if (tasks[idx].done.load(.acquire) == 0) continue;
             consumed[idx] = true;
             bundle.pending_count -= 1;
+            dirty = true;
             if (tasks[idx].err) |err| {
                 if (!isRemoteSearchFailure(err)) bundle.failed_count += 1;
                 continue;
@@ -2331,11 +2437,9 @@ fn executeQuerySearchIncremental(
             bundle.live_count += 1;
         }
 
-        clampSelection(selected_result, bundle.hits.items.len);
-        try renderQueryHome(ui, state, query_display, cursor_pos, if (bundle.hits.items.len > 0) .results else .query, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
-
         var wheel_delta: i32 = 0;
         while (try ui.loop.tryEvent()) |event| {
+            dirty = true;
             switch (event) {
                 .winsize => |ws| try ui.resize(ws),
                 .mouse => |mouse| {
@@ -2413,7 +2517,7 @@ fn executeQuerySearchIncremental(
                         const visible_order = try buildQueryHitOrder(ui.allocator, &bundle, normalizeQueryView(query_display));
                         defer ui.allocator.free(visible_order);
                         if (selected_result.* >= visible_order.len) continue;
-                        switch (try openSearchResult(ui, &bundle, visible_order[selected_result.*], state.settings, state.cache_root_path)) {
+                        switch (try openSearchResult(ui, &bundle, visible_order[selected_result.*], state)) {
                             .back, .to_query => {},
                             .quit => {
                                 search_group.cancel(runtime_io.get());
@@ -2427,7 +2531,14 @@ fn executeQuerySearchIncremental(
                 else => {},
             }
         }
-        applyWheelDelta(selected_result, bundle.hits.items.len, wheel_delta, list_mouse_wheel_step);
+        if (wheel_delta != 0) {
+            applyWheelDelta(selected_result, bundle.hits.items.len, wheel_delta, list_mouse_wheel_step);
+            dirty = true;
+        }
+        if (dirty) {
+            clampSelection(selected_result, bundle.hits.items.len);
+            try renderQueryHome(ui, state, query_display, cursor_pos, if (bundle.hits.items.len > 0) .results else .query, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
+        }
         try runtime_io.get().sleep(.fromMilliseconds(search_poll_interval_ms), .awake);
     }
 
@@ -2579,6 +2690,17 @@ fn rememberKeyword(allocator: std.mem.Allocator, state: *TuiRuntimeState, query_
         .used_at_unix = now,
         .use_count = 1,
     });
+    if (state.keywords.items.len > max_keyword_entries) {
+        var oldest: usize = 0;
+        for (state.keywords.items[1..], 1..) |entry, idx| {
+            if (entry.used_at_unix < state.keywords.items[oldest].used_at_unix) oldest = idx;
+        }
+        _ = state.keywords.orderedRemove(oldest);
+        state.arena_stale_mutations += 1;
+        if (state.arena_stale_mutations >= arena_compact_after_stale_mutations) {
+            try compactRuntimeArena(allocator, state);
+        }
+    }
 }
 
 const HistoryDirection = enum { backward, forward };
@@ -3080,7 +3202,7 @@ fn renderQueryHome(
     win.setCursorShape(.beam);
 
     const provider_count = countEnabledFlags(&state.settings.providers_enabled);
-    const download_count = if (state.settings.download_cache_enabled) cachedDownloadCount(state.cache_root_path) else 0;
+    const download_count = if (state.settings.download_cache_enabled) state.download_entries.len else 0;
     var top_buf: [320]u8 = undefined;
     const top = try formatHomeTopLine(&top_buf, focus, provider_count, app.providerCount(), download_count, results);
     try renderCompactTopLine(ui, win, top, ui.styleTitle());
@@ -3104,7 +3226,7 @@ fn renderQueryHome(
     const list_bottom: u16 = win.height;
 
     if (focus == .downloads and state.settings.download_cache_enabled) {
-        const entries = try cachedDownloadLabels(ui.frameAllocator(), state.cache_root_path);
+        const entries = state.download_entries;
         clampSelection(selected_download, entries.len);
         const page_size: usize = if (list_bottom > list_top) @intCast(list_bottom - list_top) else 1;
         ensureVisible(selected_download.*, download_scroll, page_size);
@@ -3231,8 +3353,10 @@ fn buildCombinedSearchLabelsWithSource(
     return out;
 }
 
-fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, settings: TuiSettings, cache_root_path: []const u8) !OpenResult {
+fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiRuntimeState) !OpenResult {
     if (hit_idx >= bundle.hits.items.len) return .back;
+    const settings = state.settings;
+    const cache_root_path = state.cache_root_path;
     const hit = bundle.hits.items[hit_idx];
     const selected_title = bundle.searches.items[hit.response_index].items[hit.item_index];
     const selected_provider = hit.provider;
@@ -3394,6 +3518,7 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, settings: Tu
         var result = download_task.result orelse return error.UnexpectedHttpStatus;
         defer result.deinit(std.heap.page_allocator);
         if (settings.download_cache_enabled) {
+            try refreshCachedDownloads(ui.allocator, state);
             const export_result = try exportCachedDownload(ui, result);
             switch (export_result) {
                 .ok => continue :subtitle_page_loop,
@@ -3717,9 +3842,11 @@ fn buildProviderNames(allocator: std.mem.Allocator) ![][]u8 {
     const values = app.providers();
     const out = try allocator.alloc([]u8, values.len);
     errdefer allocator.free(out);
-
+    var initialized: usize = 0;
+    errdefer freeInitializedStrings(allocator, out, initialized);
     for (values, 0..) |provider, idx| {
         out[idx] = try std.fmt.allocPrint(allocator, "{s}", .{app.providerName(provider)});
+        initialized += 1;
     }
 
     return out;
@@ -3805,27 +3932,26 @@ fn selectedCachedFile(files: []const []const u8, idx: usize) ![]const u8 {
 }
 
 fn exportCachedFile(allocator: std.mem.Allocator, source_path: []const u8, out_dir: []const u8) ![]u8 {
-    const data = try std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), source_path, allocator, .limited(128 * 1024 * 1024));
-    defer allocator.free(data);
     try std.Io.Dir.cwd().createDirPath(runtime_io.get(), out_dir);
     const safe = try sanitizeExportFilename(allocator, pathBaseName(source_path));
     defer allocator.free(safe);
     const out_path = try nextAvailableExportPath(allocator, out_dir, safe);
     errdefer allocator.free(out_path);
-    try std.Io.Dir.cwd().writeFile(runtime_io.get(), .{ .sub_path = out_path, .data = data });
+    try std.Io.Dir.copyFile(
+        std.Io.Dir.cwd(),
+        source_path,
+        std.Io.Dir.cwd(),
+        out_path,
+        runtime_io.get(),
+        .{ .replace = false },
+    );
     return out_path;
 }
 
-fn cachedDownloadCount(cache_root_path: []const u8) usize {
-    var dir_path_buf: [4096]u8 = undefined;
-    const dir_path = std.fmt.bufPrint(&dir_path_buf, "{s}/downloads", .{cache_root_path}) catch return 0;
-    return cachedDownloadCountRecursive(dir_path);
-}
-
-fn cachedDownloadLabels(allocator: std.mem.Allocator, cache_root_path: []const u8) ![][]const u8 {
+fn cachedDownloadLabels(allocator: std.mem.Allocator, cache_root_path: []const u8) ![][]u8 {
     const dir_path = try std.fmt.allocPrint(allocator, "{s}/downloads", .{cache_root_path});
     defer allocator.free(dir_path);
-    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    var out: std.ArrayListUnmanaged([]u8) = .empty;
     errdefer {
         for (out.items) |label| allocator.free(label);
         out.deinit(allocator);
@@ -3834,30 +3960,11 @@ fn cachedDownloadLabels(allocator: std.mem.Allocator, cache_root_path: []const u
     return try out.toOwnedSlice(allocator);
 }
 
-fn cachedDownloadCountRecursive(dir_path: []const u8) usize {
-    var dir = std.Io.Dir.cwd().openDir(runtime_io.get(), dir_path, .{ .iterate = true }) catch return 0;
-    defer dir.close(runtime_io.get());
-    var it = dir.iterate();
-    var count: usize = 0;
-    while (it.next(runtime_io.get()) catch null) |entry| {
-        switch (entry.kind) {
-            .file => count += 1,
-            .directory => {
-                var child_buf: [4096]u8 = undefined;
-                const child = std.fmt.bufPrint(&child_buf, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
-                count += cachedDownloadCountRecursive(child);
-            },
-            else => {},
-        }
-    }
-    return count;
-}
-
 fn cachedDownloadLabelsRecursive(
     allocator: std.mem.Allocator,
     dir_path: []const u8,
     rel_prefix: []const u8,
-    out: *std.ArrayListUnmanaged([]const u8),
+    out: *std.ArrayListUnmanaged([]u8),
 ) !void {
     var dir = std.Io.Dir.cwd().openDir(runtime_io.get(), dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -3885,46 +3992,21 @@ fn cachedDownloadLabelsRecursive(
     }
 }
 
-fn exportCachedDownloadByIndex(allocator: std.mem.Allocator, cache_root_path: []const u8, wanted_idx: usize, out_dir: []const u8) ![]u8 {
-    const dir_path = try std.fmt.allocPrint(allocator, "{s}/downloads", .{cache_root_path});
-    defer allocator.free(dir_path);
-    var idx: usize = 0;
-    return exportCachedDownloadByIndexRecursive(allocator, dir_path, wanted_idx, &idx, out_dir);
+fn refreshCachedDownloads(allocator: std.mem.Allocator, state: *TuiRuntimeState) !void {
+    const next = try cachedDownloadLabels(allocator, state.cache_root_path);
+    if (state.download_entries.len > 0) freeOwnedStrings(allocator, state.download_entries);
+    state.download_entries = next;
 }
 
-fn exportCachedDownloadByIndexRecursive(
+fn exportCachedDownloadEntry(
     allocator: std.mem.Allocator,
-    dir_path: []const u8,
-    wanted_idx: usize,
-    idx: *usize,
+    cache_root_path: []const u8,
+    relative_path: []const u8,
     out_dir: []const u8,
-) anyerror![]u8 {
-    var dir = try std.Io.Dir.cwd().openDir(runtime_io.get(), dir_path, .{ .iterate = true });
-    defer dir.close(runtime_io.get());
-    var it = dir.iterate();
-    while (try it.next(runtime_io.get())) |entry| {
-        switch (entry.kind) {
-            .file => {
-                if (idx.* == wanted_idx) {
-                    const source = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
-                    defer allocator.free(source);
-                    return exportCachedFile(allocator, source, out_dir);
-                }
-                idx.* += 1;
-            },
-            .directory => {
-                const child = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
-                defer allocator.free(child);
-                const found = exportCachedDownloadByIndexRecursive(allocator, child, wanted_idx, idx, out_dir) catch |err| switch (err) {
-                    error.FileNotFound => null,
-                    else => return err,
-                };
-                if (found) |path| return path;
-            },
-            else => {},
-        }
-    }
-    return error.FileNotFound;
+) ![]u8 {
+    const source = try std.fmt.allocPrint(allocator, "{s}/downloads/{s}", .{ cache_root_path, relative_path });
+    defer allocator.free(source);
+    return exportCachedFile(allocator, source, out_dir);
 }
 
 fn pathBaseName(path: []const u8) []const u8 {
@@ -5440,6 +5522,113 @@ test "query cache helpers trim and expire predictably" {
     try std.testing.expectEqual(@as(?i64, 0), parseCacheTtlSeconds("inf"));
     try std.testing.expectEqual(@as(?i64, 0), parseCacheTtlSeconds("0"));
     try std.testing.expectEqual(@as(?i64, 5400), parseCacheTtlSeconds("1.5"));
+}
+
+test "runtime cache replacement stays bounded and compacts stale arena data" {
+    const allocator = std.testing.allocator;
+    var state: TuiRuntimeState = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .settings = defaultTuiSettings(),
+        .state_path = try allocator.dupe(u8, "state.test"),
+        .keyword_path = try allocator.dupe(u8, "keywords.test"),
+        .cache_root_path = try allocator.dupe(u8, "cache.test"),
+    };
+    defer state.deinit(allocator);
+
+    var replacement: usize = 0;
+    while (replacement < arena_compact_after_stale_mutations * 2 + 3) : (replacement += 1) {
+        var response: app.SearchResponse = .{
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .provider = .subdl_com,
+            .items = &.{},
+        };
+        defer response.deinit();
+        try upsertCacheEntry(allocator, &state, .subdl_com, "matrix", 1, @intCast(replacement), response);
+    }
+    try std.testing.expectEqual(@as(usize, 1), state.cache_entries.items.len);
+    try std.testing.expectEqualStrings("matrix", state.cache_entries.items[0].query_norm);
+    try std.testing.expect(state.arena_stale_mutations < arena_compact_after_stale_mutations);
+
+    var keyword_idx: usize = 0;
+    while (keyword_idx < max_keyword_entries + arena_compact_after_stale_mutations + 5) : (keyword_idx += 1) {
+        const query = try std.fmt.allocPrint(allocator, "query-{d}", .{keyword_idx});
+        defer allocator.free(query);
+        try rememberKeyword(allocator, &state, query);
+    }
+    try std.testing.expectEqual(max_keyword_entries, state.keywords.items.len);
+    try std.testing.expect(state.arena_stale_mutations < arena_compact_after_stale_mutations);
+}
+
+test "download cache refresh discovers new files and exports the selected entry" {
+    const allocator = std.testing.allocator;
+    const unique = scrapers.common.compatNanoTimestamp();
+    const test_root = try std.fmt.allocPrint(allocator, ".zig-cache/tui-runtime-download-test-{d}", .{unique});
+    defer allocator.free(test_root);
+    defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
+    const cache_root = try std.fmt.allocPrint(allocator, "{s}/cache", .{test_root});
+    defer allocator.free(cache_root);
+    const export_root = try std.fmt.allocPrint(allocator, "{s}/export", .{test_root});
+    defer allocator.free(export_root);
+    const downloads_root = try std.fmt.allocPrint(allocator, "{s}/downloads", .{cache_root});
+    defer allocator.free(downloads_root);
+    try std.Io.Dir.cwd().createDirPath(runtime_io.get(), downloads_root);
+
+    const first_path = try std.fmt.allocPrint(allocator, "{s}/first.srt", .{downloads_root});
+    defer allocator.free(first_path);
+    {
+        var file = try std.Io.Dir.cwd().createFile(runtime_io.get(), first_path, .{});
+        defer file.close(runtime_io.get());
+        var buffer: [64]u8 = undefined;
+        var writer = file.writer(runtime_io.get(), &buffer);
+        try writer.interface.writeAll("first subtitle\n");
+        try writer.interface.flush();
+    }
+
+    var state: TuiRuntimeState = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .settings = defaultTuiSettings(),
+        .state_path = try std.fmt.allocPrint(allocator, "{s}/state.oneserial", .{cache_root}),
+        .keyword_path = try std.fmt.allocPrint(allocator, "{s}/keywords.oneserial", .{cache_root}),
+        .cache_root_path = try allocator.dupe(u8, cache_root),
+    };
+    defer state.deinit(allocator);
+
+    try refreshCachedDownloads(allocator, &state);
+    try std.testing.expectEqual(@as(usize, 1), state.download_entries.len);
+    try std.testing.expectEqualStrings("first.srt", state.download_entries[0]);
+
+    const second_path = try std.fmt.allocPrint(allocator, "{s}/second.srt", .{downloads_root});
+    defer allocator.free(second_path);
+    {
+        var file = try std.Io.Dir.cwd().createFile(runtime_io.get(), second_path, .{});
+        defer file.close(runtime_io.get());
+        var buffer: [64]u8 = undefined;
+        var writer = file.writer(runtime_io.get(), &buffer);
+        try writer.interface.writeAll("second subtitle\n");
+        try writer.interface.flush();
+    }
+    try refreshCachedDownloads(allocator, &state);
+    try std.testing.expectEqual(@as(usize, 2), state.download_entries.len);
+
+    var second_index: ?usize = null;
+    for (state.download_entries, 0..) |entry, idx| {
+        if (std.mem.eql(u8, entry, "second.srt")) {
+            second_index = idx;
+            break;
+        }
+    }
+    try std.testing.expect(second_index != null);
+
+    const exported = try exportCachedDownloadEntry(
+        allocator,
+        state.cache_root_path,
+        state.download_entries[second_index.?],
+        export_root,
+    );
+    defer allocator.free(exported);
+    const copied = try std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), exported, allocator, .limited(1024));
+    defer allocator.free(copied);
+    try std.testing.expectEqualStrings("second subtitle\n", copied);
 }
 
 test "keyword state serializes through oneserial" {

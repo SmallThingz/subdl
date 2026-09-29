@@ -14,7 +14,7 @@ pub const RuntimeAllocator = if (builtin.mode == .Debug)
         }
 
         pub fn deinit(self: *@This()) void {
-            _ = self.gpa.deinit();
+            std.debug.assert(self.gpa.deinit() == .ok);
         }
     }
 else

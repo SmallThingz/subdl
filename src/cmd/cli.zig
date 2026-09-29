@@ -22,6 +22,27 @@ const SearchHit = struct {
     item_index: usize,
 };
 
+const SearchTask = struct {
+    provider: app.Provider,
+    query: []const u8,
+    result: ?app.SearchResponse = null,
+    err: ?anyerror = null,
+};
+
+fn searchTaskMain(task: *SearchTask) std.Io.Cancelable!void {
+    var client: std.http.Client = .{
+        .allocator = std.heap.page_allocator,
+        .io = runtime_io.get(),
+    };
+    defer client.deinit();
+
+    task.result = app.search(std.heap.page_allocator, &client, task.provider, task.query) catch |err| {
+        if (err == error.Canceled) return error.Canceled;
+        task.err = err;
+        return;
+    };
+}
+
 pub fn main(init: std.process.Init) !void {
     runtime_io.set(init.io);
     var allocator_state = runtime_alloc.RuntimeAllocator.init();
@@ -75,22 +96,43 @@ pub fn main(init: std.process.Init) !void {
     var hits: std.ArrayListUnmanaged(SearchHit) = .empty;
     defer hits.deinit(allocator);
 
-    var failed_count: usize = 0;
+    const enabled_provider_count = countEnabledProviders(&config.providers_enabled);
+    const tasks = try allocator.alloc(SearchTask, enabled_provider_count);
+    defer {
+        for (tasks) |*task| {
+            if (task.result) |*result| result.deinit();
+        }
+        allocator.free(tasks);
+    }
+
+    var search_group: std.Io.Group = .init;
+    defer search_group.cancel(init.io);
+    var task_count: usize = 0;
     for (app.providers()) |provider| {
         if (!config.providers_enabled[app.providerIndex(provider)]) continue;
+        tasks[task_count] = .{ .provider = provider, .query = query };
+        try search_group.concurrent(init.io, searchTaskMain, .{&tasks[task_count]});
+        task_count += 1;
+    }
+    try search_group.await(init.io);
 
-        var search_result = app.search(allocator, &client, provider, query) catch |err| {
+    var failed_count: usize = 0;
+    for (tasks[0..task_count]) |*task| {
+        if (task.err) |err| {
             failed_count += 1;
-            try stderr.print("warning: search failed for {s}: {s}\n", .{ app.providerName(provider), @errorName(err) });
+            try stderr.print("warning: search failed for {s}: {s}\n", .{ app.providerName(task.provider), @errorName(err) });
+            continue;
+        }
+        const search_result = task.result orelse {
+            failed_count += 1;
             continue;
         };
-        errdefer search_result.deinit();
-
         const response_index = searches.items.len;
         try searches.append(allocator, search_result);
+        task.result = null;
         for (searches.items[response_index].items, 0..) |_, item_index| {
             try hits.append(allocator, .{
-                .provider = provider,
+                .provider = task.provider,
                 .response_index = response_index,
                 .item_index = item_index,
             });

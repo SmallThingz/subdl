@@ -352,8 +352,8 @@ fn fetchBytesViaHttp(client: *std.http.Client, allocator: Allocator, url: []cons
     const normalized_url = try normalizeUrlForFetch(allocator, url);
     defer allocator.free(normalized_url);
 
-    // std.http writes into this buffer once; HttpResponse.body is then an owned
-    // copy so every caller has the same allocator/free contract.
+    // std.http writes directly into an allocator-owned buffer. Transfer that
+    // allocation to the caller rather than duplicating the full response body.
     var body_writer = std.Io.Writer.Allocating.init(allocator);
     defer body_writer.deinit();
 
@@ -367,9 +367,11 @@ fn fetchBytesViaHttp(client: *std.http.Client, allocator: Allocator, url: []cons
         .redirect_behavior = std.http.Client.Request.RedirectBehavior.init(5),
     });
 
+    var body = body_writer.toArrayList();
+    errdefer body.deinit(allocator);
     return .{
         .status = fetched.status,
-        .body = try allocator.dupe(u8, body_writer.writer.buffered()),
+        .body = try body.toOwnedSlice(allocator),
     };
 }
 
