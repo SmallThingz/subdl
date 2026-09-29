@@ -943,10 +943,19 @@ fn runTui(ui: *Ui) !void {
                     if (key.matches(vaxis.Key.escape, .{})) {
                         const current_query_norm = normalizeQueryView(query.items);
                         const current_query_dirty = !std.mem.eql(u8, current_query_norm, last_searched_norm);
-                        editSettingsPopup(ui, &state, query.items, cursor_pos, focus, current_query_dirty, if (results) |*b| b else null, &selected_result, &result_scroll, &selected_download, &download_scroll, &info_open) catch |err| switch (err) {
+                        const search_settings_changed = editSettingsPopup(ui, &state, query.items, cursor_pos, focus, current_query_dirty, if (results) |*b| b else null, &selected_result, &result_scroll, &selected_download, &download_scroll, &info_open) catch |err| switch (err) {
                             error.TuiQuit => return,
                             else => return err,
                         };
+                        if (search_settings_changed) {
+                            if (results) |*bundle| bundle.deinit(ui.allocator);
+                            results = null;
+                            selected_result = 0;
+                            result_scroll = 0;
+                            focus = .query;
+                            ui.allocator.free(last_searched_norm);
+                            last_searched_norm = try ui.allocator.dupe(u8, "");
+                        }
                         continue;
                     }
 
@@ -1059,13 +1068,22 @@ fn runTui(ui: *Ui) !void {
                             error.TuiQuit => return,
                             else => return err,
                         };
-                        results = search_outcome.bundle;
                         ui.allocator.free(last_searched_norm);
-                        last_searched_norm = try ui.allocator.dupe(u8, owned_query);
+                        if (search_outcome.discard_results) {
+                            var stale_bundle = search_outcome.bundle;
+                            stale_bundle.deinit(ui.allocator);
+                            results = null;
+                            last_searched_norm = try ui.allocator.dupe(u8, "");
+                        } else {
+                            results = search_outcome.bundle;
+                            last_searched_norm = try ui.allocator.dupe(u8, owned_query);
+                        }
                         selected_result = 0;
                         result_scroll = 0;
                         focus = search_outcome.focus;
-                        if (results.?.cache_changed) try saveTuiRuntimeState(ui.allocator, &state);
+                        if (results) |*bundle| {
+                            if (bundle.cache_changed) try saveTuiRuntimeState(ui.allocator, &state);
+                        }
                         try saveKeywordRuntimeState(ui.allocator, &state);
                         continue;
                     }
@@ -1991,6 +2009,14 @@ fn findCacheEntry(state: *const TuiRuntimeState, provider: app.Provider, query_n
     return null;
 }
 
+fn searchCacheKey(allocator: std.mem.Allocator, query_norm: []const u8, language_code: ?[]const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}\x1flang={s}",
+        .{ query_norm, language_code orelse "*" },
+    );
+}
+
 const max_query_cache_entries: usize = 512;
 const max_keyword_entries: usize = 128;
 const arena_compact_after_stale_mutations: usize = 32;
@@ -2428,13 +2454,16 @@ fn executeQuerySearch(ui: *Ui, state: *TuiRuntimeState, query_norm: []const u8) 
     var bundle: SearchBundle = .{ .query_norm = try ui.allocator.dupe(u8, query_norm) };
     errdefer bundle.deinit(ui.allocator);
     const now = scrapers.common.compatUnixTimestamp();
+    const language_code = primaryLanguageCode(state.settings);
+    const cache_key = try searchCacheKey(ui.allocator, query_norm, language_code);
+    defer ui.allocator.free(cache_key);
 
     for (app.providers()) |provider| {
         if (!state.settings.providers_enabled[app.providerIndex(provider)]) continue;
         ui.active_provider = provider;
 
         const response_index = bundle.searches.items.len;
-        if (findCacheEntry(state, provider, query_norm, 1, now)) |cache_idx| {
+        if (findCacheEntry(state, provider, cache_key, 1, now)) |cache_idx| {
             const cached = try searchResponseFromCache(ui.allocator, state.cache_entries.items[cache_idx]);
             try bundle.searches.append(ui.allocator, cached);
             for (bundle.searches.items[response_index].items, 0..) |_, item_index| {
@@ -2453,7 +2482,7 @@ fn executeQuerySearch(ui: *Ui, state: *TuiRuntimeState, query_norm: []const u8) 
         var search_task: SearchTask = .{
             .provider = provider,
             .query = query_norm,
-            .language_code = primaryLanguageCode(state.settings),
+            .language_code = language_code,
             .page = 1,
         };
         var search_group: std.Io.Group = .init;
@@ -2478,7 +2507,7 @@ fn executeQuerySearch(ui: *Ui, state: *TuiRuntimeState, query_norm: []const u8) 
             bundle.failed_count += 1;
             continue;
         };
-        try upsertCacheEntry(ui.allocator, state, provider, query_norm, 1, now, search_result);
+        try upsertCacheEntry(ui.allocator, state, provider, cache_key, 1, now, search_result);
         bundle.cache_changed = true;
         try bundle.searches.append(ui.allocator, search_result);
         for (bundle.searches.items[response_index].items, 0..) |_, item_index| {
@@ -2494,6 +2523,7 @@ fn executeQuerySearch(ui: *Ui, state: *TuiRuntimeState, query_norm: []const u8) 
 const IncrementalSearchOutcome = struct {
     bundle: SearchBundle,
     focus: QueryFocus,
+    discard_results: bool = false,
 };
 
 fn executeQuerySearchIncremental(
@@ -2526,10 +2556,12 @@ fn executeQuerySearchIncremental(
 
     var task_count: usize = 0;
     const language_code = primaryLanguageCode(state.settings);
+    const cache_key = try searchCacheKey(ui.allocator, query_norm, language_code);
+    defer ui.allocator.free(cache_key);
     const now = scrapers.common.compatUnixTimestamp();
     for (app.providers()) |provider| {
         if (!state.settings.providers_enabled[app.providerIndex(provider)]) continue;
-        if (findCacheEntry(state, provider, query_norm, 1, now)) |cache_idx| {
+        if (findCacheEntry(state, provider, cache_key, 1, now)) |cache_idx| {
             const response_index = bundle.searches.items.len;
             const cached = try searchResponseFromCache(ui.allocator, state.cache_entries.items[cache_idx]);
             try bundle.searches.append(ui.allocator, cached);
@@ -2633,7 +2665,7 @@ fn executeQuerySearchIncremental(
                         return .{ .bundle = bundle, .focus = .query };
                     }
                     if (key.matches(vaxis.Key.escape, .{})) {
-                        try editSettingsPopup(
+                        const search_settings_changed = try editSettingsPopup(
                             ui,
                             state,
                             query_display,
@@ -2647,6 +2679,18 @@ fn executeQuerySearchIncremental(
                             &download_scroll,
                             info_open,
                         );
+                        if (search_settings_changed) {
+                            bundle.searching = false;
+                            bundle.pending_count = 0;
+                            if (ui.reapSearchWork(search_work)) {
+                                search_work_owned = false;
+                            }
+                            return .{
+                                .bundle = bundle,
+                                .focus = .query,
+                                .discard_results = true,
+                            };
+                        }
                         continue;
                     }
                     if (key.matches(vaxis.Key.f1, .{})) {
@@ -2714,7 +2758,7 @@ fn executeQuerySearchIncremental(
                 ui.allocator,
                 state,
                 response.provider,
-                query_norm,
+                cache_key,
                 1,
                 scrapers.common.compatUnixTimestamp(),
                 response,
@@ -3079,7 +3123,8 @@ fn editSettingsPopup(
     selected_download: *usize,
     download_scroll: *usize,
     info_open: *bool,
-) !void {
+) !bool {
+    const initial_settings = state.settings;
     var panel: SettingsPanel = .main;
     var main_selected: usize = 0;
     var provider_selected: usize = 0;
@@ -3193,12 +3238,12 @@ fn editSettingsPopup(
                     }
                     if (key.matches('c', .{ .ctrl = true })) {
                         if (settings_dirty) try saveTuiSettingsState(ui.allocator, state);
-                        return;
+                        return searchSettingsChanged(initial_settings, state.settings);
                     }
                     switch (panel) {
                         .main => {
                             const item_count: usize = 7;
-                            if (key.matches(vaxis.Key.escape, .{})) return;
+                            if (key.matches(vaxis.Key.escape, .{})) return searchSettingsChanged(initial_settings, state.settings);
                             if (key.matches(vaxis.Key.down, .{})) {
                                 if (main_selected + 1 < item_count) main_selected += 1;
                                 continue;
@@ -3487,6 +3532,12 @@ fn settingsMainAction(_: TuiSettings, visible_idx: usize) usize {
 fn primaryLanguageIndex(settings: TuiSettings) ?usize {
     if (!settings.language_filter_enabled) return null;
     return singleEnabledIndex(&settings.languages_enabled) orelse 0;
+}
+
+fn searchSettingsChanged(before: TuiSettings, after: TuiSettings) bool {
+    if (before.language_filter_enabled != after.language_filter_enabled) return true;
+    if (!std.mem.eql(bool, before.providers_enabled[0..], after.providers_enabled[0..])) return true;
+    return !std.mem.eql(bool, before.languages_enabled[0..], after.languages_enabled[0..]);
 }
 
 fn primaryLanguageCode(settings: TuiSettings) ?[]const u8 {
@@ -6073,6 +6124,44 @@ test "keyword state serializes through oneserial" {
     try std.testing.expectEqual(@as(usize, 2), decoded.keywords.len);
     try std.testing.expectEqualStrings("matrix", decoded.keywords[0].query);
     try std.testing.expectEqual(@as(u32, 2), decoded.keywords[0].use_count);
+}
+
+test "search settings invalidation only tracks provider and language scope" {
+    const original = defaultTuiSettings();
+
+    var changed = original;
+    changed.providers_enabled[0] = !changed.providers_enabled[0];
+    try std.testing.expect(searchSettingsChanged(original, changed));
+
+    changed = original;
+    changed.language_filter_enabled = !changed.language_filter_enabled;
+    try std.testing.expect(searchSettingsChanged(original, changed));
+
+    changed = original;
+    changed.languages_enabled[0] = !changed.languages_enabled[0];
+    try std.testing.expect(searchSettingsChanged(original, changed));
+
+    changed = original;
+    changed.cache_enabled = !changed.cache_enabled;
+    changed.download_cache_enabled = !changed.download_cache_enabled;
+    changed.cache_ttl_seconds += 60;
+    changed.keyword_cache_enabled = !changed.keyword_cache_enabled;
+    try std.testing.expect(!searchSettingsChanged(original, changed));
+}
+
+test "search cache key isolates language scope" {
+    const allocator = std.testing.allocator;
+    const english = try searchCacheKey(allocator, "matrix", "en");
+    defer allocator.free(english);
+    const spanish = try searchCacheKey(allocator, "matrix", "es");
+    defer allocator.free(spanish);
+    const unfiltered = try searchCacheKey(allocator, "matrix", null);
+    defer allocator.free(unfiltered);
+
+    try std.testing.expectEqualStrings("matrix\x1flang=en", english);
+    try std.testing.expect(!std.mem.eql(u8, english, spanish));
+    try std.testing.expect(!std.mem.eql(u8, english, unfiltered));
+    try std.testing.expect(!std.mem.eql(u8, spanish, unfiltered));
 }
 
 test "settings persist independently from search cache state" {
