@@ -62,15 +62,7 @@ pub const Scraper = struct {
             .{ .name = "x-requested-with", .value = "XMLHttpRequest" },
             .{ .name = "referer", .value = site ++ "/" },
         };
-        const response = try common.fetchBytes(self.client, a, site ++ "/search", .{
-            .method = .POST,
-            .payload = payload,
-            .content_type = "application/x-www-form-urlencoded",
-            .accept = "application/json, text/javascript, */*; q=0.01",
-            .extra_headers = &headers,
-            .cache = false,
-            .max_attempts = 2,
-        });
+        const response = try fetchSearchWithStatusRetry(self.client, a, payload, &headers);
 
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
         const array = switch (root) {
@@ -221,6 +213,50 @@ pub const Scraper = struct {
     }
 };
 
+fn fetchSearchWithStatusRetry(
+    client: *std.http.Client,
+    allocator: Allocator,
+    payload: []const u8,
+    headers: []const std.http.Header,
+) !common.HttpResponse {
+    const max_status_attempts: usize = 4;
+    var attempt: usize = 0;
+    while (attempt < max_status_attempts) : (attempt += 1) {
+        const response = try common.fetchBytes(client, allocator, site ++ "/search", .{
+            .method = .POST,
+            .payload = payload,
+            .content_type = "application/x-www-form-urlencoded",
+            .accept = "application/json, text/javascript, */*; q=0.01",
+            .extra_headers = headers,
+            .cache = false,
+            .allow_non_ok = true,
+            .max_attempts = 1,
+        });
+        if (response.status == .ok) return response;
+
+        const retry = isTransientSearchStatus(response.status) and attempt + 1 < max_status_attempts;
+        allocator.free(response.body);
+        if (!retry) return error.UnexpectedHttpStatus;
+
+        const code = @intFromEnum(response.status);
+        const delay_ms: u64 = if (code == 429 or code == 403)
+            5500
+        else
+            @as(u64, 1000) << @intCast(@min(attempt, 2));
+        common.sleepMilliseconds(delay_ms);
+    }
+    return error.UnexpectedHttpStatus;
+}
+
+fn isTransientSearchStatus(status: std.http.Status) bool {
+    const code = @intFromEnum(status);
+    return code == 403 or
+        code == 408 or
+        code == 425 or
+        code == 429 or
+        (code >= 500 and code <= 504);
+}
+
 fn extractRowsJson(body: []const u8) ?[]const u8 {
     const marker = "DataTable({ data: ";
     const start = std.mem.indexOf(u8, body, marker) orelse return null;
@@ -345,6 +381,13 @@ test "indexsubtitle extracts embedded rows and ttl" {
     try std.testing.expect(std.mem.startsWith(u8, rows, "[{"));
     try std.testing.expectEqual(@as(?i64, 1790576999), parsePageTtl(body));
     try std.testing.expectEqualStrings("657711", rowId("the-matrix-1999/english/657711").?);
+}
+
+test "indexsubtitle retries transient search statuses" {
+    try std.testing.expect(isTransientSearchStatus(.forbidden));
+    try std.testing.expect(isTransientSearchStatus(.too_many_requests));
+    try std.testing.expect(isTransientSearchStatus(.service_unavailable));
+    try std.testing.expect(!isTransientSearchStatus(.not_found));
 }
 
 test "live indexsubtitle movie and tv search/list/download" {

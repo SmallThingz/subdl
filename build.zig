@@ -413,9 +413,7 @@ fn makeParallelLiveRunScript(
         \\for i in "${!pids[@]}"; do
         \\  name="${names[$i]}"
         \\  pid="${pids[$i]}"
-        \\  if ! wait "$pid"; then
-        \\    overall_rc=1
-        \\  fi
+        \\  wait "$pid" || true
         \\  rc_file="$tmpdir/$name.rc"
         \\  if [[ ! -f "$rc_file" ]]; then
         \\    echo "[live][runner] END $name rc=missing"
@@ -428,6 +426,7 @@ fn makeParallelLiveRunScript(
         \\  fi
         \\done
         \\wait "$monitor_pid" 2>/dev/null || true
+        \\echo "[live][runner] SUMMARY rc=$overall_rc"
         \\exit "$overall_rc"
         \\
     ) catch @panic("oom");
