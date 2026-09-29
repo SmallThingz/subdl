@@ -524,7 +524,6 @@ pub fn main(init: std.process.Init) !void {
     try vx.enterAltScreen(tty.writer());
     try vx.queryTerminal(tty.writer(), .fromSeconds(1));
     try vx.setMouseMode(tty.writer(), true);
-    defer vx.setMouseMode(tty.writer(), false) catch {};
 
     var ui: Ui = .{
         .allocator = allocator,
@@ -535,9 +534,19 @@ pub fn main(init: std.process.Init) !void {
         .frame_arena = std.heap.ArenaAllocator.init(allocator),
     };
     defer ui.frame_arena.deinit();
-    defer ui.awaitSearchReapers();
 
-    try runTui(&ui);
+    {
+        defer ui.awaitSearchReapers();
+        {
+            // Restore the user's terminal before waiting for any slow provider
+            // cancellation reapers. Cleanup remains deterministic, but a quit
+            // no longer appears frozen inside the alternate-screen UI.
+            defer vx.exitAltScreen(tty.writer()) catch {};
+            defer vx.setMouseMode(tty.writer(), false) catch {};
+            defer loop.stop();
+            try runTui(&ui);
+        }
+    }
 }
 
 fn searchTaskMain(task: *SearchTask) std.Io.Cancelable!void {
