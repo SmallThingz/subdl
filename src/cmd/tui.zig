@@ -906,7 +906,9 @@ fn runTui(ui: *Ui) !void {
                         continue;
                     }
                     if (key.matches(vaxis.Key.escape, .{})) {
-                        try editSettingsPopup(ui, &state, query.items, cursor_pos, focus, query_dirty, if (results) |*b| b else null, &selected_result, &result_scroll, &selected_download, &download_scroll, &info_open);
+                        const current_query_norm = normalizeQueryView(query.items);
+                        const current_query_dirty = !std.mem.eql(u8, current_query_norm, last_searched_norm);
+                        try editSettingsPopup(ui, &state, query.items, cursor_pos, focus, current_query_dirty, if (results) |*b| b else null, &selected_result, &result_scroll, &selected_download, &download_scroll, &info_open);
                         continue;
                     }
 
@@ -1007,10 +1009,11 @@ fn runTui(ui: *Ui) !void {
                     }
 
                     if (key.matches(vaxis.Key.enter, .{})) {
-                        if (query_norm_view.len == 0) continue;
+                        const current_query_norm = normalizeQueryView(query.items);
+                        if (current_query_norm.len == 0) continue;
                         if (results) |*bundle| bundle.deinit(ui.allocator);
                         results = null;
-                        const owned_query = try ui.allocator.dupe(u8, query_norm_view);
+                        const owned_query = try ui.allocator.dupe(u8, current_query_norm);
                         defer ui.allocator.free(owned_query);
                         try rememberKeyword(ui.allocator, &state, owned_query);
                         results = executeQuerySearchIncremental(ui, &state, owned_query, query.items, cursor_pos, &selected_result, &result_scroll, &info_open) catch |err| switch (err) {
@@ -2476,8 +2479,24 @@ fn executeQuerySearchIncremental(
 
     var task_count: usize = 0;
     const language_code = primaryLanguageCode(state.settings);
+    const now = scrapers.common.compatUnixTimestamp();
     for (app.providers()) |provider| {
         if (!state.settings.providers_enabled[app.providerIndex(provider)]) continue;
+        if (findCacheEntry(state, provider, query_norm, 1, now)) |cache_idx| {
+            const response_index = bundle.searches.items.len;
+            const cached = try searchResponseFromCache(ui.allocator, state.cache_entries.items[cache_idx]);
+            try bundle.searches.append(ui.allocator, cached);
+            for (bundle.searches.items[response_index].items, 0..) |_, item_index| {
+                try bundle.hits.append(ui.allocator, .{
+                    .provider = provider,
+                    .response_index = response_index,
+                    .item_index = item_index,
+                    .source = .cache,
+                });
+            }
+            bundle.cache_count += 1;
+            continue;
+        }
         tasks[task_count] = .{
             .provider = provider,
             .query = query_norm,
@@ -2489,7 +2508,21 @@ fn executeQuerySearchIncremental(
         bundle.pending_count += 1;
     }
 
-    try renderQueryHome(ui, state, query_display, cursor_pos, .query, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
+    try renderQueryHome(
+        ui,
+        state,
+        query_display,
+        cursor_pos,
+        if (bundle.hits.items.len > 0) .results else .query,
+        false,
+        &bundle,
+        selected_result,
+        result_scroll,
+        &selected_download,
+        &download_scroll,
+        info_open.*,
+        true,
+    );
 
     while (bundle.pending_count > 0) {
         var dirty = false;
