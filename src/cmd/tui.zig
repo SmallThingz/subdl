@@ -3964,7 +3964,12 @@ fn cachedDownloadLabels(allocator: std.mem.Allocator, cache_root_path: []const u
         out.deinit(allocator);
     }
     try cachedDownloadLabelsRecursive(allocator, dir_path, "", &out);
+    std.mem.sort([]u8, out.items, {}, cachedDownloadLabelLessThan);
     return try out.toOwnedSlice(allocator);
+}
+
+fn cachedDownloadLabelLessThan(_: void, lhs: []u8, rhs: []u8) bool {
+    return std.mem.order(u8, lhs, rhs) == .lt;
 }
 
 fn cachedDownloadLabelsRecursive(
@@ -6030,6 +6035,8 @@ test "download cache refresh discovers new files and exports the selected entry"
     }
     try refreshCachedDownloads(allocator, &state);
     try std.testing.expectEqual(@as(usize, 2), state.download_entries.len);
+    try std.testing.expectEqualStrings("first.srt", state.download_entries[0]);
+    try std.testing.expectEqualStrings("second.srt", state.download_entries[1]);
 
     var second_index: ?usize = null;
     for (state.download_entries, 0..) |entry, idx| {
