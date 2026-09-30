@@ -2194,6 +2194,14 @@ fn executeQuerySearchIncremental(
                         if (canRenderOverlayMenu(ui.vx.window())) info_open.* = !info_open.*;
                         continue;
                     }
+                    if (applyActiveSearchQueryCursorKey(
+                        query.items,
+                        cursor_pos,
+                        key,
+                        bundle.display_order.len > 0,
+                    )) {
+                        continue;
+                    }
                     if (try applyActiveSearchQueryEditKey(ui.allocator, query, cursor_pos, key)) {
                         bundle.searching = false;
                         bundle.pending_count = 0;
@@ -5248,6 +5256,93 @@ fn applyActiveSearchQueryEditKey(
     try query.insertSlice(allocator, cursor_pos.*, text);
     cursor_pos.* += text.len;
     return true;
+}
+
+fn applyActiveSearchQueryCursorKey(
+    query: []const u8,
+    cursor_pos: *usize,
+    key: vaxis.Key,
+    has_results: bool,
+) bool {
+    if (key.matches(vaxis.Key.left, .{})) {
+        cursor_pos.* = prevCodepointStart(query, cursor_pos.*);
+        return true;
+    }
+    if (key.matches(vaxis.Key.right, .{})) {
+        cursor_pos.* = nextCodepointEnd(query, cursor_pos.*);
+        return true;
+    }
+    if (key.matches('a', .{ .ctrl = true }) or (!has_results and key.matches(vaxis.Key.home, .{}))) {
+        cursor_pos.* = 0;
+        return true;
+    }
+    if (key.matches('e', .{ .ctrl = true }) or (!has_results and key.matches(vaxis.Key.end, .{}))) {
+        cursor_pos.* = query.len;
+        return true;
+    }
+    return false;
+}
+
+test "active search cursor navigation matches query input semantics" {
+    const query = "AéB";
+    var cursor: usize = query.len;
+
+    try std.testing.expect(applyActiveSearchQueryCursorKey(
+        query,
+        &cursor,
+        .{ .codepoint = vaxis.Key.left },
+        false,
+    ));
+    try std.testing.expectEqual(@as(usize, 3), cursor);
+
+    try std.testing.expect(applyActiveSearchQueryCursorKey(
+        query,
+        &cursor,
+        .{ .codepoint = vaxis.Key.left },
+        false,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), cursor);
+
+    try std.testing.expect(applyActiveSearchQueryCursorKey(
+        query,
+        &cursor,
+        .{ .codepoint = vaxis.Key.right },
+        false,
+    ));
+    try std.testing.expectEqual(@as(usize, 3), cursor);
+
+    try std.testing.expect(applyActiveSearchQueryCursorKey(
+        query,
+        &cursor,
+        .{ .codepoint = vaxis.Key.home },
+        false,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), cursor);
+
+    try std.testing.expect(applyActiveSearchQueryCursorKey(
+        query,
+        &cursor,
+        .{ .codepoint = vaxis.Key.end },
+        false,
+    ));
+    try std.testing.expectEqual(query.len, cursor);
+
+    cursor = 2;
+    try std.testing.expect(!applyActiveSearchQueryCursorKey(
+        query,
+        &cursor,
+        .{ .codepoint = vaxis.Key.home },
+        true,
+    ));
+    try std.testing.expectEqual(@as(usize, 2), cursor);
+
+    try std.testing.expect(applyActiveSearchQueryCursorKey(
+        query,
+        &cursor,
+        .{ .codepoint = 'a', .mods = .{ .ctrl = true } },
+        true,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), cursor);
 }
 
 test "active search query edits are utf8-safe and bounded" {
