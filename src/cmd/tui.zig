@@ -4003,65 +4003,189 @@ fn renderQueryHome(
         }
     }
 
-    const footer = if (ui.search_reapers.items.len >= max_background_search_reapers)
-        "Finishing canceled searches · Enter retries when cleanup completes"
-    else if (results) |bundle|
-        if (bundle.searching) switch (focus) {
-            .query => if (visible_order) |order|
-                if (order.len > 0)
-                    "Searching · edit cancels · Tab results"
-                else
-                    "Searching · edit cancels"
-            else
-                "Searching · edit cancels",
-            .results => "↑/↓ select · Enter open · Tab query",
-            .downloads => "↑/↓ select · Enter export · Tab focus",
-        } else switch (focus) {
-            .query => "Enter search · ↑/↓ or click history · Tab focus",
-            .results => "↑/↓ select · Enter open · Tab focus",
-            .downloads => "↑/↓ select · Enter export · Tab focus",
-        }
-    else switch (focus) {
-        .query => "Enter search · ↑/↓ or click history · Tab focus",
-        .results => "↑/↓ select · Enter open · Tab focus",
-        .downloads => "↑/↓ select · Enter export · Tab focus",
-    };
+    const has_results = if (visible_order) |order| order.len > 0 else false;
+    const has_downloads = state.settings.download_cache_enabled and state.download_entries.len > 0;
+    const has_history = state.settings.keyword_cache_enabled and state.keywords.items.len > 0;
+    const search_active = if (results) |bundle| bundle.searching else false;
+    const footer = formatHomeFooter(
+        focus,
+        search_active,
+        ui.search_reapers.items.len >= max_background_search_reapers,
+        has_results,
+        has_downloads,
+        has_history,
+    );
     try renderCompactBottomLine(ui, win, footer);
 
     if (info_open) {
-        const default_lines = [_][]const u8{
-            "Enter search/open",
-            "Tab query/results/downloads",
-            "Up/Down move through history or results",
-            "PageUp/PageDown scroll faster",
-            "Esc settings",
-            "Ctrl+C cancel/back, Ctrl+D quit",
-        };
+        const default_tab_line: ?[]const u8 = if (has_results and has_downloads)
+            "Tab query/results/downloads"
+        else if (has_results)
+            "Tab query/results"
+        else if (has_downloads)
+            "Tab query/downloads"
+        else
+            null;
+        const default_move_line = if (has_history)
+            "Up/Down browse history; pane lists use Up/Down/Page"
+        else if (has_results or has_downloads)
+            "Up/Down/Page move in the focused list"
+        else
+            "Left/Right/Home/End move query cursor";
+        var default_lines_storage: [6][]const u8 = undefined;
+        var default_line_count: usize = 0;
+        default_lines_storage[default_line_count] = "Enter search/open";
+        default_line_count += 1;
+        if (default_tab_line) |line| {
+            default_lines_storage[default_line_count] = line;
+            default_line_count += 1;
+        }
+        default_lines_storage[default_line_count] = default_move_line;
+        default_line_count += 1;
+        if (has_results or has_downloads) {
+            default_lines_storage[default_line_count] = "PageUp/PageDown scroll focused list";
+            default_line_count += 1;
+        }
+        default_lines_storage[default_line_count] = "Esc settings";
+        default_line_count += 1;
+        default_lines_storage[default_line_count] = "Ctrl+C cancel/back, Ctrl+D quit";
+        default_line_count += 1;
+        const default_lines = default_lines_storage[0..default_line_count];
         const active_query_lines = [_][]const u8{
             "Search running",
             "Editing cancels stale search",
             "Left/Right/Home/End move query cursor",
-            if (visible_order) |order| if (order.len > 0) "Tab results • Esc settings" else "Esc settings" else "Esc settings",
+            if (has_results)
+                "Tab results • Esc settings"
+            else if (has_downloads)
+                "Tab downloads • Esc settings"
+            else
+                "Esc settings",
             "Ctrl+C cancel • Ctrl+D quit",
         };
         const active_result_lines = [_][]const u8{
             "Search running",
             "Up/Down/Page select results",
-            "Enter open • Tab query",
+            if (has_downloads) "Enter open • Tab query/downloads" else "Enter open • Tab query",
+            "Esc settings",
+            "Ctrl+C cancel • Ctrl+D quit",
+        };
+        const active_download_lines = [_][]const u8{
+            "Search running",
+            "Up/Down/Page select cached downloads",
+            if (has_results) "Enter export • Tab query/results" else "Enter export • Tab query",
             "Esc settings",
             "Ctrl+C cancel • Ctrl+D quit",
         };
         const lines: []const []const u8 = if (results) |bundle|
             if (bundle.searching)
-                if (focus == .results) &active_result_lines else &active_query_lines
+                switch (focus) {
+                    .query => &active_query_lines,
+                    .results => &active_result_lines,
+                    .downloads => &active_download_lines,
+                }
             else
-                &default_lines
+                default_lines
         else
-            &default_lines;
+            default_lines;
         try renderOverlayMenu(ui, win, "Info", lines);
     }
 
     if (flush) try ui.render();
+}
+
+fn formatHomeFooter(
+    focus: QueryFocus,
+    searching: bool,
+    cleanup_backlog_full: bool,
+    has_results: bool,
+    has_downloads: bool,
+    has_history: bool,
+) []const u8 {
+    if (cleanup_backlog_full) return "Finishing canceled searches · Enter retries when cleanup completes";
+    if (searching) {
+        return switch (focus) {
+            .query => if (has_results)
+                "Searching · edit cancels · Tab results"
+            else if (has_downloads)
+                "Searching · edit cancels · Tab downloads"
+            else
+                "Searching · edit cancels",
+            .results => if (has_downloads)
+                "↑/↓ select · Enter open · Tab query/downloads"
+            else
+                "↑/↓ select · Enter open · Tab query",
+            .downloads => if (has_results)
+                "↑/↓ select · Enter export · Tab query/results"
+            else
+                "↑/↓ select · Enter export · Tab query",
+        };
+    }
+
+    return switch (focus) {
+        .query => if (has_history and has_results and has_downloads)
+            "Enter search · ↑/↓ history · Tab results/downloads"
+        else if (has_history and has_results)
+            "Enter search · ↑/↓ history · Tab results"
+        else if (has_history and has_downloads)
+            "Enter search · ↑/↓ history · Tab downloads"
+        else if (has_history)
+            "Enter search · ↑/↓ history"
+        else if (has_results and has_downloads)
+            "Enter search · Tab results/downloads"
+        else if (has_results)
+            "Enter search · Tab results"
+        else if (has_downloads)
+            "Enter search · Tab downloads"
+        else
+            "Enter search",
+        .results => if (has_downloads)
+            "↑/↓ select · Enter open · Tab query/downloads"
+        else
+            "↑/↓ select · Enter open · Tab query",
+        .downloads => if (has_results)
+            "↑/↓ select · Enter export · Tab query/results"
+        else
+            "↑/↓ select · Enter export · Tab query",
+    };
+}
+
+test "home footer hides unavailable navigation hints" {
+    try std.testing.expectEqualStrings(
+        "Enter search",
+        formatHomeFooter(.query, false, false, false, false, false),
+    );
+    try std.testing.expectEqualStrings(
+        "Enter search · ↑/↓ history",
+        formatHomeFooter(.query, false, false, false, false, true),
+    );
+    try std.testing.expectEqualStrings(
+        "Enter search · Tab results",
+        formatHomeFooter(.query, false, false, true, false, false),
+    );
+    try std.testing.expectEqualStrings(
+        "Enter search · Tab downloads",
+        formatHomeFooter(.query, false, false, false, true, false),
+    );
+}
+
+test "home footer reflects active search panes" {
+    try std.testing.expectEqualStrings(
+        "Searching · edit cancels",
+        formatHomeFooter(.query, true, false, false, false, true),
+    );
+    try std.testing.expectEqualStrings(
+        "Searching · edit cancels · Tab downloads",
+        formatHomeFooter(.query, true, false, false, true, false),
+    );
+    try std.testing.expectEqualStrings(
+        "↑/↓ select · Enter open · Tab query/downloads",
+        formatHomeFooter(.results, true, false, true, true, false),
+    );
+    try std.testing.expectEqualStrings(
+        "Finishing canceled searches · Enter retries when cleanup completes",
+        formatHomeFooter(.query, false, true, false, false, false),
+    );
 }
 
 fn formatHomeEmptyResultMessage(buf: []u8, bundle: *const SearchBundle, query_dirty: bool) []const u8 {
