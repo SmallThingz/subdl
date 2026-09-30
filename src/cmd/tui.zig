@@ -945,35 +945,13 @@ fn runTui(ui: *Ui) !void {
                     }
                     if (mouse.type == .press and mouse.button == .left) {
                         const win = ui.vx.window();
-                        const search_box = homeSearchBoxMetrics(win.width);
                         if (mouse.row >= 0 and mouse.col >= 0) {
                             const row: u16 = @intCast(mouse.row);
                             const col: u16 = @intCast(mouse.col);
-                            if (row == search_box.input_row and
-                                col >= search_box.input_col and
-                                col < search_box.input_col + search_box.input_width)
-                            {
+                            if (homeQueryCursorForClick(win, query.items, cursor_pos, row, col)) |new_cursor| {
                                 focus = .query;
                                 resetHistoryBrowse(&history_pick, &history_draft, &history_draft_cursor);
-                                const viewport = queryViewportForCursor(
-                                    win,
-                                    query.items,
-                                    cursor_pos,
-                                    search_box.input_width,
-                                );
-                                var target_col: usize = @intCast(col - search_box.input_col);
-                                if (viewport.start > 0) {
-                                    if (target_col == 0) {
-                                        cursor_pos = viewport.start;
-                                        continue;
-                                    }
-                                    target_col -= 1;
-                                }
-                                cursor_pos = viewport.start + queryCursorByteOffsetForDisplayColumn(
-                                    win,
-                                    query.items[viewport.start..],
-                                    target_col,
-                                );
+                                cursor_pos = new_cursor;
                                 continue;
                             }
                         }
@@ -2122,6 +2100,17 @@ fn executeQuerySearchIncremental(
                     if (info_open.*) {
                         if (mouse.type == .press) info_open.* = false;
                         continue;
+                    }
+                    if (mouse.type == .press and mouse.button == .left and mouse.row >= 0 and mouse.col >= 0) {
+                        const win = ui.vx.window();
+                        const row: u16 = @intCast(mouse.row);
+                        const col: u16 = @intCast(mouse.col);
+                        if (homeQueryCursorForClick(win, query.items, cursor_pos.*, row, col)) |new_cursor| {
+                            cursor_pos.* = new_cursor;
+                            active_focus = .query;
+                            focus_explicit = true;
+                            continue;
+                        }
                     }
                     if (mouseWheelDelta(mouse)) |delta| {
                         wheel_delta += delta;
@@ -3818,6 +3807,78 @@ fn homeSearchBoxMetrics(win_width: u16) HomeSearchBoxMetrics {
         .input_col = x + 2,
         .input_width = if (width > 4) width - 4 else 0,
     };
+}
+
+fn homeQueryCursorForClick(
+    win: anytype,
+    query: []const u8,
+    cursor_pos: usize,
+    row: u16,
+    col: u16,
+) ?usize {
+    const search_box = homeSearchBoxMetrics(win.width);
+    if (row != search_box.input_row or
+        col < search_box.input_col or
+        col >= search_box.input_col + search_box.input_width)
+    {
+        return null;
+    }
+
+    const viewport = queryViewportForCursor(
+        win,
+        query,
+        cursor_pos,
+        search_box.input_width,
+    );
+    var target_col: usize = @intCast(col - search_box.input_col);
+    if (viewport.start > 0) {
+        if (target_col == 0) return viewport.start;
+        target_col -= 1;
+    }
+    return viewport.start + queryCursorByteOffsetForDisplayColumn(
+        win,
+        query[viewport.start..],
+        target_col,
+    );
+}
+
+test "home query click focuses only the input row and preserves utf8 boundaries" {
+    const FakeWin = struct {
+        width: u16 = 100,
+
+        pub fn gwidth(_: @This(), text: []const u8) usize {
+            return std.unicode.utf8CountCodepoints(text) catch text.len;
+        }
+    };
+
+    const win = FakeWin{};
+    const metrics = homeSearchBoxMetrics(win.width);
+    const query = "aé界z";
+
+    try std.testing.expectEqual(
+        @as(?usize, 3),
+        homeQueryCursorForClick(
+            win,
+            query,
+            query.len,
+            metrics.input_row,
+            metrics.input_col + 2,
+        ),
+    );
+    try std.testing.expect(homeQueryCursorForClick(
+        win,
+        query,
+        query.len,
+        metrics.input_row + 1,
+        metrics.input_col + 2,
+    ) == null);
+    try std.testing.expect(homeQueryCursorForClick(
+        win,
+        query,
+        query.len,
+        metrics.input_row,
+        metrics.input_col -| 1,
+    ) == null);
 }
 
 fn homeListBottom(height: u16) u16 {
