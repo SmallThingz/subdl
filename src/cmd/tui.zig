@@ -413,6 +413,16 @@ const Ui = struct {
         return self.tty.writer();
     }
 
+    fn hardQuit(self: *Ui) noreturn {
+        // Ctrl+D is an explicit process quit, not a graceful "back" action.
+        // Restore all terminal modes first, then let the OS reclaim any
+        // outstanding provider work instead of waiting on slow cancellation.
+        self.loop.stop();
+        self.vx.deinit(null, self.writer());
+        self.tty.deinit();
+        std.process.exit(0);
+    }
+
     fn resize(self: *Ui, ws: vaxis.Winsize) !void {
         try self.vx.resize(self.allocator, self.writer(), ws);
     }
@@ -539,8 +549,8 @@ pub fn main(init: std.process.Init) !void {
         defer ui.awaitSearchReapers();
         {
             // Restore the user's terminal before waiting for any slow provider
-            // cancellation reapers. Cleanup remains deterministic, but a quit
-            // no longer appears frozen inside the alternate-screen UI.
+            // cancellation reapers. Cleanup remains deterministic for normal
+            // back/cancel flows.
             defer vx.exitAltScreen(tty.writer()) catch {};
             defer vx.setMouseMode(tty.writer(), false) catch {};
             defer loop.stop();
@@ -699,7 +709,7 @@ fn waitForFetch(ui: *Ui, done: *const std.atomic.Value(u8), title: []const u8, d
                         continue;
                     }
                     if (key.matches('d', .{ .ctrl = true })) {
-                        return .quit;
+                        ui.hardQuit();
                     }
                     if (key.matches('c', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
                         return .canceled;
@@ -761,7 +771,7 @@ fn waitForDownloadTask(ui: *Ui, task: *const DownloadTask, title: []const u8, de
                         continue;
                     }
                     if (key.matches('d', .{ .ctrl = true })) {
-                        return .quit;
+                        ui.hardQuit();
                     }
                     if (key.matches('c', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
                         return .canceled;
@@ -954,10 +964,7 @@ fn runTui(ui: *Ui) !void {
                     if (key.matches(vaxis.Key.escape, .{})) {
                         const current_query_norm = normalizeQueryView(query.items);
                         const current_query_dirty = !std.mem.eql(u8, current_query_norm, last_searched_norm);
-                        const search_settings_changed = editSettingsPopup(ui, &state, query.items, cursor_pos, focus, current_query_dirty, if (results) |*b| b else null, &selected_result, &result_scroll, &selected_download, &download_scroll, &info_open) catch |err| switch (err) {
-                            error.TuiQuit => return,
-                            else => return err,
-                        };
+                        const search_settings_changed = try editSettingsPopup(ui, &state, query.items, cursor_pos, focus, current_query_dirty, if (results) |*b| b else null, &selected_result, &result_scroll, &selected_download, &download_scroll, &info_open);
                         if (search_settings_changed) {
                             if (results) |*bundle| bundle.deinit(ui.allocator);
                             results = null;
@@ -2670,7 +2677,7 @@ fn executeQuerySearchIncremental(
                 .key_press => |key| {
                     if (key.isModifier()) continue;
                     if (key.matches('d', .{ .ctrl = true })) {
-                        return error.TuiQuit;
+                        ui.hardQuit();
                     }
                     if (key.matches('c', .{ .ctrl = true })) {
                         bundle.searching = false;
@@ -2761,6 +2768,9 @@ fn executeQuerySearchIncremental(
                                 };
                             },
                             .quit => {
+                                if (ui.reapSearchWork(search_work)) {
+                                    search_work_owned = false;
+                                }
                                 return error.TuiQuit;
                             },
                         }
@@ -3283,7 +3293,7 @@ fn editSettingsPopup(
                     }
                     if (key.matches('d', .{ .ctrl = true })) {
                         if (settings_dirty) try saveTuiSettingsState(ui.allocator, state);
-                        return error.TuiQuit;
+                        ui.hardQuit();
                     }
                     if (key.matches('c', .{ .ctrl = true })) {
                         if (settings_dirty) try saveTuiSettingsState(ui.allocator, state);
@@ -5497,7 +5507,7 @@ const KeyAction = enum {
 
 fn handleGlobalKey(ui: *Ui, key: vaxis.Key) KeyAction {
     if (key.isModifier()) return .consumed;
-    if (key.matches('d', .{ .ctrl = true })) return .quit;
+    if (key.matches('d', .{ .ctrl = true })) ui.hardQuit();
     if (key.matches('c', .{ .ctrl = true })) return .to_query;
     if (key.matches(vaxis.Key.f2, .{})) {
         ui.toggleConfirm();
