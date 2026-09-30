@@ -3690,11 +3690,11 @@ fn renderQueryHome(
         if (bundle.searching) switch (focus) {
             .query => if (visible_order) |order|
                 if (order.len > 0)
-                    "Search running · edit query to restart · Tab results"
+                    "Searching · edit cancels · Tab results"
                 else
-                    "Search running · edit query to restart"
+                    "Searching · edit cancels"
             else
-                "Search running · edit query to restart",
+                "Searching · edit cancels",
             .results => "↑/↓ select · Enter open · Tab query",
             .downloads => "↑/↓ select · Enter export · Tab focus",
         } else switch (focus) {
@@ -3710,7 +3710,7 @@ fn renderQueryHome(
     try renderCompactBottomLine(ui, win, footer);
 
     if (info_open) {
-        const lines = [_][]const u8{
+        const default_lines = [_][]const u8{
             "Enter search/open",
             "Tab query/results/downloads",
             "Up/Down move through history or results",
@@ -3718,7 +3718,28 @@ fn renderQueryHome(
             "Esc settings",
             "Ctrl+C cancel/back, Ctrl+D quit",
         };
-        try renderOverlayMenu(ui, win, "Info", &lines);
+        const active_query_lines = [_][]const u8{
+            "Search running",
+            "Editing cancels stale search",
+            "Left/Right/Home/End move query cursor",
+            if (visible_order) |order| if (order.len > 0) "Tab results • Esc settings" else "Esc settings" else "Esc settings",
+            "Ctrl+C cancel • Ctrl+D quit",
+        };
+        const active_result_lines = [_][]const u8{
+            "Search running",
+            "Up/Down/Page select results",
+            "Enter open • Tab query",
+            "Esc settings",
+            "Ctrl+C cancel • Ctrl+D quit",
+        };
+        const lines: []const []const u8 = if (results) |bundle|
+            if (bundle.searching)
+                if (focus == .results) &active_result_lines else &active_query_lines
+            else
+                &default_lines
+        else
+            &default_lines;
+        try renderOverlayMenu(ui, win, "Info", lines);
     }
 
     if (flush) try ui.render();
@@ -5805,9 +5826,7 @@ fn readBracketedPaste(ui: *Ui) !EventBatch {
             .winsize => |ws| try ui.resize(ws),
             .key_press => |key| {
                 if (key.text) |text| {
-                    if (pasted.items.len + text.len <= max_bracketed_paste_bytes) {
-                        try pasted.appendSlice(allocator, text);
-                    }
+                    try appendBoundedPasteChunk(allocator, &pasted, text, max_bracketed_paste_bytes);
                     continue;
                 }
                 if (key.matches(vaxis.Key.enter, .{}) or
@@ -5822,9 +5841,7 @@ fn readBracketedPaste(ui: *Ui) !EventBatch {
                 }
             },
             .paste => |text| {
-                if (pasted.items.len + text.len <= max_bracketed_paste_bytes) {
-                    try pasted.appendSlice(allocator, text);
-                }
+                try appendBoundedPasteChunk(allocator, &pasted, text, max_bracketed_paste_bytes);
             },
             else => {},
         }
@@ -5833,6 +5850,34 @@ fn readBracketedPaste(ui: *Ui) !EventBatch {
     var batch: EventBatch = .{};
     batch.append(.{ .paste = pasted.items });
     return batch;
+}
+
+fn appendBoundedPasteChunk(
+    allocator: std.mem.Allocator,
+    dest: *std.ArrayListUnmanaged(u8),
+    text: []const u8,
+    max_bytes: usize,
+) !void {
+    if (text.len == 0 or dest.items.len >= max_bytes) return;
+    const remaining = max_bytes - dest.items.len;
+    var take = @min(text.len, remaining);
+    if (take < text.len) {
+        while (take > 0 and (text[take] & 0b1100_0000) == 0b1000_0000) take -= 1;
+    }
+    if (take > 0) try dest.appendSlice(allocator, text[0..take]);
+}
+
+test "bounded bracketed paste keeps a safe prefix instead of dropping oversized chunks" {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+
+    try appendBoundedPasteChunk(std.testing.allocator, &out, "abcdefgh", 5);
+    try std.testing.expectEqualStrings("abcde", out.items);
+
+    out.clearRetainingCapacity();
+    try appendBoundedPasteChunk(std.testing.allocator, &out, "abc界z", 5);
+    try std.testing.expectEqualStrings("abc", out.items);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out.items));
 }
 
 fn eventWheelDelta(event: Event) ?i32 {
