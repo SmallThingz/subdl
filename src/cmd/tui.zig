@@ -5924,15 +5924,26 @@ fn vaxisSelectSubtitle(
 }
 
 fn vaxisConfirm(ui: *Ui, title: []const u8, lines: []const []const u8) !ConfirmResult {
+    const owned_title = try ui.allocator.dupe(u8, title);
+    defer ui.allocator.free(owned_title);
+    const owned_lines = try ui.allocator.alloc([]u8, lines.len);
+    var initialized: usize = 0;
+    errdefer freeInitializedStrings(ui.allocator, owned_lines, initialized);
+    for (lines, 0..) |line, idx| {
+        owned_lines[idx] = try ui.allocator.dupe(u8, line);
+        initialized += 1;
+    }
+    defer freeOwnedStrings(ui.allocator, owned_lines);
+
     while (true) {
         const win = ui.vx.window();
         win.clear();
         win.hideCursor();
 
-        try renderTopBar(ui, win, .{ .title = title });
+        try renderTopBar(ui, win, .{ .title = owned_title });
 
         var row: u16 = 2;
-        for (lines) |line| {
+        for (owned_lines) |line| {
             const segs = [_]vaxis.Segment{.{ .text = line }};
             _ = win.print(&segs, .{ .row_offset = row, .col_offset = 1, .wrap = .none });
             row += 1;
