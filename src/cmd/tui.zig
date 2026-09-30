@@ -891,6 +891,7 @@ fn runTui(ui: *Ui) !void {
 
     while (true) {
         ui.provider_enabled = state.settings.providers_enabled;
+        if (info_open and !canRenderOverlayMenu(ui.vx.window())) info_open = false;
         focus = normalizeQueryFocus(
             focus,
             results != null and results.?.hits.items.len > 0,
@@ -954,12 +955,16 @@ fn runTui(ui: *Ui) !void {
                     if (info_open) {
                         if (key.matches(vaxis.Key.escape, .{}) or key.matches(vaxis.Key.f1, .{})) {
                             info_open = false;
+                            continue;
                         }
-                        continue;
+                        // Help is informational, not a modal dialog. Dismiss it
+                        // on the next actionable key and process that same key
+                        // so typing/navigation is never swallowed.
+                        info_open = false;
                     }
 
                     if (key.matches(vaxis.Key.f1, .{})) {
-                        info_open = true;
+                        if (canRenderOverlayMenu(ui.vx.window())) info_open = true;
                         continue;
                     }
                     if (key.matches(vaxis.Key.tab, .{})) {
@@ -2697,6 +2702,13 @@ fn executeQuerySearchIncremental(
                             .mark_query_dirty = true,
                         };
                     }
+                    if (info_open.*) {
+                        if (key.matches(vaxis.Key.escape, .{}) or key.matches(vaxis.Key.f1, .{})) {
+                            info_open.* = false;
+                            continue;
+                        }
+                        info_open.* = false;
+                    }
                     if (key.matches(vaxis.Key.escape, .{})) {
                         const search_settings_changed = try editSettingsPopup(
                             ui,
@@ -2727,7 +2739,7 @@ fn executeQuerySearchIncremental(
                         continue;
                     }
                     if (key.matches(vaxis.Key.f1, .{})) {
-                        info_open.* = !info_open.*;
+                        if (canRenderOverlayMenu(ui.vx.window())) info_open.* = !info_open.*;
                         continue;
                     }
                     if (bundle.display_order.len > 0 and key.matches(vaxis.Key.down, .{})) {
@@ -4770,6 +4782,7 @@ fn vaxisSelect(
 
     while (true) {
         const win = ui.vx.window();
+        if (info_menu_open and !canRenderOverlayMenu(win)) info_menu_open = false;
         win.clear();
         win.hideCursor();
 
@@ -4903,7 +4916,7 @@ fn vaxisSelect(
                         .quit => return .quit,
                     }
                     if (key.matches(vaxis.Key.f1, .{}) or key.matches('m', .{}) or key.matches('?', .{})) {
-                        info_menu_open = !info_menu_open;
+                        if (canRenderOverlayMenu(ui.vx.window())) info_menu_open = !info_menu_open;
                         continue;
                     }
                     if (info_menu_open and key.matches(vaxis.Key.escape, .{})) {
@@ -5068,6 +5081,7 @@ fn vaxisSelectSubtitle(
 
     while (true) {
         const win = ui.vx.window();
+        if (info_menu_open and !canRenderOverlayMenu(win)) info_menu_open = false;
         win.clear();
         win.hideCursor();
 
@@ -5199,7 +5213,7 @@ fn vaxisSelectSubtitle(
                         .quit => return .quit,
                     }
                     if (key.matches(vaxis.Key.f1, .{}) or key.matches('m', .{}) or key.matches('?', .{})) {
-                        info_menu_open = !info_menu_open;
+                        if (canRenderOverlayMenu(ui.vx.window())) info_menu_open = !info_menu_open;
                         continue;
                     }
                     if (info_menu_open and key.matches(vaxis.Key.escape, .{})) {
@@ -5504,7 +5518,7 @@ fn frameRepeatByte(ui: *Ui, byte: u8, count: usize) ![]const u8 {
 }
 
 fn renderOverlayMenu(ui: *Ui, win: anytype, title: []const u8, lines: []const []const u8) !void {
-    if (win.width < 20 or win.height < 8) return;
+    if (!canRenderOverlayMenu(win)) return;
 
     const max_box_w: u16 = @min(win.width - 2, 80);
     if (max_box_w < 12) return;
@@ -5527,6 +5541,17 @@ fn renderOverlayMenu(ui: *Ui, win: anytype, title: []const u8, lines: []const []
     }) {
         try printFitted(ui, win, line_row, x0 + 1, lines[i], ui.styleMuted(), inner_w);
     }
+}
+
+fn canRenderOverlayMenu(win: anytype) bool {
+    return win.width >= 20 and win.height >= 8;
+}
+
+test "overlay menu requires enough terminal space" {
+    const Tiny = struct { width: u16, height: u16 };
+    try std.testing.expect(!canRenderOverlayMenu(Tiny{ .width = 19, .height = 8 }));
+    try std.testing.expect(!canRenderOverlayMenu(Tiny{ .width = 20, .height = 7 }));
+    try std.testing.expect(canRenderOverlayMenu(Tiny{ .width = 20, .height = 8 }));
 }
 
 const KeyAction = enum {
