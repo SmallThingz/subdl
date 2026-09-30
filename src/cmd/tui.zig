@@ -967,10 +967,24 @@ fn runTui(ui: *Ui) !void {
                             {
                                 focus = .query;
                                 history_pick = null;
-                                cursor_pos = queryCursorByteOffsetForDisplayColumn(
+                                const viewport = queryViewportForCursor(
                                     win,
                                     query.items,
-                                    @intCast(col - search_box.input_col),
+                                    cursor_pos,
+                                    search_box.input_width,
+                                );
+                                var target_col: usize = @intCast(col - search_box.input_col);
+                                if (viewport.start > 0) {
+                                    if (target_col == 0) {
+                                        cursor_pos = viewport.start;
+                                        continue;
+                                    }
+                                    target_col -= 1;
+                                }
+                                cursor_pos = viewport.start + queryCursorByteOffsetForDisplayColumn(
+                                    win,
+                                    query.items[viewport.start..],
+                                    target_col,
                                 );
                                 continue;
                             }
@@ -3876,13 +3890,28 @@ fn renderQueryHome(
     const border_style = if (query_dirty) ui.styleWarn() else if (focus == .query) ui.styleAccent() else ui.styleMuted();
     try renderBox(ui, win, box_x, box_y, box_w, 3, border_style);
     try printFitted(ui, win, box_y, box_x + 2, " Search ", border_style, 10);
-    const query_text = if (query.len == 0) "Search films and series" else query;
+    const input_width: usize = search_box.input_width;
     const query_style = if (query.len == 0) ui.styleMuted() else vaxis.Style{ .bold = true };
-    try printFitted(ui, win, box_y + 1, box_x + 2, query_text, query_style, if (box_w > 4) @intCast(box_w - 4) else 0);
+    const viewport = queryViewportForCursor(win, query, cursor_pos, input_width);
+    if (query.len == 0) {
+        try printFitted(ui, win, search_box.input_row, search_box.input_col, "Search films and series", query_style, input_width);
+    } else if (viewport.start > 0 and input_width > 0) {
+        try printFitted(ui, win, search_box.input_row, search_box.input_col, "‹", ui.styleMuted(), 1);
+        try printFitted(
+            ui,
+            win,
+            search_box.input_row,
+            search_box.input_col + 1,
+            query[viewport.start..],
+            query_style,
+            input_width -| 1,
+        );
+    } else {
+        try printFitted(ui, win, search_box.input_row, search_box.input_col, query, query_style, input_width);
+    }
     if (focus == .query and win.width > 0) {
-        const before = query[0..@min(cursor_pos, query.len)];
-        const col = box_x + 2 + @as(u16, @intCast(@min(win.gwidth(before), if (box_w > 4) box_w - 4 else 0)));
-        win.showCursor(@min(col, win.width -| 1), box_y + 1);
+        const col = search_box.input_col + @as(u16, @intCast(@min(viewport.cursor_col, input_width)));
+        win.showCursor(@min(col, win.width -| 1), search_box.input_row);
     }
 
     const list_top = box_y + 3;
@@ -6351,6 +6380,33 @@ fn queryCursorByteOffsetForDisplayColumn(win: anytype, text: []const u8, column:
     return text.len;
 }
 
+const QueryViewport = struct {
+    start: usize,
+    cursor_col: usize,
+};
+
+fn queryViewportForCursor(win: anytype, text: []const u8, cursor_pos: usize, max_width: usize) QueryViewport {
+    const cursor = @min(cursor_pos, text.len);
+    if (max_width == 0 or text.len == 0) return .{ .start = 0, .cursor_col = 0 };
+
+    const prefix_width: usize = @intCast(win.gwidth(text[0..cursor]));
+    if (prefix_width <= max_width) return .{ .start = 0, .cursor_col = prefix_width };
+
+    const content_width = max_width -| 1;
+    var start = cursor;
+    while (start > 0) {
+        const prev = prevCodepointStart(text, start);
+        const width: usize = @intCast(win.gwidth(text[prev..cursor]));
+        if (width > content_width) break;
+        start = prev;
+    }
+    const visible_prefix_width: usize = @intCast(win.gwidth(text[start..cursor]));
+    return .{
+        .start = start,
+        .cursor_col = 1 + @min(visible_prefix_width, content_width),
+    };
+}
+
 test "utf8PrefixForDisplayWidth does not split utf8 sequences" {
     const FakeWin = struct {
         pub fn gwidth(_: @This(), s: []const u8) usize {
@@ -6383,6 +6439,38 @@ test "query mouse cursor placement stays on utf8 boundaries" {
     try std.testing.expectEqual(@as(usize, 3), queryCursorByteOffsetForDisplayColumn(win, text, 2));
     try std.testing.expectEqual(@as(usize, 6), queryCursorByteOffsetForDisplayColumn(win, text, 3));
     try std.testing.expectEqual(text.len, queryCursorByteOffsetForDisplayColumn(win, text, 99));
+}
+
+test "query viewport follows cursor without splitting utf8" {
+    const FakeWin = struct {
+        pub fn gwidth(_: @This(), s: []const u8) usize {
+            return std.unicode.utf8CountCodepoints(s) catch s.len;
+        }
+    };
+
+    const win = FakeWin{};
+    const ascii = "abcdefghij";
+    const tail = queryViewportForCursor(win, ascii, ascii.len, 5);
+    try std.testing.expectEqual(@as(usize, 6), tail.start);
+    try std.testing.expectEqual(@as(usize, 5), tail.cursor_col);
+    try std.testing.expectEqualStrings("ghij", ascii[tail.start..]);
+
+    const WideFakeWin = struct {
+        pub fn gwidth(_: @This(), s: []const u8) usize {
+            var view = std.unicode.Utf8View.init(s) catch return s.len;
+            var it = view.iterator();
+            var width: usize = 0;
+            while (it.nextCodepoint()) |cp| width += if (cp == '界') 2 else 1;
+            return width;
+        }
+    };
+
+    const unicode = "aé界z";
+    const after_cjk = "aé界".len;
+    const viewport = queryViewportForCursor(WideFakeWin{}, unicode, after_cjk, 3);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(unicode[viewport.start..]));
+    try std.testing.expectEqual(@as(usize, 3), viewport.cursor_col);
+    try std.testing.expectEqualStrings("界z", unicode[viewport.start..]);
 }
 
 test "sanitizeUtf8ForDisplay escapes invalid bytes" {
