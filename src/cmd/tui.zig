@@ -4211,11 +4211,13 @@ fn singleEnabledIndex(flags: []const bool) ?usize {
 }
 
 fn exportCachedDownload(ui: *Ui, result: app.DownloadResult) !MessageResult {
-    const files = if (result.extracted_files.len > 0) result.extracted_files else blk: {
+    const raw_files = if (result.extracted_files.len > 0) result.extracted_files else blk: {
         const one = try ui.frameAllocator().alloc([]const u8, 1);
         one[0] = result.file_path;
         break :blk one;
     };
+    const files = try cachedDownloadCandidateFiles(ui.allocator, raw_files);
+    defer ui.allocator.free(files);
 
     const labels = try buildCachedDownloadLabels(ui.allocator, files);
     defer ui.allocator.free(labels);
@@ -4243,6 +4245,62 @@ fn exportCachedDownload(ui: *Ui, result: app.DownloadResult) !MessageResult {
             .quit => return .quit,
         }
     }
+}
+
+fn cachedDownloadCandidateFiles(
+    allocator: std.mem.Allocator,
+    files: []const []const u8,
+) ![][]const u8 {
+    var subtitle_count: usize = 0;
+    for (files) |path| {
+        if (isLikelySubtitlePath(path)) subtitle_count += 1;
+    }
+
+    const out_len = if (subtitle_count > 0) subtitle_count else files.len;
+    const out = try allocator.alloc([]const u8, out_len);
+    var out_idx: usize = 0;
+    for (files) |path| {
+        if (subtitle_count > 0 and !isLikelySubtitlePath(path)) continue;
+        out[out_idx] = path;
+        out_idx += 1;
+    }
+    return out;
+}
+
+fn isLikelySubtitlePath(path: []const u8) bool {
+    const name = pathBaseName(path);
+    const extensions = [_][]const u8{
+        ".srt",  ".ass",  ".ssa", ".sub", ".vtt", ".smi", ".sami",
+        ".ttml", ".dfxp", ".sbv", ".mpl", ".sup", ".idx",
+    };
+    for (extensions) |ext| {
+        if (std.ascii.endsWithIgnoreCase(name, ext)) return true;
+    }
+    return false;
+}
+
+test "cached download candidates prefer subtitle files but retain fallback payloads" {
+    const mixed = [_][]const u8{
+        "/cache/movie/subtitle.srt",
+        "/cache/movie/README.txt",
+        "/cache/movie/cover.jpg",
+        "/cache/movie/signs.ASS",
+    };
+    const subtitles = try cachedDownloadCandidateFiles(std.testing.allocator, &mixed);
+    defer std.testing.allocator.free(subtitles);
+    try std.testing.expectEqual(@as(usize, 2), subtitles.len);
+    try std.testing.expectEqualStrings(mixed[0], subtitles[0]);
+    try std.testing.expectEqualStrings(mixed[3], subtitles[1]);
+
+    const fallback = [_][]const u8{
+        "/cache/movie/README.txt",
+        "/cache/movie/unknown.bin",
+    };
+    const all = try cachedDownloadCandidateFiles(std.testing.allocator, &fallback);
+    defer std.testing.allocator.free(all);
+    try std.testing.expectEqual(@as(usize, fallback.len), all.len);
+    try std.testing.expectEqualStrings(fallback[0], all[0]);
+    try std.testing.expectEqualStrings(fallback[1], all[1]);
 }
 
 fn buildCachedDownloadLabels(allocator: std.mem.Allocator, files: []const []const u8) ![][]const u8 {
