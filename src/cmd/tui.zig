@@ -3319,6 +3319,57 @@ fn settingsPageSize(metrics: SettingsPopupMetrics) usize {
     return if (metrics.row_end > metrics.row_start) @intCast(metrics.row_end - metrics.row_start) else 1;
 }
 
+fn activateSettingsMainRow(
+    ui: *Ui,
+    state: *TuiRuntimeState,
+    selected: usize,
+    panel: *SettingsPanel,
+    ttl_input: *std.ArrayList(u8),
+    ttl_cursor: *usize,
+    ttl_error: *?[]const u8,
+    redraw_background: *bool,
+) !void {
+    var persist_settings = false;
+    var apply_cache_settings = false;
+    switch (selected) {
+        0 => panel.* = .providers,
+        1 => panel.* = .languages,
+        2 => {
+            state.settings.cache_enabled = !state.settings.cache_enabled;
+            persist_settings = true;
+            apply_cache_settings = true;
+        },
+        3 => {
+            ttl_input.clearRetainingCapacity();
+            const text = try cacheTtlInputText(ui.allocator, state.settings.cache_ttl_seconds);
+            defer ui.allocator.free(text);
+            try ttl_input.appendSlice(ui.allocator, text);
+            ttl_cursor.* = ttl_input.items.len;
+            ttl_error.* = null;
+            panel.* = .cache_ttl;
+        },
+        4 => {
+            state.settings.download_cache_enabled = !state.settings.download_cache_enabled;
+            persist_settings = true;
+        },
+        5 => {
+            state.settings.keyword_cache_enabled = !state.settings.keyword_cache_enabled;
+            persist_settings = true;
+        },
+        6 => {
+            state.keywords.clearRetainingCapacity();
+            try saveKeywordRuntimeState(ui.allocator, state);
+            redraw_background.* = true;
+        },
+        else => {},
+    }
+    if (apply_cache_settings) applyRuntimeCacheSettings(state);
+    if (persist_settings) {
+        try saveTuiSettingsState(ui.allocator, state);
+        redraw_background.* = true;
+    }
+}
+
 fn editSettingsPopup(
     ui: *Ui,
     state: *TuiRuntimeState,
@@ -3377,7 +3428,7 @@ fn editSettingsPopup(
                 .cache_ttl => "Cache retention",
             };
             const primary_help = switch (panel) {
-                .main => "Enter opens or toggles the highlighted setting",
+                .main => "Enter or a second click opens/toggles the highlighted setting",
                 .providers => "Enter/Space toggles the highlighted provider",
                 .languages => "Enter/Space chooses the highlighted language",
                 .cache_ttl => "Type hours; Enter saves the retention value",
@@ -3421,7 +3472,22 @@ fn editSettingsPopup(
                                 .wheel_down => scrollSelection(&main_selected, item_count, .forward, 1),
                                 .wheel_up => scrollSelection(&main_selected, item_count, .backward, 1),
                                 .left => {
-                                    if (mouseRowIndex(mouse, metrics_now.row_start, metrics_now.row_end, 0, item_count)) |idx| main_selected = idx;
+                                    if (mouseRowIndex(mouse, metrics_now.row_start, metrics_now.row_end, 0, item_count)) |idx| {
+                                        const activate = idx == main_selected;
+                                        main_selected = idx;
+                                        if (activate) {
+                                            try activateSettingsMainRow(
+                                                ui,
+                                                state,
+                                                main_selected,
+                                                &panel,
+                                                &ttl_input,
+                                                &ttl_cursor,
+                                                &ttl_error,
+                                                &redraw_background,
+                                            );
+                                        }
+                                    }
                                 },
                                 else => {},
                             }
@@ -3522,44 +3588,16 @@ fn editSettingsPopup(
                                 continue;
                             }
                             if (!key.matches(vaxis.Key.enter, .{})) continue;
-                            var persist_settings = false;
-                            var apply_cache_settings = false;
-                            switch (settingsMainAction(state.settings, main_selected)) {
-                                0 => panel = .providers,
-                                1 => panel = .languages,
-                                2 => {
-                                    state.settings.cache_enabled = !state.settings.cache_enabled;
-                                    persist_settings = true;
-                                    apply_cache_settings = true;
-                                },
-                                3 => {
-                                    ttl_input.clearRetainingCapacity();
-                                    const text = try cacheTtlInputText(ui.allocator, state.settings.cache_ttl_seconds);
-                                    defer ui.allocator.free(text);
-                                    try ttl_input.appendSlice(ui.allocator, text);
-                                    ttl_cursor = ttl_input.items.len;
-                                    ttl_error = null;
-                                    panel = .cache_ttl;
-                                },
-                                4 => {
-                                    state.settings.download_cache_enabled = !state.settings.download_cache_enabled;
-                                    persist_settings = true;
-                                },
-                                5 => {
-                                    state.settings.keyword_cache_enabled = !state.settings.keyword_cache_enabled;
-                                    persist_settings = true;
-                                },
-                                6 => {
-                                    state.keywords.clearRetainingCapacity();
-                                    try saveKeywordRuntimeState(ui.allocator, state);
-                                },
-                                else => {},
-                            }
-                            if (apply_cache_settings) applyRuntimeCacheSettings(state);
-                            if (persist_settings) {
-                                try saveTuiSettingsState(ui.allocator, state);
-                                redraw_background = true;
-                            }
+                            try activateSettingsMainRow(
+                                ui,
+                                state,
+                                main_selected,
+                                &panel,
+                                &ttl_input,
+                                &ttl_cursor,
+                                &ttl_error,
+                                &redraw_background,
+                            );
                         },
                         .providers => {
                             if (key.matches(vaxis.Key.escape, .{})) {
@@ -3792,10 +3830,6 @@ fn renderSettingsPopup(
             win.showCursor(@min(col, win.width -| 1), row_start);
         },
     }
-}
-
-fn settingsMainAction(_: TuiSettings, visible_idx: usize) usize {
-    return visible_idx;
 }
 
 fn primaryLanguageIndex(settings: TuiSettings) ?usize {
