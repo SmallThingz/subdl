@@ -3504,26 +3504,7 @@ fn renderQueryHome(
         ensureVisible(selected_result.*, scroll, page_size);
         if (order.len == 0) {
             var message_buf: [160]u8 = undefined;
-            const message = if (bundle.searching and bundle.pending_count > 0)
-                std.fmt.bufPrint(
-                    &message_buf,
-                    "Searching… {d} provider{s} remaining.",
-                    .{ bundle.pending_count, if (bundle.pending_count == 1) "" else "s" },
-                ) catch "Searching…"
-            else if (bundle.canceled)
-                "Search canceled. Press Enter to search again."
-            else if (query_dirty and bundle.hits.items.len > 0)
-                "Existing results do not match the edited query. Press Enter to search."
-            else if (bundle.failed_count > 0)
-                "No results. Some providers failed; edit the query/settings and search again."
-            else if (bundle.unavailable_count > 0)
-                std.fmt.bufPrint(
-                    &message_buf,
-                    "No results. {d} provider{s} unavailable; retry or adjust providers.",
-                    .{ bundle.unavailable_count, if (bundle.unavailable_count == 1) "" else "s" },
-                ) catch "No results. Providers are currently unavailable."
-            else
-                "No results. Edit the query or provider/language settings and search again.";
+            const message = formatHomeEmptyResultMessage(&message_buf, bundle, query_dirty);
             try printFitted(
                 ui,
                 win,
@@ -3534,7 +3515,7 @@ fn renderQueryHome(
                     ui.styleAccent()
                 else if (bundle.canceled)
                     ui.styleWarn()
-                else if (query_dirty and bundle.hits.items.len > 0)
+                else if (query_dirty)
                     ui.styleMuted()
                 else if (bundle.failed_count > 0)
                     ui.styleWarn()
@@ -3602,6 +3583,44 @@ fn renderQueryHome(
     }
 
     if (flush) try ui.render();
+}
+
+fn formatHomeEmptyResultMessage(buf: []u8, bundle: *const SearchBundle, query_dirty: bool) []const u8 {
+    if (bundle.searching and bundle.pending_count > 0) {
+        return std.fmt.bufPrint(
+            buf,
+            "Searching… {d} provider{s} remaining.",
+            .{ bundle.pending_count, if (bundle.pending_count == 1) "" else "s" },
+        ) catch "Searching…";
+    }
+    if (bundle.canceled) return "Search canceled. Press Enter to search again.";
+    if (query_dirty) return "Query changed. Press Enter to search.";
+    if (bundle.failed_count > 0) {
+        return "No results. Some providers failed; edit the query/settings and search again.";
+    }
+    if (bundle.unavailable_count > 0) {
+        return std.fmt.bufPrint(
+            buf,
+            "No results. {d} provider{s} unavailable; retry or adjust providers.",
+            .{ bundle.unavailable_count, if (bundle.unavailable_count == 1) "" else "s" },
+        ) catch "No results. Providers are currently unavailable.";
+    }
+    return "No results. Edit the query or provider/language settings and search again.";
+}
+
+test "dirty query replaces stale empty-result message" {
+    var bundle: SearchBundle = .{ .query_norm = try std.testing.allocator.dupe(u8, "old query") };
+    defer bundle.deinit(std.testing.allocator);
+    var buf: [160]u8 = undefined;
+
+    try std.testing.expectEqualStrings(
+        "No results. Edit the query or provider/language settings and search again.",
+        formatHomeEmptyResultMessage(&buf, &bundle, false),
+    );
+    try std.testing.expectEqualStrings(
+        "Query changed. Press Enter to search.",
+        formatHomeEmptyResultMessage(&buf, &bundle, true),
+    );
 }
 
 const HomeSearchBoxMetrics = struct {
