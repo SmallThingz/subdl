@@ -2944,10 +2944,19 @@ fn rememberKeyword(allocator: std.mem.Allocator, state: *TuiRuntimeState, query_
         return false;
     }
     const now = scrapers.common.compatUnixTimestamp();
-    for (state.keywords.items) |*entry| {
+    for (state.keywords.items, 0..) |*entry, idx| {
         if (std.mem.eql(u8, entry.query, query_norm)) {
-            entry.used_at_unix = now;
-            entry.use_count +|= 1;
+            var refreshed = entry.*;
+            refreshed.used_at_unix = now;
+            refreshed.use_count +|= 1;
+            // Keep backing order in last-used order too. Timestamps only have
+            // one-second resolution, so rapid searches otherwise tie.
+            if (idx + 1 < state.keywords.items.len) {
+                _ = state.keywords.orderedRemove(idx);
+                try state.keywords.append(allocator, refreshed);
+            } else {
+                entry.* = refreshed;
+            }
             return true;
         }
     }
@@ -3068,11 +3077,62 @@ fn sortedKeywordIndexes(allocator: std.mem.Allocator, keywords: []const KeywordE
     const Ctx = struct { keywords: []const KeywordEntry };
     const less = struct {
         fn f(ctx: Ctx, lhs: usize, rhs: usize) bool {
-            return ctx.keywords[lhs].used_at_unix > ctx.keywords[rhs].used_at_unix;
+            const lhs_time = ctx.keywords[lhs].used_at_unix;
+            const rhs_time = ctx.keywords[rhs].used_at_unix;
+            if (lhs_time != rhs_time) return lhs_time > rhs_time;
+            // Later entries are more recently used when timestamps tie.
+            return lhs > rhs;
         }
     }.f;
     std.mem.sort(usize, order, Ctx{ .keywords = keywords }, less);
     return order;
+}
+
+test "history ordering is deterministic when timestamps tie" {
+    const entries = [_]KeywordEntry{
+        .{ .query = "first", .used_at_unix = 100, .use_count = 1 },
+        .{ .query = "second", .used_at_unix = 100, .use_count = 1 },
+        .{ .query = "third", .used_at_unix = 100, .use_count = 1 },
+    };
+    const order = try sortedKeywordIndexes(std.testing.allocator, &entries);
+    defer std.testing.allocator.free(order);
+    try std.testing.expectEqualSlices(usize, &.{ 2, 1, 0 }, order);
+}
+
+test "reusing a history query moves it to most-recent backing order" {
+    const allocator = std.testing.allocator;
+    var state: TuiRuntimeState = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .settings = defaultTuiSettings(),
+        .state_path = try allocator.dupe(u8, "state.test"),
+        .settings_path = try allocator.dupe(u8, "settings.test"),
+        .keyword_path = try allocator.dupe(u8, "keywords.test"),
+        .cache_root_path = try allocator.dupe(u8, "cache.test"),
+    };
+    defer state.deinit(allocator);
+
+    const a = state.arena.allocator();
+    try state.keywords.append(allocator, .{
+        .query = try a.dupe(u8, "first"),
+        .used_at_unix = 100,
+        .use_count = 1,
+    });
+    try state.keywords.append(allocator, .{
+        .query = try a.dupe(u8, "second"),
+        .used_at_unix = 100,
+        .use_count = 1,
+    });
+    try state.keywords.append(allocator, .{
+        .query = try a.dupe(u8, "third"),
+        .used_at_unix = 100,
+        .use_count = 1,
+    });
+
+    try std.testing.expect(try rememberKeyword(allocator, &state, "first"));
+    try std.testing.expectEqualStrings("second", state.keywords.items[0].query);
+    try std.testing.expectEqualStrings("third", state.keywords.items[1].query);
+    try std.testing.expectEqualStrings("first", state.keywords.items[2].query);
+    try std.testing.expectEqual(@as(u32, 2), state.keywords.items[2].use_count);
 }
 
 test "history navigation restores the original draft" {
