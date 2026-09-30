@@ -412,6 +412,7 @@ const Ui = struct {
     theme_index: usize = 0,
     skip_confirm: bool = false,
     preferences_path: []const u8 = "",
+    preferences_save_error: ?anyerror = null,
     context_line: ?[]const u8 = null,
     context_owned: ?[]u8 = null,
     search_reapers: std.ArrayListUnmanaged(SearchReaperEntry) = .empty,
@@ -499,12 +500,20 @@ const Ui = struct {
 
     fn toggleTheme(self: *Ui) void {
         self.theme_index = (self.theme_index + 1) % themes.len;
-        saveUiPreferences(self.allocator, self.preferences_path, self.theme_index, self.skip_confirm) catch {};
+        self.persistPreferences();
     }
 
     fn toggleConfirm(self: *Ui) void {
         self.skip_confirm = !self.skip_confirm;
-        saveUiPreferences(self.allocator, self.preferences_path, self.theme_index, self.skip_confirm) catch {};
+        self.persistPreferences();
+    }
+
+    fn persistPreferences(self: *Ui) void {
+        saveUiPreferences(self.allocator, self.preferences_path, self.theme_index, self.skip_confirm) catch |err| {
+            self.preferences_save_error = err;
+            return;
+        };
+        self.preferences_save_error = null;
     }
 
     fn styleTitle(self: *Ui) vaxis.Style {
@@ -5709,15 +5718,27 @@ fn renderCompactBottomLine(ui: *Ui, win: anytype, left: []const u8) !void {
     if (width == 0) return;
 
     const confirm_text = if (ui.skip_confirm) "off" else "on";
-    const status = try frameFmt(
-        ui,
-        "{s}:{s} {s}:{s} {s}",
-        .{ BarLayout.confirm_key, confirm_text, BarLayout.theme_key, ui.theme().name, BarLayout.quit_hint },
-    );
+    const status = if (ui.preferences_save_error) |err|
+        try frameFmt(
+            ui,
+            "{s}:{s} {s}:{s} PREFS:{s} {s}",
+            .{ BarLayout.confirm_key, confirm_text, BarLayout.theme_key, ui.theme().name, @errorName(err), BarLayout.quit_hint },
+        )
+    else
+        try frameFmt(
+            ui,
+            "{s}:{s} {s}:{s} {s}",
+            .{ BarLayout.confirm_key, confirm_text, BarLayout.theme_key, ui.theme().name, BarLayout.quit_hint },
+        );
+    const status_style = if (ui.preferences_save_error != null) ui.styleWarn() else ui.styleMuted();
     const status_width: usize = @intCast(win.gwidth(status));
     const separator_width: usize = @intCast(win.gwidth(BarLayout.separator));
     if (status_width + separator_width >= width) {
-        try printFitted(ui, win, row, 1, left, ui.styleMuted(), width);
+        if (ui.preferences_save_error != null) {
+            try printFitted(ui, win, row, 1, status, status_style, width);
+        } else {
+            try printFitted(ui, win, row, 1, left, ui.styleMuted(), width);
+        }
         return;
     }
 
@@ -5728,7 +5749,7 @@ fn renderCompactBottomLine(ui: *Ui, win: anytype, left: []const u8) !void {
         const separator_col: u16 = @intCast(@as(usize, status_col) - separator_width);
         try printFitted(ui, win, row, separator_col, BarLayout.separator, ui.styleMuted(), separator_width);
     }
-    try printFitted(ui, win, row, status_col, status, ui.styleMuted(), status_width);
+    try printFitted(ui, win, row, status_col, status, status_style, status_width);
 }
 
 fn frameFmt(ui: *Ui, comptime fmt: []const u8, args: anytype) ![]const u8 {
@@ -7370,6 +7391,47 @@ test "ui preferences persist independently and sanitize invalid themes" {
     });
     try std.testing.expectEqual(@as(u8, 0), stale_version.theme_index);
     try std.testing.expect(!stale_version.skip_confirm);
+}
+
+test "ui preference toggle records and clears persistence failures" {
+    const allocator = std.testing.allocator;
+    const unique = scrapers.common.compatNanoTimestamp();
+    const test_root = try std.fmt.allocPrint(allocator, ".zig-cache/tui-preferences-error-test-{d}", .{unique});
+    defer allocator.free(test_root);
+    defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
+    try std.Io.Dir.cwd().createDirPath(runtime_io.get(), test_root);
+
+    const blocker_path = try std.fmt.allocPrint(allocator, "{s}/blocker", .{test_root});
+    defer allocator.free(blocker_path);
+    {
+        var blocker = try std.Io.Dir.cwd().createFile(runtime_io.get(), blocker_path, .{});
+        defer blocker.close(runtime_io.get());
+    }
+    const bad_path = try std.fmt.allocPrint(allocator, "{s}/ui-preferences.oneserial", .{blocker_path});
+    defer allocator.free(bad_path);
+    const good_path = try std.fmt.allocPrint(allocator, "{s}/ui-preferences.oneserial", .{test_root});
+    defer allocator.free(good_path);
+
+    var ui: Ui = .{
+        .allocator = allocator,
+        .environ_map = undefined,
+        .tty = undefined,
+        .vx = undefined,
+        .loop = undefined,
+        .frame_arena = std.heap.ArenaAllocator.init(allocator),
+        .preferences_path = bad_path,
+    };
+    defer ui.frame_arena.deinit();
+
+    ui.toggleTheme();
+    try std.testing.expectEqual(@as(usize, 1), ui.theme_index);
+    try std.testing.expect(ui.preferences_save_error != null);
+
+    ui.preferences_path = good_path;
+    ui.toggleConfirm();
+    try std.testing.expect(ui.skip_confirm);
+    try std.testing.expect(ui.preferences_save_error == null);
+    try std.testing.expect((try loadPersistentUiPreferences(allocator, good_path)) != null);
 }
 
 test "independent settings override legacy settings embedded in search state" {
