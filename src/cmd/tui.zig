@@ -2497,11 +2497,15 @@ fn formatHomeTopLine(
     download_count: usize,
     maybe_bundle: ?*const SearchBundle,
     visible_result_count: ?usize,
+    help_available: bool,
 ) ![]const u8 {
     var pos: usize = 0;
     const search_tab = if (focus == .downloads) "Search" else "SEARCH";
     const downloads_tab = if (focus == .downloads) "DOWNLOADS" else "Downloads";
-    pos += (try std.fmt.bufPrint(buf[pos..], "F1 Help · Esc Settings · {s}", .{search_tab})).len;
+    pos += if (help_available)
+        (try std.fmt.bufPrint(buf[pos..], "F1 Help · Esc Settings · {s}", .{search_tab})).len
+    else
+        (try std.fmt.bufPrint(buf[pos..], "Esc Settings · {s}", .{search_tab})).len;
     if (download_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {s} {d}", .{ downloads_tab, download_count })).len;
     pos += (try std.fmt.bufPrint(buf[pos..], " · {d}/{d} providers", .{ enabled_provider_count, provider_count })).len;
     if (maybe_bundle) |bundle| {
@@ -2652,7 +2656,7 @@ test "query display order cache reuses stable hit sets and invalidates on change
     try std.testing.expectEqualStrings("blade runner", bundle.display_query_norm.?);
 
     var top_buf: [320]u8 = undefined;
-    const top = try formatHomeTopLine(&top_buf, .query, 1, 1, 0, &bundle, no_match.len);
+    const top = try formatHomeTopLine(&top_buf, .query, 1, 1, 0, &bundle, no_match.len, true);
     try std.testing.expect(std.mem.indexOf(u8, top, "0/3 results") != null);
 }
 
@@ -3619,6 +3623,7 @@ fn renderQueryHome(
         download_count,
         if (query_dirty) null else results,
         if (query_dirty) null else if (visible_order) |order| order.len else null,
+        canRenderOverlayMenu(win),
     );
     try renderCompactTopLine(ui, win, top, ui.styleTitle());
 
@@ -3866,10 +3871,20 @@ test "search progress distinguishes active and queued providers" {
     );
 
     var top_buf: [320]u8 = undefined;
-    const top = try formatHomeTopLine(&top_buf, .query, 38, 38, 0, &bundle, 0);
+    const top = try formatHomeTopLine(&top_buf, .query, 38, 38, 0, &bundle, 0, true);
     try std.testing.expect(std.mem.indexOf(u8, top, "12 active") != null);
     try std.testing.expect(std.mem.indexOf(u8, top, "8 queued") != null);
     try std.testing.expect(std.mem.indexOf(u8, top, "20 pending") == null);
+}
+
+test "home header only advertises help when overlay can render" {
+    var buf: [320]u8 = undefined;
+    const with_help = try formatHomeTopLine(&buf, .query, 1, 1, 0, null, null, true);
+    try std.testing.expect(std.mem.startsWith(u8, with_help, "F1 Help · Esc Settings"));
+
+    const without_help = try formatHomeTopLine(&buf, .query, 1, 1, 0, null, null, false);
+    try std.testing.expect(std.mem.startsWith(u8, without_help, "Esc Settings"));
+    try std.testing.expect(std.mem.indexOf(u8, without_help, "F1 Help") == null);
 }
 
 const HomeSearchBoxMetrics = struct {
@@ -4846,10 +4861,13 @@ fn vaxisSelect(
         const mode_text = if (filter_mode) "FILTER" else "NAV";
         const filter_display = if (filter.items.len == 0) "-" else filter.items;
 
+        const help_available = canRenderOverlayMenu(win);
         const help_line = if (filter_mode)
-            "F1 info · type Enter/Esc BS"
+            if (help_available) "F1 info · type Enter/Esc BS" else "type Enter/Esc BS"
+        else if (help_available)
+            "F1 info · j/k Enter / Esc"
         else
-            "F1 info · j/k Enter / Esc";
+            "j/k Enter / Esc";
 
         var count_buf: [128]u8 = undefined;
         const count_line = std.fmt.bufPrint(&count_buf, "{d}/{d}", .{ matches.items.len, options.len }) catch "?/?";
@@ -5149,14 +5167,17 @@ fn vaxisSelectSubtitle(
         ) catch "s:?";
 
         const can_page = if (page_nav) |pn| pn.enabled else false;
+        const help_available = canRenderOverlayMenu(win);
         const help_line = if (filter_mode)
-            "F1 info · type Enter/Esc BS"
+            if (help_available) "F1 info · type Enter/Esc BS" else "type Enter/Esc BS"
         else if (!has_selectable and matches.items.len > 0)
-            "F1 info · no selectable subtitles · / filter · Esc back"
+            if (help_available) "F1 info · no selectable subtitles · / filter · Esc back" else "no selectable subtitles · / filter · Esc back"
         else if (can_page)
-            "F1 info · j/k Enter s / [ ] Esc"
+            if (help_available) "F1 info · j/k Enter s / [ ] Esc" else "j/k Enter s / [ ] Esc"
+        else if (help_available)
+            "F1 info · j/k Enter s / Esc"
         else
-            "F1 info · j/k Enter s / Esc";
+            "j/k Enter s / Esc";
 
         var count_buf: [128]u8 = undefined;
         const count_line = if (can_page)
