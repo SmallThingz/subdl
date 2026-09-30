@@ -5378,6 +5378,12 @@ fn compactDialogBodyCapacity(layout: CompactDialogLayout) usize {
     return @intCast(end - first);
 }
 
+fn compactInputFieldVisible(layout: CompactDialogLayout, terminal_width: u16, prompt_width: usize) bool {
+    if (layout.secondary_row == null and layout.primary_row == null) return false;
+    const input_col = @min(@as(usize, 1) + prompt_width, @as(usize, terminal_width));
+    return @as(usize, terminal_width) > input_col;
+}
+
 fn confirmationLinesFitWidth(win: anytype, lines: []const []const u8) bool {
     if (lines.len == 0) return true;
     if (win.width <= 2) return false;
@@ -5431,6 +5437,14 @@ test "confirmation lines must be fully visible horizontally" {
         "x",
     }));
     try std.testing.expect(confirmationLinesFitWidth(MockWindow{ .width = 2 }, &.{}));
+}
+
+test "compact input requires a visible editable field" {
+    try std.testing.expect(!compactInputFieldVisible(compactDialogLayout(2), 80, 8));
+    try std.testing.expect(!compactInputFieldVisible(compactDialogLayout(3), 8, 8));
+    try std.testing.expect(!compactInputFieldVisible(compactDialogLayout(3), 9, 8));
+    try std.testing.expect(compactInputFieldVisible(compactDialogLayout(3), 10, 8));
+    try std.testing.expect(compactInputFieldVisible(compactDialogLayout(5), 40, 12));
 }
 
 fn vaxisStatus(ui: *Ui, title: []const u8, message: []const u8, detail: []const u8) !void {
@@ -5500,6 +5514,7 @@ fn vaxisInput(
         const input_col_usize = @as(usize, 1) + prompt_width;
         const input_col: u16 = @intCast(@min(input_col_usize, @as(usize, win.width)));
         const input_width: usize = if (win.width > input_col) @intCast(win.width - input_col) else 0;
+        const can_edit = compactInputFieldVisible(layout, win.width, prompt_width);
         const viewport = queryViewportForCursor(win, query.items, cursor_pos, input_width);
         if (input_row) |row| {
             if (viewport.start > 0 and input_width > 0) {
@@ -5515,7 +5530,11 @@ fn vaxisInput(
             win.showCursor(@min(desired_col, win.width -| 1), input_row.?);
         }
 
-        try renderBottomBar(ui, win, .{ .left = "Enter submit • Esc back • Ctrl+U clear" });
+        try renderBottomBar(
+            ui,
+            win,
+            .{ .left = if (can_edit) "Enter submit • Esc back • Ctrl+U clear" else "Resize terminal to edit • Esc back" },
+        );
 
         if (error_text) |txt| {
             if (input_row) |row| {
@@ -5564,6 +5583,7 @@ fn vaxisInput(
                     if (key.matches(vaxis.Key.escape, .{})) {
                         return .back;
                     }
+                    if (!can_edit) continue;
 
                     if (key.matches(vaxis.Key.enter, .{})) {
                         if (query.items.len == 0 and !options.allow_empty) {
