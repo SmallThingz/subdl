@@ -278,6 +278,12 @@ const PersistentKeywordState = struct {
     keywords: []const KeywordEntry,
 };
 
+const PersistentUiPreferences = struct {
+    version: u32,
+    theme_index: u8,
+    skip_confirm: bool,
+};
+
 const TuiRuntimeState = struct {
     arena: std.heap.ArenaAllocator,
     settings: TuiSettings,
@@ -404,6 +410,7 @@ const Ui = struct {
     frame_arena: std.heap.ArenaAllocator,
     theme_index: usize = 0,
     skip_confirm: bool = false,
+    preferences_path: []const u8 = "",
     context_line: ?[]const u8 = null,
     context_owned: ?[]u8 = null,
     search_reapers: std.ArrayListUnmanaged(SearchReaperEntry) = .empty,
@@ -491,10 +498,12 @@ const Ui = struct {
 
     fn toggleTheme(self: *Ui) void {
         self.theme_index = (self.theme_index + 1) % themes.len;
+        saveUiPreferences(self.allocator, self.preferences_path, self.theme_index, self.skip_confirm) catch {};
     }
 
     fn toggleConfirm(self: *Ui) void {
         self.skip_confirm = !self.skip_confirm;
+        saveUiPreferences(self.allocator, self.preferences_path, self.theme_index, self.skip_confirm) catch {};
     }
 
     fn styleTitle(self: *Ui) vaxis.Style {
@@ -557,6 +566,15 @@ pub fn main(init: std.process.Init) !void {
     try vx.queryTerminal(tty.writer(), .fromSeconds(1));
     try vx.setMouseMode(tty.writer(), true);
 
+    const preferences_path = try tuiCachePath(allocator, init.environ_map, "ui-preferences.oneserial");
+    defer allocator.free(preferences_path);
+    const loaded_preferences: PersistentUiPreferences = (try loadPersistentUiPreferences(allocator, preferences_path)) orelse .{
+        .version = ui_preferences_version,
+        .theme_index = 0,
+        .skip_confirm = false,
+    };
+    const preferences = sanitizeUiPreferences(loaded_preferences);
+
     var ui: Ui = .{
         .allocator = allocator,
         .environ_map = init.environ_map,
@@ -564,6 +582,9 @@ pub fn main(init: std.process.Init) !void {
         .vx = &vx,
         .loop = &loop,
         .frame_arena = std.heap.ArenaAllocator.init(allocator),
+        .theme_index = preferences.theme_index,
+        .skip_confirm = preferences.skip_confirm,
+        .preferences_path = preferences_path,
     };
     defer ui.frame_arena.deinit();
 
@@ -1370,10 +1391,12 @@ fn deinitSubtitlesPageCache(allocator: std.mem.Allocator, pages: *std.ArrayListU
 }
 
 const persistent_version = 10;
+const ui_preferences_version: u32 = 1;
 const default_cache_ttl_seconds: i64 = 12 * 60 * 60;
 const search_state_magic = "subdl-tui-search-state-v1\n";
 const settings_state_magic = "subdl-tui-settings-v1\n";
 const keyword_state_magic = "subdl-tui-keywords-v1\n";
+const ui_preferences_magic = "subdl-tui-preferences-v1\n";
 
 fn defaultTuiSettings() TuiSettings {
     return .{
@@ -1490,6 +1513,31 @@ fn loadPersistentSettingsState(allocator: std.mem.Allocator, path: []const u8) !
     return untrusted.toOwned(allocator) catch null;
 }
 
+fn loadPersistentUiPreferences(allocator: std.mem.Allocator, path: []const u8) !?PersistentUiPreferences {
+    const data = std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), path, allocator, .limited(4096)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return null,
+    };
+    defer allocator.free(data);
+    if (!std.mem.startsWith(u8, data, ui_preferences_magic)) return null;
+    const body = data[ui_preferences_magic.len..];
+    const untrusted = oneserial.Untrusted(PersistentUiPreferences, .{}).init(body);
+    return untrusted.toOwned(allocator) catch null;
+}
+
+fn sanitizeUiPreferences(preferences: PersistentUiPreferences) PersistentUiPreferences {
+    if (preferences.version != ui_preferences_version) {
+        return .{
+            .version = ui_preferences_version,
+            .theme_index = 0,
+            .skip_confirm = false,
+        };
+    }
+    var out = preferences;
+    if (out.theme_index >= themes.len) out.theme_index = 0;
+    return out;
+}
+
 fn saveTuiRuntimeState(allocator: std.mem.Allocator, state: *const TuiRuntimeState) !void {
     const persist: PersistentSearchState = .{
         .version = persistent_version,
@@ -1513,6 +1561,20 @@ fn saveTuiSettingsState(allocator: std.mem.Allocator, state: *const TuiRuntimeSt
         .settings = state.settings,
     };
     try saveOneSerial(PersistentSettingsState, allocator, state.settings_path, settings_state_magic, &persist);
+}
+
+fn saveUiPreferences(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    theme_index: usize,
+    skip_confirm: bool,
+) !void {
+    const persist: PersistentUiPreferences = .{
+        .version = ui_preferences_version,
+        .theme_index = @intCast(theme_index),
+        .skip_confirm = skip_confirm,
+    };
+    try saveOneSerial(PersistentUiPreferences, allocator, path, ui_preferences_magic, &persist);
 }
 
 fn saveOneSerial(comptime T: type, allocator: std.mem.Allocator, path: []const u8, magic: []const u8, value: *const T) !void {
@@ -7210,6 +7272,39 @@ test "settings persist independently from search cache state" {
     try std.testing.expect(!loaded.settings.keyword_cache_enabled);
     try std.testing.expect(!loaded.settings.language_filter_enabled);
     try std.testing.expect(!loaded.settings.providers_enabled[0]);
+}
+
+test "ui preferences persist independently and sanitize invalid themes" {
+    const allocator = std.testing.allocator;
+    const unique = scrapers.common.compatNanoTimestamp();
+    const test_root = try std.fmt.allocPrint(allocator, ".zig-cache/tui-preferences-test-{d}", .{unique});
+    defer allocator.free(test_root);
+    defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
+    const path = try std.fmt.allocPrint(allocator, "{s}/ui-preferences.oneserial", .{test_root});
+    defer allocator.free(path);
+
+    try saveUiPreferences(allocator, path, 1, true);
+    const loaded = (try loadPersistentUiPreferences(allocator, path)).?;
+    const preferences = sanitizeUiPreferences(loaded);
+    try std.testing.expectEqual(@as(u32, ui_preferences_version), preferences.version);
+    try std.testing.expectEqual(@as(u8, 1), preferences.theme_index);
+    try std.testing.expect(preferences.skip_confirm);
+
+    const invalid_theme = sanitizeUiPreferences(.{
+        .version = ui_preferences_version,
+        .theme_index = 255,
+        .skip_confirm = true,
+    });
+    try std.testing.expectEqual(@as(u8, 0), invalid_theme.theme_index);
+    try std.testing.expect(invalid_theme.skip_confirm);
+
+    const stale_version = sanitizeUiPreferences(.{
+        .version = ui_preferences_version + 1,
+        .theme_index = 1,
+        .skip_confirm = true,
+    });
+    try std.testing.expectEqual(@as(u8, 0), stale_version.theme_index);
+    try std.testing.expect(!stale_version.skip_confirm);
 }
 
 test "independent settings override legacy settings embedded in search state" {
