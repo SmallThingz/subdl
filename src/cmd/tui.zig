@@ -4912,25 +4912,30 @@ fn vaxisInput(
         const hint_segments = [_]vaxis.Segment{.{ .text = hint }};
         _ = win.print(&hint_segments, .{ .row_offset = 1, .col_offset = 1, .wrap = .none });
 
-        const before_cursor = query.items[0..cursor_pos];
-        const after_cursor = query.items[cursor_pos..];
-        const input_segments = [_]vaxis.Segment{
+        const prompt_segments = [_]vaxis.Segment{
             .{ .text = label, .style = ui.styleAccent() },
             .{ .text = ": " },
-            .{ .text = before_cursor },
-            .{ .text = after_cursor },
         };
-        _ = win.print(&input_segments, .{ .row_offset = 3, .col_offset = 1, .wrap = .none });
+        _ = win.print(&prompt_segments, .{ .row_offset = 3, .col_offset = 1, .wrap = .none });
 
-        if (win.width > 0) {
-            const prompt_width = win.gwidth(label) + 2;
-            const before_width = win.gwidth(before_cursor);
-            const desired_col: u16 = 1 + prompt_width + before_width;
-            const max_col = win.width -| 1;
-            win.showCursor(@min(desired_col, max_col), 3);
+        const prompt_width: usize = @intCast(win.gwidth(label) + 2);
+        const input_col_usize = @as(usize, 1) + prompt_width;
+        const input_col: u16 = @intCast(@min(input_col_usize, @as(usize, win.width)));
+        const input_width: usize = if (win.width > input_col) @intCast(win.width - input_col) else 0;
+        const viewport = queryViewportForCursor(win, query.items, cursor_pos, input_width);
+        if (viewport.start > 0 and input_width > 0) {
+            try printFitted(ui, win, 3, input_col, "‹", ui.styleMuted(), 1);
+            try printFitted(ui, win, 3, input_col + 1, query.items[viewport.start..], vaxis.Style{}, input_width -| 1);
+        } else {
+            try printFitted(ui, win, 3, input_col, query.items, vaxis.Style{}, input_width);
         }
 
-        try renderBottomBar(ui, win, .{ .left = "Enter search • Esc back" });
+        if (win.width > 0) {
+            const desired_col = input_col + @as(u16, @intCast(@min(viewport.cursor_col, input_width)));
+            win.showCursor(@min(desired_col, win.width -| 1), 3);
+        }
+
+        try renderBottomBar(ui, win, .{ .left = "Enter submit • Esc back • Ctrl+U clear" });
 
         if (error_text) |txt| {
             const err_segments = [_]vaxis.Segment{.{ .text = txt, .style = ui.styleError() }};
@@ -4943,6 +4948,25 @@ fn vaxisInput(
         for (batch.slice()) |event| {
             switch (event) {
                 .winsize => |ws| try ui.resize(ws),
+                .mouse => |mouse| {
+                    if (mouse.type != .press or mouse.button != .left or mouse.row < 0 or mouse.col < 0) continue;
+                    const row: u16 = @intCast(mouse.row);
+                    const col: u16 = @intCast(mouse.col);
+                    if (row != 3 or col < input_col or col >= input_col + @as(u16, @intCast(input_width))) continue;
+                    var target_col: usize = @intCast(col - input_col);
+                    if (viewport.start > 0) {
+                        if (target_col == 0) {
+                            cursor_pos = viewport.start;
+                            continue;
+                        }
+                        target_col -= 1;
+                    }
+                    cursor_pos = viewport.start + queryCursorByteOffsetForDisplayColumn(
+                        win,
+                        query.items[viewport.start..],
+                        target_col,
+                    );
+                },
                 .key_press => |key| {
                     switch (handleGlobalKey(ui, key)) {
                         .none => {},
@@ -4965,6 +4989,14 @@ fn vaxisInput(
                         cursor_pos = prevCodepointStart(query.items, cursor_pos);
                     } else if (key.matches(vaxis.Key.right, .{})) {
                         cursor_pos = nextCodepointEnd(query.items, cursor_pos);
+                    } else if (key.matches('a', .{ .ctrl = true })) {
+                        cursor_pos = 0;
+                    } else if (key.matches('e', .{ .ctrl = true })) {
+                        cursor_pos = query.items.len;
+                    } else if (key.matches('u', .{ .ctrl = true })) {
+                        query.clearRetainingCapacity();
+                        cursor_pos = 0;
+                        error_text = null;
                     } else if (key.matches(vaxis.Key.backspace, .{})) {
                         if (cursor_pos > 0) {
                             const prev = prevCodepointStart(query.items, cursor_pos);
