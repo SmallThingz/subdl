@@ -1239,7 +1239,7 @@ fn runTui(ui: *Ui) !void {
                         results = null;
                         const owned_query = try ui.allocator.dupe(u8, current_query_norm);
                         defer ui.allocator.free(owned_query);
-                        try rememberKeyword(ui.allocator, &state, owned_query);
+                        const keyword_changed = try rememberKeyword(ui.allocator, &state, owned_query);
                         const search_outcome = executeQuerySearchIncremental(ui, &state, owned_query, &query, &cursor_pos, &selected_result, &result_scroll, &info_open) catch |err| switch (err) {
                             error.TuiQuit => return,
                             else => return err,
@@ -1263,7 +1263,7 @@ fn runTui(ui: *Ui) !void {
                         if (results) |*bundle| {
                             if (bundle.cache_changed) try saveTuiRuntimeState(ui.allocator, &state);
                         }
-                        try saveKeywordRuntimeState(ui.allocator, &state);
+                        if (keyword_changed) try saveKeywordRuntimeState(ui.allocator, &state);
                         continue;
                     }
                     if (key.matches(vaxis.Key.up, .{})) {
@@ -2735,20 +2735,20 @@ fn startsWithCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
     return true;
 }
 
-fn rememberKeyword(allocator: std.mem.Allocator, state: *TuiRuntimeState, query_norm: []const u8) !void {
+fn rememberKeyword(allocator: std.mem.Allocator, state: *TuiRuntimeState, query_norm: []const u8) !bool {
     if (!state.settings.keyword_cache_enabled or
         query_norm.len == 0 or
         query_norm.len > max_home_query_bytes or
         !std.unicode.utf8ValidateSlice(query_norm))
     {
-        return;
+        return false;
     }
     const now = scrapers.common.compatUnixTimestamp();
     for (state.keywords.items) |*entry| {
         if (std.mem.eql(u8, entry.query, query_norm)) {
             entry.used_at_unix = now;
             entry.use_count +|= 1;
-            return;
+            return true;
         }
     }
     try state.keywords.append(allocator, .{
@@ -2767,6 +2767,7 @@ fn rememberKeyword(allocator: std.mem.Allocator, state: *TuiRuntimeState, query_
             try compactRuntimeArena(allocator, state);
         }
     }
+    return true;
 }
 
 const HistoryDirection = enum { backward, forward };
@@ -6897,7 +6898,7 @@ test "runtime cache replacement stays bounded and compacts stale arena data" {
     while (keyword_idx < max_keyword_entries + arena_compact_after_stale_mutations + 5) : (keyword_idx += 1) {
         const query = try std.fmt.allocPrint(allocator, "query-{d}", .{keyword_idx});
         defer allocator.free(query);
-        try rememberKeyword(allocator, &state, query);
+        try std.testing.expect(try rememberKeyword(allocator, &state, query));
     }
     try std.testing.expectEqual(max_keyword_entries, state.keywords.items.len);
     try std.testing.expect(state.arena_stale_mutations < arena_compact_after_stale_mutations);
@@ -6933,6 +6934,24 @@ test "disabled runtime cache does not mutate persistent search state" {
         response,
     )));
     try std.testing.expectEqual(@as(usize, 0), state.cache_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.arena_stale_mutations);
+}
+
+test "disabled history does not mutate keyword state" {
+    const allocator = std.testing.allocator;
+    var state: TuiRuntimeState = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .settings = defaultTuiSettings(),
+        .state_path = try allocator.dupe(u8, "state.test"),
+        .settings_path = try allocator.dupe(u8, "settings.test"),
+        .keyword_path = try allocator.dupe(u8, "keywords.test"),
+        .cache_root_path = try allocator.dupe(u8, "cache.test"),
+    };
+    defer state.deinit(allocator);
+    state.settings.keyword_cache_enabled = false;
+
+    try std.testing.expect(!(try rememberKeyword(allocator, &state, "matrix")));
+    try std.testing.expectEqual(@as(usize, 0), state.keywords.items.len);
     try std.testing.expectEqual(@as(usize, 0), state.arena_stale_mutations);
 }
 
