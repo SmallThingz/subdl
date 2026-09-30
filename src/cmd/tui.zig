@@ -5076,6 +5076,15 @@ fn vaxisSelect(
                         if (mouseRowIndex(mouse, list_top, list_bottom, scroll, matches.items.len)) |row_idx| {
                             const already_selected = row_idx == selected_row;
                             selected_row = row_idx;
+                            if (provider_toggles) |flags| {
+                                // Rows render as: cursor at col 1..2, checkbox
+                                // at col 3..5, then a separating space.
+                                if (mouseColumnInRange(mouse, 3, 6)) {
+                                    const option_idx = matches.items[selected_row];
+                                    flags[option_idx] = !flags[option_idx];
+                                    continue;
+                                }
+                            }
                             if (provider_toggles == null) {
                                 moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
                             }
@@ -5787,6 +5796,32 @@ fn mouseRowIndex(mouse: vaxis.Mouse, list_top: u16, list_bottom: u16, scroll: us
     const idx = scroll + @as(usize, @intCast(row - list_top));
     if (idx >= total) return null;
     return idx;
+}
+
+fn mouseColumnInRange(mouse: vaxis.Mouse, start: u16, end_exclusive: u16) bool {
+    if (mouse.col < 0) return false;
+    const col: u16 = @intCast(mouse.col);
+    return col >= start and col < end_exclusive;
+}
+
+test "mouse checkbox hitbox excludes provider label" {
+    const base: vaxis.Mouse = .{
+        .col = 3,
+        .row = 1,
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    };
+    try std.testing.expect(mouseColumnInRange(base, 3, 6));
+    var edge = base;
+    edge.col = 5;
+    try std.testing.expect(mouseColumnInRange(edge, 3, 6));
+    var label = base;
+    label.col = 6;
+    try std.testing.expect(!mouseColumnInRange(label, 3, 6));
+    var invalid = base;
+    invalid.col = -1;
+    try std.testing.expect(!mouseColumnInRange(invalid, 3, 6));
 }
 
 fn scrollSelection(selected_row: *usize, item_count: usize, direction: SearchDirection, step: usize) void {
