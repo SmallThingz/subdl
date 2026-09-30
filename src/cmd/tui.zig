@@ -5408,7 +5408,7 @@ fn vaxisSelect(
 
         try renderCompactTopLine(ui, win, title, ui.styleTitle());
 
-        const show_provider_panel = ui.providerPanelVisible(win.width);
+        const show_provider_panel = provider_toggles != null and ui.providerPanelVisible(win.width);
         const provider_panel_width: u16 = if (show_provider_panel) 30 else 0;
         const content_width: u16 = if (show_provider_panel and win.width > provider_panel_width + 2)
             win.width - provider_panel_width - 2
