@@ -2989,6 +2989,7 @@ fn formatHomeTopLine(
     provider_count: usize,
     download_count: usize,
     maybe_bundle: ?*const SearchBundle,
+    visible_result_count: ?usize,
 ) ![]const u8 {
     var pos: usize = 0;
     const search_tab = if (focus == .downloads) "Search" else "SEARCH";
@@ -2997,7 +2998,14 @@ fn formatHomeTopLine(
     if (download_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {s} {d}", .{ downloads_tab, download_count })).len;
     pos += (try std.fmt.bufPrint(buf[pos..], " · {d}/{d} providers", .{ enabled_provider_count, provider_count })).len;
     if (maybe_bundle) |bundle| {
-        if (bundle.hits.items.len > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} results", .{bundle.hits.items.len})).len;
+        if (bundle.hits.items.len > 0) {
+            const visible_count = visible_result_count orelse bundle.hits.items.len;
+            if (visible_count == bundle.hits.items.len) {
+                pos += (try std.fmt.bufPrint(buf[pos..], " · {d} results", .{bundle.hits.items.len})).len;
+            } else {
+                pos += (try std.fmt.bufPrint(buf[pos..], " · {d}/{d} results", .{ visible_count, bundle.hits.items.len })).len;
+            }
+        }
         if (bundle.live_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} live", .{bundle.live_count})).len;
         if (bundle.cache_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} cached", .{bundle.cache_count})).len;
         if (bundle.failed_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} failed", .{bundle.failed_count})).len;
@@ -3129,6 +3137,10 @@ test "query display order cache reuses stable hit sets and invalidates on change
     const no_match = try ensureQueryHitOrder(allocator, &bundle, "blade runner");
     try std.testing.expectEqual(@as(usize, 0), no_match.len);
     try std.testing.expectEqualStrings("blade runner", bundle.display_query_norm.?);
+
+    var top_buf: [320]u8 = undefined;
+    const top = try formatHomeTopLine(&top_buf, .query, 1, 1, 0, &bundle, no_match.len);
+    try std.testing.expect(std.mem.indexOf(u8, top, "0/3 results") != null);
 }
 
 fn queryHitScore(bundle: *const SearchBundle, hit_idx: usize, query_norm: []const u8) u32 {
@@ -3808,8 +3820,21 @@ fn renderQueryHome(
 
     const provider_count = countEnabledFlags(&state.settings.providers_enabled);
     const download_count = if (state.settings.download_cache_enabled) state.download_entries.len else 0;
+    const query_norm = normalizeQueryView(query);
+    const visible_order = if (results) |bundle|
+        try ensureQueryHitOrder(ui.allocator, bundle, query_norm)
+    else
+        null;
     var top_buf: [320]u8 = undefined;
-    const top = try formatHomeTopLine(&top_buf, focus, provider_count, app.providerCount(), download_count, results);
+    const top = try formatHomeTopLine(
+        &top_buf,
+        focus,
+        provider_count,
+        app.providerCount(),
+        download_count,
+        results,
+        if (visible_order) |order| order.len else null,
+    );
     try renderCompactTopLine(ui, win, top, ui.styleTitle());
 
     const box_w: u16 = @min(if (win.width > 6) win.width - 6 else win.width, 86);
@@ -3849,12 +3874,11 @@ fn renderQueryHome(
             }
         }
     } else if (results) |bundle| {
-        const query_norm = normalizeQueryView(query);
-        const visible_order = try ensureQueryHitOrder(ui.allocator, bundle, query_norm);
-        clampSelection(selected_result, visible_order.len);
+        const order = visible_order.?;
+        clampSelection(selected_result, order.len);
         const page_size: usize = if (list_bottom > list_top) @intCast(list_bottom - list_top) else 1;
         ensureVisible(selected_result.*, scroll, page_size);
-        if (visible_order.len == 0) {
+        if (order.len == 0) {
             var message_buf: [160]u8 = undefined;
             const message = if (bundle.searching and bundle.pending_count > 0)
                 std.fmt.bufPrint(
@@ -3899,11 +3923,11 @@ fn renderQueryHome(
         }
         var row = list_top;
         var i = scroll.*;
-        while (i < visible_order.len and row < list_bottom) : (i += 1) {
+        while (i < order.len and row < list_bottom) : (i += 1) {
             const active = focus == .results and i == selected_result.*;
             const style = if (active) ui.styleSelected() else vaxis.Style{};
             const prefix = if (active) "› " else "  ";
-            const hit = bundle.hits.items[visible_order[i]];
+            const hit = bundle.hits.items[order[i]];
             const item = bundle.searches.items[hit.response_index].items[hit.item_index];
             const title = cleanSearchTitle(item.label);
             const provider_tag = app.providerDisplayName(hit.provider);
