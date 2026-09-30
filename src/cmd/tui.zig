@@ -4398,7 +4398,13 @@ fn sanitizeExportFilename(allocator: std.mem.Allocator, input: []const u8) ![]u8
 
 fn isWindowsReservedFilename(name: []const u8) bool {
     const stem_end = std.mem.indexOfScalar(u8, name, '.') orelse name.len;
-    const stem = name[0..stem_end];
+    var trimmed_end = stem_end;
+    while (trimmed_end > 0) {
+        const ch = name[trimmed_end - 1];
+        if (ch != ' ' and ch != '.') break;
+        trimmed_end -= 1;
+    }
+    const stem = name[0..trimmed_end];
     if (stem.len == 0) return false;
     if (std.ascii.eqlIgnoreCase(stem, "CON") or
         std.ascii.eqlIgnoreCase(stem, "PRN") or
@@ -4429,8 +4435,10 @@ test "export filenames remain valid on Windows targets" {
         .{ .input = "movie. ", .expected = "movie" },
         .{ .input = "...", .expected = "subtitle.srt" },
         .{ .input = "CON.srt", .expected = "_CON.srt" },
+        .{ .input = "CON .srt", .expected = "_CON .srt" },
         .{ .input = "nul", .expected = "_nul" },
         .{ .input = "Lpt9.ass", .expected = "_Lpt9.ass" },
+        .{ .input = "COM1 .srt", .expected = "_COM1 .srt" },
         .{ .input = "COM10.srt", .expected = "COM10.srt" },
         .{ .input = "normal.srt", .expected = "normal.srt" },
     };
