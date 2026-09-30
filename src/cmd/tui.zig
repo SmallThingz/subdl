@@ -1286,7 +1286,7 @@ fn runTui(ui: *Ui) !void {
                         }
                     } else if (isTextKey(key)) {
                         const text = key.text orelse continue;
-                        if (query.items.len + text.len <= 180) {
+                        if (query.items.len + text.len <= max_home_query_bytes) {
                             try query.insertSlice(ui.allocator, cursor_pos, text);
                             cursor_pos += text.len;
                             resetHistoryBrowse(&history_pick, &history_draft, &history_draft_cursor);
@@ -1295,7 +1295,7 @@ fn runTui(ui: *Ui) !void {
                     }
                 },
                 .paste => |text| {
-                    if (try insertNormalizedPaste(ui.allocator, &query, &cursor_pos, text, 180)) {
+                    if (try insertNormalizedPaste(ui.allocator, &query, &cursor_pos, text, max_home_query_bytes)) {
                         resetHistoryBrowse(&history_pick, &history_draft, &history_draft_cursor);
                         focus = .query;
                     }
@@ -1536,6 +1536,7 @@ fn searchCacheKey(allocator: std.mem.Allocator, query_norm: []const u8, language
 
 const max_query_cache_entries: usize = 512;
 const max_keyword_entries: usize = 128;
+const max_home_query_bytes: usize = 180;
 const arena_compact_after_stale_mutations: usize = 32;
 
 fn trimRuntimeStateBounds(state: *TuiRuntimeState) void {
@@ -1549,6 +1550,15 @@ fn trimRuntimeStateBounds(state: *TuiRuntimeState) void {
             if (entry.used_at_unix < state.keywords.items[oldest].used_at_unix) oldest = idx;
         }
         _ = state.keywords.orderedRemove(oldest);
+    }
+    var keyword_idx: usize = 0;
+    while (keyword_idx < state.keywords.items.len) {
+        const query = state.keywords.items[keyword_idx].query;
+        if (query.len == 0 or query.len > max_home_query_bytes or !std.unicode.utf8ValidateSlice(query)) {
+            _ = state.keywords.orderedRemove(keyword_idx);
+            continue;
+        }
+        keyword_idx += 1;
     }
 }
 
@@ -2547,7 +2557,13 @@ fn startsWithCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
 }
 
 fn rememberKeyword(allocator: std.mem.Allocator, state: *TuiRuntimeState, query_norm: []const u8) !void {
-    if (!state.settings.keyword_cache_enabled or query_norm.len == 0) return;
+    if (!state.settings.keyword_cache_enabled or
+        query_norm.len == 0 or
+        query_norm.len > max_home_query_bytes or
+        !std.unicode.utf8ValidateSlice(query_norm))
+    {
+        return;
+    }
     const now = scrapers.common.compatUnixTimestamp();
     for (state.keywords.items) |*entry| {
         if (std.mem.eql(u8, entry.query, query_norm)) {
@@ -4398,10 +4414,11 @@ fn vaxisSelect(
                         }
                         if (isTextKey(key)) {
                             const text = key.text orelse continue;
-                            try filter.appendSlice(ui.allocator, text);
-                            try rebuildOptionMatches(ui.allocator, options, filter.items, &matches);
-                            selected_row = 0;
-                            scroll = 0;
+                            if (try appendFilterText(ui.allocator, &filter, text)) {
+                                try rebuildOptionMatches(ui.allocator, options, filter.items, &matches);
+                                selected_row = 0;
+                                scroll = 0;
+                            }
                         }
                         continue;
                     }
@@ -4682,10 +4699,11 @@ fn vaxisSelectSubtitle(
                         }
                         if (isTextKey(key)) {
                             const text = key.text orelse continue;
-                            try filter.appendSlice(ui.allocator, text);
-                            try rebuildSubtitleMatches(ui.allocator, subtitles, order, filter.items, &matches);
-                            selected_row = 0;
-                            scroll = 0;
+                            if (try appendFilterText(ui.allocator, &filter, text)) {
+                                try rebuildSubtitleMatches(ui.allocator, subtitles, order, filter.items, &matches);
+                                selected_row = 0;
+                                scroll = 0;
+                            }
                         }
                         continue;
                     }
@@ -5093,6 +5111,16 @@ fn appendNormalizedPaste(
     return insertNormalizedPaste(allocator, dest, &cursor, input, max_len);
 }
 
+fn appendFilterText(
+    allocator: std.mem.Allocator,
+    filter: *std.ArrayList(u8),
+    text: []const u8,
+) !bool {
+    if (text.len == 0 or filter.items.len + text.len > max_filter_bytes) return false;
+    try filter.appendSlice(allocator, text);
+    return true;
+}
+
 fn insertTtlPaste(
     allocator: std.mem.Allocator,
     dest: *std.ArrayList(u8),
@@ -5190,6 +5218,19 @@ test "filter backspace removes complete utf8 codepoints" {
     try std.testing.expectEqualStrings("", filter.items);
     popLastUtf8Codepoint(&filter);
     try std.testing.expectEqualStrings("", filter.items);
+}
+
+test "filter typing respects byte limit without splitting input" {
+    var filter: std.ArrayList(u8) = .empty;
+    defer filter.deinit(std.testing.allocator);
+
+    try filter.appendNTimes(std.testing.allocator, 'a', max_filter_bytes - 2);
+    try std.testing.expect(try appendFilterText(std.testing.allocator, &filter, "é"));
+    try std.testing.expectEqual(@as(usize, max_filter_bytes), filter.items.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(filter.items));
+
+    try std.testing.expect(!(try appendFilterText(std.testing.allocator, &filter, "x")));
+    try std.testing.expectEqual(@as(usize, max_filter_bytes), filter.items.len);
 }
 
 fn nextCodepointEnd(text: []const u8, cursor_pos: usize) usize {
