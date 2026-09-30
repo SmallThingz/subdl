@@ -3120,7 +3120,7 @@ fn editSettingsPopup(
             const secondary_help = switch (panel) {
                 .main => "Up/Down moves · Esc/Ctrl+C closes Settings",
                 .providers, .languages => "Up/Down moves · Esc/Ctrl+C returns to Settings",
-                .cache_ttl => "Left/Right edit · Esc/Ctrl+C returns without saving",
+                .cache_ttl => "Arrows/Home/End edit · Ctrl+U clears · Esc/Ctrl+C returns without saving",
             };
             var panel_buf: [96]u8 = undefined;
             const panel_line = std.fmt.bufPrint(&panel_buf, "panel: {s}", .{panel_name}) catch "panel: Settings";
@@ -3371,6 +3371,20 @@ fn editSettingsPopup(
                             }
                             if (key.matches(vaxis.Key.right, .{})) {
                                 if (ttl_cursor < ttl_input.items.len) ttl_cursor += 1;
+                                continue;
+                            }
+                            if (key.matches(vaxis.Key.home, .{}) or key.matches('a', .{ .ctrl = true })) {
+                                ttl_cursor = 0;
+                                continue;
+                            }
+                            if (key.matches(vaxis.Key.end, .{}) or key.matches('e', .{ .ctrl = true })) {
+                                ttl_cursor = ttl_input.items.len;
+                                continue;
+                            }
+                            if (key.matches('u', .{ .ctrl = true })) {
+                                ttl_input.clearRetainingCapacity();
+                                ttl_cursor = 0;
+                                ttl_error = null;
                                 continue;
                             }
                             if (key.matches(vaxis.Key.backspace, .{})) {
