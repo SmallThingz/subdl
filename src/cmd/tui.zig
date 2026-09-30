@@ -4656,7 +4656,15 @@ fn exportHomeCachedDownload(ui: *Ui, state: *TuiRuntimeState, selected_download:
         state.download_entries[selected_download],
         if (trimmed_dir.len == 0) "downloads" else trimmed_dir,
     ) catch |err| {
-        if (err == error.FileNotFound) refreshCachedDownloads(ui.allocator, state) catch {};
+        if (err == error.FileNotFound or err == error.NotDir or err == error.AccessDenied) {
+            refreshCachedDownloads(ui.allocator, state) catch |refresh_err| {
+                return showFriendlyError(
+                    ui,
+                    "Cached download disappeared and cache refresh failed",
+                    refresh_err,
+                );
+            };
+        }
         return showFriendlyError(ui, "Could not export cached download", err);
     };
     defer ui.allocator.free(exported);
