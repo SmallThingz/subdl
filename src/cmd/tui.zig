@@ -322,6 +322,7 @@ const SearchBundle = struct {
     cache_count: usize = 0,
     cache_changed: bool = false,
     failed_count: usize = 0,
+    unavailable_count: usize = 0,
     pending_count: usize = 0,
     searching: bool = false,
     canceled: bool = false,
@@ -644,6 +645,14 @@ fn isRemoteSearchFailure(err: anyerror) bool {
         => true,
         else => false,
     };
+}
+
+fn recordSearchFailure(bundle: *SearchBundle, err: anyerror) void {
+    if (isRemoteSearchFailure(err)) {
+        bundle.unavailable_count += 1;
+    } else {
+        bundle.failed_count += 1;
+    }
 }
 
 fn subtitlesTaskMain(task: *SubtitlesTask) std.Io.Cancelable!void {
@@ -2566,8 +2575,8 @@ fn executeQuerySearch(ui: *Ui, state: *TuiRuntimeState, query_norm: []const u8) 
             if (search_task.result) |*r| r.deinit();
             return bundle;
         }
-        if (search_task.err) |_| {
-            bundle.failed_count += 1;
+        if (search_task.err) |err| {
+            recordSearchFailure(&bundle, err);
             continue;
         }
         const search_result = search_task.result orelse {
@@ -2684,7 +2693,7 @@ fn executeQuerySearchIncremental(
             bundle.pending_count -= 1;
             dirty = true;
             if (tasks[idx].err) |err| {
-                if (!isRemoteSearchFailure(err)) bundle.failed_count += 1;
+                recordSearchFailure(&bundle, err);
                 continue;
             }
             const search_result = tasks[idx].result orelse {
@@ -2992,6 +3001,7 @@ fn formatHomeTopLine(
         if (bundle.live_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} live", .{bundle.live_count})).len;
         if (bundle.cache_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} cached", .{bundle.cache_count})).len;
         if (bundle.failed_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} failed", .{bundle.failed_count})).len;
+        if (bundle.unavailable_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} unavailable", .{bundle.unavailable_count})).len;
         if (bundle.pending_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} pending", .{bundle.pending_count})).len;
         if (bundle.canceled) pos += (try std.fmt.bufPrint(buf[pos..], " · canceled", .{})).len;
     }
@@ -3300,13 +3310,23 @@ fn editSettingsPopup(
                 .languages => "Language",
                 .cache_ttl => "Cache retention",
             };
+            const primary_help = switch (panel) {
+                .main => "Enter opens or toggles the highlighted setting",
+                .providers => "Enter/Space toggles the highlighted provider",
+                .languages => "Enter/Space chooses the highlighted language",
+                .cache_ttl => "Type hours; Enter saves the retention value",
+            };
+            const secondary_help = switch (panel) {
+                .main => "Up/Down moves · Esc/Ctrl+C closes Settings",
+                .providers, .languages => "Up/Down moves · Esc/Ctrl+C returns to Settings",
+                .cache_ttl => "Left/Right edit · Esc/Ctrl+C returns without saving",
+            };
             var panel_buf: [96]u8 = undefined;
             const panel_line = std.fmt.bufPrint(&panel_buf, "panel: {s}", .{panel_name}) catch "panel: Settings";
             const lines = [_][]const u8{
                 panel_line,
-                "Up/Down move through settings",
-                "Enter/Space changes the highlighted setting",
-                "Esc/Ctrl+C goes back",
+                primary_help,
+                secondary_help,
                 "F2 confirmations · F3 theme · Ctrl+D quit",
             };
             try renderOverlayMenu(ui, win, "Settings Help", &lines);
@@ -3842,6 +3862,12 @@ fn renderQueryHome(
                 "Search canceled. Press Enter to search again."
             else if (bundle.failed_count > 0)
                 "No results. Some providers failed; edit the query/settings and search again."
+            else if (bundle.unavailable_count > 0)
+                std.fmt.bufPrint(
+                    &message_buf,
+                    "No results. {d} provider{s} unavailable; retry or adjust providers.",
+                    .{ bundle.unavailable_count, if (bundle.unavailable_count == 1) "" else "s" },
+                ) catch "No results. Providers are currently unavailable."
             else
                 "No results. Edit the query or provider/language settings and search again.";
             try printFitted(
@@ -3855,6 +3881,8 @@ fn renderQueryHome(
                 else if (bundle.canceled)
                     ui.styleWarn()
                 else if (bundle.failed_count > 0)
+                    ui.styleWarn()
+                else if (bundle.unavailable_count > 0)
                     ui.styleWarn()
                 else
                     ui.styleMuted(),
@@ -6216,6 +6244,18 @@ test "remote search failures do not count as application failures" {
     try std.testing.expect(isRemoteSearchFailure(error.InvalidFieldType));
     try std.testing.expect(isRemoteSearchFailure(error.CloudflareSessionUnavailable));
     try std.testing.expect(!isRemoteSearchFailure(error.OutOfMemory));
+
+    const allocator = std.testing.allocator;
+    var bundle: SearchBundle = .{ .query_norm = try allocator.dupe(u8, "matrix") };
+    defer bundle.deinit(allocator);
+
+    recordSearchFailure(&bundle, error.UnexpectedHttpStatus);
+    try std.testing.expectEqual(@as(usize, 1), bundle.unavailable_count);
+    try std.testing.expectEqual(@as(usize, 0), bundle.failed_count);
+
+    recordSearchFailure(&bundle, error.OutOfMemory);
+    try std.testing.expectEqual(@as(usize, 1), bundle.unavailable_count);
+    try std.testing.expectEqual(@as(usize, 1), bundle.failed_count);
 }
 
 test "cached export rejects stale selection index" {
