@@ -1685,7 +1685,7 @@ fn formatPersistenceFailure(buf: []u8, failure: PersistenceFailure) []const u8 {
         .{
             persistenceAreaName(failure.area),
             persistenceOperationName(failure.operation),
-            @errorName(failure.err),
+            friendlyErrorMessage(failure.err),
         },
     ) catch "Persistence failed";
 }
@@ -3752,7 +3752,7 @@ fn renderSettingsPopup(
             std.fmt.bufPrint(
                 &download_error_buf,
                 "Download cache unavailable: {s}",
-                .{@errorName(err)},
+                .{friendlyErrorMessage(err)},
             ) catch "Download cache unavailable"
         else
             null
@@ -5241,6 +5241,7 @@ fn friendlyErrorMessage(err: anyerror) []const u8 {
         error.FileNotFound => "The requested file or directory no longer exists.",
         error.AccessDenied => "Permission denied while accessing this file or directory.",
         error.NotDir => "Expected a directory, but found a file instead.",
+        error.InvalidPersistentData => "Saved TUI data is invalid or incompatible and could not be loaded.",
         error.UnexpectedHttpStatus => "Provider returned an unexpected HTTP status.",
         error.HttpRequestFailed => "The HTTP request to the provider failed.",
         error.RateLimited => "Provider rate limit hit. Retry in a few moments.",
@@ -7837,6 +7838,8 @@ test "corrupt settings fall back and surface a load warning" {
     var warning_buf: [128]u8 = undefined;
     const warning = formatPersistenceFailure(&warning_buf, state.persistence_error.?);
     try std.testing.expect(std.mem.indexOf(u8, warning, "settings load failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, warning, "Saved TUI data is invalid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, warning, "InvalidPersistentData") == null);
 }
 
 test "ui preferences persist independently and sanitize invalid themes" {
