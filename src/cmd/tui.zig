@@ -977,8 +977,19 @@ fn runTui(ui: *Ui) !void {
                             .left => {
                                 const win = ui.vx.window();
                                 if (mouseRowIndex(mouse, 4, homeListBottom(win.height), result_scroll, visible_count)) |row_idx| {
+                                    const activate = focus == .results and row_idx == selected_result;
                                     selected_result = row_idx;
                                     focus = .results;
+                                    if (activate) {
+                                        const visible_order = bundle.display_order;
+                                        if (selected_result < visible_order.len) {
+                                            switch (try openSearchResult(ui, bundle, visible_order[selected_result], &state)) {
+                                                .back => focus = .results,
+                                                .to_query => focus = .query,
+                                                .quit => return,
+                                            }
+                                        }
+                                    }
                                 }
                             },
                             else => {},
