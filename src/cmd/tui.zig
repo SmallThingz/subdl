@@ -906,7 +906,10 @@ fn runTui(ui: *Ui) !void {
             switch (event) {
                 .winsize => |ws| try ui.resize(ws),
                 .mouse => |mouse| {
-                    if (info_open) continue;
+                    if (info_open) {
+                        if (mouse.type == .press) info_open = false;
+                        continue;
+                    }
                     if (focus == .downloads and state.settings.download_cache_enabled) {
                         const download_count = state.download_entries.len;
                         if (mouse.type == .press and download_count > 0) switch (mouse.button) {
@@ -2671,7 +2674,10 @@ fn executeQuerySearchIncremental(
             switch (event) {
                 .winsize => |ws| try ui.resize(ws),
                 .mouse => |mouse| {
-                    if (info_open.*) continue;
+                    if (info_open.*) {
+                        if (mouse.type == .press) info_open.* = false;
+                        continue;
+                    }
                     if (mouseWheelDelta(mouse)) |delta| {
                         wheel_delta += delta;
                     } else if (mouse.type == .press and bundle.display_order.len > 0) switch (mouse.button) {
@@ -4923,6 +4929,7 @@ fn vaxisSelect(
                         info_menu_open = false;
                         continue;
                     }
+                    if (info_menu_open) info_menu_open = false;
 
                     if (filter_mode) {
                         if (key.matches(vaxis.Key.escape, .{}) or key.matches(vaxis.Key.enter, .{})) {
@@ -5022,6 +5029,10 @@ fn vaxisSelect(
                     }
                 },
                 .mouse => |mouse| {
+                    if (info_menu_open) {
+                        if (mouse.type == .press) info_menu_open = false;
+                        continue;
+                    }
                     if (handleMouseWheel(mouse, matches.items.len, &selected_row, provider_toggles == null, matches.items, enabled)) continue;
                     if (mouse.type == .press and mouse.button == .left) {
                         if (mouseRowIndex(mouse, list_top, list_bottom, scroll, matches.items.len)) |row_idx| {
@@ -5220,6 +5231,7 @@ fn vaxisSelectSubtitle(
                         info_menu_open = false;
                         continue;
                     }
+                    if (info_menu_open) info_menu_open = false;
 
                     if (filter_mode) {
                         if (key.matches(vaxis.Key.escape, .{}) or key.matches(vaxis.Key.enter, .{})) {
@@ -5310,6 +5322,10 @@ fn vaxisSelectSubtitle(
                     }
                 },
                 .mouse => |mouse| {
+                    if (info_menu_open) {
+                        if (mouse.type == .press) info_menu_open = false;
+                        continue;
+                    }
                     if (handleMouseWheel(mouse, matches.items.len, &selected_row, true, matches.items, enabled)) continue;
                     if (mouse.type == .press and mouse.button == .left) {
                         if (mouseRowIndex(mouse, list_top, list_bottom, scroll, matches.items.len)) |row_idx| {
