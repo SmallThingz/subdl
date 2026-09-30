@@ -5524,8 +5524,21 @@ fn renderCompactBottomLine(ui: *Ui, win: anytype, left: []const u8) !void {
         "{s}:{s} {s}:{s} {s}",
         .{ BarLayout.confirm_key, confirm_text, BarLayout.theme_key, ui.theme().name, BarLayout.quit_hint },
     );
-    const line = try frameFmt(ui, "{s}{s}{s}", .{ left, BarLayout.separator, status });
-    try printFitted(ui, win, row, 1, line, ui.styleMuted(), width);
+    const status_width: usize = @intCast(win.gwidth(status));
+    if (status_width >= width) {
+        try printFitted(ui, win, row, 1, status, ui.styleMuted(), width);
+        return;
+    }
+
+    const status_col: u16 = @intCast(1 + width - status_width);
+    const separator_width: usize = @intCast(win.gwidth(BarLayout.separator));
+    if (width > status_width + separator_width) {
+        const left_width = width - status_width - separator_width;
+        try printFitted(ui, win, row, 1, left, ui.styleMuted(), left_width);
+        const separator_col: u16 = @intCast(@as(usize, status_col) - separator_width);
+        try printFitted(ui, win, row, separator_col, BarLayout.separator, ui.styleMuted(), separator_width);
+    }
+    try printFitted(ui, win, row, status_col, status, ui.styleMuted(), status_width);
 }
 
 fn renderProviderPanel(ui: *Ui, win: anytype, col: u16, width: u16) !void {
