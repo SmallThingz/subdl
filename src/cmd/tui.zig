@@ -3859,6 +3859,7 @@ fn renderSettingsPopup(
     std.debug.assert(main_selected < settingsMainItemCount(state.keywords.items.len));
     std.debug.assert(provider_selected < app.providerCount());
     std.debug.assert(language_selected <= languageCount());
+    win.hideCursor();
     const metrics = settingsPopupMetrics(win.width, win.height);
     const width = metrics.width;
     const height = metrics.height;
