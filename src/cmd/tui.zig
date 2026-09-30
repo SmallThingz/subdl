@@ -321,6 +321,8 @@ const SearchBundle = struct {
     failed_count: usize = 0,
     unavailable_count: usize = 0,
     pending_count: usize = 0,
+    active_count: usize = 0,
+    queued_count: usize = 0,
     searching: bool = false,
     canceled: bool = false,
 
@@ -2056,6 +2058,8 @@ fn executeQuerySearchIncremental(
     var started_count: usize = 0;
     var in_flight: usize = 0;
     startQueuedProviderSearches(search_group, tasks, task_count, &started_count, &in_flight);
+    bundle.active_count = in_flight;
+    bundle.queued_count = task_count - started_count;
 
     try renderQueryHome(
         ui,
@@ -2103,6 +2107,8 @@ fn executeQuerySearchIncremental(
             cache_response_count += 1;
         }
         startQueuedProviderSearches(search_group, tasks, task_count, &started_count, &in_flight);
+        bundle.active_count = in_flight;
+        bundle.queued_count = task_count - started_count;
 
         var wheel_delta: i32 = 0;
         while (try ui.loop.tryEvent()) |event| {
@@ -2134,6 +2140,8 @@ fn executeQuerySearchIncremental(
                     if (key.matches('c', .{ .ctrl = true })) {
                         bundle.searching = false;
                         bundle.pending_count = 0;
+                        bundle.active_count = 0;
+                        bundle.queued_count = 0;
                         bundle.canceled = true;
                         if (ui.reapSearchWork(search_work)) {
                             search_work_owned = false;
@@ -2169,6 +2177,8 @@ fn executeQuerySearchIncremental(
                         if (search_settings_changed) {
                             bundle.searching = false;
                             bundle.pending_count = 0;
+                            bundle.active_count = 0;
+                            bundle.queued_count = 0;
                             if (ui.reapSearchWork(search_work)) {
                                 search_work_owned = false;
                             }
@@ -2216,6 +2226,8 @@ fn executeQuerySearchIncremental(
                             .to_query => {
                                 bundle.searching = false;
                                 bundle.pending_count = 0;
+                                bundle.active_count = 0;
+                                bundle.queued_count = 0;
                                 bundle.canceled = true;
                                 if (ui.reapSearchWork(search_work)) {
                                     search_work_owned = false;
@@ -2265,6 +2277,8 @@ fn executeQuerySearchIncremental(
 
     try search_group.await(runtime_io.get());
     bundle.searching = false;
+    bundle.active_count = 0;
+    bundle.queued_count = 0;
     try renderQueryHome(ui, state, query_display, cursor_pos, if (bundle.hits.items.len > 0) .results else .query, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
     return .{
         .bundle = bundle,
@@ -2289,7 +2303,6 @@ fn startQueuedProviderSearches(
             tasks[idx].err = err;
             tasks[idx].done.store(1, .release);
             started_count.* += 1;
-            in_flight.* += 1;
             continue;
         };
         started_count.* += 1;
@@ -2429,7 +2442,13 @@ fn formatHomeTopLine(
         if (bundle.cache_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} cached", .{bundle.cache_count})).len;
         if (bundle.failed_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} failed", .{bundle.failed_count})).len;
         if (bundle.unavailable_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} unavailable", .{bundle.unavailable_count})).len;
-        if (bundle.pending_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} pending", .{bundle.pending_count})).len;
+        if (bundle.searching) {
+            if (bundle.active_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} active", .{bundle.active_count})).len;
+            if (bundle.queued_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {d} queued", .{bundle.queued_count})).len;
+            if (bundle.active_count == 0 and bundle.queued_count == 0 and bundle.pending_count > 0) {
+                pos += (try std.fmt.bufPrint(buf[pos..], " · {d} pending", .{bundle.pending_count})).len;
+            }
+        }
         if (bundle.canceled) pos += (try std.fmt.bufPrint(buf[pos..], " · canceled", .{})).len;
     }
     return buf[0..pos];
@@ -3625,11 +3644,21 @@ fn renderQueryHome(
 
 fn formatHomeEmptyResultMessage(buf: []u8, bundle: *const SearchBundle, query_dirty: bool) []const u8 {
     if (bundle.searching and bundle.pending_count > 0) {
-        return std.fmt.bufPrint(
-            buf,
-            "Searching… {d} provider{s} remaining.",
-            .{ bundle.pending_count, if (bundle.pending_count == 1) "" else "s" },
-        ) catch "Searching…";
+        if (bundle.queued_count > 0) {
+            return std.fmt.bufPrint(
+                buf,
+                "Searching… {d} active, {d} queued.",
+                .{ bundle.active_count, bundle.queued_count },
+            ) catch "Searching…";
+        }
+        if (bundle.active_count > 0) {
+            return std.fmt.bufPrint(
+                buf,
+                "Searching… {d} provider{s} active.",
+                .{ bundle.active_count, if (bundle.active_count == 1) "" else "s" },
+            ) catch "Searching…";
+        }
+        return "Starting providers…";
     }
     if (bundle.canceled) return "Search canceled. Press Enter to search again.";
     if (query_dirty) return "Query changed. Press Enter to search.";
@@ -3659,6 +3688,29 @@ test "dirty query replaces stale empty-result message" {
         "Query changed. Press Enter to search.",
         formatHomeEmptyResultMessage(&buf, &bundle, true),
     );
+}
+
+test "search progress distinguishes active and queued providers" {
+    var bundle: SearchBundle = .{
+        .query_norm = try std.testing.allocator.dupe(u8, "matrix"),
+        .searching = true,
+        .pending_count = 20,
+        .active_count = 12,
+        .queued_count = 8,
+    };
+    defer bundle.deinit(std.testing.allocator);
+
+    var message_buf: [160]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Searching… 12 active, 8 queued.",
+        formatHomeEmptyResultMessage(&message_buf, &bundle, false),
+    );
+
+    var top_buf: [320]u8 = undefined;
+    const top = try formatHomeTopLine(&top_buf, .query, 38, 38, 0, &bundle, 0);
+    try std.testing.expect(std.mem.indexOf(u8, top, "12 active") != null);
+    try std.testing.expect(std.mem.indexOf(u8, top, "8 queued") != null);
+    try std.testing.expect(std.mem.indexOf(u8, top, "20 pending") == null);
 }
 
 const HomeSearchBoxMetrics = struct {
