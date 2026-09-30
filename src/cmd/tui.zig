@@ -3961,6 +3961,10 @@ fn editSettingsPopup(
             }
         }
         if (batch.wheel_delta != 0) {
+            if (help_open) {
+                help_open = false;
+                redraw_background = true;
+            }
             switch (panel) {
                 .main => applyWheelDelta(&main_selected, 7, batch.wheel_delta, 1),
                 .providers => applyWheelDelta(&provider_selected, app.providerCount(), batch.wheel_delta, list_mouse_wheel_step),
@@ -5657,6 +5661,7 @@ fn vaxisSelect(
             }
         }
         if (batch.wheel_delta != 0) {
+            if (info_menu_open) info_menu_open = false;
             applyWheelDelta(&selected_row, matches.items.len, batch.wheel_delta, list_mouse_wheel_step);
             if (provider_toggles == null) {
                 moveSelectionToEnabled(matches.items, enabled, &selected_row, if (batch.wheel_delta > 0) .forward else .backward);
@@ -5951,6 +5956,7 @@ fn vaxisSelectSubtitle(
             }
         }
         if (batch.wheel_delta != 0) {
+            if (info_menu_open) info_menu_open = false;
             applyWheelDelta(&selected_row, matches.items.len, batch.wheel_delta, list_mouse_wheel_step);
             moveSelectionToEnabled(matches.items, enabled, &selected_row, if (batch.wheel_delta > 0) .forward else .backward);
         }
