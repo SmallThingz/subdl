@@ -469,6 +469,11 @@ const Ui = struct {
         }
     }
 
+    fn searchReaperBacklogFull(self: *Ui) bool {
+        self.collectSearchReapers();
+        return self.search_reapers.items.len >= max_background_search_reapers;
+    }
+
     fn awaitSearchReapers(self: *Ui) void {
         for (self.search_reapers.items) |*entry| {
             entry.future.await(runtime_io.get());
@@ -1191,6 +1196,7 @@ fn runTui(ui: *Ui) !void {
                     if (key.matches(vaxis.Key.enter, .{})) {
                         const current_query_norm = normalizeQueryView(query.items);
                         if (current_query_norm.len == 0) continue;
+                        if (ui.searchReaperBacklogFull()) continue;
                         resetHistoryBrowse(&history_pick, &history_draft, &history_draft_cursor);
                         if (results) |*bundle| bundle.deinit(ui.allocator);
                         results = null;
@@ -3734,7 +3740,9 @@ fn renderQueryHome(
         }
     }
 
-    const footer = if (results) |bundle|
+    const footer = if (ui.search_reapers.items.len >= max_background_search_reapers)
+        "Finishing canceled searches · Enter retries when cleanup completes"
+    else if (results) |bundle|
         if (bundle.searching) switch (focus) {
             .query => if (visible_order) |order|
                 if (order.len > 0)
@@ -5989,6 +5997,7 @@ const list_mouse_wheel_step: usize = 3;
 const search_active_poll_interval_ms: u64 = 1;
 const search_poll_interval_ms: u64 = 8;
 const max_parallel_provider_searches: usize = 12;
+const max_background_search_reapers: usize = 3;
 const event_batch_capacity: usize = 1;
 const max_filter_bytes: usize = 512;
 const max_bracketed_paste_bytes: usize = 16 * 1024;
@@ -6925,6 +6934,42 @@ test "incremental search work only releases initialized task slots" {
     };
     work.task_count = 1;
     releaseIncrementalSearchWork(work);
+}
+
+test "search reaper backlog guard caps outstanding cleanup jobs" {
+    const allocator = std.testing.allocator;
+    var ui: Ui = .{
+        .allocator = allocator,
+        .environ_map = undefined,
+        .tty = undefined,
+        .vx = undefined,
+        .loop = undefined,
+        .frame_arena = std.heap.ArenaAllocator.init(allocator),
+    };
+    defer ui.frame_arena.deinit();
+
+    var jobs: [max_background_search_reapers]*SearchReaperJob = undefined;
+    var initialized: usize = 0;
+    defer {
+        for (jobs[0..initialized]) |job| allocator.destroy(job);
+        ui.search_reapers.deinit(allocator);
+    }
+
+    while (initialized < jobs.len) : (initialized += 1) {
+        const job = try allocator.create(SearchReaperJob);
+        job.* = .{ .work = undefined };
+        jobs[initialized] = job;
+        try ui.search_reapers.append(allocator, .{
+            .future = undefined,
+            .job = job,
+        });
+
+        if (initialized + 1 < jobs.len) {
+            try std.testing.expect(!ui.searchReaperBacklogFull());
+        }
+    }
+
+    try std.testing.expect(ui.searchReaperBacklogFull());
 }
 
 test "settings persist independently from search cache state" {
