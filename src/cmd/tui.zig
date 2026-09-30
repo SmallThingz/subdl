@@ -3273,6 +3273,7 @@ fn editSettingsPopup(
     var ttl_error: ?[]const u8 = null;
     var redraw_background = true;
     var settings_dirty = false;
+    var help_open = false;
     info_open.* = false;
     language_selected = if (state.settings.language_filter_enabled)
         (singleEnabledIndex(&state.settings.languages_enabled) orelse 0) + 1
@@ -3281,6 +3282,7 @@ fn editSettingsPopup(
 
     while (true) {
         const win = ui.vx.window();
+        if (help_open and !canRenderOverlayMenu(win)) help_open = false;
         const metrics = settingsPopupMetrics(win.width, win.height);
         const page_size = settingsPageSize(metrics);
         ensureVisible(provider_selected, &provider_scroll, page_size);
@@ -3291,6 +3293,24 @@ fn editSettingsPopup(
             redraw_background = false;
         }
         try renderSettingsPopup(ui, win, state, panel, main_selected, provider_selected, language_selected, provider_scroll, language_scroll, ttl_input.items, ttl_cursor, ttl_error);
+        if (help_open) {
+            const panel_name = switch (panel) {
+                .main => "Main",
+                .providers => "Providers",
+                .languages => "Language",
+                .cache_ttl => "Cache retention",
+            };
+            var panel_buf: [96]u8 = undefined;
+            const panel_line = std.fmt.bufPrint(&panel_buf, "panel: {s}", .{panel_name}) catch "panel: Settings";
+            const lines = [_][]const u8{
+                panel_line,
+                "Up/Down move through settings",
+                "Enter/Space changes the highlighted setting",
+                "Esc/Ctrl+C goes back",
+                "F2 confirmations · F3 theme · Ctrl+D quit",
+            };
+            try renderOverlayMenu(ui, win, "Settings Help", &lines);
+        }
         try ui.render();
 
         const batch = try readEventBatch(ui, try ui.loop.nextEvent());
@@ -3302,6 +3322,10 @@ fn editSettingsPopup(
                 },
                 .mouse => |mouse| {
                     if (mouse.type != .press) continue;
+                    if (help_open) {
+                        help_open = false;
+                        continue;
+                    }
                     const win_now = ui.vx.window();
                     const metrics_now = settingsPopupMetrics(win_now.width, win_now.height);
                     switch (panel) {
@@ -3358,6 +3382,17 @@ fn editSettingsPopup(
                 },
                 .key_press => |key| {
                     if (key.isModifier()) continue;
+                    if (help_open) {
+                        if (key.matches(vaxis.Key.f1, .{}) or key.matches(vaxis.Key.escape, .{})) {
+                            help_open = false;
+                            continue;
+                        }
+                        help_open = false;
+                    }
+                    if (key.matches(vaxis.Key.f1, .{})) {
+                        if (canRenderOverlayMenu(ui.vx.window())) help_open = true;
+                        continue;
+                    }
                     if (key.matches(vaxis.Key.f2, .{})) {
                         ui.toggleConfirm();
                         redraw_background = true;
