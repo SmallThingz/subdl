@@ -4217,9 +4217,8 @@ fn exportCachedDownload(ui: *Ui, result: app.DownloadResult) !MessageResult {
         break :blk one;
     };
 
-    const labels = try ui.allocator.alloc([]const u8, files.len);
+    const labels = try buildCachedDownloadLabels(ui.allocator, files);
     defer ui.allocator.free(labels);
-    for (files, 0..) |path, idx| labels[idx] = pathBaseName(path);
 
     while (true) {
         const choice = try vaxisSelect(
@@ -4244,6 +4243,37 @@ fn exportCachedDownload(ui: *Ui, result: app.DownloadResult) !MessageResult {
             .quit => return .quit,
         }
     }
+}
+
+fn buildCachedDownloadLabels(allocator: std.mem.Allocator, files: []const []const u8) ![][]const u8 {
+    const labels = try allocator.alloc([]const u8, files.len);
+    for (files, 0..) |path, idx| {
+        const basename = pathBaseName(path);
+        var duplicate = false;
+        for (files, 0..) |other, other_idx| {
+            if (idx == other_idx) continue;
+            if (std.mem.eql(u8, basename, pathBaseName(other))) {
+                duplicate = true;
+                break;
+            }
+        }
+        labels[idx] = if (duplicate) path else basename;
+    }
+    return labels;
+}
+
+test "cached download labels disambiguate duplicate basenames" {
+    const files = [_][]const u8{
+        "/cache/movie/en/subtitle.srt",
+        "/cache/movie/fr/subtitle.srt",
+        "/cache/movie/notes.txt",
+    };
+    const labels = try buildCachedDownloadLabels(std.testing.allocator, &files);
+    defer std.testing.allocator.free(labels);
+
+    try std.testing.expectEqualStrings(files[0], labels[0]);
+    try std.testing.expectEqualStrings(files[1], labels[1]);
+    try std.testing.expectEqualStrings("notes.txt", labels[2]);
 }
 
 fn selectedCachedFile(files: []const []const u8, idx: usize) ![]const u8 {
