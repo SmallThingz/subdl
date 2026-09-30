@@ -31,6 +31,9 @@ const Event = union(enum) {
     winsize: vaxis.Winsize,
     focus_in,
     focus_out,
+    paste_start,
+    paste_end,
+    paste: []const u8,
 };
 
 const InputResult = union(enum) {
@@ -1328,6 +1331,12 @@ fn runTui(ui: *Ui) !void {
                             resetHistoryBrowse(&history_pick, &history_draft, &history_draft_cursor);
                             focus = .query;
                         }
+                    }
+                },
+                .paste => |text| {
+                    if (try insertNormalizedPaste(ui.allocator, &query, &cursor_pos, text, 180)) {
+                        resetHistoryBrowse(&history_pick, &history_draft, &history_draft_cursor);
+                        focus = .query;
                     }
                 },
                 else => {},
@@ -3958,6 +3967,13 @@ fn editSettingsPopup(
                         },
                     }
                 },
+                .paste => |text| {
+                    if (panel == .cache_ttl) {
+                        if (try insertTtlPaste(ui.allocator, &ttl_input, &ttl_cursor, text)) {
+                            ttl_error = null;
+                        }
+                    }
+                },
                 else => {},
             }
         }
@@ -5336,6 +5352,11 @@ fn vaxisInput(
                         }
                     }
                 },
+                .paste => |text| {
+                    if (try insertNormalizedPaste(ui.allocator, &query, &cursor_pos, text, options.max_len)) {
+                        error_text = null;
+                    }
+                },
                 else => {},
             }
         }
@@ -5622,6 +5643,13 @@ fn vaxisSelect(
                         if (matches.items.len > 0) selected_row = matches.items.len - 1;
                         moveSelectionToEnabled(matches.items, enabled, &selected_row, .backward);
                         continue;
+                    }
+                },
+                .paste => |text| {
+                    if (filter_mode and try appendNormalizedPaste(ui.allocator, &filter, text, max_filter_bytes)) {
+                        try rebuildOptionMatches(ui.allocator, options, filter.items, &matches);
+                        selected_row = 0;
+                        scroll = 0;
                     }
                 },
                 .mouse => |mouse| {
@@ -5933,6 +5961,13 @@ fn vaxisSelectSubtitle(
                         continue;
                     }
                 },
+                .paste => |text| {
+                    if (filter_mode and try appendNormalizedPaste(ui.allocator, &filter, text, max_filter_bytes)) {
+                        try rebuildSubtitleMatches(ui.allocator, subtitles, order, filter.items, &matches);
+                        selected_row = 0;
+                        scroll = 0;
+                    }
+                },
                 .mouse => |mouse| {
                     if (info_menu_open) {
                         if (mouse.type == .press) {
@@ -6240,6 +6275,145 @@ fn isTextKey(key: vaxis.Key) bool {
     return text.len > 0;
 }
 
+fn normalizePastedText(allocator: std.mem.Allocator, input: []const u8, max_bytes: usize) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var pending_space = false;
+    var i: usize = 0;
+    while (i < input.len and out.items.len < max_bytes) {
+        const byte = input[i];
+        if (byte < 0x80) {
+            i += 1;
+            if (byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n' or byte == 0x0b or byte == 0x0c) {
+                pending_space = true;
+                continue;
+            }
+            if (byte < 0x20 or byte == 0x7f) continue;
+            if (pending_space and out.items.len < max_bytes) {
+                try out.append(allocator, ' ');
+                pending_space = false;
+            }
+            if (out.items.len < max_bytes) try out.append(allocator, byte);
+            continue;
+        }
+
+        const seq_len = std.unicode.utf8ByteSequenceLength(byte) catch {
+            i += 1;
+            continue;
+        };
+        if (i + seq_len > input.len) break;
+        const codepoint = input[i .. i + seq_len];
+        if (!std.unicode.utf8ValidateSlice(codepoint)) {
+            i += 1;
+            continue;
+        }
+        if (pending_space) {
+            if (out.items.len >= max_bytes) break;
+            try out.append(allocator, ' ');
+            pending_space = false;
+        }
+        if (out.items.len + codepoint.len > max_bytes) break;
+        try out.appendSlice(allocator, codepoint);
+        i += seq_len;
+    }
+    if (pending_space and out.items.len < max_bytes) try out.append(allocator, ' ');
+    return out.toOwnedSlice(allocator);
+}
+
+fn insertNormalizedPaste(
+    allocator: std.mem.Allocator,
+    dest: *std.ArrayList(u8),
+    cursor: *usize,
+    input: []const u8,
+    max_len: usize,
+) !bool {
+    if (dest.items.len >= max_len) return false;
+    cursor.* = @min(cursor.*, dest.items.len);
+    const normalized = try normalizePastedText(allocator, input, max_len - dest.items.len);
+    defer allocator.free(normalized);
+    if (normalized.len == 0) return false;
+    try dest.insertSlice(allocator, cursor.*, normalized);
+    cursor.* += normalized.len;
+    return true;
+}
+
+fn appendNormalizedPaste(
+    allocator: std.mem.Allocator,
+    dest: *std.ArrayList(u8),
+    input: []const u8,
+    max_len: usize,
+) !bool {
+    var cursor = dest.items.len;
+    return insertNormalizedPaste(allocator, dest, &cursor, input, max_len);
+}
+
+fn insertTtlPaste(
+    allocator: std.mem.Allocator,
+    dest: *std.ArrayList(u8),
+    cursor: *usize,
+    input: []const u8,
+) !bool {
+    cursor.* = @min(cursor.*, dest.items.len);
+    var changed = false;
+    for (input) |ch| {
+        if (!(std.ascii.isDigit(ch) or ch == '.' or std.ascii.isAlphabetic(ch))) continue;
+        if (dest.items.len >= 32) break;
+        try dest.insert(allocator, cursor.*, ch);
+        cursor.* += 1;
+        changed = true;
+    }
+    return changed;
+}
+
+test "paste normalization folds whitespace and preserves valid unicode" {
+    const normalized = try normalizePastedText(
+        std.testing.allocator,
+        "The\tMatrix\r\né\x01界",
+        64,
+    );
+    defer std.testing.allocator.free(normalized);
+    try std.testing.expectEqualStrings("The Matrix é界", normalized);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(normalized));
+}
+
+test "paste normalization does not split utf8 at byte limit" {
+    const normalized = try normalizePastedText(std.testing.allocator, "ab界cd", 4);
+    defer std.testing.allocator.free(normalized);
+    try std.testing.expectEqualStrings("ab", normalized);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(normalized));
+}
+
+test "normalized paste inserts at cursor without triggering commands" {
+    var query: std.ArrayList(u8) = .empty;
+    defer query.deinit(std.testing.allocator);
+    try query.appendSlice(std.testing.allocator, "TheMatrix");
+    var cursor: usize = 3;
+
+    try std.testing.expect(try insertNormalizedPaste(
+        std.testing.allocator,
+        &query,
+        &cursor,
+        " \nCool\t",
+        32,
+    ));
+    try std.testing.expectEqualStrings("The Cool Matrix", query.items);
+    try std.testing.expectEqual(@as(usize, 9), cursor);
+}
+
+test "ttl paste keeps only accepted characters" {
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(std.testing.allocator);
+    var cursor: usize = 0;
+    try std.testing.expect(try insertTtlPaste(
+        std.testing.allocator,
+        &input,
+        &cursor,
+        "12.5 hours!?inf",
+    ));
+    try std.testing.expectEqualStrings("12.5hoursinf", input.items);
+    try std.testing.expectEqual(input.items.len, cursor);
+}
+
 fn prevCodepointStart(text: []const u8, cursor_pos: usize) usize {
     if (cursor_pos == 0) return 0;
     var i = cursor_pos - 1;
@@ -6318,6 +6492,8 @@ const list_mouse_wheel_step: usize = 3;
 const search_active_poll_interval_ms: u64 = 1;
 const search_poll_interval_ms: u64 = 8;
 const event_batch_capacity: usize = 1;
+const max_filter_bytes: usize = 512;
+const max_bracketed_paste_bytes: usize = 16 * 1024;
 
 const EventBatch = struct {
     items: [event_batch_capacity]Event = undefined,
@@ -6344,7 +6520,7 @@ const EventBatch = struct {
 };
 
 fn readEventBatch(ui: *Ui, first: Event) !EventBatch {
-    _ = ui;
+    if (first == .paste_start) return readBracketedPaste(ui);
     var batch: EventBatch = .{};
     batch.collect(first);
     // Do not eagerly drain keyboard events. Many TUI handlers intentionally
@@ -6352,6 +6528,48 @@ fn readEventBatch(ui: *Ui, first: Event) !EventBatch {
     // any immediately-following keystrokes from the same terminal burst.
     // Rendering is sub-millisecond in optimized builds, so one event per frame
     // keeps input lossless without sacrificing navigation responsiveness.
+    return batch;
+}
+
+fn readBracketedPaste(ui: *Ui) !EventBatch {
+    var pasted: std.ArrayListUnmanaged(u8) = .empty;
+    const allocator = ui.frameAllocator();
+
+    while (true) {
+        const event = try ui.loop.nextEvent();
+        switch (event) {
+            .paste_end => break,
+            .paste_start => {},
+            .winsize => |ws| try ui.resize(ws),
+            .key_press => |key| {
+                if (key.text) |text| {
+                    if (pasted.items.len + text.len <= max_bracketed_paste_bytes) {
+                        try pasted.appendSlice(allocator, text);
+                    }
+                    continue;
+                }
+                if (key.matches(vaxis.Key.enter, .{}) or
+                    key.matches(vaxis.Key.tab, .{}) or
+                    key.matches('j', .{ .ctrl = true }))
+                {
+                    if (pasted.items.len < max_bracketed_paste_bytes and
+                        (pasted.items.len == 0 or pasted.items[pasted.items.len - 1] != ' '))
+                    {
+                        try pasted.append(allocator, ' ');
+                    }
+                }
+            },
+            .paste => |text| {
+                if (pasted.items.len + text.len <= max_bracketed_paste_bytes) {
+                    try pasted.appendSlice(allocator, text);
+                }
+            },
+            else => {},
+        }
+    }
+
+    var batch: EventBatch = .{};
+    batch.append(.{ .paste = pasted.items });
     return batch;
 }
 
