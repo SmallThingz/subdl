@@ -2843,6 +2843,28 @@ fn ensureQueryHitOrder(
     return bundle.display_order;
 }
 
+fn ensureQueryHitOrderPreservingSelection(
+    allocator: std.mem.Allocator,
+    bundle: *SearchBundle,
+    query_norm: []const u8,
+    selected_row: *usize,
+) ![]const usize {
+    const selected_hit: ?usize = if (selected_row.* < bundle.display_order.len)
+        bundle.display_order[selected_row.*]
+    else
+        null;
+
+    const order = try ensureQueryHitOrder(allocator, bundle, query_norm);
+    if (selected_hit) |hit_idx| {
+        if (findIndexInMatches(order, hit_idx)) |row| {
+            selected_row.* = row;
+            return order;
+        }
+    }
+    clampSelection(selected_row, order.len);
+    return order;
+}
+
 test "search title cleanup strips only known metadata prefixes" {
     try std.testing.expectEqualStrings("The Matrix (1999)", cleanSearchTitle("[movie] The Matrix (1999)"));
     try std.testing.expectEqualStrings("The Matrix", cleanSearchTitle("[en] The Matrix"));
@@ -2885,13 +2907,16 @@ test "query display order cache reuses stable hit sets and invalidates on change
     const second = try ensureQueryHitOrder(allocator, &bundle, "matrix");
     try std.testing.expectEqual(cached_ptr, second.ptr);
 
+    var selected_row: usize = 1;
     try bundle.hits.append(allocator, .{ .provider = .subdl_com, .response_index = 0, .item_index = 2 });
-    const expanded = try ensureQueryHitOrder(allocator, &bundle, "matrix");
+    const expanded = try ensureQueryHitOrderPreservingSelection(allocator, &bundle, "matrix", &selected_row);
     try std.testing.expectEqualSlices(usize, &.{ 0, 2, 1 }, expanded);
+    try std.testing.expectEqual(@as(usize, 2), selected_row);
     try std.testing.expectEqual(@as(usize, 3), bundle.display_hit_count);
 
-    const narrowed = try ensureQueryHitOrder(allocator, &bundle, "the matrix");
+    const narrowed = try ensureQueryHitOrderPreservingSelection(allocator, &bundle, "the matrix", &selected_row);
     try std.testing.expectEqualSlices(usize, &.{1}, narrowed);
+    try std.testing.expectEqual(@as(usize, 0), selected_row);
     try std.testing.expectEqualStrings("the matrix", bundle.display_query_norm.?);
 
     const no_match = try ensureQueryHitOrder(allocator, &bundle, "blade runner");
@@ -4011,7 +4036,7 @@ fn renderQueryHome(
         if (query_dirty)
             &.{}
         else
-            try ensureQueryHitOrder(ui.allocator, bundle, query_norm)
+            try ensureQueryHitOrderPreservingSelection(ui.allocator, bundle, query_norm, selected_result)
     else
         null;
     var top_buf: [320]u8 = undefined;
