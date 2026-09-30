@@ -2953,6 +2953,43 @@ fn settingsPageSize(metrics: SettingsPopupMetrics) usize {
     return if (metrics.row_end > metrics.row_start) @intCast(metrics.row_end - metrics.row_start) else 1;
 }
 
+fn settingsTtlCursorForClick(
+    metrics: SettingsPopupMetrics,
+    input_len: usize,
+    row: u16,
+    col: u16,
+) ?usize {
+    const input_col = metrics.x + 10;
+    const input_width: u16 = metrics.width -| 12;
+    if (row != metrics.row_start or col < input_col or col >= input_col + input_width) return null;
+    return @min(@as(usize, @intCast(col - input_col)), input_len);
+}
+
+test "settings ttl mouse cursor only accepts the input field" {
+    const metrics = settingsPopupMetrics(80, 24);
+    const input_col = metrics.x + 10;
+    try std.testing.expectEqual(
+        @as(?usize, 3),
+        settingsTtlCursorForClick(metrics, 5, metrics.row_start, input_col + 3),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, 5),
+        settingsTtlCursorForClick(metrics, 5, metrics.row_start, input_col + 20),
+    );
+    try std.testing.expect(settingsTtlCursorForClick(
+        metrics,
+        5,
+        metrics.row_start + 1,
+        input_col + 2,
+    ) == null);
+    try std.testing.expect(settingsTtlCursorForClick(
+        metrics,
+        5,
+        metrics.row_start,
+        input_col -| 1,
+    ) == null);
+}
+
 fn activateSettingsMainRow(
     ui: *Ui,
     state: *TuiRuntimeState,
@@ -3163,7 +3200,15 @@ fn editSettingsPopup(
                                 else => {},
                             }
                         },
-                        .cache_ttl => {},
+                        .cache_ttl => {
+                            if (mouse.button != .left or mouse.row < 0 or mouse.col < 0) continue;
+                            const row: u16 = @intCast(mouse.row);
+                            const col: u16 = @intCast(mouse.col);
+                            if (settingsTtlCursorForClick(metrics_now, ttl_input.items.len, row, col)) |new_cursor| {
+                                ttl_cursor = new_cursor;
+                                ttl_error = null;
+                            }
+                        },
                     }
                 },
                 .key_press => |key| {
