@@ -4374,6 +4374,18 @@ test "cached download labels disambiguate duplicate basenames" {
     try std.testing.expectEqualStrings("notes.txt", labels[2]);
 }
 
+test "cached download labels sort case-insensitively" {
+    var alpha = [_]u8{ 'a', 'l', 'p', 'h', 'a', '.', 's', 'r', 't' };
+    var beta = [_]u8{ 'B', 'e', 't', 'a', '.', 's', 'r', 't' };
+    var zulu = [_]u8{ 'Z', 'u', 'l', 'u', '.', 's', 'r', 't' };
+    var labels = [_][]u8{ zulu[0..], beta[0..], alpha[0..] };
+
+    std.mem.sort([]u8, &labels, {}, cachedDownloadLabelLessThan);
+    try std.testing.expectEqualStrings("alpha.srt", labels[0]);
+    try std.testing.expectEqualStrings("Beta.srt", labels[1]);
+    try std.testing.expectEqualStrings("Zulu.srt", labels[2]);
+}
+
 fn selectedCachedFile(files: []const []const u8, idx: usize) ![]const u8 {
     if (idx >= files.len) return error.InvalidSelection;
     return files[idx];
@@ -4426,6 +4438,8 @@ fn cachedDownloadLabels(allocator: std.mem.Allocator, cache_root_path: []const u
 }
 
 fn cachedDownloadLabelLessThan(_: void, lhs: []u8, rhs: []u8) bool {
+    const order = compareCaseInsensitive(lhs, rhs);
+    if (order != .eq) return order == .lt;
     return std.mem.order(u8, lhs, rhs) == .lt;
 }
 
