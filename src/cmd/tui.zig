@@ -881,6 +881,19 @@ fn finalizeWorkerGroup(group: *std.Io.Group, control: FetchControl) void {
     }
 }
 
+fn finalizeWorkerGroupWithStatus(
+    ui: *Ui,
+    group: *std.Io.Group,
+    control: FetchControl,
+    title: []const u8,
+    detail: []const u8,
+) !void {
+    if (control == .canceled) {
+        try vaxisStatus(ui, title, "Canceling…", detail);
+    }
+    finalizeWorkerGroup(group, control);
+}
+
 fn setContext(ui: *Ui, context_line: ?[]const u8) void {
     if (ui.context_owned) |buf| {
         ui.allocator.free(buf);
@@ -4119,7 +4132,7 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
             defer subtitles_group.cancel(runtime_io.get());
             try subtitles_group.concurrent(runtime_io.get(), subtitlesTaskMain, .{&subtitles_task});
             const subtitles_control = try waitForTask(ui, &subtitles_task.done, "Subtitles", detail);
-            finalizeWorkerGroup(&subtitles_group, subtitles_control);
+            try finalizeWorkerGroupWithStatus(ui, &subtitles_group, subtitles_control, "Subtitles", detail);
             if (subtitles_control == .quit) {
                 if (subtitles_task.result) |*r| r.deinit();
                 return .quit;
@@ -4226,7 +4239,7 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
         defer download_group.cancel(runtime_io.get());
         try download_group.concurrent(runtime_io.get(), downloadTaskMain, .{&download_task});
         const download_control = try waitForDownloadTask(ui, &download_task, "Download", download_detail);
-        finalizeWorkerGroup(&download_group, download_control);
+        try finalizeWorkerGroupWithStatus(ui, &download_group, download_control, "Download", download_detail);
         if (download_control == .quit) {
             if (download_task.result) |*r| r.deinit(std.heap.page_allocator);
             return .quit;
@@ -4709,7 +4722,7 @@ fn vaxisStatus(ui: *Ui, title: []const u8, message: []const u8, detail: []const 
     const detail_segments = [_]vaxis.Segment{.{ .text = detail, .style = ui.styleMuted() }};
     _ = win.print(&detail_segments, .{ .row_offset = 3, .col_offset = 1, .wrap = .none });
 
-    try renderBottomBar(ui, win, .{ .left = "Ctrl+C/Esc/q cancel fetch" });
+    try renderBottomBar(ui, win, .{ .left = "Ctrl+C/Esc/q cancel" });
     try ui.render();
 }
 
