@@ -2505,11 +2505,14 @@ fn formatHomeTopLine(
     var pos: usize = 0;
     const search_tab = if (focus == .downloads) "Search" else "SEARCH";
     const downloads_tab = if (focus == .downloads) "DOWNLOADS" else "Downloads";
-    pos += if (help_available)
-        (try std.fmt.bufPrint(buf[pos..], "F1 Help · Esc Settings · {s}", .{search_tab})).len
-    else
-        (try std.fmt.bufPrint(buf[pos..], "Esc Settings · {s}", .{search_tab})).len;
-    if (download_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {s} {d}", .{ downloads_tab, download_count })).len;
+    if (focus == .downloads and download_count > 0) {
+        pos += (try std.fmt.bufPrint(buf[pos..], "{s} {d} · {s}", .{ downloads_tab, download_count, search_tab })).len;
+    } else {
+        pos += (try std.fmt.bufPrint(buf[pos..], "{s}", .{search_tab})).len;
+        if (download_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {s} {d}", .{ downloads_tab, download_count })).len;
+    }
+    pos += (try std.fmt.bufPrint(buf[pos..], " · Esc Settings", .{})).len;
+    if (help_available) pos += (try std.fmt.bufPrint(buf[pos..], " · F1 Help", .{})).len;
     pos += (try std.fmt.bufPrint(buf[pos..], " · {d}/{d} providers", .{ enabled_provider_count, provider_count })).len;
     if (maybe_bundle) |bundle| {
         if (bundle.hits.items.len > 0) {
@@ -3897,11 +3900,18 @@ test "search progress distinguishes active and queued providers" {
 test "home header only advertises help when overlay can render" {
     var buf: [320]u8 = undefined;
     const with_help = try formatHomeTopLine(&buf, .query, 1, 1, 0, null, null, true);
-    try std.testing.expect(std.mem.startsWith(u8, with_help, "F1 Help · Esc Settings"));
+    try std.testing.expect(std.mem.startsWith(u8, with_help, "SEARCH · Esc Settings"));
+    try std.testing.expect(std.mem.indexOf(u8, with_help, "F1 Help") != null);
 
     const without_help = try formatHomeTopLine(&buf, .query, 1, 1, 0, null, null, false);
-    try std.testing.expect(std.mem.startsWith(u8, without_help, "Esc Settings"));
+    try std.testing.expect(std.mem.startsWith(u8, without_help, "SEARCH · Esc Settings"));
     try std.testing.expect(std.mem.indexOf(u8, without_help, "F1 Help") == null);
+}
+
+test "home header prioritizes active downloads pane" {
+    var buf: [320]u8 = undefined;
+    const top = try formatHomeTopLine(&buf, .downloads, 2, 3, 7, null, null, true);
+    try std.testing.expect(std.mem.startsWith(u8, top, "DOWNLOADS 7 · Search"));
 }
 
 const HomeSearchBoxMetrics = struct {
