@@ -4691,7 +4691,7 @@ fn refreshCachedDownloads(allocator: std.mem.Allocator, state: *TuiRuntimeState)
     state.download_entries = next;
 }
 
-fn exportHomeCachedDownload(ui: *Ui, state: *const TuiRuntimeState, selected_download: usize) !MessageResult {
+fn exportHomeCachedDownload(ui: *Ui, state: *TuiRuntimeState, selected_download: usize) !MessageResult {
     if (selected_download >= state.download_entries.len) return .ok;
 
     const input = try vaxisInput(ui, "Export Download", "Destination directory", "Directory", 240);
@@ -4708,7 +4708,10 @@ fn exportHomeCachedDownload(ui: *Ui, state: *const TuiRuntimeState, selected_dow
         state.cache_root_path,
         state.download_entries[selected_download],
         if (trimmed_dir.len == 0) "downloads" else trimmed_dir,
-    ) catch |err| return showFriendlyError(ui, "Could not export cached download", err);
+    ) catch |err| {
+        if (err == error.FileNotFound) refreshCachedDownloads(ui.allocator, state) catch {};
+        return showFriendlyError(ui, "Could not export cached download", err);
+    };
     defer ui.allocator.free(exported);
 
     return vaxisMessage(ui, "Exported", exported, "Press any key to continue.", ui.styleAccent());
