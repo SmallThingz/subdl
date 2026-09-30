@@ -934,13 +934,14 @@ fn runTui(ui: *Ui) !void {
         ui.collectSearchReapers();
         ui.provider_enabled = state.settings.providers_enabled;
         if (info_open and !canRenderOverlayMenu(ui.vx.window())) info_open = false;
-        focus = normalizeQueryFocus(
-            focus,
-            results != null and results.?.hits.items.len > 0,
-            state.settings.download_cache_enabled and state.download_entries.len > 0,
-        );
         const query_norm_view = normalizeQueryView(query.items);
         const query_dirty = !std.mem.eql(u8, query_norm_view, last_searched_norm);
+        const has_current_results = !query_dirty and results != null and results.?.hits.items.len > 0;
+        focus = normalizeQueryFocus(
+            focus,
+            has_current_results,
+            state.settings.download_cache_enabled and state.download_entries.len > 0,
+        );
         try renderQueryHome(ui, &state, query.items, cursor_pos, focus, query_dirty, if (results) |*b| b else null, &selected_result, &result_scroll, &selected_download, &download_scroll, info_open, true);
 
         const batch = try readEventBatch(ui, try ui.loop.nextEvent());
@@ -1032,37 +1033,39 @@ fn runTui(ui: *Ui) !void {
                             },
                             else => {},
                         };
-                    } else if (results) |*bundle| {
-                        const visible_count = bundle.display_order.len;
-                        if (mouse.type == .press and visible_count > 0) switch (mouse.button) {
-                            .wheel_down => {
-                                scrollSelection(&selected_result, visible_count, .forward, list_mouse_wheel_step);
-                                focus = .results;
-                            },
-                            .wheel_up => {
-                                scrollSelection(&selected_result, visible_count, .backward, list_mouse_wheel_step);
-                                focus = .results;
-                            },
-                            .left => {
-                                const win = ui.vx.window();
-                                if (mouseRowIndex(mouse, homeListTop(), homeListBottom(win.height), result_scroll, visible_count)) |row_idx| {
-                                    const activate = focus == .results and row_idx == selected_result;
-                                    selected_result = row_idx;
+                    } else if (!query_dirty) {
+                        if (results) |*bundle| {
+                            const visible_count = bundle.display_order.len;
+                            if (mouse.type == .press and visible_count > 0) switch (mouse.button) {
+                                .wheel_down => {
+                                    scrollSelection(&selected_result, visible_count, .forward, list_mouse_wheel_step);
                                     focus = .results;
-                                    if (activate) {
-                                        const visible_order = bundle.display_order;
-                                        if (selected_result < visible_order.len) {
-                                            switch (try openSearchResult(ui, bundle, visible_order[selected_result], &state)) {
-                                                .back => focus = .results,
-                                                .to_query => focus = .query,
-                                                .quit => return,
+                                },
+                                .wheel_up => {
+                                    scrollSelection(&selected_result, visible_count, .backward, list_mouse_wheel_step);
+                                    focus = .results;
+                                },
+                                .left => {
+                                    const win = ui.vx.window();
+                                    if (mouseRowIndex(mouse, homeListTop(), homeListBottom(win.height), result_scroll, visible_count)) |row_idx| {
+                                        const activate = focus == .results and row_idx == selected_result;
+                                        selected_result = row_idx;
+                                        focus = .results;
+                                        if (activate) {
+                                            const visible_order = bundle.display_order;
+                                            if (selected_result < visible_order.len) {
+                                                switch (try openSearchResult(ui, bundle, visible_order[selected_result], &state)) {
+                                                    .back => focus = .results,
+                                                    .to_query => focus = .query,
+                                                    .quit => return,
+                                                }
                                             }
                                         }
                                     }
-                                }
-                            },
-                            else => {},
-                        };
+                                },
+                                else => {},
+                            };
+                        }
                     }
                 },
                 .key_press => |key| {
@@ -1093,7 +1096,7 @@ fn runTui(ui: *Ui) !void {
                         continue;
                     }
                     if (key.matches(vaxis.Key.tab, .{})) {
-                        focus = nextQueryFocus(focus, results != null and results.?.hits.items.len > 0, state.settings.download_cache_enabled and state.download_entries.len > 0);
+                        focus = nextQueryFocus(focus, has_current_results, state.settings.download_cache_enabled and state.download_entries.len > 0);
                         continue;
                     }
                     if (key.matches(vaxis.Key.escape, .{})) {
@@ -1279,10 +1282,12 @@ fn runTui(ui: *Ui) !void {
         if (batch.wheel_delta != 0 and !info_open) {
             if (focus == .downloads and state.settings.download_cache_enabled) {
                 applyWheelDelta(&selected_download, state.download_entries.len, batch.wheel_delta, list_mouse_wheel_step);
-            } else if (results) |*bundle| {
-                const visible_count = bundle.display_order.len;
-                applyWheelDelta(&selected_result, visible_count, batch.wheel_delta, list_mouse_wheel_step);
-                if (visible_count > 0) focus = .results;
+            } else if (!query_dirty) {
+                if (results) |*bundle| {
+                    const visible_count = bundle.display_order.len;
+                    applyWheelDelta(&selected_result, visible_count, batch.wheel_delta, list_mouse_wheel_step);
+                    if (visible_count > 0) focus = .results;
+                }
             }
         }
     }
@@ -3928,8 +3933,11 @@ fn renderQueryHome(
     const provider_count = countEnabledFlags(&state.settings.providers_enabled);
     const download_count = if (state.settings.download_cache_enabled) state.download_entries.len else 0;
     const query_norm = normalizeQueryView(query);
-    const visible_order = if (results) |bundle|
-        try ensureQueryHitOrder(ui.allocator, bundle, query_norm)
+    const visible_order: ?[]const usize = if (results) |bundle|
+        if (query_dirty)
+            &.{}
+        else
+            try ensureQueryHitOrder(ui.allocator, bundle, query_norm)
     else
         null;
     var top_buf: [320]u8 = undefined;
