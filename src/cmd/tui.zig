@@ -952,6 +952,27 @@ fn runTui(ui: *Ui) !void {
                         if (mouse.type == .press) info_open = false;
                         continue;
                     }
+                    if (mouse.type == .press and mouse.button == .left) {
+                        const win = ui.vx.window();
+                        const search_box = homeSearchBoxMetrics(win.width);
+                        if (mouse.row >= 0 and mouse.col >= 0) {
+                            const row: u16 = @intCast(mouse.row);
+                            const col: u16 = @intCast(mouse.col);
+                            if (row == search_box.input_row and
+                                col >= search_box.input_col and
+                                col < search_box.input_col + search_box.input_width)
+                            {
+                                focus = .query;
+                                history_pick = null;
+                                cursor_pos = queryCursorByteOffsetForDisplayColumn(
+                                    win,
+                                    query.items,
+                                    @intCast(col - search_box.input_col),
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     if (focus == .downloads and state.settings.download_cache_enabled) {
                         const download_count = state.download_entries.len;
                         if (mouse.type == .press and download_count > 0) switch (mouse.button) {
@@ -3846,9 +3867,10 @@ fn renderQueryHome(
     );
     try renderCompactTopLine(ui, win, top, ui.styleTitle());
 
-    const box_w: u16 = @min(if (win.width > 6) win.width - 6 else win.width, 86);
-    const box_x: u16 = if (win.width > box_w) (win.width - box_w) / 2 else 0;
-    const box_y: u16 = 1;
+    const search_box = homeSearchBoxMetrics(win.width);
+    const box_w = search_box.width;
+    const box_x = search_box.x;
+    const box_y = search_box.y;
     const border_style = if (query_dirty) ui.styleWarn() else if (focus == .query) ui.styleAccent() else ui.styleMuted();
     try renderBox(ui, win, box_x, box_y, box_w, 3, border_style);
     try printFitted(ui, win, box_y, box_x + 2, " Search ", border_style, 10);
@@ -3987,6 +4009,29 @@ fn renderQueryHome(
     }
 
     if (flush) try ui.render();
+}
+
+const HomeSearchBoxMetrics = struct {
+    width: u16,
+    x: u16,
+    y: u16,
+    input_row: u16,
+    input_col: u16,
+    input_width: u16,
+};
+
+fn homeSearchBoxMetrics(win_width: u16) HomeSearchBoxMetrics {
+    const width: u16 = @min(if (win_width > 6) win_width - 6 else win_width, 86);
+    const x: u16 = if (win_width > width) (win_width - width) / 2 else 0;
+    const y: u16 = 1;
+    return .{
+        .width = width,
+        .x = x,
+        .y = y,
+        .input_row = y + 1,
+        .input_col = x + 2,
+        .input_width = if (width > 4) width - 4 else 0,
+    };
 }
 
 fn homeListBottom(height: u16) u16 {
@@ -6278,6 +6323,26 @@ fn utf8PrefixForDisplayWidth(win: anytype, text: []const u8, max_width: usize) [
     return text[0..best];
 }
 
+fn queryCursorByteOffsetForDisplayColumn(win: anytype, text: []const u8, column: usize) usize {
+    if (text.len == 0 or column == 0) return 0;
+
+    var idx: usize = 0;
+    var previous_width: usize = 0;
+    while (idx < text.len) {
+        const next = nextCodepointEnd(text, idx);
+        if (next <= idx or next > text.len) break;
+        const next_width: usize = @intCast(win.gwidth(text[0..next]));
+        if (next_width > column) {
+            const before_distance = column -| previous_width;
+            const after_distance = next_width - column;
+            return if (after_distance < before_distance) next else idx;
+        }
+        previous_width = next_width;
+        idx = next;
+    }
+    return text.len;
+}
+
 test "utf8PrefixForDisplayWidth does not split utf8 sequences" {
     const FakeWin = struct {
         pub fn gwidth(_: @This(), s: []const u8) usize {
@@ -6294,6 +6359,22 @@ test "utf8PrefixForDisplayWidth does not split utf8 sequences" {
 
     const full = utf8PrefixForDisplayWidth(win, text, 64);
     try std.testing.expectEqualStrings(text, full);
+}
+
+test "query mouse cursor placement stays on utf8 boundaries" {
+    const FakeWin = struct {
+        pub fn gwidth(_: @This(), s: []const u8) usize {
+            return std.unicode.utf8CountCodepoints(s) catch s.len;
+        }
+    };
+
+    const win = FakeWin{};
+    const text = "aé界z";
+    try std.testing.expectEqual(@as(usize, 0), queryCursorByteOffsetForDisplayColumn(win, text, 0));
+    try std.testing.expectEqual(@as(usize, 1), queryCursorByteOffsetForDisplayColumn(win, text, 1));
+    try std.testing.expectEqual(@as(usize, 3), queryCursorByteOffsetForDisplayColumn(win, text, 2));
+    try std.testing.expectEqual(@as(usize, 6), queryCursorByteOffsetForDisplayColumn(win, text, 3));
+    try std.testing.expectEqual(text.len, queryCursorByteOffsetForDisplayColumn(win, text, 99));
 }
 
 test "sanitizeUtf8ForDisplay escapes invalid bytes" {
