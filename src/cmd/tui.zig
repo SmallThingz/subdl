@@ -3355,7 +3355,10 @@ fn editSettingsPopup(
 
     while (true) {
         const win = ui.vx.window();
-        if (help_open and !canRenderOverlayMenu(win)) help_open = false;
+        if (help_open and !canRenderOverlayMenu(win)) {
+            help_open = false;
+            redraw_background = true;
+        }
         const metrics = settingsPopupMetrics(win.width, win.height);
         const page_size = settingsPageSize(metrics);
         ensureVisible(provider_selected, &provider_scroll, page_size);
@@ -3407,6 +3410,7 @@ fn editSettingsPopup(
                     if (mouse.type != .press) continue;
                     if (help_open) {
                         help_open = false;
+                        redraw_background = true;
                     }
                     const win_now = ui.vx.window();
                     const metrics_now = settingsPopupMetrics(win_now.width, win_now.height);
@@ -3467,9 +3471,11 @@ fn editSettingsPopup(
                     if (help_open) {
                         if (key.matches(vaxis.Key.f1, .{}) or key.matches(vaxis.Key.escape, .{})) {
                             help_open = false;
+                            redraw_background = true;
                             continue;
                         }
                         help_open = false;
+                        redraw_background = true;
                     }
                     if (key.matches(vaxis.Key.f1, .{})) {
                         if (canRenderOverlayMenu(ui.vx.window())) help_open = true;
