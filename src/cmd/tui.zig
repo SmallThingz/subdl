@@ -1333,7 +1333,8 @@ fn runTui(ui: *Ui) !void {
                 else => {},
             }
         }
-        if (batch.wheel_delta != 0 and !info_open) {
+        if (batch.wheel_delta != 0) {
+            if (info_open) info_open = false;
             if (focus == .downloads and state.settings.download_cache_enabled) {
                 applyWheelDelta(&selected_download, state.download_entries.len, batch.wheel_delta, list_mouse_wheel_step);
             } else if (!query_dirty) {
