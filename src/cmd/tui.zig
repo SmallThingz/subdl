@@ -925,6 +925,9 @@ fn runTui(ui: *Ui) !void {
     var download_scroll: usize = 0;
     var info_open = false;
     var history_pick: ?usize = null;
+    var history_draft: std.ArrayList(u8) = .empty;
+    defer history_draft.deinit(ui.allocator);
+    var history_draft_cursor: usize = 0;
     var last_searched_norm: []u8 = try ui.allocator.dupe(u8, "");
     defer ui.allocator.free(last_searched_norm);
     var results: ?SearchBundle = null;
@@ -976,7 +979,7 @@ fn runTui(ui: *Ui) !void {
                                 col < search_box.input_col + search_box.input_width)
                             {
                                 focus = .query;
-                                history_pick = null;
+                                resetHistoryBrowse(&history_pick, &history_draft, &history_draft_cursor);
                                 const viewport = queryViewportForCursor(
                                     win,
                                     query.items,
@@ -1011,6 +1014,14 @@ fn runTui(ui: *Ui) !void {
                                 const visible_count = @min(suggestions.len, @as(usize, 6));
                                 if (display_idx < visible_count) {
                                     const keyword = state.keywords.items[suggestions[display_idx]];
+                                    try captureHistoryDraft(
+                                        ui.allocator,
+                                        &query,
+                                        cursor_pos,
+                                        &history_pick,
+                                        &history_draft,
+                                        &history_draft_cursor,
+                                    );
                                     query.clearRetainingCapacity();
                                     try query.appendSlice(ui.allocator, keyword.query);
                                     cursor_pos = query.items.len;
@@ -1212,6 +1223,7 @@ fn runTui(ui: *Ui) !void {
                     if (key.matches(vaxis.Key.enter, .{})) {
                         const current_query_norm = normalizeQueryView(query.items);
                         if (current_query_norm.len == 0) continue;
+                        resetHistoryBrowse(&history_pick, &history_draft, &history_draft_cursor);
                         if (results) |*bundle| bundle.deinit(ui.allocator);
                         results = null;
                         const owned_query = try ui.allocator.dupe(u8, current_query_norm);
@@ -1244,9 +1256,27 @@ fn runTui(ui: *Ui) !void {
                         continue;
                     }
                     if (key.matches(vaxis.Key.up, .{})) {
-                        if (try applyHistorySuggestion(ui.allocator, &state, &query, &cursor_pos, .backward, &history_pick)) continue;
+                        if (try applyHistorySuggestion(
+                            ui.allocator,
+                            &state,
+                            &query,
+                            &cursor_pos,
+                            .backward,
+                            &history_pick,
+                            &history_draft,
+                            &history_draft_cursor,
+                        )) continue;
                     } else if (key.matches(vaxis.Key.down, .{})) {
-                        if (try applyHistorySuggestion(ui.allocator, &state, &query, &cursor_pos, .forward, &history_pick)) continue;
+                        if (try applyHistorySuggestion(
+                            ui.allocator,
+                            &state,
+                            &query,
+                            &cursor_pos,
+                            .forward,
+                            &history_pick,
+                            &history_draft,
+                            &history_draft_cursor,
+                        )) continue;
                     } else if (key.matches(vaxis.Key.left, .{})) {
                         cursor_pos = prevCodepointStart(query.items, cursor_pos);
                     } else if (key.matches(vaxis.Key.right, .{})) {
@@ -1258,21 +1288,21 @@ fn runTui(ui: *Ui) !void {
                     } else if (key.matches('u', .{ .ctrl = true })) {
                         query.clearRetainingCapacity();
                         cursor_pos = 0;
-                        history_pick = null;
+                        resetHistoryBrowse(&history_pick, &history_draft, &history_draft_cursor);
                         focus = .query;
                     } else if (key.matches(vaxis.Key.backspace, .{})) {
                         if (cursor_pos > 0) {
                             const prev = prevCodepointStart(query.items, cursor_pos);
                             query.replaceRangeAssumeCapacity(prev, cursor_pos - prev, "");
                             cursor_pos = prev;
-                            history_pick = null;
+                            resetHistoryBrowse(&history_pick, &history_draft, &history_draft_cursor);
                             focus = .query;
                         }
                     } else if (key.matches(vaxis.Key.delete, .{})) {
                         if (cursor_pos < query.items.len) {
                             const next = nextCodepointEnd(query.items, cursor_pos);
                             query.replaceRangeAssumeCapacity(cursor_pos, next - cursor_pos, "");
-                            history_pick = null;
+                            resetHistoryBrowse(&history_pick, &history_draft, &history_draft_cursor);
                             focus = .query;
                         }
                     } else if (isTextKey(key)) {
@@ -1280,7 +1310,7 @@ fn runTui(ui: *Ui) !void {
                         if (query.items.len + text.len <= 180) {
                             try query.insertSlice(ui.allocator, cursor_pos, text);
                             cursor_pos += text.len;
-                            history_pick = null;
+                            resetHistoryBrowse(&history_pick, &history_draft, &history_draft_cursor);
                             focus = .query;
                         }
                     }
@@ -3287,6 +3317,30 @@ fn rememberKeyword(allocator: std.mem.Allocator, state: *TuiRuntimeState, query_
 
 const HistoryDirection = enum { backward, forward };
 
+fn resetHistoryBrowse(
+    history_pick: *?usize,
+    history_draft: *std.ArrayList(u8),
+    history_draft_cursor: *usize,
+) void {
+    history_pick.* = null;
+    history_draft.clearRetainingCapacity();
+    history_draft_cursor.* = 0;
+}
+
+fn captureHistoryDraft(
+    allocator: std.mem.Allocator,
+    query: *const std.ArrayList(u8),
+    cursor_pos: usize,
+    history_pick: *const ?usize,
+    history_draft: *std.ArrayList(u8),
+    history_draft_cursor: *usize,
+) !void {
+    if (history_pick.* != null) return;
+    history_draft.clearRetainingCapacity();
+    try history_draft.appendSlice(allocator, query.items);
+    history_draft_cursor.* = @min(cursor_pos, query.items.len);
+}
+
 fn applyHistorySuggestion(
     allocator: std.mem.Allocator,
     state: *const TuiRuntimeState,
@@ -3294,11 +3348,34 @@ fn applyHistorySuggestion(
     cursor_pos: *usize,
     direction: HistoryDirection,
     history_pick: *?usize,
+    history_draft: *std.ArrayList(u8),
+    history_draft_cursor: *usize,
 ) !bool {
     if (!state.settings.keyword_cache_enabled or state.keywords.items.len == 0) return false;
     const next = switch (direction) {
-        .backward => if (history_pick.*) |idx| idx + 1 else 0,
-        .forward => if (history_pick.*) |idx| idx -| 1 else 0,
+        .backward => blk: {
+            if (history_pick.*) |idx| break :blk idx + 1;
+            try captureHistoryDraft(
+                allocator,
+                query,
+                cursor_pos.*,
+                history_pick,
+                history_draft,
+                history_draft_cursor,
+            );
+            break :blk 0;
+        },
+        .forward => blk: {
+            const idx = history_pick.* orelse return false;
+            if (idx == 0) {
+                query.clearRetainingCapacity();
+                try query.appendSlice(allocator, history_draft.items);
+                cursor_pos.* = @min(history_draft_cursor.*, query.items.len);
+                resetHistoryBrowse(history_pick, history_draft, history_draft_cursor);
+                return true;
+            }
+            break :blk idx - 1;
+        },
     };
     if (next >= state.keywords.items.len) return false;
     const sorted = try sortedKeywordIndexes(allocator, state.keywords.items);
@@ -3322,6 +3399,108 @@ fn sortedKeywordIndexes(allocator: std.mem.Allocator, keywords: []const KeywordE
     }.f;
     std.mem.sort(usize, order, Ctx{ .keywords = keywords }, less);
     return order;
+}
+
+test "history navigation restores the original draft" {
+    const allocator = std.testing.allocator;
+    var state: TuiRuntimeState = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .settings = defaultTuiSettings(),
+        .state_path = try allocator.dupe(u8, "state.test"),
+        .settings_path = try allocator.dupe(u8, "settings.test"),
+        .keyword_path = try allocator.dupe(u8, "keywords.test"),
+        .cache_root_path = try allocator.dupe(u8, "cache.test"),
+    };
+    defer state.deinit(allocator);
+
+    const a = state.arena.allocator();
+    try state.keywords.append(allocator, .{
+        .query = try a.dupe(u8, "older"),
+        .used_at_unix = 10,
+        .use_count = 1,
+    });
+    try state.keywords.append(allocator, .{
+        .query = try a.dupe(u8, "newer"),
+        .used_at_unix = 20,
+        .use_count = 1,
+    });
+
+    var query: std.ArrayList(u8) = .empty;
+    defer query.deinit(allocator);
+    try query.appendSlice(allocator, "draft");
+    var cursor_pos: usize = 2;
+    var history_pick: ?usize = null;
+    var history_draft: std.ArrayList(u8) = .empty;
+    defer history_draft.deinit(allocator);
+    var history_draft_cursor: usize = 0;
+
+    try std.testing.expect(!try applyHistorySuggestion(
+        allocator,
+        &state,
+        &query,
+        &cursor_pos,
+        .forward,
+        &history_pick,
+        &history_draft,
+        &history_draft_cursor,
+    ));
+    try std.testing.expectEqualStrings("draft", query.items);
+    try std.testing.expectEqual(@as(?usize, null), history_pick);
+
+    try std.testing.expect(try applyHistorySuggestion(
+        allocator,
+        &state,
+        &query,
+        &cursor_pos,
+        .backward,
+        &history_pick,
+        &history_draft,
+        &history_draft_cursor,
+    ));
+    try std.testing.expectEqualStrings("newer", query.items);
+    try std.testing.expectEqualStrings("draft", history_draft.items);
+    try std.testing.expectEqual(@as(usize, 2), history_draft_cursor);
+    try std.testing.expectEqual(@as(?usize, 0), history_pick);
+
+    try std.testing.expect(try applyHistorySuggestion(
+        allocator,
+        &state,
+        &query,
+        &cursor_pos,
+        .backward,
+        &history_pick,
+        &history_draft,
+        &history_draft_cursor,
+    ));
+    try std.testing.expectEqualStrings("older", query.items);
+    try std.testing.expectEqual(@as(?usize, 1), history_pick);
+
+    try std.testing.expect(try applyHistorySuggestion(
+        allocator,
+        &state,
+        &query,
+        &cursor_pos,
+        .forward,
+        &history_pick,
+        &history_draft,
+        &history_draft_cursor,
+    ));
+    try std.testing.expectEqualStrings("newer", query.items);
+    try std.testing.expectEqual(@as(?usize, 0), history_pick);
+
+    try std.testing.expect(try applyHistorySuggestion(
+        allocator,
+        &state,
+        &query,
+        &cursor_pos,
+        .forward,
+        &history_pick,
+        &history_draft,
+        &history_draft_cursor,
+    ));
+    try std.testing.expectEqualStrings("draft", query.items);
+    try std.testing.expectEqual(@as(usize, 2), cursor_pos);
+    try std.testing.expectEqual(@as(?usize, null), history_pick);
 }
 
 const SettingsPanel = enum { main, providers, languages, cache_ttl };
