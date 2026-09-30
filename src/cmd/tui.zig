@@ -5371,6 +5371,13 @@ fn compactDialogLayout(height: u16) CompactDialogLayout {
     };
 }
 
+fn compactDialogBodyCapacity(layout: CompactDialogLayout) usize {
+    const first = layout.primary_row orelse return 0;
+    const end = layout.footer_row orelse return 0;
+    if (end <= first) return 0;
+    return @intCast(end - first);
+}
+
 test "compact dialog layout keeps content above footer" {
     try std.testing.expectEqual(CompactDialogLayout{}, compactDialogLayout(0));
     try std.testing.expectEqual(CompactDialogLayout{}, compactDialogLayout(1));
@@ -5387,6 +5394,11 @@ test "compact dialog layout keeps content above footer" {
         CompactDialogLayout{ .primary_row = 2, .secondary_row = 3, .footer_row = 4 },
         compactDialogLayout(5),
     );
+    try std.testing.expectEqual(@as(usize, 0), compactDialogBodyCapacity(compactDialogLayout(2)));
+    try std.testing.expectEqual(@as(usize, 1), compactDialogBodyCapacity(compactDialogLayout(3)));
+    try std.testing.expectEqual(@as(usize, 2), compactDialogBodyCapacity(compactDialogLayout(4)));
+    try std.testing.expectEqual(@as(usize, 2), compactDialogBodyCapacity(compactDialogLayout(5)));
+    try std.testing.expectEqual(@as(usize, 4), compactDialogBodyCapacity(compactDialogLayout(7)));
 }
 
 fn vaxisStatus(ui: *Ui, title: []const u8, message: []const u8, detail: []const u8) !void {
@@ -6170,10 +6182,23 @@ fn vaxisConfirm(ui: *Ui, title: []const u8, lines: []const []const u8) !ConfirmR
         win.clear();
         win.hideCursor();
         const layout = compactDialogLayout(win.height);
+        const can_confirm = owned_lines.len <= compactDialogBodyCapacity(layout);
 
         try renderTopBar(ui, win, .{ .title = owned_title });
 
-        if (layout.primary_row) |first_row| {
+        if (!can_confirm) {
+            if (layout.primary_row) |row| {
+                try printFitted(
+                    ui,
+                    win,
+                    row,
+                    1,
+                    "Resize terminal to review all confirmation details.",
+                    ui.styleWarn(),
+                    if (win.width > 2) @intCast(win.width - 2) else 0,
+                );
+            }
+        } else if (layout.primary_row) |first_row| {
             var row = first_row;
             const body_end = layout.footer_row orelse win.height;
             for (owned_lines) |line| {
@@ -6184,7 +6209,11 @@ fn vaxisConfirm(ui: *Ui, title: []const u8, lines: []const []const u8) !ConfirmR
             }
         }
 
-        try renderBottomBar(ui, win, .{ .left = "Enter confirm • Esc back" });
+        try renderBottomBar(
+            ui,
+            win,
+            .{ .left = if (can_confirm) "Enter confirm • Esc back" else "Resize terminal • Esc back" },
+        );
         try ui.render();
 
         const batch = try readEventBatch(ui, try ui.loop.nextEvent());
@@ -6199,7 +6228,7 @@ fn vaxisConfirm(ui: *Ui, title: []const u8, lines: []const []const u8) !ConfirmR
                         .quit => return .quit,
                     }
 
-                    if (key.matches(vaxis.Key.enter, .{})) return .confirm;
+                    if (key.matches(vaxis.Key.enter, .{}) and can_confirm) return .confirm;
                     if (key.matches(vaxis.Key.escape, .{})) return .back;
                 },
                 else => {},
