@@ -842,7 +842,13 @@ fn downloadPhaseFromRaw(raw: u8) app.DownloadPhase {
 
 fn formatDownloadProgressBar(buf: *[20]u8, done: u32, total: u32) []const u8 {
     const width: u32 = 14;
-    const filled = if (total == 0) 0 else @min(width, (done * width) / total);
+    const filled: u32 = if (total == 0)
+        0
+    else
+        @intCast(@min(
+            @as(u64, width),
+            (@as(u64, done) * @as(u64, width)) / @as(u64, total),
+        ));
     buf[0] = '[';
     var i: u32 = 0;
     while (i < width) : (i += 1) {
@@ -850,6 +856,22 @@ fn formatDownloadProgressBar(buf: *[20]u8, done: u32, total: u32) []const u8 {
     }
     buf[width + 1] = ']';
     return buf[0 .. width + 2];
+}
+
+test "download progress bar handles saturated counters" {
+    var buf: [20]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "[--------------]",
+        formatDownloadProgressBar(&buf, 0, std.math.maxInt(u32)),
+    );
+    try std.testing.expectEqualStrings(
+        "[##############]",
+        formatDownloadProgressBar(&buf, std.math.maxInt(u32), std.math.maxInt(u32)),
+    );
+    try std.testing.expectEqualStrings(
+        "[##############]",
+        formatDownloadProgressBar(&buf, std.math.maxInt(u32), 1),
+    );
 }
 
 fn finalizeWorkerGroup(group: *std.Io.Group, control: FetchControl) void {
