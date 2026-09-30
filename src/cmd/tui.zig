@@ -3024,7 +3024,7 @@ fn buildQueryHitOrder(
         if (score.* > 0) match_count += 1;
     }
 
-    const include_all = query_norm.len == 0 or match_count == 0;
+    const include_all = query_norm.len == 0;
     const visible_count = if (include_all) hit_count else match_count;
     const out = try allocator.alloc(usize, visible_count);
     var out_len: usize = 0;
@@ -3125,6 +3125,10 @@ test "query display order cache reuses stable hit sets and invalidates on change
     const narrowed = try ensureQueryHitOrder(allocator, &bundle, "the matrix");
     try std.testing.expectEqualSlices(usize, &.{1}, narrowed);
     try std.testing.expectEqualStrings("the matrix", bundle.display_query_norm.?);
+
+    const no_match = try ensureQueryHitOrder(allocator, &bundle, "blade runner");
+    try std.testing.expectEqual(@as(usize, 0), no_match.len);
+    try std.testing.expectEqualStrings("blade runner", bundle.display_query_norm.?);
 }
 
 fn queryHitScore(bundle: *const SearchBundle, hit_idx: usize, query_norm: []const u8) u32 {
@@ -3860,6 +3864,8 @@ fn renderQueryHome(
                 ) catch "Searching…"
             else if (bundle.canceled)
                 "Search canceled. Press Enter to search again."
+            else if (query_dirty and bundle.hits.items.len > 0)
+                "Existing results do not match the edited query. Press Enter to search."
             else if (bundle.failed_count > 0)
                 "No results. Some providers failed; edit the query/settings and search again."
             else if (bundle.unavailable_count > 0)
@@ -3880,6 +3886,8 @@ fn renderQueryHome(
                     ui.styleAccent()
                 else if (bundle.canceled)
                     ui.styleWarn()
+                else if (query_dirty and bundle.hits.items.len > 0)
+                    ui.styleMuted()
                 else if (bundle.failed_count > 0)
                     ui.styleWarn()
                 else if (bundle.unavailable_count > 0)
