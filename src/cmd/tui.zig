@@ -2161,6 +2161,14 @@ fn executeQuerySearchIncremental(
                             .mark_query_dirty = true,
                         };
                     }
+                    if (key.matches(vaxis.Key.f2, .{})) {
+                        ui.toggleConfirm();
+                        continue;
+                    }
+                    if (key.matches(vaxis.Key.f3, .{})) {
+                        ui.toggleTheme();
+                        continue;
+                    }
                     if (info_open.*) {
                         if (key.matches(vaxis.Key.escape, .{}) or key.matches(vaxis.Key.f1, .{})) {
                             info_open.* = false;
