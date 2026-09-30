@@ -4575,7 +4575,14 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
                     .quit => .quit,
                 };
             }
-            const subtitles = subtitles_task.result orelse return error.UnexpectedHttpStatus;
+            const subtitles = subtitles_task.result orelse {
+                const msg = try showFriendlyError(ui, "Could not load subtitles", error.UnexpectedHttpStatus);
+                return switch (msg) {
+                    .ok => .back,
+                    .to_query => .to_query,
+                    .quit => .quit,
+                };
+            };
             try subtitle_pages.append(ui.allocator, .{ .page = subtitle_page_current, .response = subtitles });
             break :blk_fetch subtitle_pages.items.len - 1;
         };
@@ -4696,10 +4703,19 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
                 .quit => .quit,
             };
         }
-        var result = download_task.result orelse return error.UnexpectedHttpStatus;
+        var result = download_task.result orelse {
+            const msg = try showFriendlyError(ui, "Download failed", error.UnexpectedHttpStatus);
+            return switch (msg) {
+                .ok => .back,
+                .to_query => .to_query,
+                .quit => .quit,
+            };
+        };
         defer result.deinit(std.heap.page_allocator);
         if (settings.download_cache_enabled) {
-            try refreshCachedDownloads(ui.allocator, state);
+            refreshCachedDownloads(ui.allocator, state) catch |err| {
+                if (err == error.OutOfMemory) return err;
+            };
             const export_result = try exportCachedDownload(ui, result);
             switch (export_result) {
                 .ok => continue :subtitle_page_loop,
