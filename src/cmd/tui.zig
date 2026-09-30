@@ -3146,7 +3146,7 @@ const SettingsPopupMetrics = struct {
 
 fn settingsPopupMetrics(win_width: u16, win_height: u16) SettingsPopupMetrics {
     const width: u16 = @min(if (win_width > 8) win_width - 8 else win_width, 68);
-    const height: u16 = @min(if (win_height > 6) win_height - 4 else win_height, 22);
+    const height: u16 = @min(if (win_height > 2) win_height - 2 else win_height, 22);
     const x: u16 = if (win_width > width) (win_width - width) / 2 else 0;
     const y: u16 = if (win_height > height) (win_height - height) / 2 else 0;
     return .{
@@ -3155,7 +3155,9 @@ fn settingsPopupMetrics(win_width: u16, win_height: u16) SettingsPopupMetrics {
         .x = x,
         .y = y,
         .row_start = y + 3,
-        .row_end = y + height -| 2,
+        // Exclusive end of the interior list. The bottom border is at
+        // y + height - 1, so the row immediately above it is usable.
+        .row_end = y + height -| 1,
     };
 }
 
@@ -3198,6 +3200,16 @@ test "settings ttl mouse cursor only accepts the input field" {
         metrics.row_start,
         input_col -| 1,
     ) == null);
+}
+
+test "settings main list stays scrollable on short terminals" {
+    const metrics = settingsPopupMetrics(80, 8);
+    const page_size = settingsPageSize(metrics);
+    try std.testing.expectEqual(@as(usize, 2), page_size);
+
+    var scroll: usize = 0;
+    ensureVisible(6, &scroll, page_size);
+    try std.testing.expectEqual(@as(usize, 5), scroll);
 }
 
 fn activateSettingsMainRow(
@@ -3271,6 +3283,7 @@ fn editSettingsPopup(
     const initial_settings = state.settings;
     var panel: SettingsPanel = .main;
     var main_selected: usize = 0;
+    var main_scroll: usize = 0;
     var provider_selected: usize = 0;
     var language_selected: usize = 0;
     var provider_scroll: usize = 0;
@@ -3296,6 +3309,7 @@ fn editSettingsPopup(
         }
         const metrics = settingsPopupMetrics(win.width, win.height);
         const page_size = settingsPageSize(metrics);
+        ensureVisible(main_selected, &main_scroll, page_size);
         ensureVisible(provider_selected, &provider_scroll, page_size);
         ensureVisible(language_selected, &language_scroll, page_size);
 
@@ -3303,7 +3317,7 @@ fn editSettingsPopup(
             try renderQueryHome(ui, state, query, cursor_pos, focus, query_dirty, results, selected_result, result_scroll, selected_download, download_scroll, false, false);
             redraw_background = false;
         }
-        try renderSettingsPopup(ui, win, state, panel, main_selected, provider_selected, language_selected, provider_scroll, language_scroll, ttl_input.items, ttl_cursor, ttl_error);
+        try renderSettingsPopup(ui, win, state, panel, main_selected, main_scroll, provider_selected, language_selected, provider_scroll, language_scroll, ttl_input.items, ttl_cursor, ttl_error);
         if (help_open) {
             const panel_name = switch (panel) {
                 .main => "Main",
@@ -3356,7 +3370,7 @@ fn editSettingsPopup(
                                 .wheel_down => scrollSelection(&main_selected, item_count, .forward, 1),
                                 .wheel_up => scrollSelection(&main_selected, item_count, .backward, 1),
                                 .left => {
-                                    if (mouseRowIndex(mouse, metrics_now.row_start, metrics_now.row_end, 0, item_count)) |idx| {
+                                    if (mouseRowIndex(mouse, metrics_now.row_start, metrics_now.row_end, main_scroll, item_count)) |idx| {
                                         const activate = idx == main_selected;
                                         main_selected = idx;
                                         if (activate) {
@@ -3646,6 +3660,7 @@ fn renderSettingsPopup(
     state: *const TuiRuntimeState,
     panel: SettingsPanel,
     main_selected: usize,
+    main_scroll: usize,
     provider_selected: usize,
     language_selected: usize,
     provider_scroll: usize,
@@ -3695,14 +3710,16 @@ fn renderSettingsPopup(
             row_count += 1;
             rows[row_count] = "Clear history";
             row_count += 1;
-            const visible_rows = rows[0..row_count];
             var row = row_start;
-            for (visible_rows, 0..) |line, idx| {
-                if (row >= row_end) break;
+            var idx = main_scroll;
+            while (idx < row_count and row < row_end) : ({
+                idx += 1;
+                row += 1;
+            }) {
+                const line = rows[idx];
                 const style = if (idx == main_selected) ui.styleSelected() else vaxis.Style{};
                 try printFitted(ui, win, row, x + 2, if (idx == main_selected) "›" else " ", style, 1);
                 try printFitted(ui, win, row, x + 4, line, style, width -| 6);
-                row += 1;
             }
         },
         .providers => {
