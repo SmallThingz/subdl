@@ -3294,6 +3294,10 @@ fn settingsPageSize(metrics: SettingsPopupMetrics) usize {
     return if (metrics.row_end > metrics.row_start) @intCast(metrics.row_end - metrics.row_start) else 1;
 }
 
+fn settingsPopupInteractive(metrics: SettingsPopupMetrics) bool {
+    return metrics.row_end > metrics.row_start;
+}
+
 fn settingsMainItemCount(keyword_count: usize) usize {
     return if (keyword_count > 0) 7 else 6;
 }
@@ -3343,6 +3347,12 @@ test "settings main list stays scrollable on short terminals" {
     var scroll: usize = 0;
     ensureVisible(6, &scroll, page_size);
     try std.testing.expectEqual(@as(usize, 5), scroll);
+}
+
+test "settings blocks hidden interaction until at least one row is visible" {
+    try std.testing.expect(!settingsPopupInteractive(settingsPopupMetrics(80, 4)));
+    try std.testing.expect(!settingsPopupInteractive(settingsPopupMetrics(80, 6)));
+    try std.testing.expect(settingsPopupInteractive(settingsPopupMetrics(80, 7)));
 }
 
 test "settings hides clear history when history is empty" {
@@ -3434,6 +3444,7 @@ fn editSettingsPopup(
     defer ttl_input.deinit(ui.allocator);
     var ttl_cursor: usize = 0;
     var ttl_error: ?[]const u8 = null;
+    var provider_notice: ?[]const u8 = null;
     var redraw_background = true;
     var settings_dirty = false;
     var help_open = false;
@@ -3460,7 +3471,7 @@ fn editSettingsPopup(
             try renderQueryHome(ui, state, query, cursor_pos, focus, query_dirty, results, selected_result, result_scroll, selected_download, download_scroll, false, false);
             redraw_background = false;
         }
-        try renderSettingsPopup(ui, win, state, panel, main_selected, main_scroll, provider_selected, language_selected, provider_scroll, language_scroll, ttl_input.items, ttl_cursor, ttl_error);
+        try renderSettingsPopup(ui, win, state, panel, main_selected, main_scroll, provider_selected, language_selected, provider_scroll, language_scroll, ttl_input.items, ttl_cursor, ttl_error, provider_notice);
         if (help_open) {
             const panel_name = switch (panel) {
                 .main => "Main",
@@ -3506,6 +3517,7 @@ fn editSettingsPopup(
                     }
                     const win_now = ui.vx.window();
                     const metrics_now = settingsPopupMetrics(win_now.width, win_now.height);
+                    if (!settingsPopupInteractive(metrics_now)) continue;
                     switch (panel) {
                         .main => {
                             const item_count = settingsMainItemCount(state.keywords.items.len);
@@ -3535,14 +3547,23 @@ fn editSettingsPopup(
                         },
                         .providers => {
                             switch (mouse.button) {
-                                .wheel_down => scrollSelection(&provider_selected, app.providerCount(), .forward, list_mouse_wheel_step),
-                                .wheel_up => scrollSelection(&provider_selected, app.providerCount(), .backward, list_mouse_wheel_step),
+                                .wheel_down => {
+                                    provider_notice = null;
+                                    scrollSelection(&provider_selected, app.providerCount(), .forward, list_mouse_wheel_step);
+                                },
+                                .wheel_up => {
+                                    provider_notice = null;
+                                    scrollSelection(&provider_selected, app.providerCount(), .backward, list_mouse_wheel_step);
+                                },
                                 .left => {
                                     if (mouseRowIndex(mouse, metrics_now.row_start, metrics_now.row_end, provider_scroll, app.providerCount())) |idx| {
                                         provider_selected = idx;
-                                        state.settings.providers_enabled[idx] = !state.settings.providers_enabled[idx];
-                                        if (countEnabledFlags(&state.settings.providers_enabled) == 0) state.settings.providers_enabled[idx] = true;
-                                        settings_dirty = true;
+                                        if (toggleProviderSetting(&state.settings.providers_enabled, idx)) {
+                                            provider_notice = null;
+                                            settings_dirty = true;
+                                        } else {
+                                            provider_notice = "At least one provider must remain enabled.";
+                                        }
                                         redraw_background = true;
                                     }
                                 },
@@ -3617,12 +3638,24 @@ fn editSettingsPopup(
                         }
                         switch (panel) {
                             .main => return searchSettingsChanged(initial_settings, state.settings),
-                            .providers, .languages, .cache_ttl => {
+                            .providers => {
+                                provider_notice = null;
+                                panel = .main;
+                                ttl_error = null;
+                                continue;
+                            },
+                            .languages, .cache_ttl => {
                                 panel = .main;
                                 ttl_error = null;
                                 continue;
                             },
                         }
+                    }
+                    if (!settingsPopupInteractive(metrics)) {
+                        if (key.matches(vaxis.Key.escape, .{})) {
+                            return searchSettingsChanged(initial_settings, state.settings);
+                        }
+                        continue;
                     }
                     switch (panel) {
                         .main => {
@@ -3654,21 +3687,27 @@ fn editSettingsPopup(
                                     try persistTuiSettingsState(ui.allocator, state);
                                     settings_dirty = false;
                                 }
+                                provider_notice = null;
                                 panel = .main;
                                 continue;
                             }
                             if (key.matches(vaxis.Key.down, .{})) {
+                                provider_notice = null;
                                 if (provider_selected + 1 < app.providerCount()) provider_selected += 1;
                                 continue;
                             }
                             if (key.matches(vaxis.Key.up, .{})) {
+                                provider_notice = null;
                                 provider_selected = provider_selected -| 1;
                                 continue;
                             }
                             if (key.matches(vaxis.Key.enter, .{}) or key.matches(vaxis.Key.space, .{})) {
-                                state.settings.providers_enabled[provider_selected] = !state.settings.providers_enabled[provider_selected];
-                                if (countEnabledFlags(&state.settings.providers_enabled) == 0) state.settings.providers_enabled[provider_selected] = true;
-                                settings_dirty = true;
+                                if (toggleProviderSetting(&state.settings.providers_enabled, provider_selected)) {
+                                    provider_notice = null;
+                                    settings_dirty = true;
+                                } else {
+                                    provider_notice = "At least one provider must remain enabled.";
+                                }
                                 redraw_background = true;
                                 continue;
                             }
@@ -3787,9 +3826,13 @@ fn editSettingsPopup(
                 help_open = false;
                 redraw_background = true;
             }
+            if (!settingsPopupInteractive(settingsPopupMetrics(ui.vx.window().width, ui.vx.window().height))) continue;
             switch (panel) {
                 .main => applyWheelDelta(&main_selected, settingsMainItemCount(state.keywords.items.len), batch.wheel_delta, 1),
-                .providers => applyWheelDelta(&provider_selected, app.providerCount(), batch.wheel_delta, list_mouse_wheel_step),
+                .providers => {
+                    provider_notice = null;
+                    applyWheelDelta(&provider_selected, app.providerCount(), batch.wheel_delta, list_mouse_wheel_step);
+                },
                 .languages => applyWheelDelta(&language_selected, languageCount() + 1, batch.wheel_delta, list_mouse_wheel_step),
                 .cache_ttl => {},
             }
@@ -3811,6 +3854,7 @@ fn renderSettingsPopup(
     ttl_input: []const u8,
     ttl_cursor: usize,
     ttl_error: ?[]const u8,
+    provider_notice: ?[]const u8,
 ) !void {
     std.debug.assert(main_selected < settingsMainItemCount(state.keywords.items.len));
     std.debug.assert(provider_selected < app.providerCount());
@@ -3823,6 +3867,10 @@ fn renderSettingsPopup(
     try fillBoxBackground(ui, win, x, y, width, height);
     try renderBox(ui, win, x, y, width, height, ui.styleAccent());
     try printFitted(ui, win, y + 1, x + 2, "Settings", ui.stylePaneTitle(), width -| 4);
+    if (!settingsPopupInteractive(metrics)) {
+        try renderCompactBottomLine(ui, win, "Resize terminal to use Settings · Esc/Ctrl+C closes");
+        return;
+    }
 
     const row_start = metrics.row_start;
     const row_end = metrics.row_end;
@@ -3882,13 +3930,14 @@ fn renderSettingsPopup(
             }
         },
         .providers => {
+            const provider_banner = persistence_banner orelse provider_notice;
             try printFitted(
                 ui,
                 win,
                 y + 2,
                 x + 2,
-                persistence_banner orelse "Enter/Space toggles. Esc/Ctrl+C returns.",
-                if (persistence_banner != null) ui.styleWarn() else ui.styleMuted(),
+                provider_banner orelse "Enter/Space toggles. Esc/Ctrl+C returns.",
+                if (provider_banner != null) ui.styleWarn() else ui.styleMuted(),
                 width -| 4,
             );
             var row = row_start;
@@ -4039,9 +4088,9 @@ fn renderQueryHome(
             try ensureQueryHitOrderPreservingSelection(ui.allocator, bundle, query_norm, selected_result)
     else
         null;
-    var top_buf: [320]u8 = undefined;
+    const top_buf = try ui.frameAllocator().alloc(u8, 320);
     var top = try formatHomeTopLine(
-        &top_buf,
+        top_buf,
         focus,
         provider_count,
         app.providerCount(),
@@ -4122,8 +4171,8 @@ fn renderQueryHome(
         const page_size: usize = if (list_bottom > list_top) @intCast(list_bottom - list_top) else 1;
         ensureVisible(selected_result.*, scroll, page_size);
         if (order.len == 0) {
-            var message_buf: [160]u8 = undefined;
-            const message = formatHomeEmptyResultMessage(&message_buf, bundle, query_dirty);
+            const message_buf = try ui.frameAllocator().alloc(u8, 160);
+            const message = formatHomeEmptyResultMessage(message_buf, bundle, query_dirty);
             try printFitted(
                 ui,
                 win,
@@ -4161,8 +4210,7 @@ fn renderQueryHome(
             try printFitted(ui, win, row, 4, title, style, title_width);
             if (win.width > 48) {
                 const tag_col: u16 = @intCast(@min(@as(usize, 4) + title_width + 2, @as(usize, win.width - 1)));
-                var tag_buf: [128]u8 = undefined;
-                const tag_line = std.fmt.bufPrint(&tag_buf, "{s}  {s}", .{ provider_tag, source_tag }) catch provider_tag;
+                const tag_line = try frameFmt(ui, "{s}  {s}", .{ provider_tag, source_tag });
                 try printFitted(ui, win, row, tag_col, tag_line, if (hit.source == .live) ui.styleAccent() else ui.styleMuted(), if (win.width > tag_col) @intCast(win.width - tag_col - 1) else 0);
             }
             row += 1;
@@ -4190,6 +4238,7 @@ fn renderQueryHome(
         focus,
         search_active,
         ui.search_reapers.items.len >= max_background_search_reapers,
+        query_norm.len == 0,
         has_results,
         has_downloads,
         has_history,
@@ -4277,6 +4326,7 @@ fn formatHomeFooter(
     focus: QueryFocus,
     searching: bool,
     cleanup_backlog_full: bool,
+    query_empty: bool,
     has_results: bool,
     has_downloads: bool,
     has_history: bool,
@@ -4302,7 +4352,24 @@ fn formatHomeFooter(
     }
 
     return switch (focus) {
-        .query => if (has_history and has_results and has_downloads)
+        .query => if (query_empty)
+            if (has_history and has_results and has_downloads)
+                "Type a query · ↑/↓ history · Tab results/downloads"
+            else if (has_history and has_results)
+                "Type a query · ↑/↓ history · Tab results"
+            else if (has_history and has_downloads)
+                "Type a query · ↑/↓ history · Tab downloads"
+            else if (has_history)
+                "Type a query · ↑/↓ history"
+            else if (has_results and has_downloads)
+                "Type a query · Tab results/downloads"
+            else if (has_results)
+                "Type a query · Tab results"
+            else if (has_downloads)
+                "Type a query · Tab downloads"
+            else
+                "Type a query to search"
+        else if (has_history and has_results and has_downloads)
             "Enter search · ↑/↓ history · Tab results/downloads"
         else if (has_history and has_results)
             "Enter search · ↑/↓ history · Tab results"
@@ -4332,38 +4399,46 @@ fn formatHomeFooter(
 test "home footer hides unavailable navigation hints" {
     try std.testing.expectEqualStrings(
         "Enter search",
-        formatHomeFooter(.query, false, false, false, false, false),
+        formatHomeFooter(.query, false, false, false, false, false, false),
     );
     try std.testing.expectEqualStrings(
         "Enter search · ↑/↓ history",
-        formatHomeFooter(.query, false, false, false, false, true),
+        formatHomeFooter(.query, false, false, false, false, false, true),
     );
     try std.testing.expectEqualStrings(
         "Enter search · Tab results",
-        formatHomeFooter(.query, false, false, true, false, false),
+        formatHomeFooter(.query, false, false, false, true, false, false),
     );
     try std.testing.expectEqualStrings(
         "Enter search · Tab downloads",
-        formatHomeFooter(.query, false, false, false, true, false),
+        formatHomeFooter(.query, false, false, false, false, true, false),
+    );
+    try std.testing.expectEqualStrings(
+        "Type a query to search",
+        formatHomeFooter(.query, false, false, true, false, false, false),
+    );
+    try std.testing.expectEqualStrings(
+        "Type a query · ↑/↓ history",
+        formatHomeFooter(.query, false, false, true, false, false, true),
     );
 }
 
 test "home footer reflects active search panes" {
     try std.testing.expectEqualStrings(
         "Searching · edit cancels",
-        formatHomeFooter(.query, true, false, false, false, true),
+        formatHomeFooter(.query, true, false, false, false, false, true),
     );
     try std.testing.expectEqualStrings(
         "Searching · edit cancels · Tab downloads",
-        formatHomeFooter(.query, true, false, false, true, false),
+        formatHomeFooter(.query, true, false, false, false, true, false),
     );
     try std.testing.expectEqualStrings(
         "↑/↓ select · Enter open · Tab query/downloads",
-        formatHomeFooter(.results, true, false, true, true, false),
+        formatHomeFooter(.results, true, false, false, true, true, false),
     );
     try std.testing.expectEqualStrings(
         "Finishing canceled searches · Enter retries when cleanup completes",
-        formatHomeFooter(.query, false, true, false, false, false),
+        formatHomeFooter(.query, false, true, false, false, false, false),
     );
 }
 
@@ -7020,6 +7095,24 @@ fn countEnabledFlags(flags: []const bool) usize {
         if (enabled) count += 1;
     }
     return count;
+}
+
+fn toggleProviderSetting(flags: []bool, idx: usize) bool {
+    if (idx >= flags.len) return false;
+    if (flags[idx] and countEnabledFlags(flags) == 1) return false;
+    flags[idx] = !flags[idx];
+    return true;
+}
+
+test "provider settings keep at least one provider enabled" {
+    var flags = [_]bool{ true, false, false };
+    try std.testing.expect(!toggleProviderSetting(&flags, 0));
+    try std.testing.expectEqualSlices(bool, &.{ true, false, false }, &flags);
+
+    try std.testing.expect(toggleProviderSetting(&flags, 1));
+    try std.testing.expectEqualSlices(bool, &.{ true, true, false }, &flags);
+    try std.testing.expect(toggleProviderSetting(&flags, 0));
+    try std.testing.expectEqualSlices(bool, &.{ false, true, false }, &flags);
 }
 
 const list_mouse_wheel_step: usize = 3;
