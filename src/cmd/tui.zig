@@ -317,8 +317,14 @@ const PersistenceArea = enum {
     history,
 };
 
+const PersistenceOperation = enum {
+    load,
+    save,
+};
+
 const PersistenceFailure = struct {
     area: PersistenceArea,
+    operation: PersistenceOperation = .save,
     err: anyerror,
 };
 
@@ -590,7 +596,12 @@ pub fn main(init: std.process.Init) !void {
 
     const preferences_path = try tuiCachePath(allocator, init.environ_map, "ui-preferences.oneserial");
     defer allocator.free(preferences_path);
-    const loaded_preferences: PersistentUiPreferences = (try loadPersistentUiPreferences(allocator, preferences_path)) orelse .{
+    var preferences_load_error: ?anyerror = null;
+    const loaded_preferences: PersistentUiPreferences = (loadPersistentUiPreferences(allocator, preferences_path) catch |err| blk: {
+        if (err == error.OutOfMemory) return err;
+        preferences_load_error = err;
+        break :blk null;
+    }) orelse .{
         .version = ui_preferences_version,
         .theme_index = 0,
         .skip_confirm = false,
@@ -607,6 +618,7 @@ pub fn main(init: std.process.Init) !void {
         .theme_index = preferences.theme_index,
         .skip_confirm = preferences.skip_confirm,
         .preferences_path = preferences_path,
+        .preferences_save_error = preferences_load_error,
     };
     defer ui.frame_arena.deinit();
 
@@ -1462,20 +1474,32 @@ fn loadTuiRuntimeState(allocator: std.mem.Allocator, environ_map: *std.process.E
     };
     errdefer out.deinit(allocator);
 
-    if (try loadPersistentSearchState(out.arena.allocator(), state_path)) |loaded| {
+    if (loadPersistentSearchState(out.arena.allocator(), state_path) catch |err| blk: {
+        if (err == error.OutOfMemory) return err;
+        notePersistenceLoadFailure(&out, .cache, err);
+        break :blk null;
+    }) |loaded| {
         if (loaded.version == persistent_version) {
             out.settings = sanitizeSettings(loaded.settings);
             try out.cache_entries.appendSlice(allocator, loaded.cache_entries);
         }
     }
 
-    if (try loadPersistentSettingsState(out.arena.allocator(), settings_path)) |loaded| {
+    if (loadPersistentSettingsState(out.arena.allocator(), settings_path) catch |err| blk: {
+        if (err == error.OutOfMemory) return err;
+        notePersistenceLoadFailure(&out, .settings, err);
+        break :blk null;
+    }) |loaded| {
         if (loaded.version == persistent_version) {
             out.settings = sanitizeSettings(loaded.settings);
         }
     }
 
-    if (try loadPersistentKeywordState(out.arena.allocator(), keyword_path)) |loaded| {
+    if (loadPersistentKeywordState(out.arena.allocator(), keyword_path) catch |err| blk: {
+        if (err == error.OutOfMemory) return err;
+        notePersistenceLoadFailure(&out, .history, err);
+        break :blk null;
+    }) |loaded| {
         if (loaded.version == persistent_version) {
             try out.keywords.appendSlice(allocator, loaded.keywords);
         }
@@ -1512,49 +1536,49 @@ fn applyRuntimeCacheSettings(state: *const TuiRuntimeState) void {
 fn loadPersistentSearchState(allocator: std.mem.Allocator, path: []const u8) !?PersistentSearchState {
     const data = std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), path, allocator, .limited(64 * 1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return null,
-        else => return null,
+        else => return err,
     };
     defer allocator.free(data);
-    if (!std.mem.startsWith(u8, data, search_state_magic)) return null;
+    if (!std.mem.startsWith(u8, data, search_state_magic)) return error.InvalidPersistentData;
     const body = data[search_state_magic.len..];
     const untrusted = oneserial.Untrusted(PersistentSearchState, .{}).init(body);
-    return untrusted.toOwned(allocator) catch null;
+    return try untrusted.toOwned(allocator);
 }
 
 fn loadPersistentKeywordState(allocator: std.mem.Allocator, path: []const u8) !?PersistentKeywordState {
     const data = std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), path, allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return null,
-        else => return null,
+        else => return err,
     };
     defer allocator.free(data);
-    if (!std.mem.startsWith(u8, data, keyword_state_magic)) return null;
+    if (!std.mem.startsWith(u8, data, keyword_state_magic)) return error.InvalidPersistentData;
     const body = data[keyword_state_magic.len..];
     const untrusted = oneserial.Untrusted(PersistentKeywordState, .{}).init(body);
-    return untrusted.toOwned(allocator) catch null;
+    return try untrusted.toOwned(allocator);
 }
 
 fn loadPersistentSettingsState(allocator: std.mem.Allocator, path: []const u8) !?PersistentSettingsState {
     const data = std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return null,
-        else => return null,
+        else => return err,
     };
     defer allocator.free(data);
-    if (!std.mem.startsWith(u8, data, settings_state_magic)) return null;
+    if (!std.mem.startsWith(u8, data, settings_state_magic)) return error.InvalidPersistentData;
     const body = data[settings_state_magic.len..];
     const untrusted = oneserial.Untrusted(PersistentSettingsState, .{}).init(body);
-    return untrusted.toOwned(allocator) catch null;
+    return try untrusted.toOwned(allocator);
 }
 
 fn loadPersistentUiPreferences(allocator: std.mem.Allocator, path: []const u8) !?PersistentUiPreferences {
     const data = std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), path, allocator, .limited(4096)) catch |err| switch (err) {
         error.FileNotFound => return null,
-        else => return null,
+        else => return err,
     };
     defer allocator.free(data);
-    if (!std.mem.startsWith(u8, data, ui_preferences_magic)) return null;
+    if (!std.mem.startsWith(u8, data, ui_preferences_magic)) return error.InvalidPersistentData;
     const body = data[ui_preferences_magic.len..];
     const untrusted = oneserial.Untrusted(PersistentUiPreferences, .{}).init(body);
-    return untrusted.toOwned(allocator) catch null;
+    return try untrusted.toOwned(allocator);
 }
 
 fn sanitizeUiPreferences(preferences: PersistentUiPreferences) PersistentUiPreferences {
@@ -1628,6 +1652,15 @@ fn clearPersistenceError(state: *TuiRuntimeState, area: PersistenceArea) void {
     }
 }
 
+fn notePersistenceLoadFailure(state: *TuiRuntimeState, area: PersistenceArea, err: anyerror) void {
+    if (state.persistence_error != null) return;
+    state.persistence_error = .{
+        .area = area,
+        .operation = .load,
+        .err = err,
+    };
+}
+
 fn persistenceAreaName(area: PersistenceArea) []const u8 {
     return switch (area) {
         .cache => "cache",
@@ -1636,12 +1669,23 @@ fn persistenceAreaName(area: PersistenceArea) []const u8 {
     };
 }
 
+fn persistenceOperationName(operation: PersistenceOperation) []const u8 {
+    return switch (operation) {
+        .load => "load",
+        .save => "save",
+    };
+}
+
 fn formatPersistenceFailure(buf: []u8, failure: PersistenceFailure) []const u8 {
     return std.fmt.bufPrint(
         buf,
-        "{s} save failed: {s}",
-        .{ persistenceAreaName(failure.area), @errorName(failure.err) },
-    ) catch "Save failed";
+        "{s} {s} failed: {s}",
+        .{
+            persistenceAreaName(failure.area),
+            persistenceOperationName(failure.operation),
+            @errorName(failure.err),
+        },
+    ) catch "Persistence failed";
 }
 
 fn saveUiPreferences(
@@ -3907,8 +3951,12 @@ fn renderQueryHome(
     if (state.persistence_error) |failure| {
         const suffix = std.fmt.bufPrint(
             top_buf[top.len..],
-            " · SAVE! {s}:{s}",
-            .{ persistenceAreaName(failure.area), @errorName(failure.err) },
+            " · {s}! {s}:{s}",
+            .{
+                if (failure.operation == .load) "LOAD" else "SAVE",
+                persistenceAreaName(failure.area),
+                @errorName(failure.err),
+            },
         ) catch "";
         top = top_buf[0 .. top.len + suffix.len];
     }
@@ -7614,6 +7662,40 @@ test "settings persist independently from search cache state" {
     try std.testing.expect(!loaded.settings.providers_enabled[0]);
 }
 
+test "corrupt settings fall back and surface a load warning" {
+    const allocator = std.testing.allocator;
+    const unique = scrapers.common.compatNanoTimestamp();
+    const test_root = try std.fmt.allocPrint(allocator, ".zig-cache/tui-settings-corrupt-test-{d}", .{unique});
+    defer allocator.free(test_root);
+    defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
+
+    const settings_path = try std.fmt.allocPrint(allocator, "{s}/subdl/settings.oneserial", .{test_root});
+    defer allocator.free(settings_path);
+    try ensureParentDir(settings_path);
+    {
+        var file = try std.Io.Dir.cwd().createFile(runtime_io.get(), settings_path, .{});
+        defer file.close(runtime_io.get());
+        try file.writeAll(runtime_io.get(), "not-a-valid-settings-file");
+    }
+
+    var env_map = try std.testing.environ.createMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("XDG_CACHE_HOME", test_root);
+
+    var state = try loadTuiRuntimeState(allocator, &env_map);
+    defer state.deinit(allocator);
+    try std.testing.expect(state.persistence_error != null);
+    try std.testing.expectEqual(PersistenceArea.settings, state.persistence_error.?.area);
+    try std.testing.expectEqual(PersistenceOperation.load, state.persistence_error.?.operation);
+    try std.testing.expectEqual(error.InvalidPersistentData, state.persistence_error.?.err);
+    try std.testing.expect(state.settings.cache_enabled);
+    try std.testing.expectEqual(app.providerCount(), countEnabledFlags(&state.settings.providers_enabled));
+
+    var warning_buf: [128]u8 = undefined;
+    const warning = formatPersistenceFailure(&warning_buf, state.persistence_error.?);
+    try std.testing.expect(std.mem.indexOf(u8, warning, "settings load failed") != null);
+}
+
 test "ui preferences persist independently and sanitize invalid themes" {
     const allocator = std.testing.allocator;
     const unique = scrapers.common.compatNanoTimestamp();
@@ -7645,6 +7727,27 @@ test "ui preferences persist independently and sanitize invalid themes" {
     });
     try std.testing.expectEqual(@as(u8, 0), stale_version.theme_index);
     try std.testing.expect(!stale_version.skip_confirm);
+}
+
+test "corrupt ui preferences report an error instead of silently resetting" {
+    const allocator = std.testing.allocator;
+    const unique = scrapers.common.compatNanoTimestamp();
+    const test_root = try std.fmt.allocPrint(allocator, ".zig-cache/tui-preferences-corrupt-test-{d}", .{unique});
+    defer allocator.free(test_root);
+    defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
+    const path = try std.fmt.allocPrint(allocator, "{s}/ui-preferences.oneserial", .{test_root});
+    defer allocator.free(path);
+    try ensureParentDir(path);
+    {
+        var file = try std.Io.Dir.cwd().createFile(runtime_io.get(), path, .{});
+        defer file.close(runtime_io.get());
+        try file.writeAll(runtime_io.get(), "corrupt-preferences");
+    }
+
+    try std.testing.expectError(
+        error.InvalidPersistentData,
+        loadPersistentUiPreferences(allocator, path),
+    );
 }
 
 test "ui preference toggle records and clears persistence failures" {
