@@ -1122,7 +1122,22 @@ fn runTui(ui: *Ui) !void {
                     if (key.matches(vaxis.Key.escape, .{})) {
                         const current_query_norm = normalizeQueryView(query.items);
                         const current_query_dirty = !std.mem.eql(u8, current_query_norm, last_searched_norm);
+                        const history_len_before = state.keywords.items.len;
+                        const history_enabled_before = state.settings.keyword_cache_enabled;
                         const search_settings_changed = try editSettingsPopup(ui, &state, query.items, cursor_pos, focus, current_query_dirty, if (results) |*b| b else null, &selected_result, &result_scroll, &selected_download, &download_scroll, &info_open);
+                        if (history_pick != null and
+                            (history_len_before != state.keywords.items.len or
+                                history_enabled_before != state.settings.keyword_cache_enabled))
+                        {
+                            _ = try restoreHistoryDraft(
+                                ui.allocator,
+                                &query,
+                                &cursor_pos,
+                                &history_pick,
+                                &history_draft,
+                                &history_draft_cursor,
+                            );
+                        }
                         if (search_settings_changed) {
                             if (results) |*bundle| bundle.deinit(ui.allocator);
                             results = null;
@@ -3327,6 +3342,22 @@ fn resetHistoryBrowse(
     history_draft_cursor.* = 0;
 }
 
+fn restoreHistoryDraft(
+    allocator: std.mem.Allocator,
+    query: *std.ArrayList(u8),
+    cursor_pos: *usize,
+    history_pick: *?usize,
+    history_draft: *std.ArrayList(u8),
+    history_draft_cursor: *usize,
+) !bool {
+    if (history_pick.* == null) return false;
+    query.clearRetainingCapacity();
+    try query.appendSlice(allocator, history_draft.items);
+    cursor_pos.* = @min(history_draft_cursor.*, query.items.len);
+    resetHistoryBrowse(history_pick, history_draft, history_draft_cursor);
+    return true;
+}
+
 fn captureHistoryDraft(
     allocator: std.mem.Allocator,
     query: *const std.ArrayList(u8),
@@ -3368,11 +3399,14 @@ fn applyHistorySuggestion(
         .forward => blk: {
             const idx = history_pick.* orelse return false;
             if (idx == 0) {
-                query.clearRetainingCapacity();
-                try query.appendSlice(allocator, history_draft.items);
-                cursor_pos.* = @min(history_draft_cursor.*, query.items.len);
-                resetHistoryBrowse(history_pick, history_draft, history_draft_cursor);
-                return true;
+                return restoreHistoryDraft(
+                    allocator,
+                    query,
+                    cursor_pos,
+                    history_pick,
+                    history_draft,
+                    history_draft_cursor,
+                );
             }
             break :blk idx - 1;
         },
