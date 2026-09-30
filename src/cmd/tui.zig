@@ -4581,6 +4581,20 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
             .has_next = subtitles.has_next_page,
         };
         const page_nav_opt: ?PageNav = if (page_nav.enabled) page_nav else null;
+        if (subtitlePageHasNoSelectableExit(countEnabledFlags(subtitle_enabled), page_nav_opt)) {
+            const msg = try vaxisMessage(
+                ui,
+                "No Selectable Subtitles",
+                noSelectableSubtitleMessage(subtitles.items, settings),
+                "Press any key to return to titles.",
+                ui.styleWarn(),
+            );
+            return switch (msg) {
+                .ok => .back,
+                .to_query => .to_query,
+                .quit => .quit,
+            };
+        }
         const subtitle_idx = (if (allow_auto_subtitle_select) singleEnabledIndex(subtitle_enabled) else null) orelse blk: {
             const subtitle_choice = try vaxisSelectSubtitle(
                 ui,
@@ -4696,6 +4710,65 @@ fn buildSubtitleEnabled(allocator: std.mem.Allocator, items: []const app.Subtitl
         out[idx] = item.download_url != null and subtitleLanguageAllowed(item, settings);
     }
     return out;
+}
+
+fn noSelectableSubtitleMessage(items: []const app.SubtitleChoice, settings: TuiSettings) []const u8 {
+    for (items) |item| {
+        if (item.download_url == null) continue;
+        if (settings.language_filter_enabled) {
+            return "No downloadable subtitles match the active language filter. Change Settings > Language and try again.";
+        }
+        return "No selectable subtitles were returned.";
+    }
+    return "The provider returned subtitle rows, but none have a downloadable file.";
+}
+
+fn subtitlePageHasNoSelectableExit(enabled_count: usize, page_nav: ?PageNav) bool {
+    if (enabled_count != 0) return false;
+    const nav = page_nav orelse return true;
+    return !nav.has_prev and !nav.has_next;
+}
+
+test "no selectable subtitle state explains why the list cannot be used" {
+    const settings = defaultTuiSettings();
+    const filtered = [_]app.SubtitleChoice{.{
+        .label = "Spanish release",
+        .language = "es",
+        .filename = "movie.es.srt",
+        .download_url = "https://example.test/movie.es.srt",
+    }};
+    const missing_download = [_]app.SubtitleChoice{.{
+        .label = "Metadata-only row",
+        .language = "en",
+        .filename = "movie.en.srt",
+        .download_url = null,
+    }};
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        noSelectableSubtitleMessage(&filtered, settings),
+        "language filter",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        noSelectableSubtitleMessage(&missing_download, settings),
+        "none have a downloadable file",
+    ) != null);
+
+    try std.testing.expect(subtitlePageHasNoSelectableExit(0, null));
+    try std.testing.expect(subtitlePageHasNoSelectableExit(0, .{
+        .enabled = true,
+        .page = 1,
+        .has_prev = false,
+        .has_next = false,
+    }));
+    try std.testing.expect(!subtitlePageHasNoSelectableExit(0, .{
+        .enabled = true,
+        .page = 1,
+        .has_prev = false,
+        .has_next = true,
+    }));
+    try std.testing.expect(!subtitlePageHasNoSelectableExit(1, null));
 }
 
 fn singleEnabledIndex(flags: []const bool) ?usize {
