@@ -4365,6 +4365,22 @@ fn cachedDownloadLabels(allocator: std.mem.Allocator, cache_root_path: []const u
         out.deinit(allocator);
     }
     try cachedDownloadLabelsRecursive(allocator, dir_path, "", &out);
+    var subtitle_count: usize = 0;
+    for (out.items) |label| {
+        if (isLikelySubtitlePath(label)) subtitle_count += 1;
+    }
+    if (subtitle_count > 0 and subtitle_count < out.items.len) {
+        var write_idx: usize = 0;
+        for (out.items) |label| {
+            if (isLikelySubtitlePath(label)) {
+                out.items[write_idx] = label;
+                write_idx += 1;
+            } else {
+                allocator.free(label);
+            }
+        }
+        out.items.len = write_idx;
+    }
     std.mem.sort([]u8, out.items, {}, cachedDownloadLabelLessThan);
     return try out.toOwnedSlice(allocator);
 }
@@ -6770,6 +6786,23 @@ test "download cache refresh discovers new files and exports the selected entry"
         var writer = file.writer(runtime_io.get(), &buffer);
         try writer.interface.writeAll("first subtitle\n");
         try writer.interface.flush();
+    }
+
+    const readme_path = try std.fmt.allocPrint(allocator, "{s}/README.txt", .{downloads_root});
+    defer allocator.free(readme_path);
+    {
+        var file = try std.Io.Dir.cwd().createFile(runtime_io.get(), readme_path, .{});
+        defer file.close(runtime_io.get());
+        var buffer: [64]u8 = undefined;
+        var writer = file.writer(runtime_io.get(), &buffer);
+        try writer.interface.writeAll("not a subtitle\n");
+        try writer.interface.flush();
+    }
+    const archive_path = try std.fmt.allocPrint(allocator, "{s}/bundle.zip", .{downloads_root});
+    defer allocator.free(archive_path);
+    {
+        var file = try std.Io.Dir.cwd().createFile(runtime_io.get(), archive_path, .{});
+        defer file.close(runtime_io.get());
     }
 
     var state: TuiRuntimeState = .{
