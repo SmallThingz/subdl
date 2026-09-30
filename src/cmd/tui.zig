@@ -5351,12 +5351,20 @@ fn vaxisSelectSubtitle(
                         continue;
                     }
                     if (key.matches('s', .{})) {
+                        const selected_subtitle_idx = if (selected_row < matches.items.len)
+                            matches.items[selected_row]
+                        else
+                            null;
                         sort_mode = nextSortMode(sort_mode);
                         ui.allocator.free(order);
                         order = try buildSubtitleOrder(ui.allocator, subtitles, sort_mode);
                         try rebuildSubtitleMatches(ui.allocator, subtitles, order, filter.items, &matches);
-                        selected_row = 0;
-                        scroll = 0;
+                        if (selected_subtitle_idx) |subtitle_idx| {
+                            selected_row = findIndexInMatches(matches.items, subtitle_idx) orelse 0;
+                        } else {
+                            selected_row = 0;
+                        }
+                        if (matches.items.len == 0) scroll = 0;
                         continue;
                     }
                     if (key.matches(vaxis.Key.enter, .{})) {
@@ -7311,6 +7319,30 @@ fn rebuildSubtitleMatches(
             try out.append(allocator, idx);
         }
     }
+}
+
+test "subtitle sorting can preserve the highlighted item" {
+    const allocator = std.testing.allocator;
+    const subtitles = [_]app.SubtitleChoice{
+        .{ .label = "Zulu", .language = "en", .filename = "z.srt", .download_url = "https://example.test/z" },
+        .{ .label = "Alpha", .language = "en", .filename = "a.srt", .download_url = "https://example.test/a" },
+        .{ .label = "Beta", .language = "en", .filename = "b.srt", .download_url = "https://example.test/b" },
+    };
+
+    var order = try buildSubtitleOrder(allocator, &subtitles, .relevance);
+    defer allocator.free(order);
+    var matches: std.ArrayList(usize) = .empty;
+    defer matches.deinit(allocator);
+    try rebuildSubtitleMatches(allocator, &subtitles, order, "", &matches);
+
+    const selected_subtitle_idx = matches.items[0];
+    try std.testing.expectEqual(@as(usize, 0), selected_subtitle_idx);
+
+    allocator.free(order);
+    order = try buildSubtitleOrder(allocator, &subtitles, .label);
+    try rebuildSubtitleMatches(allocator, &subtitles, order, "", &matches);
+
+    try std.testing.expectEqual(@as(?usize, 2), findIndexInMatches(matches.items, selected_subtitle_idx));
 }
 
 fn subtitleMatchesFilter(subtitle: app.SubtitleChoice, filter: []const u8) bool {
