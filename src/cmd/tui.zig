@@ -290,6 +290,7 @@ const TuiRuntimeState = struct {
     cache_entries: std.ArrayListUnmanaged(QueryCacheEntry) = .empty,
     keywords: std.ArrayListUnmanaged(KeywordEntry) = .empty,
     download_entries: [][]u8 = &.{},
+    download_scan_error: ?anyerror = null,
     arena_stale_mutations: usize = 0,
     state_path: []u8,
     settings_path: []u8,
@@ -1133,7 +1134,14 @@ fn runTui(ui: *Ui) !void {
                     }
                     if (key.matches(vaxis.Key.tab, .{})) {
                         if (state.settings.download_cache_enabled) {
-                            refreshCachedDownloads(ui.allocator, &state) catch {};
+                            refreshCachedDownloads(ui.allocator, &state) catch |err| {
+                                switch (try showFriendlyError(ui, "Could not refresh cached downloads", err)) {
+                                    .ok => {},
+                                    .to_query => focus = .query,
+                                    .quit => return,
+                                }
+                                continue;
+                            };
                         }
                         focus = nextQueryFocus(focus, has_current_results, state.settings.download_cache_enabled and state.download_entries.len > 0);
                         continue;
@@ -1456,7 +1464,10 @@ fn loadTuiRuntimeState(allocator: std.mem.Allocator, environ_map: *std.process.E
     // Repack deserialized state once so temporary decoding allocations and
     // entries evicted by the bounds above do not remain pinned for the TUI lifetime.
     try compactRuntimeArena(allocator, &out);
-    out.download_entries = try cachedDownloadLabels(allocator, cache_root_path);
+    out.download_entries = cachedDownloadLabels(allocator, cache_root_path) catch |err| blk: {
+        out.download_scan_error = err;
+        break :blk &.{};
+    };
 
     return out;
 }
@@ -2600,18 +2611,28 @@ fn formatHomeTopLine(
     enabled_provider_count: usize,
     provider_count: usize,
     download_count: usize,
+    download_error: bool,
     maybe_bundle: ?*const SearchBundle,
     visible_result_count: ?usize,
     help_available: bool,
 ) ![]const u8 {
     var pos: usize = 0;
     const search_tab = if (focus == .downloads) "Search" else "SEARCH";
-    const downloads_tab = if (focus == .downloads) "DOWNLOADS" else "Downloads";
+    const downloads_tab = if (focus == .downloads)
+        if (download_error) "DOWNLOADS!" else "DOWNLOADS"
+    else if (download_error)
+        "Downloads!"
+    else
+        "Downloads";
     if (focus == .downloads and download_count > 0) {
         pos += (try std.fmt.bufPrint(buf[pos..], "{s} {d} · {s}", .{ downloads_tab, download_count, search_tab })).len;
     } else {
         pos += (try std.fmt.bufPrint(buf[pos..], "{s}", .{search_tab})).len;
-        if (download_count > 0) pos += (try std.fmt.bufPrint(buf[pos..], " · {s} {d}", .{ downloads_tab, download_count })).len;
+        if (download_count > 0) {
+            pos += (try std.fmt.bufPrint(buf[pos..], " · {s} {d}", .{ downloads_tab, download_count })).len;
+        } else if (download_error) {
+            pos += (try std.fmt.bufPrint(buf[pos..], " · {s}", .{downloads_tab})).len;
+        }
     }
     pos += (try std.fmt.bufPrint(buf[pos..], " · Esc Settings", .{})).len;
     if (help_available) pos += (try std.fmt.bufPrint(buf[pos..], " · F1 Help", .{})).len;
@@ -2764,7 +2785,7 @@ test "query display order cache reuses stable hit sets and invalidates on change
     try std.testing.expectEqualStrings("blade runner", bundle.display_query_norm.?);
 
     var top_buf: [320]u8 = undefined;
-    const top = try formatHomeTopLine(&top_buf, .query, 1, 1, 0, &bundle, no_match.len, true);
+    const top = try formatHomeTopLine(&top_buf, .query, 1, 1, 0, false, &bundle, no_match.len, true);
     try std.testing.expect(std.mem.indexOf(u8, top, "0/3 results") != null);
 }
 
@@ -3747,6 +3768,7 @@ fn renderQueryHome(
         provider_count,
         app.providerCount(),
         download_count,
+        state.download_scan_error != null,
         if (query_dirty) null else results,
         if (query_dirty) null else if (visible_order) |order| order.len else null,
         canRenderOverlayMenu(win),
@@ -3997,7 +4019,7 @@ test "search progress distinguishes active and queued providers" {
     );
 
     var top_buf: [320]u8 = undefined;
-    const top = try formatHomeTopLine(&top_buf, .query, 38, 38, 0, &bundle, 0, true);
+    const top = try formatHomeTopLine(&top_buf, .query, 38, 38, 0, false, &bundle, 0, true);
     try std.testing.expect(std.mem.indexOf(u8, top, "12 active") != null);
     try std.testing.expect(std.mem.indexOf(u8, top, "8 queued") != null);
     try std.testing.expect(std.mem.indexOf(u8, top, "20 pending") == null);
@@ -4005,19 +4027,28 @@ test "search progress distinguishes active and queued providers" {
 
 test "home header only advertises help when overlay can render" {
     var buf: [320]u8 = undefined;
-    const with_help = try formatHomeTopLine(&buf, .query, 1, 1, 0, null, null, true);
+    const with_help = try formatHomeTopLine(&buf, .query, 1, 1, 0, false, null, null, true);
     try std.testing.expect(std.mem.startsWith(u8, with_help, "SEARCH · Esc Settings"));
     try std.testing.expect(std.mem.indexOf(u8, with_help, "F1 Help") != null);
 
-    const without_help = try formatHomeTopLine(&buf, .query, 1, 1, 0, null, null, false);
+    const without_help = try formatHomeTopLine(&buf, .query, 1, 1, 0, false, null, null, false);
     try std.testing.expect(std.mem.startsWith(u8, without_help, "SEARCH · Esc Settings"));
     try std.testing.expect(std.mem.indexOf(u8, without_help, "F1 Help") == null);
 }
 
 test "home header prioritizes active downloads pane" {
     var buf: [320]u8 = undefined;
-    const top = try formatHomeTopLine(&buf, .downloads, 2, 3, 7, null, null, true);
+    const top = try formatHomeTopLine(&buf, .downloads, 2, 3, 7, false, null, null, true);
     try std.testing.expect(std.mem.startsWith(u8, top, "DOWNLOADS 7 · Search"));
+}
+
+test "home header surfaces cached download scan errors" {
+    var buf: [320]u8 = undefined;
+    const empty = try formatHomeTopLine(&buf, .query, 2, 3, 0, true, null, null, true);
+    try std.testing.expect(std.mem.indexOf(u8, empty, "Downloads!") != null);
+
+    const stale = try formatHomeTopLine(&buf, .query, 2, 3, 4, true, null, null, true);
+    try std.testing.expect(std.mem.indexOf(u8, stale, "Downloads! 4") != null);
 }
 
 const HomeSearchBoxMetrics = struct {
@@ -4567,7 +4598,7 @@ fn cachedDownloadLabelsRecursive(
 ) !void {
     var dir = std.Io.Dir.cwd().openDir(runtime_io.get(), dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
-        else => return,
+        else => return err,
     };
     defer dir.close(runtime_io.get());
 
@@ -4592,9 +4623,13 @@ fn cachedDownloadLabelsRecursive(
 }
 
 fn refreshCachedDownloads(allocator: std.mem.Allocator, state: *TuiRuntimeState) !void {
-    const next = try cachedDownloadLabels(allocator, state.cache_root_path);
+    const next = cachedDownloadLabels(allocator, state.cache_root_path) catch |err| {
+        state.download_scan_error = err;
+        return err;
+    };
     if (state.download_entries.len > 0) freeOwnedStrings(allocator, state.download_entries);
     state.download_entries = next;
+    state.download_scan_error = null;
 }
 
 fn exportHomeCachedDownload(ui: *Ui, state: *TuiRuntimeState, selected_download: usize) !MessageResult {
@@ -4764,6 +4799,9 @@ fn showFriendlyError(ui: *Ui, context: []const u8, err: anyerror) !MessageResult
 
 fn friendlyErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
+        error.FileNotFound => "The requested file or directory no longer exists.",
+        error.AccessDenied => "Permission denied while accessing this file or directory.",
+        error.NotDir => "Expected a directory, but found a file instead.",
         error.UnexpectedHttpStatus => "Provider returned an unexpected HTTP status.",
         error.RateLimited => "Provider rate limit hit. Retry in a few moments.",
         error.MissingField, error.InvalidField, error.InvalidFieldType => "Provider response format was not as expected.",
@@ -7110,6 +7148,25 @@ test "download cache refresh discovers new files and exports the selected entry"
     const copied = try std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), exported, allocator, .limited(1024));
     defer allocator.free(copied);
     try std.testing.expectEqualStrings("second subtitle\n", copied);
+}
+
+test "download cache scan propagates invalid downloads directory" {
+    const allocator = std.testing.allocator;
+    const unique = scrapers.common.compatNanoTimestamp();
+    const test_root = try std.fmt.allocPrint(allocator, ".zig-cache/tui-download-invalid-root-{d}", .{unique});
+    defer allocator.free(test_root);
+    defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
+    const cache_root = try std.fmt.allocPrint(allocator, "{s}/cache", .{test_root});
+    defer allocator.free(cache_root);
+    try std.Io.Dir.cwd().createDirPath(runtime_io.get(), cache_root);
+    const downloads_path = try std.fmt.allocPrint(allocator, "{s}/downloads", .{cache_root});
+    defer allocator.free(downloads_path);
+    {
+        var file = try std.Io.Dir.cwd().createFile(runtime_io.get(), downloads_path, .{});
+        defer file.close(runtime_io.get());
+    }
+
+    try std.testing.expectError(error.NotDir, cachedDownloadLabels(allocator, cache_root));
 }
 
 test "keyword state serializes through oneserial" {
