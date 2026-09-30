@@ -567,6 +567,15 @@ pub fn main(init: std.process.Init) !void {
             defer vx.exitAltScreen(tty.writer()) catch {};
             defer vx.setMouseMode(tty.writer(), false) catch {};
             defer loop.stop();
+
+            // Terminals that do not advertise in-band resize rely on SIGWINCH.
+            // vaxis does not install that handler as part of Loop.start(), so
+            // without this the UI can remain stuck at stale dimensions after a
+            // normal terminal resize.
+            const use_signal_resize = !vx.state.in_band_resize;
+            if (use_signal_resize) try loop.installResizeHandler();
+            defer if (use_signal_resize) loop.uninstallResizeHandler();
+
             try runTui(&ui);
         }
     }
