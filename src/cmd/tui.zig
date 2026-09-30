@@ -2102,8 +2102,11 @@ fn executeQuerySearchIncremental(
                 .winsize => |ws| try ui.resize(ws),
                 .mouse => |mouse| {
                     if (info_open.*) {
-                        if (mouse.type == .press) info_open.* = false;
-                        continue;
+                        if (mouse.type == .press) {
+                            info_open.* = false;
+                        } else {
+                            continue;
+                        }
                     }
                     if (mouse.type == .press and mouse.button == .left and mouse.row >= 0 and mouse.col >= 0) {
                         const win = ui.vx.window();
@@ -4359,7 +4362,7 @@ fn subtitleLanguageAllowed(item: app.SubtitleChoice, settings: TuiSettings) bool
     // require a positive match instead of letting unmapped languages bypass
     // the active filter.
     const raw = item.language orelse return true;
-    const normalized = scrapers.common.normalizeLanguageCode(raw) orelse return true;
+    const normalized = scrapers.common.normalizeLanguageCode(raw) orelse return false;
     for (language_options, 0..) |option, idx| {
         if (std.mem.eql(u8, option.code, normalized)) return settings.languages_enabled[idx];
     }
@@ -6072,6 +6075,12 @@ test "language filter rejects unmapped languages and keeps missing metadata usab
         .filename = null,
         .download_url = "https://example.test/ku.srt",
     };
+    const unrecognized: app.SubtitleChoice = .{
+        .label = "Unrecognized",
+        .language = "unknown",
+        .filename = null,
+        .download_url = "https://example.test/unrecognized.srt",
+    };
     const missing: app.SubtitleChoice = .{
         .label = "Unknown",
         .language = null,
@@ -6081,10 +6090,12 @@ test "language filter rejects unmapped languages and keeps missing metadata usab
 
     try std.testing.expect(subtitleLanguageAllowed(english, settings));
     try std.testing.expect(!subtitleLanguageAllowed(unknown, settings));
+    try std.testing.expect(!subtitleLanguageAllowed(unrecognized, settings));
     try std.testing.expect(subtitleLanguageAllowed(missing, settings));
 
     settings.language_filter_enabled = false;
     try std.testing.expect(subtitleLanguageAllowed(unknown, settings));
+    try std.testing.expect(subtitleLanguageAllowed(unrecognized, settings));
     try std.testing.expect(subtitleLanguageAllowed(missing, settings));
 }
 
