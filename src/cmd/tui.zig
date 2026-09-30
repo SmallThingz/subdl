@@ -5691,7 +5691,7 @@ fn vaxisSelectSubtitle(
         win.clear();
         win.hideCursor();
 
-        const show_pane = win.width >= 96;
+        const show_pane = subtitleDetailsPaneVisible(win.width, win.height);
         const left_width: u16 = if (show_pane) @max(@as(u16, 36), (win.width * 56) / 100) else win.width;
         const pane_col: u16 = left_width + 3;
         const pane_width: usize = if (show_pane and win.width > pane_col + 1) @intCast(win.width - pane_col - 1) else 0;
@@ -8081,6 +8081,17 @@ fn subtitleMatchesFilter(subtitle: app.SubtitleChoice, filter: []const u8) bool 
         if (containsCaseInsensitive(url, filter)) return true;
     }
     return false;
+}
+
+fn subtitleDetailsPaneVisible(width: u16, height: u16) bool {
+    return width >= 96 and height >= 10;
+}
+
+test "subtitle details pane requires usable width and height" {
+    try std.testing.expect(subtitleDetailsPaneVisible(120, 24));
+    try std.testing.expect(subtitleDetailsPaneVisible(96, 10));
+    try std.testing.expect(!subtitleDetailsPaneVisible(95, 24));
+    try std.testing.expect(!subtitleDetailsPaneVisible(120, 9));
 }
 
 fn renderSubtitleDetails(
