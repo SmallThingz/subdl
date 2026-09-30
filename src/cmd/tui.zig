@@ -3969,11 +3969,10 @@ fn renderQueryHome(
     if (state.persistence_error) |failure| {
         const suffix = std.fmt.bufPrint(
             top_buf[top.len..],
-            " · {s}! {s}:{s}",
+            " · {s}! {s}",
             .{
                 if (failure.operation == .load) "LOAD" else "SAVE",
                 persistenceAreaName(failure.area),
-                @errorName(failure.err),
             },
         ) catch "";
         top = top_buf[0 .. top.len + suffix.len];
@@ -6176,8 +6175,8 @@ fn renderCompactBottomLine(ui: *Ui, win: anytype, left: []const u8) !void {
     const status = if (ui.preferences_save_error) |err|
         try frameFmt(
             ui,
-            "{s}:{s} {s}:{s} PREFS:{s} {s}",
-            .{ BarLayout.confirm_key, confirm_text, BarLayout.theme_key, ui.theme().name, @errorName(err), BarLayout.quit_hint },
+            "{s}:{s} {s}:{s} PREFS! {s} {s}",
+            .{ BarLayout.confirm_key, confirm_text, BarLayout.theme_key, ui.theme().name, friendlyErrorMessage(err), BarLayout.quit_hint },
         )
     else
         try frameFmt(
