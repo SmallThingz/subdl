@@ -989,6 +989,27 @@ fn runTui(ui: *Ui) !void {
                                 continue;
                             }
                         }
+                        if (focus != .downloads and results == null and
+                            state.settings.keyword_cache_enabled and state.keywords.items.len > 0 and
+                            mouse.row >= 0)
+                        {
+                            const row: u16 = @intCast(mouse.row);
+                            const first_history_row = homeRecentSearchFirstRow();
+                            if (row >= first_history_row and row < homeListBottom(win.height)) {
+                                const display_idx: usize = @intCast(row - first_history_row);
+                                const suggestions = try sortedKeywordIndexes(ui.frameAllocator(), state.keywords.items);
+                                const visible_count = @min(suggestions.len, @as(usize, 6));
+                                if (display_idx < visible_count) {
+                                    const keyword = state.keywords.items[suggestions[display_idx]];
+                                    query.clearRetainingCapacity();
+                                    try query.appendSlice(ui.allocator, keyword.query);
+                                    cursor_pos = query.items.len;
+                                    history_pick = display_idx;
+                                    focus = .query;
+                                    continue;
+                                }
+                            }
+                        }
                     }
                     if (focus == .downloads and state.settings.download_cache_enabled) {
                         const download_count = state.download_entries.len;
@@ -997,7 +1018,7 @@ fn runTui(ui: *Ui) !void {
                             .wheel_up => scrollSelection(&selected_download, download_count, .backward, list_mouse_wheel_step),
                             .left => {
                                 const win = ui.vx.window();
-                                if (mouseRowIndex(mouse, 4, homeListBottom(win.height), download_scroll, download_count)) |row_idx| {
+                                if (mouseRowIndex(mouse, homeListTop(), homeListBottom(win.height), download_scroll, download_count)) |row_idx| {
                                     const activate = row_idx == selected_download;
                                     selected_download = row_idx;
                                     if (activate) {
@@ -1024,7 +1045,7 @@ fn runTui(ui: *Ui) !void {
                             },
                             .left => {
                                 const win = ui.vx.window();
-                                if (mouseRowIndex(mouse, 4, homeListBottom(win.height), result_scroll, visible_count)) |row_idx| {
+                                if (mouseRowIndex(mouse, homeListTop(), homeListBottom(win.height), result_scroll, visible_count)) |row_idx| {
                                     const activate = focus == .results and row_idx == selected_result;
                                     selected_result = row_idx;
                                     focus = .results;
@@ -2772,7 +2793,7 @@ fn executeQuerySearchIncremental(
                     } else if (mouse.type == .press and bundle.display_order.len > 0) switch (mouse.button) {
                         .left => {
                             const win = ui.vx.window();
-                            if (mouseRowIndex(mouse, 4, homeListBottom(win.height), result_scroll.*, bundle.display_order.len)) |row_idx| {
+                            if (mouseRowIndex(mouse, homeListTop(), homeListBottom(win.height), result_scroll.*, bundle.display_order.len)) |row_idx| {
                                 selected_result.* = row_idx;
                             }
                         },
@@ -3954,7 +3975,7 @@ fn renderQueryHome(
         win.showCursor(@min(col, win.width -| 1), search_box.input_row);
     }
 
-    const list_top = box_y + 3;
+    const list_top = homeListTop();
     const list_bottom = homeListBottom(win.height);
 
     if (focus == .downloads and state.settings.download_cache_enabled) {
@@ -4061,7 +4082,7 @@ fn renderQueryHome(
     }
 
     const footer = switch (focus) {
-        .query => "Enter search · ↑/↓ history · Tab focus",
+        .query => "Enter search · ↑/↓ or click history · Tab focus",
         .results => "↑/↓ select · Enter open · Tab focus",
         .downloads => "↑/↓ select · Enter export · Tab focus",
     };
@@ -4091,10 +4112,12 @@ const HomeSearchBoxMetrics = struct {
     input_width: u16,
 };
 
+const home_search_box_y: u16 = 1;
+
 fn homeSearchBoxMetrics(win_width: u16) HomeSearchBoxMetrics {
     const width: u16 = @min(if (win_width > 6) win_width - 6 else win_width, 86);
     const x: u16 = if (win_width > width) (win_width - width) / 2 else 0;
-    const y: u16 = 1;
+    const y = home_search_box_y;
     return .{
         .width = width,
         .x = x,
@@ -4107,6 +4130,14 @@ fn homeSearchBoxMetrics(win_width: u16) HomeSearchBoxMetrics {
 
 fn homeListBottom(height: u16) u16 {
     return height -| 1;
+}
+
+fn homeListTop() u16 {
+    return home_search_box_y + 3;
+}
+
+fn homeRecentSearchFirstRow() u16 {
+    return homeListTop() + 1;
 }
 
 fn renderBox(ui: *Ui, win: anytype, x: u16, y: u16, width: u16, height: u16, style: vaxis.Style) !void {
