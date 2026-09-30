@@ -3956,8 +3956,8 @@ fn renderQueryHome(
         provider_count,
         app.providerCount(),
         download_count,
-        results,
-        if (visible_order) |order| order.len else null,
+        if (query_dirty) null else results,
+        if (query_dirty) null else if (visible_order) |order| order.len else null,
     );
     try renderCompactTopLine(ui, win, top, ui.styleTitle());
 
