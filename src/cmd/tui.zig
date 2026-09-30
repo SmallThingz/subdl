@@ -4602,7 +4602,7 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
 
         const subtitles = &subtitle_pages.items[subtitles_idx].response;
         if (subtitles.items.len == 0) {
-            const msg = try vaxisMessage(ui, "No Subtitles", "No subtitle rows were returned.", "Press any key to continue.", ui.styleWarn());
+            const msg = try vaxisMessage(ui, "No Subtitles", "No subtitle rows were returned.", "Press Enter to continue.", ui.styleWarn());
             return switch (msg) {
                 .ok => .back,
                 .to_query => .to_query,
@@ -4624,7 +4624,7 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
                 ui,
                 "No Selectable Subtitles",
                 noSelectableSubtitleMessage(subtitles.items, settings),
-                "Press any key to return to titles.",
+                "Press Enter to return to titles.",
                 ui.styleWarn(),
             );
             return switch (msg) {
@@ -4741,7 +4741,7 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
             else
                 try ui.allocator.dupe(u8, result.file_path);
             defer ui.allocator.free(detail);
-            const msg = try vaxisMessage(ui, "Downloaded", detail, "Press any key to keep browsing.", ui.styleAccent());
+            const msg = try vaxisMessage(ui, "Downloaded", detail, "Press Enter to keep browsing.", ui.styleAccent());
             switch (msg) {
                 .ok => continue :subtitle_page_loop,
                 .to_query => return .to_query,
@@ -4856,7 +4856,7 @@ fn exportCachedDownload(ui: *Ui, result: app.DownloadResult) !MessageResult {
         const source = selectedCachedFile(files, idx) catch |err| return showFriendlyError(ui, "Could not export subtitle", err);
         const exported = exportCachedFile(ui.allocator, source, "downloads") catch |err| return showFriendlyError(ui, "Could not export subtitle", err);
         defer ui.allocator.free(exported);
-        const msg = try vaxisMessage(ui, "Exported", exported, "Press any key to continue.", ui.styleAccent());
+        const msg = try vaxisMessage(ui, "Exported", exported, "Press Enter to continue.", ui.styleAccent());
         switch (msg) {
             .ok => return .ok,
             .to_query => return .to_query,
@@ -5100,7 +5100,7 @@ fn exportHomeCachedDownload(ui: *Ui, state: *TuiRuntimeState, selected_download:
     };
     defer ui.allocator.free(exported);
 
-    return vaxisMessage(ui, "Exported", exported, "Press any key to continue.", ui.styleAccent());
+    return vaxisMessage(ui, "Exported", exported, "Press Enter to continue.", ui.styleAccent());
 }
 
 fn exportCachedDownloadEntry(
@@ -6097,7 +6097,7 @@ fn vaxisMessage(
         const detail_segments = [_]vaxis.Segment{.{ .text = detail, .style = ui.styleMuted() }};
         _ = win.print(&detail_segments, .{ .row_offset = 3, .col_offset = 1, .wrap = .none });
 
-        try renderBottomBar(ui, win, .{ .left = "Press any key to continue" });
+        try renderBottomBar(ui, win, .{ .left = "Enter/Esc continues · Ctrl+C back" });
         try ui.render();
 
         const batch = try readEventBatch(ui, try ui.loop.nextEvent());
@@ -6111,12 +6111,23 @@ fn vaxisMessage(
                         .to_query => return .to_query,
                         .quit => return .quit,
                     }
-                    return .ok;
+                    if (messageDismissKey(key)) return .ok;
                 },
                 else => {},
             }
         }
     }
+}
+
+fn messageDismissKey(key: vaxis.Key) bool {
+    return key.matches(vaxis.Key.enter, .{}) or key.matches(vaxis.Key.escape, .{});
+}
+
+test "message dialogs dismiss only on enter or escape" {
+    try std.testing.expect(messageDismissKey(.{ .codepoint = vaxis.Key.enter }));
+    try std.testing.expect(messageDismissKey(.{ .codepoint = vaxis.Key.escape }));
+    try std.testing.expect(!messageDismissKey(.{ .codepoint = 'x', .text = "x" }));
+    try std.testing.expect(!messageDismissKey(.{ .codepoint = vaxis.Key.f2 }));
 }
 
 const TopBarConfig = struct {
