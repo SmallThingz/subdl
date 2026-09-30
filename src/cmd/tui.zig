@@ -745,7 +745,7 @@ fn waitForFetch(ui: *Ui, done: *const std.atomic.Value(u8), title: []const u8, d
         }
 
         spinner_idx += 1;
-        try runtime_io.get().sleep(.fromMilliseconds(90), .awake);
+        try runtime_io.get().sleep(.fromMilliseconds(fetch_status_poll_interval_ms), .awake);
     }
     return .completed;
 }
@@ -807,7 +807,7 @@ fn waitForDownloadTask(ui: *Ui, task: *const DownloadTask, title: []const u8, de
         }
 
         spinner_idx += 1;
-        try runtime_io.get().sleep(.fromMilliseconds(90), .awake);
+        try runtime_io.get().sleep(.fromMilliseconds(fetch_status_poll_interval_ms), .awake);
     }
 
     return .completed;
@@ -6086,6 +6086,7 @@ fn countEnabledFlags(flags: []const bool) usize {
 const list_mouse_wheel_step: usize = 3;
 const search_active_poll_interval_ms: u64 = 1;
 const search_poll_interval_ms: u64 = 8;
+const fetch_status_poll_interval_ms: u64 = 32;
 const max_parallel_provider_searches: usize = 12;
 const max_background_search_reapers: usize = 3;
 const event_batch_capacity: usize = 1;
