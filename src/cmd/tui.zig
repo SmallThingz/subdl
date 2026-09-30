@@ -5492,13 +5492,13 @@ fn renderCompactBottomLine(ui: *Ui, win: anytype, left: []const u8) !void {
         .{ BarLayout.confirm_key, confirm_text, BarLayout.theme_key, ui.theme().name, BarLayout.quit_hint },
     );
     const status_width: usize = @intCast(win.gwidth(status));
-    if (status_width >= width) {
-        try printFitted(ui, win, row, 1, status, ui.styleMuted(), width);
+    const separator_width: usize = @intCast(win.gwidth(BarLayout.separator));
+    if (status_width + separator_width >= width) {
+        try printFitted(ui, win, row, 1, left, ui.styleMuted(), width);
         return;
     }
 
     const status_col: u16 = @intCast(1 + width - status_width);
-    const separator_width: usize = @intCast(win.gwidth(BarLayout.separator));
     if (width > status_width + separator_width) {
         const left_width = width - status_width - separator_width;
         try printFitted(ui, win, row, 1, left, ui.styleMuted(), left_width);
