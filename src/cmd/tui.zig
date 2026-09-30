@@ -1111,6 +1111,9 @@ fn runTui(ui: *Ui) !void {
                         continue;
                     }
                     if (key.matches(vaxis.Key.tab, .{})) {
+                        if (state.settings.download_cache_enabled) {
+                            refreshCachedDownloads(ui.allocator, &state) catch {};
+                        }
                         focus = nextQueryFocus(focus, has_current_results, state.settings.download_cache_enabled and state.download_entries.len > 0);
                         continue;
                     }
