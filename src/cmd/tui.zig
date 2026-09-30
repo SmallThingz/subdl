@@ -3514,6 +3514,7 @@ fn editSettingsPopup(
                     if (help_open) {
                         help_open = false;
                         redraw_background = true;
+                        continue;
                     }
                     const win_now = ui.vx.window();
                     const metrics_now = settingsPopupMetrics(win_now.width, win_now.height);
@@ -3610,8 +3611,11 @@ fn editSettingsPopup(
                             redraw_background = true;
                             continue;
                         }
-                        help_open = false;
-                        redraw_background = true;
+                        const global_key = key.matches(vaxis.Key.f2, .{}) or
+                            key.matches(vaxis.Key.f3, .{}) or
+                            key.matches('c', .{ .ctrl = true }) or
+                            key.matches('d', .{ .ctrl = true });
+                        if (!global_key) continue;
                     }
                     if (key.matches(vaxis.Key.f1, .{})) {
                         if (canRenderOverlayMenu(ui.vx.window())) help_open = true;
@@ -5925,7 +5929,7 @@ fn vaxisSelect(
                         info_menu_open = false;
                         continue;
                     }
-                    if (info_menu_open) info_menu_open = false;
+                    if (info_menu_open) continue;
 
                     if (filter_mode) {
                         if (key.matches(vaxis.Key.escape, .{}) or key.matches(vaxis.Key.enter, .{})) {
@@ -6006,6 +6010,7 @@ fn vaxisSelect(
                     if (info_menu_open) {
                         if (mouse.type == .press) {
                             info_menu_open = false;
+                            continue;
                         } else {
                             continue;
                         }
@@ -6028,7 +6033,10 @@ fn vaxisSelect(
             }
         }
         if (batch.wheel_delta != 0) {
-            if (info_menu_open) info_menu_open = false;
+            if (info_menu_open) {
+                info_menu_open = false;
+                continue;
+            }
             applyWheelDelta(&selected_row, matches.items.len, batch.wheel_delta, list_mouse_wheel_step);
         }
     }
@@ -6245,7 +6253,7 @@ fn vaxisSelectSubtitle(
                         info_menu_open = false;
                         continue;
                     }
-                    if (info_menu_open) info_menu_open = false;
+                    if (info_menu_open) continue;
 
                     if (filter_mode) {
                         if (key.matches(vaxis.Key.escape, .{}) or key.matches(vaxis.Key.enter, .{})) {
@@ -6351,6 +6359,7 @@ fn vaxisSelectSubtitle(
                     if (info_menu_open) {
                         if (mouse.type == .press) {
                             info_menu_open = false;
+                            continue;
                         } else {
                             continue;
                         }
@@ -6372,7 +6381,10 @@ fn vaxisSelectSubtitle(
             }
         }
         if (batch.wheel_delta != 0) {
-            if (info_menu_open) info_menu_open = false;
+            if (info_menu_open) {
+                info_menu_open = false;
+                continue;
+            }
             applyWheelDelta(&selected_row, matches.items.len, batch.wheel_delta, list_mouse_wheel_step);
             moveSelectionToEnabled(matches.items, enabled, &selected_row, if (batch.wheel_delta > 0) .forward else .backward);
         }
