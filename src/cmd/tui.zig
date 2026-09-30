@@ -891,6 +891,11 @@ fn runTui(ui: *Ui) !void {
 
     while (true) {
         ui.provider_enabled = state.settings.providers_enabled;
+        focus = normalizeQueryFocus(
+            focus,
+            results != null and results.?.hits.items.len > 0,
+            state.settings.download_cache_enabled and state.download_entries.len > 0,
+        );
         const query_norm_view = normalizeQueryView(query.items);
         const query_dirty = !std.mem.eql(u8, query_norm_view, last_searched_norm);
         try renderQueryHome(ui, &state, query.items, cursor_pos, focus, query_dirty, if (results) |*b| b else null, &selected_result, &result_scroll, &selected_download, &download_scroll, info_open, true);
@@ -2875,6 +2880,22 @@ fn nextQueryFocus(current: QueryFocus, has_results: bool, has_downloads: bool) Q
         .results => if (has_downloads) .downloads else .query,
         .downloads => .query,
     };
+}
+
+fn normalizeQueryFocus(current: QueryFocus, has_results: bool, has_downloads: bool) QueryFocus {
+    return switch (current) {
+        .query => .query,
+        .results => if (has_results) .results else .query,
+        .downloads => if (has_downloads) .downloads else if (has_results) .results else .query,
+    };
+}
+
+test "query focus cannot stay on hidden panes" {
+    try std.testing.expectEqual(QueryFocus.query, normalizeQueryFocus(.results, false, false));
+    try std.testing.expectEqual(QueryFocus.results, normalizeQueryFocus(.results, true, false));
+    try std.testing.expectEqual(QueryFocus.query, normalizeQueryFocus(.downloads, false, false));
+    try std.testing.expectEqual(QueryFocus.results, normalizeQueryFocus(.downloads, true, false));
+    try std.testing.expectEqual(QueryFocus.downloads, normalizeQueryFocus(.downloads, true, true));
 }
 
 fn cleanSearchTitle(label: []const u8) []const u8 {
