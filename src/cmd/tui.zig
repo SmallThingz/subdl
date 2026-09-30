@@ -1247,12 +1247,16 @@ fn runTui(ui: *Ui) !void {
                         )) continue;
                     } else if (key.matches(vaxis.Key.left, .{})) {
                         cursor_pos = prevCodepointStart(query.items, cursor_pos);
+                        focus = .query;
                     } else if (key.matches(vaxis.Key.right, .{})) {
                         cursor_pos = nextCodepointEnd(query.items, cursor_pos);
+                        focus = .query;
                     } else if (key.matches(vaxis.Key.home, .{}) or key.matches('a', .{ .ctrl = true })) {
                         cursor_pos = 0;
+                        focus = .query;
                     } else if (key.matches(vaxis.Key.end, .{}) or key.matches('e', .{ .ctrl = true })) {
                         cursor_pos = query.items.len;
+                        focus = .query;
                     } else if (key.matches('u', .{ .ctrl = true })) {
                         query.clearRetainingCapacity();
                         cursor_pos = 0;
@@ -2209,7 +2213,7 @@ fn executeQuerySearchIncremental(
                         query.items,
                         cursor_pos,
                         key,
-                        bundle.display_order.len > 0,
+                        active_focus == .query,
                     )) {
                         active_focus = .query;
                         focus_explicit = true;
@@ -2229,76 +2233,67 @@ fn executeQuerySearchIncremental(
                             .discard_results = true,
                         };
                     }
-                    if (bundle.display_order.len > 0 and key.matches(vaxis.Key.down, .{})) {
-                        selected_result.* = @min(bundle.display_order.len - 1, selected_result.* + 1);
-                        active_focus = .results;
-                        focus_explicit = true;
-                        continue;
-                    }
-                    if (bundle.display_order.len > 0 and key.matches(vaxis.Key.up, .{})) {
-                        selected_result.* = selected_result.* -| 1;
-                        active_focus = .results;
-                        focus_explicit = true;
-                        continue;
-                    }
-                    if (bundle.display_order.len > 0 and key.matches(vaxis.Key.page_down, .{})) {
-                        selected_result.* = @min(bundle.display_order.len - 1, selected_result.* + queryPageSize(ui));
-                        active_focus = .results;
-                        focus_explicit = true;
-                        continue;
-                    }
-                    if (key.matches(vaxis.Key.page_up, .{})) {
-                        selected_result.* = selected_result.* -| queryPageSize(ui);
-                        if (bundle.display_order.len > 0) {
-                            active_focus = .results;
+                    if (active_focus == .results) {
+                        if (bundle.display_order.len > 0 and key.matches(vaxis.Key.down, .{})) {
+                            selected_result.* = @min(bundle.display_order.len - 1, selected_result.* + 1);
                             focus_explicit = true;
+                            continue;
                         }
-                        continue;
-                    }
-                    if (bundle.display_order.len > 0 and key.matches(vaxis.Key.end, .{})) {
-                        selected_result.* = bundle.display_order.len - 1;
-                        active_focus = .results;
-                        focus_explicit = true;
-                        continue;
-                    }
-                    if (key.matches(vaxis.Key.home, .{})) {
-                        selected_result.* = 0;
-                        if (bundle.display_order.len > 0) {
-                            active_focus = .results;
+                        if (bundle.display_order.len > 0 and key.matches(vaxis.Key.up, .{})) {
+                            selected_result.* = selected_result.* -| 1;
                             focus_explicit = true;
+                            continue;
                         }
-                        continue;
-                    }
-                    if (bundle.display_order.len > 0 and key.matches(vaxis.Key.enter, .{})) {
-                        active_focus = .results;
-                        focus_explicit = true;
-                        const visible_order = bundle.display_order;
-                        if (selected_result.* >= visible_order.len) continue;
-                        switch (try openSearchResult(ui, &bundle, visible_order[selected_result.*], state)) {
-                            .back => {},
-                            .to_query => {
-                                bundle.searching = false;
-                                bundle.pending_count = 0;
-                                bundle.active_count = 0;
-                                bundle.queued_count = 0;
-                                bundle.canceled = true;
-                                if (ui.reapSearchWork(search_work)) {
-                                    search_work_owned = false;
-                                }
-                                return .{
-                                    .bundle = bundle,
-                                    .focus = .query,
-                                    .mark_query_dirty = true,
-                                };
-                            },
-                            .quit => {
-                                if (ui.reapSearchWork(search_work)) {
-                                    search_work_owned = false;
-                                }
-                                return error.TuiQuit;
-                            },
+                        if (bundle.display_order.len > 0 and key.matches(vaxis.Key.page_down, .{})) {
+                            selected_result.* = @min(bundle.display_order.len - 1, selected_result.* + queryPageSize(ui));
+                            focus_explicit = true;
+                            continue;
                         }
-                        continue;
+                        if (key.matches(vaxis.Key.page_up, .{})) {
+                            selected_result.* = selected_result.* -| queryPageSize(ui);
+                            focus_explicit = true;
+                            continue;
+                        }
+                        if (bundle.display_order.len > 0 and key.matches(vaxis.Key.end, .{})) {
+                            selected_result.* = bundle.display_order.len - 1;
+                            focus_explicit = true;
+                            continue;
+                        }
+                        if (key.matches(vaxis.Key.home, .{})) {
+                            selected_result.* = 0;
+                            focus_explicit = true;
+                            continue;
+                        }
+                        if (bundle.display_order.len > 0 and key.matches(vaxis.Key.enter, .{})) {
+                            focus_explicit = true;
+                            const visible_order = bundle.display_order;
+                            if (selected_result.* >= visible_order.len) continue;
+                            switch (try openSearchResult(ui, &bundle, visible_order[selected_result.*], state)) {
+                                .back => {},
+                                .to_query => {
+                                    bundle.searching = false;
+                                    bundle.pending_count = 0;
+                                    bundle.active_count = 0;
+                                    bundle.queued_count = 0;
+                                    bundle.canceled = true;
+                                    if (ui.reapSearchWork(search_work)) {
+                                        search_work_owned = false;
+                                    }
+                                    return .{
+                                        .bundle = bundle,
+                                        .focus = .query,
+                                        .mark_query_dirty = true,
+                                    };
+                                },
+                                .quit => {
+                                    if (ui.reapSearchWork(search_work)) {
+                                        search_work_owned = false;
+                                    }
+                                    return error.TuiQuit;
+                                },
+                            }
+                            continue;
+                        }
                     }
                 },
                 .paste => |text| {
@@ -3691,7 +3686,23 @@ fn renderQueryHome(
         }
     }
 
-    const footer = switch (focus) {
+    const footer = if (results) |bundle|
+        if (bundle.searching) switch (focus) {
+            .query => if (visible_order) |order|
+                if (order.len > 0)
+                    "Search running · edit query to restart · Tab results"
+                else
+                    "Search running · edit query to restart"
+            else
+                "Search running · edit query to restart",
+            .results => "↑/↓ select · Enter open · Tab query",
+            .downloads => "↑/↓ select · Enter export · Tab focus",
+        } else switch (focus) {
+            .query => "Enter search · ↑/↓ or click history · Tab focus",
+            .results => "↑/↓ select · Enter open · Tab focus",
+            .downloads => "↑/↓ select · Enter export · Tab focus",
+        }
+    else switch (focus) {
         .query => "Enter search · ↑/↓ or click history · Tab focus",
         .results => "↑/↓ select · Enter open · Tab focus",
         .downloads => "↑/↓ select · Enter export · Tab focus",
@@ -5367,7 +5378,7 @@ fn applyActiveSearchQueryCursorKey(
     query: []const u8,
     cursor_pos: *usize,
     key: vaxis.Key,
-    has_results: bool,
+    query_focused: bool,
 ) bool {
     if (key.matches(vaxis.Key.left, .{})) {
         cursor_pos.* = prevCodepointStart(query, cursor_pos.*);
@@ -5377,11 +5388,11 @@ fn applyActiveSearchQueryCursorKey(
         cursor_pos.* = nextCodepointEnd(query, cursor_pos.*);
         return true;
     }
-    if (key.matches('a', .{ .ctrl = true }) or (!has_results and key.matches(vaxis.Key.home, .{}))) {
+    if (key.matches('a', .{ .ctrl = true }) or (query_focused and key.matches(vaxis.Key.home, .{}))) {
         cursor_pos.* = 0;
         return true;
     }
-    if (key.matches('e', .{ .ctrl = true }) or (!has_results and key.matches(vaxis.Key.end, .{}))) {
+    if (key.matches('e', .{ .ctrl = true }) or (query_focused and key.matches(vaxis.Key.end, .{}))) {
         cursor_pos.* = query.len;
         return true;
     }
@@ -5437,7 +5448,7 @@ test "active search cursor navigation matches query input semantics" {
         query,
         &cursor,
         .{ .codepoint = vaxis.Key.home },
-        true,
+        false,
     ));
     try std.testing.expectEqual(@as(usize, 2), cursor);
 
@@ -5445,7 +5456,7 @@ test "active search cursor navigation matches query input semantics" {
         query,
         &cursor,
         .{ .codepoint = 'a', .mods = .{ .ctrl = true } },
-        true,
+        false,
     ));
     try std.testing.expectEqual(@as(usize, 0), cursor);
 }
