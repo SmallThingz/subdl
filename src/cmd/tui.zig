@@ -1219,7 +1219,7 @@ fn runTui(ui: *Ui) !void {
                         const owned_query = try ui.allocator.dupe(u8, current_query_norm);
                         defer ui.allocator.free(owned_query);
                         try rememberKeyword(ui.allocator, &state, owned_query);
-                        const search_outcome = executeQuerySearchIncremental(ui, &state, owned_query, query.items, cursor_pos, &selected_result, &result_scroll, &info_open) catch |err| switch (err) {
+                        const search_outcome = executeQuerySearchIncremental(ui, &state, owned_query, &query, &cursor_pos, &selected_result, &result_scroll, &info_open) catch |err| switch (err) {
                             error.TuiQuit => return,
                             else => return err,
                         };
@@ -1999,8 +1999,8 @@ fn executeQuerySearchIncremental(
     ui: *Ui,
     state: *TuiRuntimeState,
     query_norm: []const u8,
-    query_display: []const u8,
-    cursor_pos: usize,
+    query: *std.ArrayList(u8),
+    cursor_pos: *usize,
     selected_result: *usize,
     result_scroll: *usize,
     info_open: *bool,
@@ -2064,8 +2064,8 @@ fn executeQuerySearchIncremental(
     try renderQueryHome(
         ui,
         state,
-        query_display,
-        cursor_pos,
+        query.items,
+        cursor_pos.*,
         if (bundle.hits.items.len > 0) .results else .query,
         false,
         &bundle,
@@ -2163,8 +2163,8 @@ fn executeQuerySearchIncremental(
                         const search_settings_changed = try editSettingsPopup(
                             ui,
                             state,
-                            query_display,
-                            cursor_pos,
+                            query.items,
+                            cursor_pos.*,
                             if (bundle.hits.items.len > 0) .results else .query,
                             false,
                             &bundle,
@@ -2193,6 +2193,20 @@ fn executeQuerySearchIncremental(
                     if (key.matches(vaxis.Key.f1, .{})) {
                         if (canRenderOverlayMenu(ui.vx.window())) info_open.* = !info_open.*;
                         continue;
+                    }
+                    if (try applyActiveSearchQueryEditKey(ui.allocator, query, cursor_pos, key)) {
+                        bundle.searching = false;
+                        bundle.pending_count = 0;
+                        bundle.active_count = 0;
+                        bundle.queued_count = 0;
+                        if (ui.reapSearchWork(search_work)) {
+                            search_work_owned = false;
+                        }
+                        return .{
+                            .bundle = bundle,
+                            .focus = .query,
+                            .discard_results = true,
+                        };
                     }
                     if (bundle.display_order.len > 0 and key.matches(vaxis.Key.down, .{})) {
                         selected_result.* = @min(bundle.display_order.len - 1, selected_result.* + 1);
@@ -2248,6 +2262,22 @@ fn executeQuerySearchIncremental(
                         continue;
                     }
                 },
+                .paste => |text| {
+                    if (try insertNormalizedPaste(ui.allocator, query, cursor_pos, text, max_home_query_bytes)) {
+                        bundle.searching = false;
+                        bundle.pending_count = 0;
+                        bundle.active_count = 0;
+                        bundle.queued_count = 0;
+                        if (ui.reapSearchWork(search_work)) {
+                            search_work_owned = false;
+                        }
+                        return .{
+                            .bundle = bundle,
+                            .focus = .query,
+                            .discard_results = true,
+                        };
+                    }
+                },
                 else => {},
             }
         }
@@ -2257,7 +2287,7 @@ fn executeQuerySearchIncremental(
         }
         if (dirty) {
             clampSelection(selected_result, bundle.display_order.len);
-            try renderQueryHome(ui, state, query_display, cursor_pos, if (bundle.hits.items.len > 0) .results else .query, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
+            try renderQueryHome(ui, state, query.items, cursor_pos.*, if (bundle.hits.items.len > 0) .results else .query, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
         }
         for (cache_response_indices[0..cache_response_count]) |response_index| {
             const response = bundle.searches.items[response_index];
@@ -2279,7 +2309,7 @@ fn executeQuerySearchIncremental(
     bundle.searching = false;
     bundle.active_count = 0;
     bundle.queued_count = 0;
-    try renderQueryHome(ui, state, query_display, cursor_pos, if (bundle.hits.items.len > 0) .results else .query, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
+    try renderQueryHome(ui, state, query.items, cursor_pos.*, if (bundle.hits.items.len > 0) .results else .query, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
     return .{
         .bundle = bundle,
         .focus = if (bundle.hits.items.len > 0) .results else .query,
@@ -5185,6 +5215,91 @@ fn isTextKey(key: vaxis.Key) bool {
     if (key.matches(vaxis.Key.enter, .{})) return false;
     if (key.matches(vaxis.Key.tab, .{})) return false;
     return text.len > 0;
+}
+
+fn applyActiveSearchQueryEditKey(
+    allocator: std.mem.Allocator,
+    query: *std.ArrayList(u8),
+    cursor_pos: *usize,
+    key: vaxis.Key,
+) !bool {
+    if (key.matches('u', .{ .ctrl = true })) {
+        if (query.items.len == 0) return false;
+        query.clearRetainingCapacity();
+        cursor_pos.* = 0;
+        return true;
+    }
+    if (key.matches(vaxis.Key.backspace, .{})) {
+        if (cursor_pos.* == 0) return false;
+        const prev = prevCodepointStart(query.items, cursor_pos.*);
+        query.replaceRangeAssumeCapacity(prev, cursor_pos.* - prev, "");
+        cursor_pos.* = prev;
+        return true;
+    }
+    if (key.matches(vaxis.Key.delete, .{})) {
+        if (cursor_pos.* >= query.items.len) return false;
+        const next = nextCodepointEnd(query.items, cursor_pos.*);
+        query.replaceRangeAssumeCapacity(cursor_pos.*, next - cursor_pos.*, "");
+        return true;
+    }
+    if (!isTextKey(key)) return false;
+    const text = key.text orelse return false;
+    if (query.items.len + text.len > max_home_query_bytes) return false;
+    try query.insertSlice(allocator, cursor_pos.*, text);
+    cursor_pos.* += text.len;
+    return true;
+}
+
+test "active search query edits are utf8-safe and bounded" {
+    var query: std.ArrayList(u8) = .empty;
+    defer query.deinit(std.testing.allocator);
+    try query.appendSlice(std.testing.allocator, "AéB");
+    var cursor: usize = 3;
+
+    try std.testing.expect(try applyActiveSearchQueryEditKey(
+        std.testing.allocator,
+        &query,
+        &cursor,
+        .{ .codepoint = vaxis.Key.backspace },
+    ));
+    try std.testing.expectEqualStrings("AB", query.items);
+    try std.testing.expectEqual(@as(usize, 1), cursor);
+
+    try std.testing.expect(try applyActiveSearchQueryEditKey(
+        std.testing.allocator,
+        &query,
+        &cursor,
+        .{ .codepoint = 'X', .text = "X" },
+    ));
+    try std.testing.expectEqualStrings("AXB", query.items);
+    try std.testing.expectEqual(@as(usize, 2), cursor);
+
+    try std.testing.expect(try applyActiveSearchQueryEditKey(
+        std.testing.allocator,
+        &query,
+        &cursor,
+        .{ .codepoint = vaxis.Key.delete },
+    ));
+    try std.testing.expectEqualStrings("AX", query.items);
+
+    try std.testing.expect(try applyActiveSearchQueryEditKey(
+        std.testing.allocator,
+        &query,
+        &cursor,
+        .{ .codepoint = 'u', .mods = .{ .ctrl = true } },
+    ));
+    try std.testing.expectEqualStrings("", query.items);
+    try std.testing.expectEqual(@as(usize, 0), cursor);
+
+    try query.appendNTimes(std.testing.allocator, 'a', max_home_query_bytes);
+    cursor = query.items.len;
+    try std.testing.expect(!try applyActiveSearchQueryEditKey(
+        std.testing.allocator,
+        &query,
+        &cursor,
+        .{ .codepoint = 'Z', .text = "Z" },
+    ));
+    try std.testing.expectEqual(@as(usize, max_home_query_bytes), query.items.len);
 }
 
 fn normalizePastedText(allocator: std.mem.Allocator, input: []const u8, max_bytes: usize) ![]u8 {
