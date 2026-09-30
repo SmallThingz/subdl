@@ -291,6 +291,7 @@ const TuiRuntimeState = struct {
     keywords: std.ArrayListUnmanaged(KeywordEntry) = .empty,
     download_entries: [][]u8 = &.{},
     download_scan_error: ?anyerror = null,
+    persistence_error: ?PersistenceFailure = null,
     arena_stale_mutations: usize = 0,
     state_path: []u8,
     settings_path: []u8,
@@ -308,6 +309,17 @@ const TuiRuntimeState = struct {
         self.arena.deinit();
         self.* = undefined;
     }
+};
+
+const PersistenceArea = enum {
+    cache,
+    settings,
+    history,
+};
+
+const PersistenceFailure = struct {
+    area: PersistenceArea,
+    err: anyerror,
 };
 
 const QueryFocus = enum {
@@ -1302,9 +1314,9 @@ fn runTui(ui: *Ui) !void {
                         result_scroll = 0;
                         focus = search_outcome.focus;
                         if (results) |*bundle| {
-                            if (bundle.cache_changed) try saveTuiRuntimeState(ui.allocator, &state);
+                            if (bundle.cache_changed) try persistTuiRuntimeState(ui.allocator, &state);
                         }
-                        if (keyword_changed) try saveKeywordRuntimeState(ui.allocator, &state);
+                        if (keyword_changed) try persistKeywordRuntimeState(ui.allocator, &state);
                         continue;
                     }
                     if (key.matches(vaxis.Key.up, .{})) {
@@ -1581,6 +1593,55 @@ fn saveTuiSettingsState(allocator: std.mem.Allocator, state: *const TuiRuntimeSt
         .settings = state.settings,
     };
     try saveOneSerial(PersistentSettingsState, allocator, state.settings_path, settings_state_magic, &persist);
+}
+
+fn persistTuiRuntimeState(allocator: std.mem.Allocator, state: *TuiRuntimeState) !void {
+    saveTuiRuntimeState(allocator, state) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        state.persistence_error = .{ .area = .cache, .err = err };
+        return;
+    };
+    clearPersistenceError(state, .cache);
+}
+
+fn persistKeywordRuntimeState(allocator: std.mem.Allocator, state: *TuiRuntimeState) !void {
+    saveKeywordRuntimeState(allocator, state) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        state.persistence_error = .{ .area = .history, .err = err };
+        return;
+    };
+    clearPersistenceError(state, .history);
+}
+
+fn persistTuiSettingsState(allocator: std.mem.Allocator, state: *TuiRuntimeState) !void {
+    saveTuiSettingsState(allocator, state) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        state.persistence_error = .{ .area = .settings, .err = err };
+        return;
+    };
+    clearPersistenceError(state, .settings);
+}
+
+fn clearPersistenceError(state: *TuiRuntimeState, area: PersistenceArea) void {
+    if (state.persistence_error) |failure| {
+        if (failure.area == area) state.persistence_error = null;
+    }
+}
+
+fn persistenceAreaName(area: PersistenceArea) []const u8 {
+    return switch (area) {
+        .cache => "cache",
+        .settings => "settings",
+        .history => "history",
+    };
+}
+
+fn formatPersistenceFailure(buf: []u8, failure: PersistenceFailure) []const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "{s} save failed: {s}",
+        .{ persistenceAreaName(failure.area), @errorName(failure.err) },
+    ) catch "Save failed";
 }
 
 fn saveUiPreferences(
@@ -3181,14 +3242,14 @@ fn activateSettingsMainRow(
         },
         6 => {
             state.keywords.clearRetainingCapacity();
-            try saveKeywordRuntimeState(ui.allocator, state);
+            try persistKeywordRuntimeState(ui.allocator, state);
             redraw_background.* = true;
         },
         else => {},
     }
     if (apply_cache_settings) applyRuntimeCacheSettings(state);
     if (persist_settings) {
-        try saveTuiSettingsState(ui.allocator, state);
+        try persistTuiSettingsState(ui.allocator, state);
         redraw_background.* = true;
     }
 }
@@ -3389,12 +3450,12 @@ fn editSettingsPopup(
                         continue;
                     }
                     if (key.matches('d', .{ .ctrl = true })) {
-                        if (settings_dirty) try saveTuiSettingsState(ui.allocator, state);
+                        if (settings_dirty) try persistTuiSettingsState(ui.allocator, state);
                         ui.hardQuit();
                     }
                     if (key.matches('c', .{ .ctrl = true })) {
                         if (settings_dirty) {
-                            try saveTuiSettingsState(ui.allocator, state);
+                            try persistTuiSettingsState(ui.allocator, state);
                             settings_dirty = false;
                         }
                         switch (panel) {
@@ -3433,7 +3494,7 @@ fn editSettingsPopup(
                         .providers => {
                             if (key.matches(vaxis.Key.escape, .{})) {
                                 if (settings_dirty) {
-                                    try saveTuiSettingsState(ui.allocator, state);
+                                    try persistTuiSettingsState(ui.allocator, state);
                                     settings_dirty = false;
                                 }
                                 panel = .main;
@@ -3459,7 +3520,7 @@ fn editSettingsPopup(
                             const language_items = languageCount() + 1;
                             if (key.matches(vaxis.Key.escape, .{})) {
                                 if (settings_dirty) {
-                                    try saveTuiSettingsState(ui.allocator, state);
+                                    try persistTuiSettingsState(ui.allocator, state);
                                     settings_dirty = false;
                                 }
                                 panel = .main;
@@ -3498,7 +3559,7 @@ fn editSettingsPopup(
                                 };
                                 state.settings.cache_ttl_seconds = ttl;
                                 applyRuntimeCacheSettings(state);
-                                try saveTuiSettingsState(ui.allocator, state);
+                                try persistTuiSettingsState(ui.allocator, state);
                                 redraw_background = true;
                                 panel = .main;
                                 ttl_error = null;
@@ -3607,8 +3668,16 @@ fn renderSettingsPopup(
 
     const row_start = metrics.row_start;
     const row_end = metrics.row_end;
+    var persistence_buf: [160]u8 = undefined;
+    const persistence_banner: ?[]const u8 = if (state.persistence_error) |failure|
+        formatPersistenceFailure(&persistence_buf, failure)
+    else
+        null;
     switch (panel) {
         .main => {
+            if (persistence_banner) |banner| {
+                try printFitted(ui, win, y + 2, x + 2, banner, ui.styleWarn(), width -| 4);
+            }
             var provider_buf: [64]u8 = undefined;
             var language_buf: [64]u8 = undefined;
             var cache_buf: [64]u8 = undefined;
@@ -3637,7 +3706,15 @@ fn renderSettingsPopup(
             }
         },
         .providers => {
-            try printFitted(ui, win, y + 2, x + 2, "Enter/Space toggles. Esc/Ctrl+C returns.", ui.styleMuted(), width -| 4);
+            try printFitted(
+                ui,
+                win,
+                y + 2,
+                x + 2,
+                persistence_banner orelse "Enter/Space toggles. Esc/Ctrl+C returns.",
+                if (persistence_banner != null) ui.styleWarn() else ui.styleMuted(),
+                width -| 4,
+            );
             var row = row_start;
             var idx = provider_scroll;
             while (idx < app.providerCount() and row < row_end) : (idx += 1) {
@@ -3653,7 +3730,15 @@ fn renderSettingsPopup(
             }
         },
         .languages => {
-            try printFitted(ui, win, y + 2, x + 2, "Enter/Space chooses. Esc/Ctrl+C returns.", ui.styleMuted(), width -| 4);
+            try printFitted(
+                ui,
+                win,
+                y + 2,
+                x + 2,
+                persistence_banner orelse "Enter/Space chooses. Esc/Ctrl+C returns.",
+                if (persistence_banner != null) ui.styleWarn() else ui.styleMuted(),
+                width -| 4,
+            );
             var row = row_start;
             var idx = language_scroll;
             const language_items = language_options.len + 1;
@@ -3678,7 +3763,15 @@ fn renderSettingsPopup(
             }
         },
         .cache_ttl => {
-            try printFitted(ui, win, y + 2, x + 2, "Hours; decimals allowed. 0 or inf keeps forever.", ui.styleMuted(), width -| 4);
+            try printFitted(
+                ui,
+                win,
+                y + 2,
+                x + 2,
+                persistence_banner orelse "Hours; decimals allowed. 0 or inf keeps forever.",
+                if (persistence_banner != null) ui.styleWarn() else ui.styleMuted(),
+                width -| 4,
+            );
             try printFitted(ui, win, row_start, x + 2, "Hours", ui.styleAccent(), 8);
             try printFitted(ui, win, row_start, x + 10, ttl_input, vaxis.Style{ .bold = true }, width -| 12);
             if (ttl_error) |err| try printFitted(ui, win, row_start + 2, x + 2, err, ui.styleWarn(), width -| 4);
@@ -3771,7 +3864,7 @@ fn renderQueryHome(
     else
         null;
     var top_buf: [320]u8 = undefined;
-    const top = try formatHomeTopLine(
+    var top = try formatHomeTopLine(
         &top_buf,
         focus,
         provider_count,
@@ -3782,6 +3875,14 @@ fn renderQueryHome(
         if (query_dirty) null else if (visible_order) |order| order.len else null,
         canRenderOverlayMenu(win),
     );
+    if (state.persistence_error) |failure| {
+        const suffix = std.fmt.bufPrint(
+            top_buf[top.len..],
+            " · SAVE! {s}:{s}",
+            .{ persistenceAreaName(failure.area), @errorName(failure.err) },
+        ) catch "";
+        top = top_buf[0 .. top.len + suffix.len];
+    }
     try renderCompactTopLine(ui, win, top, ui.styleTitle());
 
     const search_box = homeSearchBoxMetrics(win.width);
