@@ -5272,13 +5272,14 @@ fn vaxisSelect(
             const l3 = std.fmt.bufPrint(&m3, "ctx: {s}", .{ui.context_line orelse "-"}) catch "ctx";
             const l4 = std.fmt.bufPrint(&m4, "controls: {s}", .{help_line}) catch "controls";
             const l5 = std.fmt.bufPrint(&m5, "state: mode={s} filter={s} count={s}", .{ mode_text, filter_display, count_line }) catch "state";
+            const close_help = if (filter_mode) "close: F1/Esc" else "close: F1/m/?/Esc";
             const lines = [_][]const u8{
                 l1,
                 l2,
                 l3,
                 l4,
                 l5,
-                "close: F1/m/?/Esc",
+                close_help,
             };
             try renderOverlayMenu(ui, win, "Menu", &lines);
         }
@@ -5296,7 +5297,9 @@ fn vaxisSelect(
                         .to_query => return .to_query,
                         .quit => return .quit,
                     }
-                    if (key.matches(vaxis.Key.f1, .{}) or key.matches('m', .{}) or key.matches('?', .{})) {
+                    if (key.matches(vaxis.Key.f1, .{}) or
+                        (!filter_mode and (key.matches('m', .{}) or key.matches('?', .{}))))
+                    {
                         if (canRenderOverlayMenu(ui.vx.window())) info_menu_open = !info_menu_open;
                         continue;
                     }
@@ -5586,13 +5589,14 @@ fn vaxisSelectSubtitle(
             const l3 = std.fmt.bufPrint(&m3, "ctx: {s}", .{ui.context_line orelse "-"}) catch "ctx";
             const l4 = std.fmt.bufPrint(&m4, "controls: {s}", .{help_line}) catch "controls";
             const l5 = std.fmt.bufPrint(&m5, "state: {s} count={s}", .{ sort_line, count_line }) catch "state";
+            const close_help = if (filter_mode) "close: F1/Esc" else "close: F1/m/?/Esc";
             const lines = [_][]const u8{
                 l1,
                 l2,
                 l3,
                 l4,
                 l5,
-                "close: F1/m/?/Esc",
+                close_help,
             };
             try renderOverlayMenu(ui, win, "Menu", &lines);
         }
@@ -5610,7 +5614,9 @@ fn vaxisSelectSubtitle(
                         .to_query => return .to_query,
                         .quit => return .quit,
                     }
-                    if (key.matches(vaxis.Key.f1, .{}) or key.matches('m', .{}) or key.matches('?', .{})) {
+                    if (key.matches(vaxis.Key.f1, .{}) or
+                        (!filter_mode and (key.matches('m', .{}) or key.matches('?', .{}))))
+                    {
                         if (canRenderOverlayMenu(ui.vx.window())) info_menu_open = !info_menu_open;
                         continue;
                     }
