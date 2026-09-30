@@ -2049,11 +2049,13 @@ fn executeQuerySearchIncremental(
             .language_code = language_code,
             .page = 1,
         };
-        try search_group.concurrent(runtime_io.get(), providerSearchTaskMain, .{&tasks[task_count]});
         task_count += 1;
-        search_work.task_count = task_count;
         bundle.pending_count += 1;
     }
+    search_work.task_count = task_count;
+    var started_count: usize = 0;
+    var in_flight: usize = 0;
+    startQueuedProviderSearches(search_group, tasks, task_count, &started_count, &in_flight);
 
     try renderQueryHome(
         ui,
@@ -2076,11 +2078,12 @@ fn executeQuerySearchIncremental(
         var cache_response_indices: [app.providerCount()]usize = undefined;
         var cache_response_count: usize = 0;
         var idx: usize = 0;
-        while (idx < task_count) : (idx += 1) {
+        while (idx < started_count) : (idx += 1) {
             if (consumed[idx]) continue;
             if (tasks[idx].done.load(.acquire) == 0) continue;
             consumed[idx] = true;
             bundle.pending_count -= 1;
+            in_flight -|= 1;
             dirty = true;
             if (tasks[idx].err) |err| {
                 recordSearchFailure(&bundle, err);
@@ -2099,6 +2102,7 @@ fn executeQuerySearchIncremental(
             cache_response_indices[cache_response_count] = response_index;
             cache_response_count += 1;
         }
+        startQueuedProviderSearches(search_group, tasks, task_count, &started_count, &in_flight);
 
         var wheel_delta: i32 = 0;
         while (try ui.loop.tryEvent()) |event| {
@@ -2266,6 +2270,31 @@ fn executeQuerySearchIncremental(
         .bundle = bundle,
         .focus = if (bundle.hits.items.len > 0) .results else .query,
     };
+}
+
+fn startQueuedProviderSearches(
+    group: *std.Io.Group,
+    tasks: []ProviderSearchTask,
+    task_count: usize,
+    started_count: *usize,
+    in_flight: *usize,
+) void {
+    std.debug.assert(task_count <= tasks.len);
+    std.debug.assert(started_count.* <= task_count);
+    while (started_count.* < task_count and in_flight.* < max_parallel_provider_searches) {
+        const idx = started_count.*;
+        group.concurrent(runtime_io.get(), providerSearchTaskMain, .{&tasks[idx]}) catch |err| {
+            // Scheduler/resource exhaustion is a per-provider failure, not a
+            // reason to abort the whole interactive search.
+            tasks[idx].err = err;
+            tasks[idx].done.store(1, .release);
+            started_count.* += 1;
+            in_flight.* += 1;
+            continue;
+        };
+        started_count.* += 1;
+        in_flight.* += 1;
+    }
 }
 
 fn cleanupUnconsumedProviderTasks(tasks: []ProviderSearchTask, consumed: []const bool) void {
@@ -5345,6 +5374,7 @@ fn countEnabledFlags(flags: []const bool) usize {
 const list_mouse_wheel_step: usize = 3;
 const search_active_poll_interval_ms: u64 = 1;
 const search_poll_interval_ms: u64 = 8;
+const max_parallel_provider_searches: usize = 12;
 const event_batch_capacity: usize = 1;
 const max_filter_bytes: usize = 512;
 const max_bracketed_paste_bytes: usize = 16 * 1024;
