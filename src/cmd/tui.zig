@@ -5817,6 +5817,7 @@ fn readEventBatch(ui: *Ui, first: Event) !EventBatch {
 fn readBracketedPaste(ui: *Ui) !EventBatch {
     var pasted: std.ArrayListUnmanaged(u8) = .empty;
     const allocator = ui.frameAllocator();
+    var saturated = false;
 
     while (true) {
         const event = try ui.loop.nextEvent();
@@ -5826,22 +5827,28 @@ fn readBracketedPaste(ui: *Ui) !EventBatch {
             .winsize => |ws| try ui.resize(ws),
             .key_press => |key| {
                 if (key.text) |text| {
-                    try appendBoundedPasteChunk(allocator, &pasted, text, max_bracketed_paste_bytes);
+                    if (!saturated) {
+                        saturated = try appendBoundedPasteChunk(allocator, &pasted, text, max_bracketed_paste_bytes);
+                    }
                     continue;
                 }
                 if (key.matches(vaxis.Key.enter, .{}) or
                     key.matches(vaxis.Key.tab, .{}) or
                     key.matches('j', .{ .ctrl = true }))
                 {
-                    if (pasted.items.len < max_bracketed_paste_bytes and
+                    if (!saturated and
+                        pasted.items.len < max_bracketed_paste_bytes and
                         (pasted.items.len == 0 or pasted.items[pasted.items.len - 1] != ' '))
                     {
                         try pasted.append(allocator, ' ');
+                        saturated = pasted.items.len >= max_bracketed_paste_bytes;
                     }
                 }
             },
             .paste => |text| {
-                try appendBoundedPasteChunk(allocator, &pasted, text, max_bracketed_paste_bytes);
+                if (!saturated) {
+                    saturated = try appendBoundedPasteChunk(allocator, &pasted, text, max_bracketed_paste_bytes);
+                }
             },
             else => {},
         }
@@ -5857,27 +5864,36 @@ fn appendBoundedPasteChunk(
     dest: *std.ArrayListUnmanaged(u8),
     text: []const u8,
     max_bytes: usize,
-) !void {
-    if (text.len == 0 or dest.items.len >= max_bytes) return;
+) !bool {
+    if (dest.items.len >= max_bytes) return true;
+    if (text.len == 0) return false;
     const remaining = max_bytes - dest.items.len;
     var take = @min(text.len, remaining);
-    if (take < text.len) {
+    const clipped = take < text.len;
+    if (clipped) {
         while (take > 0 and (text[take] & 0b1100_0000) == 0b1000_0000) take -= 1;
     }
     if (take > 0) try dest.appendSlice(allocator, text[0..take]);
+    return clipped or dest.items.len >= max_bytes;
 }
 
 test "bounded bracketed paste keeps a safe prefix instead of dropping oversized chunks" {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(std.testing.allocator);
 
-    try appendBoundedPasteChunk(std.testing.allocator, &out, "abcdefgh", 5);
+    try std.testing.expect(try appendBoundedPasteChunk(std.testing.allocator, &out, "abcdefgh", 5));
     try std.testing.expectEqualStrings("abcde", out.items);
 
     out.clearRetainingCapacity();
-    try appendBoundedPasteChunk(std.testing.allocator, &out, "abc界z", 5);
+    try std.testing.expect(try appendBoundedPasteChunk(std.testing.allocator, &out, "abc界z", 5));
     try std.testing.expectEqualStrings("abc", out.items);
     try std.testing.expect(std.unicode.utf8ValidateSlice(out.items));
+
+    out.clearRetainingCapacity();
+    const saturated = try appendBoundedPasteChunk(std.testing.allocator, &out, "ab界", 4);
+    try std.testing.expect(saturated);
+    if (!saturated) _ = try appendBoundedPasteChunk(std.testing.allocator, &out, "Z", 4);
+    try std.testing.expectEqualStrings("ab", out.items);
 }
 
 fn eventWheelDelta(event: Event) ?i32 {
