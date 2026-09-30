@@ -6625,6 +6625,7 @@ fn frameRepeatByte(ui: *Ui, byte: u8, count: usize) ![]const u8 {
 
 fn renderOverlayMenu(ui: *Ui, win: anytype, title: []const u8, lines: []const []const u8) !void {
     if (!canRenderOverlayMenu(win)) return;
+    win.hideCursor();
 
     const max_box_w: u16 = @min(win.width - 2, 80);
     if (max_box_w < 12) return;
