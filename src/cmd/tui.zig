@@ -1317,6 +1317,8 @@ fn runTui(ui: *Ui) !void {
                             stale_bundle.deinit(ui.allocator);
                             results = null;
                             last_searched_norm = try ui.allocator.dupe(u8, "");
+                            selected_result = 0;
+                            result_scroll = 0;
                         } else {
                             results = search_outcome.bundle;
                             last_searched_norm = try ui.allocator.dupe(
@@ -1324,8 +1326,6 @@ fn runTui(ui: *Ui) !void {
                                 if (search_outcome.mark_query_dirty) "" else owned_query,
                             );
                         }
-                        selected_result = 0;
-                        result_scroll = 0;
                         focus = search_outcome.focus;
                         if (results) |*bundle| {
                             if (bundle.cache_changed) try persistTuiRuntimeState(ui.allocator, &state);
