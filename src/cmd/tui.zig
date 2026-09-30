@@ -5378,6 +5378,16 @@ fn compactDialogBodyCapacity(layout: CompactDialogLayout) usize {
     return @intCast(end - first);
 }
 
+fn confirmationLinesFitWidth(win: anytype, lines: []const []const u8) bool {
+    if (lines.len == 0) return true;
+    if (win.width <= 2) return false;
+    const max_width: usize = @intCast(win.width - 2);
+    for (lines) |line| {
+        if (win.gwidth(line) > max_width) return false;
+    }
+    return true;
+}
+
 test "compact dialog layout keeps content above footer" {
     try std.testing.expectEqual(CompactDialogLayout{}, compactDialogLayout(0));
     try std.testing.expectEqual(CompactDialogLayout{}, compactDialogLayout(1));
@@ -5399,6 +5409,28 @@ test "compact dialog layout keeps content above footer" {
     try std.testing.expectEqual(@as(usize, 2), compactDialogBodyCapacity(compactDialogLayout(4)));
     try std.testing.expectEqual(@as(usize, 2), compactDialogBodyCapacity(compactDialogLayout(5)));
     try std.testing.expectEqual(@as(usize, 4), compactDialogBodyCapacity(compactDialogLayout(7)));
+}
+
+test "confirmation lines must be fully visible horizontally" {
+    const MockWindow = struct {
+        width: u16,
+
+        pub fn gwidth(_: @This(), text: []const u8) usize {
+            return text.len;
+        }
+    };
+
+    try std.testing.expect(confirmationLinesFitWidth(MockWindow{ .width = 12 }, &.{
+        "short",
+        "fits too",
+    }));
+    try std.testing.expect(!confirmationLinesFitWidth(MockWindow{ .width = 10 }, &.{
+        "123456789",
+    }));
+    try std.testing.expect(!confirmationLinesFitWidth(MockWindow{ .width = 2 }, &.{
+        "x",
+    }));
+    try std.testing.expect(confirmationLinesFitWidth(MockWindow{ .width = 2 }, &.{}));
 }
 
 fn vaxisStatus(ui: *Ui, title: []const u8, message: []const u8, detail: []const u8) !void {
@@ -6182,7 +6214,8 @@ fn vaxisConfirm(ui: *Ui, title: []const u8, lines: []const []const u8) !ConfirmR
         win.clear();
         win.hideCursor();
         const layout = compactDialogLayout(win.height);
-        const can_confirm = owned_lines.len <= compactDialogBodyCapacity(layout);
+        const can_confirm = owned_lines.len <= compactDialogBodyCapacity(layout) and
+            confirmationLinesFitWidth(win, owned_lines);
 
         try renderTopBar(ui, win, .{ .title = owned_title });
 
