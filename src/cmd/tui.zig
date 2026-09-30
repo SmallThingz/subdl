@@ -2671,9 +2671,7 @@ fn runSearchReaper(job: *SearchReaperJob) void {
 }
 
 fn queryPageSize(ui: *Ui) usize {
-    const win = ui.vx.window();
-    if (win.height <= 12) return 4;
-    return @max(@as(usize, 4), @as(usize, @intCast(win.height - 10)));
+    return homeListPageSize(ui.vx.window().height);
 }
 
 fn nextQueryFocus(current: QueryFocus, has_results: bool, has_downloads: bool) QueryFocus {
@@ -4483,6 +4481,19 @@ fn homeListBottom(height: u16) u16 {
 
 fn homeListTop() u16 {
     return home_search_box_y + 3;
+}
+
+fn homeListPageSize(height: u16) usize {
+    const top = homeListTop();
+    const bottom = homeListBottom(height);
+    return if (bottom > top) @intCast(bottom - top) else 1;
+}
+
+test "home page navigation matches visible list rows" {
+    try std.testing.expectEqual(@as(usize, 19), homeListPageSize(24));
+    try std.testing.expectEqual(@as(usize, 5), homeListPageSize(10));
+    try std.testing.expectEqual(@as(usize, 1), homeListPageSize(5));
+    try std.testing.expectEqual(@as(usize, 1), homeListPageSize(1));
 }
 
 fn homeRecentSearchFirstRow() u16 {
