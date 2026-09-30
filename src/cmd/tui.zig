@@ -5384,6 +5384,15 @@ fn compactInputFieldVisible(layout: CompactDialogLayout, terminal_width: u16, pr
     return @as(usize, terminal_width) > input_col;
 }
 
+fn compactInputErrorRow(layout: CompactDialogLayout, input_row: ?u16) ?u16 {
+    const row = input_row orelse return null;
+    const error_row = row + 1;
+    if (layout.footer_row) |footer_row| {
+        if (error_row >= footer_row) return null;
+    }
+    return error_row;
+}
+
 fn confirmationLinesFitWidth(win: anytype, lines: []const []const u8) bool {
     if (lines.len == 0) return true;
     if (win.width <= 2) return false;
@@ -5447,6 +5456,14 @@ test "compact input requires a visible editable field" {
     try std.testing.expect(compactInputFieldVisible(compactDialogLayout(5), 40, 12));
 }
 
+test "compact input surfaces hidden errors through the footer" {
+    try std.testing.expectEqual(@as(?u16, null), compactInputErrorRow(compactDialogLayout(2), null));
+    try std.testing.expectEqual(@as(?u16, null), compactInputErrorRow(compactDialogLayout(3), 1));
+    try std.testing.expectEqual(@as(?u16, null), compactInputErrorRow(compactDialogLayout(4), 2));
+    try std.testing.expectEqual(@as(?u16, null), compactInputErrorRow(compactDialogLayout(5), 3));
+    try std.testing.expectEqual(@as(?u16, 4), compactInputErrorRow(compactDialogLayout(6), 3));
+}
+
 fn vaxisStatus(ui: *Ui, title: []const u8, message: []const u8, detail: []const u8) !void {
     const win = ui.vx.window();
     win.clear();
@@ -5456,13 +5473,27 @@ fn vaxisStatus(ui: *Ui, title: []const u8, message: []const u8, detail: []const 
     const layout = compactDialogLayout(win.height);
 
     if (layout.primary_row) |row| {
-        const msg_segments = [_]vaxis.Segment{.{ .text = message, .style = ui.styleWarn() }};
-        _ = win.print(&msg_segments, .{ .row_offset = row, .col_offset = 1, .wrap = .none });
+        try printFitted(
+            ui,
+            win,
+            row,
+            1,
+            message,
+            ui.styleWarn(),
+            if (win.width > 2) @intCast(win.width - 2) else 0,
+        );
     }
 
     if (layout.secondary_row) |row| {
-        const detail_segments = [_]vaxis.Segment{.{ .text = detail, .style = ui.styleMuted() }};
-        _ = win.print(&detail_segments, .{ .row_offset = row, .col_offset = 1, .wrap = .none });
+        try printFitted(
+            ui,
+            win,
+            row,
+            1,
+            detail,
+            ui.styleMuted(),
+            if (win.width > 2) @intCast(win.width - 2) else 0,
+        );
     }
 
     try renderBottomBar(ui, win, .{ .left = "Ctrl+C/Esc/q cancel" });
@@ -5498,8 +5529,15 @@ fn vaxisInput(
 
         const input_row = layout.secondary_row orelse layout.primary_row;
         if (input_row != null and input_row.? > 1) {
-            const hint_segments = [_]vaxis.Segment{.{ .text = hint }};
-            _ = win.print(&hint_segments, .{ .row_offset = 1, .col_offset = 1, .wrap = .none });
+            try printFitted(
+                ui,
+                win,
+                1,
+                1,
+                hint,
+                vaxis.Style{},
+                if (win.width > 2) @intCast(win.width - 2) else 0,
+            );
         }
 
         const prompt_segments = [_]vaxis.Segment{
@@ -5530,20 +5568,29 @@ fn vaxisInput(
             win.showCursor(@min(desired_col, win.width -| 1), input_row.?);
         }
 
+        const error_row = compactInputErrorRow(layout, input_row);
+        const footer_text = if (error_text != null and error_row == null)
+            error_text.?
+        else if (can_edit)
+            "Enter submit • Esc back • Ctrl+U clear"
+        else
+            "Resize terminal to edit • Esc back";
         try renderBottomBar(
             ui,
             win,
-            .{ .left = if (can_edit) "Enter submit • Esc back • Ctrl+U clear" else "Resize terminal to edit • Esc back" },
+            .{ .left = footer_text },
         );
 
         if (error_text) |txt| {
-            if (input_row) |row| {
-                const error_row = row + 1;
-                if (layout.footer_row == null or error_row < layout.footer_row.?) {
-                    const err_segments = [_]vaxis.Segment{.{ .text = txt, .style = ui.styleError() }};
-                    _ = win.print(&err_segments, .{ .row_offset = error_row, .col_offset = 1, .wrap = .none });
-                }
-            }
+            if (error_row) |row| try printFitted(
+                ui,
+                win,
+                row,
+                1,
+                txt,
+                ui.styleError(),
+                if (win.width > 2) @intCast(win.width - 2) else 0,
+            );
         }
 
         try ui.render();
@@ -5698,8 +5745,15 @@ fn vaxisSelect(
         }
 
         if (matches.items.len == 0) {
-            const empty_segments = [_]vaxis.Segment{.{ .text = "No matches. Edit filter and try again.", .style = ui.styleWarn() }};
-            _ = win.print(&empty_segments, .{ .row_offset = list_top, .col_offset = 1, .wrap = .none });
+            try printFitted(
+                ui,
+                win,
+                list_top,
+                1,
+                "No matches. Edit filter and try again.",
+                ui.styleWarn(),
+                if (content_width > 2) @intCast(content_width - 2) else 0,
+            );
         }
 
         const mode_text = if (filter_mode) "FILTER" else "NAV";
@@ -5973,8 +6027,15 @@ fn vaxisSelectSubtitle(
         }
 
         if (matches.items.len == 0) {
-            const empty_segments = [_]vaxis.Segment{.{ .text = "No subtitle matches for current filter.", .style = ui.styleWarn() }};
-            _ = win.print(&empty_segments, .{ .row_offset = list_top, .col_offset = 1, .wrap = .none });
+            try printFitted(
+                ui,
+                win,
+                list_top,
+                1,
+                "No subtitle matches for current filter.",
+                ui.styleWarn(),
+                if (left_width > 2) @intCast(left_width - 2) else 0,
+            );
         }
 
         if (show_pane) {
@@ -6302,20 +6363,39 @@ fn vaxisMessage(
         win.clear();
         win.hideCursor();
         const layout = compactDialogLayout(win.height);
+        const message_visible = layout.primary_row != null;
 
         try renderTopBar(ui, win, .{ .title = title, .style = title_style });
 
         if (layout.primary_row) |row| {
-            const message_segments = [_]vaxis.Segment{.{ .text = message }};
-            _ = win.print(&message_segments, .{ .row_offset = row, .col_offset = 1, .wrap = .none });
+            try printFitted(
+                ui,
+                win,
+                row,
+                1,
+                message,
+                vaxis.Style{},
+                if (win.width > 2) @intCast(win.width - 2) else 0,
+            );
         }
 
         if (layout.secondary_row) |row| {
-            const detail_segments = [_]vaxis.Segment{.{ .text = detail, .style = ui.styleMuted() }};
-            _ = win.print(&detail_segments, .{ .row_offset = row, .col_offset = 1, .wrap = .none });
+            try printFitted(
+                ui,
+                win,
+                row,
+                1,
+                detail,
+                ui.styleMuted(),
+                if (win.width > 2) @intCast(win.width - 2) else 0,
+            );
         }
 
-        try renderBottomBar(ui, win, .{ .left = "Enter/Esc continues · Ctrl+C back" });
+        try renderBottomBar(
+            ui,
+            win,
+            .{ .left = if (message_visible) "Enter/Esc continues · Ctrl+C back" else "Resize terminal to read message · Ctrl+C back" },
+        );
         try ui.render();
 
         const batch = try readEventBatch(ui, try ui.loop.nextEvent());
@@ -6329,7 +6409,7 @@ fn vaxisMessage(
                         .to_query => return .to_query,
                         .quit => return .quit,
                     }
-                    if (messageDismissKey(key)) return .ok;
+                    if (messageDismissAllowed(layout, key)) return .ok;
                 },
                 else => {},
             }
@@ -6341,11 +6421,18 @@ fn messageDismissKey(key: vaxis.Key) bool {
     return key.matches(vaxis.Key.enter, .{}) or key.matches(vaxis.Key.escape, .{});
 }
 
+fn messageDismissAllowed(layout: CompactDialogLayout, key: vaxis.Key) bool {
+    return layout.primary_row != null and messageDismissKey(key);
+}
+
 test "message dialogs dismiss only on enter or escape" {
     try std.testing.expect(messageDismissKey(.{ .codepoint = vaxis.Key.enter }));
     try std.testing.expect(messageDismissKey(.{ .codepoint = vaxis.Key.escape }));
     try std.testing.expect(!messageDismissKey(.{ .codepoint = 'x', .text = "x" }));
     try std.testing.expect(!messageDismissKey(.{ .codepoint = vaxis.Key.f2 }));
+    try std.testing.expect(!messageDismissAllowed(compactDialogLayout(2), .{ .codepoint = vaxis.Key.enter }));
+    try std.testing.expect(messageDismissAllowed(compactDialogLayout(3), .{ .codepoint = vaxis.Key.enter }));
+    try std.testing.expect(messageDismissAllowed(compactDialogLayout(3), .{ .codepoint = vaxis.Key.escape }));
 }
 
 const TopBarConfig = struct {
