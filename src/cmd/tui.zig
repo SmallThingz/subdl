@@ -212,11 +212,6 @@ const PageNav = struct {
     has_next: bool = false,
 };
 
-const SearchPageCacheEntry = struct {
-    page: usize,
-    response: app.SearchResponse,
-};
-
 const SubtitlesPageCacheEntry = struct {
     page: usize,
     response: app.SubtitlesResponse,
@@ -317,7 +312,6 @@ const SearchBundle = struct {
     query_norm: []u8,
     searches: std.ArrayListUnmanaged(app.SearchResponse) = .empty,
     hits: std.ArrayListUnmanaged(CombinedSearchHit) = .empty,
-    labels: [][]u8 = &.{},
     display_query_norm: ?[]u8 = null,
     display_hit_count: usize = 0,
     display_order: []usize = &.{},
@@ -337,19 +331,8 @@ const SearchBundle = struct {
         for (self.searches.items) |*search| search.deinit();
         self.searches.deinit(allocator);
         self.hits.deinit(allocator);
-        if (self.labels.len > 0) freeOwnedStrings(allocator, self.labels);
         self.* = undefined;
     }
-};
-
-const SearchTask = struct {
-    provider: app.Provider,
-    query: []const u8,
-    language_code: ?[]const u8 = null,
-    page: usize = 1,
-    done: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
-    err: ?anyerror = null,
-    result: ?app.SearchResponse = null,
 };
 
 const ProviderSearchTask = struct {
@@ -419,8 +402,6 @@ const Ui = struct {
     skip_confirm: bool = false,
     context_line: ?[]const u8 = null,
     context_owned: ?[]u8 = null,
-    active_provider: ?app.Provider = null,
-    provider_enabled: [app.providerCount()]bool = app.providerSelectionNone(),
     search_reapers: std.ArrayListUnmanaged(SearchReaperEntry) = .empty,
 
     fn writer(self: *Ui) *std.Io.Writer {
@@ -543,10 +524,6 @@ const Ui = struct {
         _ = self;
         return .{};
     }
-
-    fn providerPanelVisible(_: *Ui, width: u16) bool {
-        return width >= 92;
-    }
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -593,20 +570,6 @@ pub fn main(init: std.process.Init) !void {
             try runTui(&ui);
         }
     }
-}
-
-fn searchTaskMain(task: *SearchTask) std.Io.Cancelable!void {
-    defer task.done.store(1, .release);
-    var client: std.http.Client = .{ .allocator = std.heap.page_allocator, .io = runtime_io.get() };
-    defer client.deinit();
-
-    task.result = app.searchPageWithOptions(std.heap.page_allocator, &client, task.provider, task.query, task.page, .{
-        .language_code = task.language_code,
-    }) catch |err| {
-        if (err == error.Canceled) return error.Canceled;
-        task.err = err;
-        return;
-    };
 }
 
 fn providerSearchTaskMain(task: *ProviderSearchTask) std.Io.Cancelable!void {
@@ -916,7 +879,6 @@ fn runTui(ui: *Ui) !void {
     var state = try loadTuiRuntimeState(ui.allocator, ui.environ_map);
     defer state.deinit(ui.allocator);
     applyRuntimeCacheSettings(&state);
-    ui.provider_enabled = state.settings.providers_enabled;
 
     var query: std.ArrayList(u8) = .empty;
     defer query.deinit(ui.allocator);
@@ -938,7 +900,6 @@ fn runTui(ui: *Ui) !void {
 
     while (true) {
         ui.collectSearchReapers();
-        ui.provider_enabled = state.settings.providers_enabled;
         if (info_open and !canRenderOverlayMenu(ui.vx.window())) info_open = false;
         const query_norm_view = normalizeQueryView(query.items);
         if (query_norm_view.len == 0 and results != null) {
@@ -1357,668 +1318,11 @@ fn runTui(ui: *Ui) !void {
     }
 }
 
-fn runProviderFirstTui(ui: *Ui) !void {
-    defer setContext(ui, null);
-    const provider_names = try buildProviderNames(ui.allocator);
-    defer freeOwnedStrings(ui.allocator, provider_names);
-
-    var provider_default: ?usize = 0;
-
-    provider_loop: while (true) {
-        setContext(ui, "Provider list • URL: choose provider");
-        const provider_choice = try vaxisSelect(
-            ui,
-            "Subtitle Downloader",
-            "Space selects providers. Enter searches checked providers; if none are checked, it uses the highlighted provider. Esc quits.",
-            provider_names,
-            provider_default,
-            null,
-            null,
-            &ui.provider_enabled,
-        );
-
-        const provider_idx = switch (provider_choice) {
-            .selected => |idx| idx,
-            .back, .to_query, .quit => return,
-            .page_prev, .page_next => continue :provider_loop,
-        };
-
-        provider_default = provider_idx;
-        const selected_provider_count = countEnabledFlags(&ui.provider_enabled);
-        if (selected_provider_count > 1) {
-            // Multiple checked providers means "combined search"; the
-            // highlighted row only matters when zero providers are checked.
-            switch (try runCombinedSearch(ui, &ui.provider_enabled)) {
-                .back => continue :provider_loop,
-                .quit => return,
-                else => continue :provider_loop,
-            }
-            continue :provider_loop;
-        }
-
-        const provider = if (selected_provider_count == 1)
-            firstEnabledProvider(&ui.provider_enabled) orelse app.providers()[provider_idx]
-        else
-            app.providers()[provider_idx];
-        ui.active_provider = provider;
-        const provider_url = providerHomeUrl(provider);
-        const supports_search_pagination = app.providerSupportsSearchPagination(provider);
-        const supports_subtitles_pagination = app.providerSupportsSubtitlesPagination(provider);
-
-        query_loop: while (true) {
-            var hint_buf: [192]u8 = undefined;
-            const query_hint = std.fmt.bufPrint(
-                &hint_buf,
-                "Provider: {s}. Enter search query. Esc returns to providers.",
-                .{app.providerDisplayName(provider)},
-            ) catch "Enter search query. Esc returns to providers.";
-
-            const query_context = try std.fmt.allocPrint(
-                ui.allocator,
-                "Provider: {s} • URL: {s}",
-                .{ app.providerDisplayName(provider), provider_url },
-            );
-            defer ui.allocator.free(query_context);
-            setContext(ui, query_context);
-
-            const input = try vaxisInput(ui, "Subtitle Downloader", query_hint, "Query", .{ .max_len = 180 });
-            const query = switch (input) {
-                .submit => |q| q,
-                .back => continue :provider_loop,
-                .quit => return,
-            };
-            defer ui.allocator.free(query);
-
-            var search_pages: std.ArrayListUnmanaged(SearchPageCacheEntry) = .empty;
-            defer deinitSearchPageCache(ui.allocator, &search_pages);
-            var search_page_current: usize = 1;
-
-            title_loop: while (true) {
-                const search_idx = findSearchPageCacheIndex(search_pages.items, search_page_current) orelse blk_fetch: {
-                    const search_detail = if (supports_search_pagination)
-                        try std.fmt.allocPrint(
-                            ui.allocator,
-                            "provider={s} query={s} page={d}",
-                            .{ app.providerDisplayName(provider), query, search_page_current },
-                        )
-                    else
-                        try std.fmt.allocPrint(
-                            ui.allocator,
-                            "provider={s} query={s}",
-                            .{ app.providerDisplayName(provider), query },
-                        );
-                    defer ui.allocator.free(search_detail);
-
-                    const search_context = if (supports_search_pagination)
-                        try std.fmt.allocPrint(
-                            ui.allocator,
-                            "Search URL base: {s} • page={d}",
-                            .{ provider_url, search_page_current },
-                        )
-                    else
-                        try std.fmt.allocPrint(
-                            ui.allocator,
-                            "Search URL base: {s}",
-                            .{provider_url},
-                        );
-                    defer ui.allocator.free(search_context);
-                    setContext(ui, search_context);
-
-                    var search_task: SearchTask = .{
-                        .provider = provider,
-                        .query = query,
-                        .page = search_page_current,
-                    };
-                    var search_group: std.Io.Group = .init;
-                    defer search_group.cancel(runtime_io.get());
-                    try search_group.concurrent(runtime_io.get(), searchTaskMain, .{&search_task});
-                    const search_control = try waitForTask(ui, &search_task.done, "Search", search_detail);
-                    finalizeWorkerGroup(&search_group, search_control);
-
-                    if (search_control == .quit) {
-                        if (search_task.result) |*r| r.deinit();
-                        return;
-                    }
-                    if (search_control == .canceled) {
-                        if (search_task.result) |*r| r.deinit();
-                        const msg_result = try vaxisMessage(
-                            ui,
-                            "Search Canceled",
-                            "Canceled current fetch.",
-                            "Press any key to continue.",
-                            ui.styleWarn(),
-                        );
-                        switch (msg_result) {
-                            .ok, .to_query => continue :query_loop,
-                            .quit => return,
-                        }
-                    }
-
-                    if (search_task.err) |err| {
-                        const msg_result = try showFriendlyError(ui, "Search failed", err);
-                        switch (msg_result) {
-                            .ok, .to_query => continue :query_loop,
-                            .quit => return,
-                        }
-                    }
-
-                    const search_result = search_task.result orelse return error.UnexpectedHttpStatus;
-                    try search_pages.append(ui.allocator, .{
-                        .page = search_page_current,
-                        .response = search_result,
-                    });
-                    break :blk_fetch search_pages.items.len - 1;
-                };
-
-                const search_result = &search_pages.items[search_idx].response;
-                if (search_result.items.len == 0) {
-                    const msg_result = try vaxisMessage(
-                        ui,
-                        "No Results",
-                        if (search_page_current == 1)
-                            "No titles matched your query."
-                        else
-                            "No titles were found on this page.",
-                        "Press any key to continue.",
-                        ui.styleWarn(),
-                    );
-                    switch (msg_result) {
-                        .ok => {
-                            if (search_page_current > 1) {
-                                search_page_current -= 1;
-                                continue :title_loop;
-                            }
-                            continue :query_loop;
-                        },
-                        .to_query => continue :query_loop,
-                        .quit => return,
-                    }
-                }
-
-                const title_labels = try borrowSearchLabels(ui.allocator, search_result.items);
-                defer ui.allocator.free(title_labels);
-
-                const title_context = if (supports_search_pagination)
-                    try std.fmt.allocPrint(
-                        ui.allocator,
-                        "Provider: {s} • Search base URL: {s} • page={d}",
-                        .{ app.providerDisplayName(provider), provider_url, search_page_current },
-                    )
-                else
-                    try std.fmt.allocPrint(
-                        ui.allocator,
-                        "Provider: {s} • Search base URL: {s}",
-                        .{ app.providerDisplayName(provider), provider_url },
-                    );
-                defer ui.allocator.free(title_context);
-                setContext(ui, title_context);
-
-                const page_nav = PageNav{
-                    .enabled = app.providerSupportsSearchPagination(provider),
-                    .page = search_page_current,
-                    .has_prev = search_result.has_prev_page,
-                    .has_next = search_result.has_next_page,
-                };
-                const page_nav_opt: ?PageNav = if (page_nav.enabled) page_nav else null;
-                const title_choice = try vaxisSelect(
-                    ui,
-                    "Select Title",
-                    if (supports_search_pagination)
-                        "Use filter/sort keys. [ prev page, ] next page, Esc query."
-                    else
-                        "Use filter/sort keys. Esc query.",
-                    title_labels,
-                    null,
-                    null,
-                    page_nav_opt,
-                    null,
-                );
-
-                const title_idx = switch (title_choice) {
-                    .selected => |idx| idx,
-                    .back, .to_query => continue :query_loop,
-                    .page_prev => {
-                        if (page_nav.enabled and search_page_current > 1) search_page_current -= 1;
-                        continue :title_loop;
-                    },
-                    .page_next => {
-                        if (!page_nav.enabled or !search_result.has_next_page) continue :title_loop;
-                        search_page_current += 1;
-                        continue :title_loop;
-                    },
-                    .quit => return,
-                };
-
-                const selected_title = search_result.items[title_idx];
-                const title_ref_url = app.searchRefUrl(selected_title.ref);
-                var selected_subdl_season_slug: ?[]u8 = null;
-                defer if (selected_subdl_season_slug) |slug| ui.allocator.free(slug);
-                var selected_subdl_season_label: ?[]u8 = null;
-                defer if (selected_subdl_season_label) |label| ui.allocator.free(label);
-
-                if (isSubdlSeriesRef(selected_title.ref)) {
-                    const seasons_detail = try std.fmt.allocPrint(
-                        ui.allocator,
-                        "{s}",
-                        .{selected_title.label},
-                    );
-                    defer ui.allocator.free(seasons_detail);
-                    const seasons_context = try std.fmt.allocPrint(
-                        ui.allocator,
-                        "Series URL: {s}",
-                        .{title_ref_url},
-                    );
-                    defer ui.allocator.free(seasons_context);
-                    setContext(ui, seasons_context);
-
-                    var seasons_task: SubdlSeasonsTask = .{
-                        .ref = selected_title.ref,
-                    };
-                    var seasons_group: std.Io.Group = .init;
-                    defer seasons_group.cancel(runtime_io.get());
-                    try seasons_group.concurrent(runtime_io.get(), subdlSeasonsTaskMain, .{&seasons_task});
-                    const seasons_control = try waitForTask(ui, &seasons_task.done, "Seasons", seasons_detail);
-                    finalizeWorkerGroup(&seasons_group, seasons_control);
-
-                    if (seasons_control == .quit) {
-                        if (seasons_task.result) |*r| r.deinit();
-                        return;
-                    }
-                    if (seasons_control == .canceled) {
-                        if (seasons_task.result) |*r| r.deinit();
-                        const msg_result = try vaxisMessage(
-                            ui,
-                            "Fetch Canceled",
-                            "Canceled season list fetch.",
-                            "Press any key to continue.",
-                            ui.styleWarn(),
-                        );
-                        switch (msg_result) {
-                            .ok => continue :title_loop,
-                            .to_query => continue :query_loop,
-                            .quit => return,
-                        }
-                    }
-
-                    if (seasons_task.err) |err| {
-                        const msg_result = try showFriendlyError(ui, "Could not load seasons", err);
-                        switch (msg_result) {
-                            .ok => continue :title_loop,
-                            .to_query => continue :query_loop,
-                            .quit => return,
-                        }
-                    }
-
-                    var seasons = seasons_task.result orelse return error.UnexpectedHttpStatus;
-                    defer seasons.deinit();
-
-                    if (seasons.items.len == 0) {
-                        const msg_result = try vaxisMessage(
-                            ui,
-                            "No Seasons",
-                            "No season rows were returned.",
-                            "Press any key to continue.",
-                            ui.styleWarn(),
-                        );
-                        switch (msg_result) {
-                            .ok => continue :title_loop,
-                            .to_query => continue :query_loop,
-                            .quit => return,
-                        }
-                    }
-
-                    const season_labels = try borrowSubdlSeasonLabels(ui.allocator, seasons.items);
-                    defer ui.allocator.free(season_labels);
-                    setContext(ui, seasons_context);
-
-                    const season_choice = try vaxisSelect(
-                        ui,
-                        "Select Season",
-                        "Use filter/sort keys. Esc titles.",
-                        season_labels,
-                        null,
-                        null,
-                        null,
-                        null,
-                    );
-
-                    const season_idx = switch (season_choice) {
-                        .selected => |idx| idx,
-                        .back => continue :title_loop,
-                        .to_query => continue :query_loop,
-                        .page_prev, .page_next => continue :title_loop,
-                        .quit => return,
-                    };
-
-                    const season = seasons.items[season_idx];
-                    selected_subdl_season_slug = try ui.allocator.dupe(u8, season.season_slug);
-                    selected_subdl_season_label = try ui.allocator.dupe(u8, season.label);
-                }
-
-                const subtitle_ref_url = if (selected_subdl_season_slug) |season_slug|
-                    try subdlSeasonUrl(ui.allocator, title_ref_url, season_slug)
-                else
-                    try ui.allocator.dupe(u8, title_ref_url);
-                defer ui.allocator.free(subtitle_ref_url);
-
-                var subtitle_pages: std.ArrayListUnmanaged(SubtitlesPageCacheEntry) = .empty;
-                defer deinitSubtitlesPageCache(ui.allocator, &subtitle_pages);
-                var subtitle_page_current: usize = 1;
-                var allow_auto_subtitle_select = true;
-
-                subtitle_page_loop: while (true) {
-                    const subtitles_idx = findSubtitlesPageCacheIndex(subtitle_pages.items, subtitle_page_current) orelse blk_fetch: {
-                        const subtitles_detail = if (selected_subdl_season_label) |season_label|
-                            if (supports_subtitles_pagination)
-                                try std.fmt.allocPrint(
-                                    ui.allocator,
-                                    "{s} • {s} • page={d}",
-                                    .{ selected_title.label, season_label, subtitle_page_current },
-                                )
-                            else
-                                try std.fmt.allocPrint(
-                                    ui.allocator,
-                                    "{s} • {s}",
-                                    .{ selected_title.label, season_label },
-                                )
-                        else if (supports_subtitles_pagination)
-                            try std.fmt.allocPrint(
-                                ui.allocator,
-                                "{s} • page={d}",
-                                .{ selected_title.label, subtitle_page_current },
-                            )
-                        else
-                            try std.fmt.allocPrint(
-                                ui.allocator,
-                                "{s}",
-                                .{selected_title.label},
-                            );
-                        defer ui.allocator.free(subtitles_detail);
-
-                        const subtitles_context = if (supports_subtitles_pagination)
-                            try std.fmt.allocPrint(
-                                ui.allocator,
-                                "Title URL: {s} • page={d}",
-                                .{ subtitle_ref_url, subtitle_page_current },
-                            )
-                        else
-                            try std.fmt.allocPrint(
-                                ui.allocator,
-                                "Title URL: {s}",
-                                .{subtitle_ref_url},
-                            );
-                        defer ui.allocator.free(subtitles_context);
-                        setContext(ui, subtitles_context);
-
-                        var subtitles_task: SubtitlesTask = .{
-                            .ref = selected_title.ref,
-                            .page = subtitle_page_current,
-                            .subdl_season_slug = selected_subdl_season_slug,
-                        };
-                        var subtitles_group: std.Io.Group = .init;
-                        defer subtitles_group.cancel(runtime_io.get());
-                        try subtitles_group.concurrent(runtime_io.get(), subtitlesTaskMain, .{&subtitles_task});
-                        const subtitles_control = try waitForTask(ui, &subtitles_task.done, "Subtitles", subtitles_detail);
-                        finalizeWorkerGroup(&subtitles_group, subtitles_control);
-
-                        if (subtitles_control == .quit) {
-                            if (subtitles_task.result) |*r| r.deinit();
-                            return;
-                        }
-                        if (subtitles_control == .canceled) {
-                            if (subtitles_task.result) |*r| r.deinit();
-                            const msg_result = try vaxisMessage(
-                                ui,
-                                "Fetch Canceled",
-                                "Canceled subtitle list fetch.",
-                                "Press any key to continue.",
-                                ui.styleWarn(),
-                            );
-                            switch (msg_result) {
-                                .ok => continue :title_loop,
-                                .to_query => continue :query_loop,
-                                .quit => return,
-                            }
-                        }
-
-                        if (subtitles_task.err) |err| {
-                            const msg_result = try showFriendlyError(ui, "Could not load subtitles", err);
-                            switch (msg_result) {
-                                .ok => continue :title_loop,
-                                .to_query => continue :query_loop,
-                                .quit => return,
-                            }
-                        }
-
-                        const subtitles = subtitles_task.result orelse return error.UnexpectedHttpStatus;
-                        try subtitle_pages.append(ui.allocator, .{
-                            .page = subtitle_page_current,
-                            .response = subtitles,
-                        });
-                        break :blk_fetch subtitle_pages.items.len - 1;
-                    };
-
-                    const subtitles = &subtitle_pages.items[subtitles_idx].response;
-                    if (subtitles.items.len == 0) {
-                        const msg_result = try vaxisMessage(
-                            ui,
-                            "No Subtitles",
-                            if (subtitle_page_current == 1)
-                                "No subtitle rows were returned."
-                            else
-                                "No subtitle rows were returned on this page.",
-                            "Press any key to continue.",
-                            ui.styleWarn(),
-                        );
-                        switch (msg_result) {
-                            .ok => {
-                                if (subtitle_page_current > 1) {
-                                    subtitle_page_current -= 1;
-                                    continue :subtitle_page_loop;
-                                }
-                                continue :title_loop;
-                            },
-                            .to_query => continue :query_loop,
-                            .quit => return,
-                        }
-                    }
-
-                    const subtitle_enabled = try buildSubtitleEnabled(ui.allocator, subtitles.items, defaultTuiSettings());
-                    defer ui.allocator.free(subtitle_enabled);
-
-                    const subtitle_context = if (supports_subtitles_pagination)
-                        try std.fmt.allocPrint(
-                            ui.allocator,
-                            "Title URL: {s} • page={d}",
-                            .{ subtitle_ref_url, subtitle_page_current },
-                        )
-                    else
-                        try std.fmt.allocPrint(
-                            ui.allocator,
-                            "Title URL: {s}",
-                            .{subtitle_ref_url},
-                        );
-                    defer ui.allocator.free(subtitle_context);
-                    setContext(ui, subtitle_context);
-
-                    const subtitle_page_nav = PageNav{
-                        .enabled = app.providerSupportsSubtitlesPagination(provider),
-                        .page = subtitle_page_current,
-                        .has_prev = subtitles.has_prev_page,
-                        .has_next = subtitles.has_next_page,
-                    };
-                    const subtitle_page_nav_opt: ?PageNav = if (subtitle_page_nav.enabled) subtitle_page_nav else null;
-                    const subtitle_idx = (if (allow_auto_subtitle_select) singleEnabledIndex(subtitle_enabled) else null) orelse blk: {
-                        const subtitle_choice = try vaxisSelectSubtitle(
-                            ui,
-                            "Select Subtitle",
-                            if (supports_subtitles_pagination)
-                                "s sort, / filter, [ prev page, ] next page, Esc titles."
-                            else
-                                "s sort, / filter, Esc titles.",
-                            subtitles.items,
-                            subtitle_enabled,
-                            subtitle_page_nav_opt,
-                        );
-
-                        break :blk switch (subtitle_choice) {
-                            .selected => |idx| idx,
-                            .back => continue :title_loop,
-                            .to_query => continue :query_loop,
-                            .page_prev => {
-                                if (subtitle_page_nav.enabled and subtitle_page_current > 1) subtitle_page_current -= 1;
-                                continue :subtitle_page_loop;
-                            },
-                            .page_next => {
-                                if (!subtitle_page_nav.enabled or !subtitles.has_next_page) continue :subtitle_page_loop;
-                                subtitle_page_current += 1;
-                                continue :subtitle_page_loop;
-                            },
-                            .quit => return,
-                        };
-                    };
-                    allow_auto_subtitle_select = false;
-
-                    const selected_subtitle = subtitles.items[subtitle_idx];
-                    const download_url = selected_subtitle.download_url orelse "(no direct URL)";
-                    const download_url_display = if (isSubtitlecatTranslateToken(selected_subtitle.download_url))
-                        "subtitlecat translate request"
-                    else
-                        download_url;
-
-                    if (!ui.skip_confirm) {
-                        var provider_buf: [224]u8 = undefined;
-                        const provider_line = std.fmt.bufPrint(&provider_buf, "Provider: {s}", .{app.providerDisplayName(provider)}) catch "Provider: (overflow)";
-
-                        const display_title = if (subtitles.title.len > 0) subtitles.title else app.titleFromRef(selected_title.ref);
-                        var title_buf: [320]u8 = undefined;
-                        const title_line = std.fmt.bufPrint(&title_buf, "Title: {s}", .{display_title}) catch "Title: (overflow)";
-
-                        var subtitle_buf: [384]u8 = undefined;
-                        const subtitle_line = std.fmt.bufPrint(&subtitle_buf, "Subtitle: {s}", .{selected_subtitle.label}) catch "Subtitle: (overflow)";
-                        var url_buf: [320]u8 = undefined;
-                        const url_line = std.fmt.bufPrint(&url_buf, "URL: {s}", .{download_url_display}) catch "URL: (overflow)";
-
-                        const confirm_lines = [_][]const u8{
-                            provider_line,
-                            title_line,
-                            subtitle_line,
-                            url_line,
-                            "Enter confirms download. Esc goes back.",
-                        };
-
-                        setContext(ui, subtitle_ref_url);
-                        const confirm_result = try vaxisConfirm(ui, "Confirm Selection", &confirm_lines);
-                        switch (confirm_result) {
-                            .confirm => {},
-                            .back => continue :subtitle_page_loop,
-                            .to_query => continue :query_loop,
-                            .quit => return,
-                        }
-                    }
-
-                    const download_detail = try std.fmt.allocPrint(
-                        ui.allocator,
-                        "{s}",
-                        .{selected_subtitle.label},
-                    );
-                    defer ui.allocator.free(download_detail);
-                    const download_context = try std.fmt.allocPrint(
-                        ui.allocator,
-                        "Download URL: {s}",
-                        .{download_url_display},
-                    );
-                    defer ui.allocator.free(download_context);
-                    setContext(ui, download_context);
-
-                    const download_out_dir = try ui.allocator.dupe(u8, "downloads");
-                    defer ui.allocator.free(download_out_dir);
-
-                    var download_task: DownloadTask = .{
-                        .subtitle = selected_subtitle,
-                        .out_dir = download_out_dir,
-                        .extract_archive = true,
-                    };
-                    var download_group: std.Io.Group = .init;
-                    defer download_group.cancel(runtime_io.get());
-                    try download_group.concurrent(runtime_io.get(), downloadTaskMain, .{&download_task});
-                    const download_control = try waitForDownloadTask(ui, &download_task, "Download", download_detail);
-                    finalizeWorkerGroup(&download_group, download_control);
-
-                    if (download_control == .quit) {
-                        if (download_task.result) |*r| r.deinit(std.heap.page_allocator);
-                        return;
-                    }
-                    if (download_control == .canceled) {
-                        if (download_task.result) |*r| r.deinit(std.heap.page_allocator);
-                        const msg_result = try vaxisMessage(
-                            ui,
-                            "Download Canceled",
-                            "Canceled current download.",
-                            "Press any key to continue.",
-                            ui.styleWarn(),
-                        );
-                        switch (msg_result) {
-                            .ok => continue :subtitle_page_loop,
-                            .to_query => continue :query_loop,
-                            .quit => return,
-                        }
-                    }
-
-                    if (download_task.err) |err| {
-                        const msg_result = try showFriendlyError(ui, "Download failed", err);
-                        switch (msg_result) {
-                            .ok => continue :subtitle_page_loop,
-                            .to_query => continue :query_loop,
-                            .quit => return,
-                        }
-                    }
-
-                    var result = download_task.result orelse return error.UnexpectedHttpStatus;
-                    defer result.deinit(std.heap.page_allocator);
-
-                    const detail = if (result.extracted_files.len > 0)
-                        try std.fmt.allocPrint(ui.allocator, "{s} (+{d} extracted)", .{ result.file_path, result.extracted_files.len })
-                    else
-                        try std.fmt.allocPrint(ui.allocator, "{s}", .{result.file_path});
-                    defer ui.allocator.free(detail);
-
-                    setContext(ui, download_context);
-                    const msg_result = try vaxisMessage(
-                        ui,
-                        "Downloaded",
-                        detail,
-                        "Press any key to keep browsing subtitles.",
-                        ui.styleAccent(),
-                    );
-                    switch (msg_result) {
-                        .ok => continue :subtitle_page_loop,
-                        .to_query => continue :query_loop,
-                        .quit => return,
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn findSearchPageCacheIndex(pages: []const SearchPageCacheEntry, page: usize) ?usize {
-    for (pages, 0..) |entry, idx| {
-        if (entry.page == page) return idx;
-    }
-    return null;
-}
-
 fn findSubtitlesPageCacheIndex(pages: []const SubtitlesPageCacheEntry, page: usize) ?usize {
     for (pages, 0..) |entry, idx| {
         if (entry.page == page) return idx;
     }
     return null;
-}
-
-fn deinitSearchPageCache(allocator: std.mem.Allocator, pages: *std.ArrayListUnmanaged(SearchPageCacheEntry)) void {
-    for (pages.items) |*entry| entry.response.deinit();
-    pages.deinit(allocator);
 }
 
 fn deinitSubtitlesPageCache(allocator: std.mem.Allocator, pages: *std.ArrayListUnmanaged(SubtitlesPageCacheEntry)) void {
@@ -2661,76 +1965,6 @@ fn cloneSearchRef(allocator: std.mem.Allocator, ref: app.SearchRef) !app.SearchR
 
 fn dupOptionalLocal(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
     return if (value) |v| try allocator.dupe(u8, v) else null;
-}
-
-fn executeQuerySearch(ui: *Ui, state: *TuiRuntimeState, query_norm: []const u8) !SearchBundle {
-    var bundle: SearchBundle = .{ .query_norm = try ui.allocator.dupe(u8, query_norm) };
-    errdefer bundle.deinit(ui.allocator);
-    const now = scrapers.common.compatUnixTimestamp();
-    const language_code = primaryLanguageCode(state.settings);
-    const cache_key = try searchCacheKey(ui.allocator, query_norm, language_code);
-    defer ui.allocator.free(cache_key);
-
-    for (app.providers()) |provider| {
-        if (!state.settings.providers_enabled[app.providerIndex(provider)]) continue;
-        ui.active_provider = provider;
-
-        const response_index = bundle.searches.items.len;
-        if (findCacheEntry(state, provider, cache_key, 1, now)) |cache_idx| {
-            const cached = try searchResponseFromCache(ui.allocator, state.cache_entries.items[cache_idx]);
-            try bundle.searches.append(ui.allocator, cached);
-            for (bundle.searches.items[response_index].items, 0..) |_, item_index| {
-                try bundle.hits.append(ui.allocator, .{ .provider = provider, .response_index = response_index, .item_index = item_index, .source = .cache });
-            }
-            bundle.cache_count += 1;
-            continue;
-        }
-
-        const detail = try std.fmt.allocPrint(ui.allocator, "provider={s} query={s}", .{ app.providerDisplayName(provider), query_norm });
-        defer ui.allocator.free(detail);
-        const context = try std.fmt.allocPrint(ui.allocator, "Search URL: {s}", .{providerHomeUrl(provider)});
-        defer ui.allocator.free(context);
-        setContext(ui, context);
-
-        var search_task: SearchTask = .{
-            .provider = provider,
-            .query = query_norm,
-            .language_code = language_code,
-            .page = 1,
-        };
-        var search_group: std.Io.Group = .init;
-        defer search_group.cancel(runtime_io.get());
-        try search_group.concurrent(runtime_io.get(), searchTaskMain, .{&search_task});
-        const search_control = try waitForTask(ui, &search_task.done, "Searching", detail);
-        finalizeWorkerGroup(&search_group, search_control);
-
-        if (search_control == .quit) {
-            if (search_task.result) |*r| r.deinit();
-            return error.TuiQuit;
-        }
-        if (search_control == .canceled) {
-            if (search_task.result) |*r| r.deinit();
-            return bundle;
-        }
-        if (search_task.err) |err| {
-            recordSearchFailure(&bundle, err);
-            continue;
-        }
-        const search_result = search_task.result orelse {
-            bundle.failed_count += 1;
-            continue;
-        };
-        try upsertCacheEntry(ui.allocator, state, provider, cache_key, 1, now, search_result);
-        bundle.cache_changed = true;
-        try bundle.searches.append(ui.allocator, search_result);
-        for (bundle.searches.items[response_index].items, 0..) |_, item_index| {
-            try bundle.hits.append(ui.allocator, .{ .provider = provider, .response_index = response_index, .item_index = item_index, .source = .live });
-        }
-        bundle.live_count += 1;
-    }
-
-    bundle.labels = try buildCombinedSearchLabelsWithSource(ui.allocator, bundle.searches.items, bundle.hits.items);
-    return bundle;
 }
 
 const IncrementalSearchOutcome = struct {
@@ -4423,27 +3657,6 @@ fn frameRepeatText(ui: *Ui, text: []const u8, count: usize) ![]const u8 {
     return out.items;
 }
 
-fn buildCombinedSearchLabelsWithSource(
-    allocator: std.mem.Allocator,
-    searches: []const app.SearchResponse,
-    hits: []const CombinedSearchHit,
-) ![][]u8 {
-    const out = try allocator.alloc([]u8, hits.len);
-    errdefer allocator.free(out);
-    var initialized: usize = 0;
-    errdefer freeInitializedStrings(allocator, out, initialized);
-    for (hits, 0..) |hit, idx| {
-        const item = searches[hit.response_index].items[hit.item_index];
-        const source = switch (hit.source) {
-            .live => "live",
-            .cache => "cache",
-        };
-        out[idx] = try std.fmt.allocPrint(allocator, "[{s}] [{s}] {s}", .{ app.providerDisplayName(hit.provider), source, item.label });
-        initialized += 1;
-    }
-    return out;
-}
-
 fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiRuntimeState) !OpenResult {
     if (hit_idx >= bundle.hits.items.len) return .back;
     const settings = state.settings;
@@ -4451,7 +3664,6 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
     const hit = bundle.hits.items[hit_idx];
     const selected_title = bundle.searches.items[hit.response_index].items[hit.item_index];
     const selected_provider = hit.provider;
-    ui.active_provider = selected_provider;
     const title_ref_url = app.searchRefUrl(selected_title.ref);
 
     var subtitle_pages: std.ArrayListUnmanaged(SubtitlesPageCacheEntry) = .empty;
@@ -4632,333 +3844,6 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
     }
 }
 
-fn runCombinedSearch(ui: *Ui, provider_enabled: []const bool) !SelectResult {
-    query_loop: while (true) {
-        ui.active_provider = null;
-        setContext(ui, "Combined search • selected providers");
-        const input = try vaxisInput(ui, "Combined Search", "Searches every selected provider. Esc returns to providers.", "Query", .{ .max_len = 180 });
-        const query = switch (input) {
-            .submit => |q| q,
-            .back => return .back,
-            .quit => return .quit,
-        };
-        defer ui.allocator.free(query);
-
-        var searches: std.ArrayListUnmanaged(app.SearchResponse) = .empty;
-        defer {
-            for (searches.items) |*search| search.deinit();
-            searches.deinit(ui.allocator);
-        }
-
-        var hits: std.ArrayListUnmanaged(CombinedSearchHit) = .empty;
-        defer hits.deinit(ui.allocator);
-
-        // Keep each provider response alive while the merged hit list borrows
-        // individual SearchChoice rows from those response arenas.
-        for (app.providers()) |provider| {
-            if (!provider_enabled[app.providerIndex(provider)]) continue;
-
-            const detail = try std.fmt.allocPrint(ui.allocator, "provider={s} query={s}", .{ app.providerDisplayName(provider), query });
-            defer ui.allocator.free(detail);
-            const context = try std.fmt.allocPrint(ui.allocator, "Combined search • provider: {s}", .{app.providerDisplayName(provider)});
-            defer ui.allocator.free(context);
-            setContext(ui, context);
-
-            var search_task: SearchTask = .{
-                .provider = provider,
-                .query = query,
-                .page = 1,
-            };
-            var search_group: std.Io.Group = .init;
-            defer search_group.cancel(runtime_io.get());
-            try search_group.concurrent(runtime_io.get(), searchTaskMain, .{&search_task});
-            const search_control = try waitForTask(ui, &search_task.done, "Combined Search", detail);
-            finalizeWorkerGroup(&search_group, search_control);
-
-            if (search_control == .quit) {
-                if (search_task.result) |*r| r.deinit();
-                return .quit;
-            }
-            if (search_control == .canceled) {
-                if (search_task.result) |*r| r.deinit();
-                const msg_result = try vaxisMessage(ui, "Search Canceled", "Canceled current provider fetch.", "Press any key to continue.", ui.styleWarn());
-                switch (msg_result) {
-                    .ok, .to_query => continue :query_loop,
-                    .quit => return .quit,
-                }
-            }
-            if (search_task.err) |_| {
-                continue;
-            }
-
-            const search_result = search_task.result orelse continue;
-            const response_index = searches.items.len;
-            try searches.append(ui.allocator, search_result);
-            for (searches.items[response_index].items, 0..) |_, item_index| {
-                try hits.append(ui.allocator, .{
-                    .provider = provider,
-                    .response_index = response_index,
-                    .item_index = item_index,
-                });
-            }
-        }
-
-        if (hits.items.len == 0) {
-            const msg_result = try vaxisMessage(ui, "No Results", "No selected provider returned titles.", "Press any key to continue.", ui.styleWarn());
-            switch (msg_result) {
-                .ok, .to_query => continue :query_loop,
-                .quit => return .quit,
-            }
-        }
-
-        const title_labels = try buildCombinedSearchLabels(ui.allocator, searches.items, hits.items);
-        defer freeOwnedStrings(ui.allocator, title_labels);
-
-        title_loop: while (true) {
-            setContext(ui, "Combined search results • first page per provider");
-            const title_choice = try vaxisSelect(
-                ui,
-                "Combined Search Results",
-                "Results include every selected provider. Esc returns to query.",
-                title_labels,
-                null,
-                null,
-                null,
-                null,
-            );
-
-            const hit_idx = switch (title_choice) {
-                .selected => |idx| idx,
-                .back, .to_query => continue :query_loop,
-                .page_prev, .page_next => continue :title_loop,
-                .quit => return .quit,
-            };
-
-            const hit = hits.items[hit_idx];
-            const selected_title = searches.items[hit.response_index].items[hit.item_index];
-            const selected_provider = hit.provider;
-            ui.active_provider = selected_provider;
-
-            const title_ref_url = app.searchRefUrl(selected_title.ref);
-            const detail = try std.fmt.allocPrint(ui.allocator, "{s}", .{selected_title.label});
-            defer ui.allocator.free(detail);
-            const context = try std.fmt.allocPrint(ui.allocator, "Provider: {s} • Title URL: {s}", .{ app.providerDisplayName(selected_provider), title_ref_url });
-            defer ui.allocator.free(context);
-            setContext(ui, context);
-
-            var subtitles_task: SubtitlesTask = .{
-                .ref = selected_title.ref,
-                .page = 1,
-            };
-            var subtitles_group: std.Io.Group = .init;
-            defer subtitles_group.cancel(runtime_io.get());
-            try subtitles_group.concurrent(runtime_io.get(), subtitlesTaskMain, .{&subtitles_task});
-            const subtitles_control = try waitForTask(ui, &subtitles_task.done, "Subtitles", detail);
-            finalizeWorkerGroup(&subtitles_group, subtitles_control);
-
-            if (subtitles_control == .quit) {
-                if (subtitles_task.result) |*r| r.deinit();
-                return .quit;
-            }
-            if (subtitles_control == .canceled) {
-                if (subtitles_task.result) |*r| r.deinit();
-                const msg_result = try vaxisMessage(ui, "Fetch Canceled", "Canceled subtitle list fetch.", "Press any key to continue.", ui.styleWarn());
-                switch (msg_result) {
-                    .ok => continue :title_loop,
-                    .to_query => continue :query_loop,
-                    .quit => return .quit,
-                }
-            }
-            if (subtitles_task.err) |err| {
-                const msg_result = try showFriendlyError(ui, "Could not load subtitles", err);
-                switch (msg_result) {
-                    .ok => continue :title_loop,
-                    .to_query => continue :query_loop,
-                    .quit => return .quit,
-                }
-            }
-
-            var subtitles = subtitles_task.result orelse return error.UnexpectedHttpStatus;
-            defer subtitles.deinit();
-
-            if (subtitles.items.len == 0) {
-                const msg_result = try vaxisMessage(ui, "No Subtitles", "No subtitle rows were returned.", "Press any key to continue.", ui.styleWarn());
-                switch (msg_result) {
-                    .ok => continue :title_loop,
-                    .to_query => continue :query_loop,
-                    .quit => return .quit,
-                }
-            }
-
-            const subtitle_enabled = try buildSubtitleEnabled(ui.allocator, subtitles.items, defaultTuiSettings());
-            defer ui.allocator.free(subtitle_enabled);
-
-            var allow_auto_subtitle_select = true;
-            subtitle_loop: while (true) {
-                setContext(ui, context);
-                const subtitle_idx = (if (allow_auto_subtitle_select) singleEnabledIndex(subtitle_enabled) else null) orelse blk: {
-                    const subtitle_choice = try vaxisSelectSubtitle(
-                        ui,
-                        "Combined Search: Select Subtitle",
-                        "s sort, / filter, Esc titles.",
-                        subtitles.items,
-                        subtitle_enabled,
-                        null,
-                    );
-
-                    break :blk switch (subtitle_choice) {
-                        .selected => |idx| idx,
-                        .back => continue :title_loop,
-                        .to_query => continue :query_loop,
-                        .page_prev, .page_next => continue :subtitle_loop,
-                        .quit => return .quit,
-                    };
-                };
-                allow_auto_subtitle_select = false;
-
-                const selected_subtitle = subtitles.items[subtitle_idx];
-                const download_url = selected_subtitle.download_url orelse "(no direct URL)";
-                const download_url_display = if (isSubtitlecatTranslateToken(selected_subtitle.download_url))
-                    "subtitlecat translate request"
-                else
-                    download_url;
-
-                if (!ui.skip_confirm) {
-                    var provider_buf: [224]u8 = undefined;
-                    const provider_line = std.fmt.bufPrint(&provider_buf, "Provider: {s}", .{app.providerDisplayName(selected_provider)}) catch "Provider: (overflow)";
-                    const display_title = if (subtitles.title.len > 0) subtitles.title else app.titleFromRef(selected_title.ref);
-                    var title_buf: [320]u8 = undefined;
-                    const title_line = std.fmt.bufPrint(&title_buf, "Title: {s}", .{display_title}) catch "Title: (overflow)";
-                    var subtitle_buf: [384]u8 = undefined;
-                    const subtitle_line = std.fmt.bufPrint(&subtitle_buf, "Subtitle: {s}", .{selected_subtitle.label}) catch "Subtitle: (overflow)";
-                    var url_buf: [320]u8 = undefined;
-                    const url_line = std.fmt.bufPrint(&url_buf, "URL: {s}", .{download_url_display}) catch "URL: (overflow)";
-
-                    const confirm_lines = [_][]const u8{
-                        provider_line,
-                        title_line,
-                        subtitle_line,
-                        url_line,
-                        "Enter confirms download. Esc goes back.",
-                    };
-
-                    const confirm_result = try vaxisConfirm(ui, "Confirm Selection", &confirm_lines);
-                    switch (confirm_result) {
-                        .confirm => {},
-                        .back => continue :subtitle_loop,
-                        .to_query => continue :query_loop,
-                        .quit => return .quit,
-                    }
-                }
-
-                const download_detail = try std.fmt.allocPrint(ui.allocator, "{s}", .{selected_subtitle.label});
-                defer ui.allocator.free(download_detail);
-                const download_context = try std.fmt.allocPrint(ui.allocator, "Download URL: {s}", .{download_url_display});
-                defer ui.allocator.free(download_context);
-                setContext(ui, download_context);
-
-                var download_task: DownloadTask = .{
-                    .subtitle = selected_subtitle,
-                    .out_dir = "downloads",
-                };
-                var download_group: std.Io.Group = .init;
-                defer download_group.cancel(runtime_io.get());
-                try download_group.concurrent(runtime_io.get(), downloadTaskMain, .{&download_task});
-                const download_control = try waitForDownloadTask(ui, &download_task, "Download", download_detail);
-                finalizeWorkerGroup(&download_group, download_control);
-
-                if (download_control == .quit) {
-                    if (download_task.result) |*r| r.deinit(std.heap.page_allocator);
-                    return .quit;
-                }
-                if (download_control == .canceled) {
-                    if (download_task.result) |*r| r.deinit(std.heap.page_allocator);
-                    const msg_result = try vaxisMessage(ui, "Download Canceled", "Canceled current download.", "Press any key to continue.", ui.styleWarn());
-                    switch (msg_result) {
-                        .ok => continue :subtitle_loop,
-                        .to_query => continue :query_loop,
-                        .quit => return .quit,
-                    }
-                }
-                if (download_task.err) |err| {
-                    const msg_result = try showFriendlyError(ui, "Download failed", err);
-                    switch (msg_result) {
-                        .ok => continue :subtitle_loop,
-                        .to_query => continue :query_loop,
-                        .quit => return .quit,
-                    }
-                }
-
-                var result = download_task.result orelse return error.UnexpectedHttpStatus;
-                defer result.deinit(std.heap.page_allocator);
-
-                const result_detail = if (result.extracted_files.len > 0)
-                    try std.fmt.allocPrint(ui.allocator, "{s} (+{d} extracted)", .{ result.file_path, result.extracted_files.len })
-                else
-                    try std.fmt.allocPrint(ui.allocator, "{s}", .{result.file_path});
-                defer ui.allocator.free(result_detail);
-
-                const msg_result = try vaxisMessage(ui, "Downloaded", result_detail, "Press any key to keep browsing subtitles.", ui.styleAccent());
-                switch (msg_result) {
-                    .ok => continue :subtitle_loop,
-                    .to_query => continue :query_loop,
-                    .quit => return .quit,
-                }
-            }
-        }
-    }
-}
-
-fn buildCombinedSearchLabels(
-    allocator: std.mem.Allocator,
-    searches: []const app.SearchResponse,
-    hits: []const CombinedSearchHit,
-) ![][]u8 {
-    const out = try allocator.alloc([]u8, hits.len);
-    errdefer allocator.free(out);
-
-    var initialized: usize = 0;
-    errdefer freeInitializedStrings(allocator, out, initialized);
-
-    for (hits, 0..) |hit, idx| {
-        const item = searches[hit.response_index].items[hit.item_index];
-        out[idx] = try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ app.providerDisplayName(hit.provider), item.label });
-        initialized += 1;
-    }
-
-    return out;
-}
-
-fn buildProviderNames(allocator: std.mem.Allocator) ![][]u8 {
-    const values = app.providers();
-    const out = try allocator.alloc([]u8, values.len);
-    errdefer allocator.free(out);
-    var initialized: usize = 0;
-    errdefer freeInitializedStrings(allocator, out, initialized);
-    for (values, 0..) |provider, idx| {
-        out[idx] = try std.fmt.allocPrint(allocator, "{s}", .{app.providerDisplayName(provider)});
-        initialized += 1;
-    }
-
-    return out;
-}
-
-fn borrowSearchLabels(allocator: std.mem.Allocator, items: []const app.SearchChoice) ![][]const u8 {
-    const out = try allocator.alloc([]const u8, items.len);
-    for (items, 0..) |item, idx| {
-        out[idx] = item.label;
-    }
-    return out;
-}
-
-fn borrowSubdlSeasonLabels(allocator: std.mem.Allocator, items: []const app.SubdlSeasonChoice) ![][]const u8 {
-    const out = try allocator.alloc([]const u8, items.len);
-    for (items, 0..) |item, idx| {
-        out[idx] = item.label;
-    }
-    return out;
-}
-
 fn buildSubtitleEnabled(allocator: std.mem.Allocator, items: []const app.SubtitleChoice, settings: TuiSettings) ![]bool {
     const out = try allocator.alloc(bool, items.len);
     for (items, 0..) |item, idx| {
@@ -4994,10 +3879,6 @@ fn exportCachedDownload(ui: *Ui, result: app.DownloadResult) !MessageResult {
             "Cached Download",
             "Enter exports selected subtitle file. Esc keeps it cached.",
             labels,
-            null,
-            null,
-            null,
-            null,
         );
         const idx = switch (choice) {
             .selected => |i| i,
@@ -5368,18 +4249,8 @@ fn vaxisSelect(
     title: []const u8,
     hint: []const u8,
     options: []const []const u8,
-    default_idx: ?usize,
-    enabled: ?[]const bool,
-    page_nav: ?PageNav,
-    provider_toggles: ?[]bool,
 ) !SelectResult {
     if (options.len == 0) return error.NoData;
-    if (enabled) |flags| {
-        if (flags.len != options.len) return error.InvalidFieldType;
-    }
-    if (provider_toggles) |flags| {
-        if (flags.len != options.len) return error.InvalidFieldType;
-    }
 
     var filter: std.ArrayList(u8) = .empty;
     defer filter.deinit(ui.allocator);
@@ -5390,11 +4261,6 @@ fn vaxisSelect(
     try rebuildOptionMatches(ui.allocator, options, filter.items, &matches);
 
     var selected_row: usize = 0;
-    if (default_idx) |idx| {
-        if (idx < options.len) {
-            selected_row = findIndexInMatches(matches.items, idx) orelse 0;
-        }
-    }
 
     var scroll: usize = 0;
     var filter_mode = false;
@@ -5407,13 +4273,7 @@ fn vaxisSelect(
         win.hideCursor();
 
         try renderCompactTopLine(ui, win, title, ui.styleTitle());
-
-        const show_provider_panel = provider_toggles != null and ui.providerPanelVisible(win.width);
-        const provider_panel_width: u16 = if (show_provider_panel) 30 else 0;
-        const content_width: u16 = if (show_provider_panel and win.width > provider_panel_width + 2)
-            win.width - provider_panel_width - 2
-        else
-            win.width;
+        const content_width = win.width;
 
         const list_top: u16 = 1;
         const footer_rows: u16 = 1;
@@ -5424,9 +4284,6 @@ fn vaxisSelect(
             1;
 
         clampSelection(&selected_row, matches.items.len);
-        if (provider_toggles == null) {
-            moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
-        }
         ensureVisible(selected_row, &scroll, page_size);
 
         var row = list_top;
@@ -5434,25 +4291,15 @@ fn vaxisSelect(
         while (i < matches.items.len and row < list_bottom) : (i += 1) {
             const option_idx = matches.items[i];
             const active = i == selected_row;
-            const is_enabled = if (provider_toggles) |flags| flags[option_idx] else isOptionEnabled(enabled, option_idx);
-            const style = if (active)
-                ui.styleSelected()
-            else if (!is_enabled)
-                ui.styleMuted()
-            else
-                vaxis.Style{};
+            const style = if (active) ui.styleSelected() else vaxis.Style{};
             const cursor_prefix = if (active) "> " else "  ";
-            const toggle_prefix = if (provider_toggles) |flags| if (flags[option_idx]) "[x] " else "[ ] " else "";
 
             const list_width: usize = if (content_width > 2) @intCast(content_width - 2) else 0;
-            const prefix_width: usize = cursor_prefix.len + toggle_prefix.len;
+            const prefix_width: usize = cursor_prefix.len;
             const text_width = list_width -| prefix_width;
             const option_col: u16 = @intCast(1 + prefix_width);
 
             try printFitted(ui, win, row, 1, cursor_prefix, style, cursor_prefix.len);
-            if (toggle_prefix.len > 0) {
-                try printFitted(ui, win, row, 1 + @as(u16, @intCast(cursor_prefix.len)), toggle_prefix, style, toggle_prefix.len);
-            }
             try printFitted(ui, win, row, option_col, options[option_idx], style, text_width);
 
             row += 1;
@@ -5463,34 +4310,16 @@ fn vaxisSelect(
             _ = win.print(&empty_segments, .{ .row_offset = list_top, .col_offset = 1, .wrap = .none });
         }
 
-        if (show_provider_panel) {
-            try renderProviderPanel(ui, win, content_width + 1, provider_panel_width);
-        }
-
         const mode_text = if (filter_mode) "FILTER" else "NAV";
         const filter_display = if (filter.items.len == 0) "-" else filter.items;
 
-        const can_page = if (page_nav) |pn| pn.enabled else false;
         const help_line = if (filter_mode)
             "F1 info · type Enter/Esc BS"
-        else if (provider_toggles != null)
-            "F1 info · j/k Space select Enter search Esc"
-        else if (can_page)
-            "F1 info · j/k Enter / [ ] Esc"
         else
             "F1 info · j/k Enter / Esc";
 
         var count_buf: [128]u8 = undefined;
-        const count_line = if (can_page)
-            std.fmt.bufPrint(
-                &count_buf,
-                "{d}/{d} p{d}",
-                .{ matches.items.len, options.len, if (page_nav) |pn| pn.page else 1 },
-            ) catch "?/? p?"
-        else if (provider_toggles) |flags|
-            std.fmt.bufPrint(&count_buf, "{d}/{d} selected", .{ countEnabledFlags(flags), options.len }) catch "?/? selected"
-        else
-            std.fmt.bufPrint(&count_buf, "{d}/{d}", .{ matches.items.len, options.len }) catch "?/?";
+        const count_line = std.fmt.bufPrint(&count_buf, "{d}/{d}", .{ matches.items.len, options.len }) catch "?/?";
 
         var compact_buf: [768]u8 = undefined;
         const compact_line = std.fmt.bufPrint(
@@ -5578,70 +4407,44 @@ fn vaxisSelect(
                     }
 
                     if (key.matches(vaxis.Key.escape, .{})) return .back;
-                    if (can_page and key.matches('[', .{})) return .page_prev;
-                    if (can_page and key.matches(']', .{})) return .page_next;
                     if (key.matches('/', .{})) {
                         filter_mode = true;
                         continue;
                     }
                     if (key.matches(vaxis.Key.enter, .{})) {
                         if (matches.items.len > 0) {
-                            const option_idx = matches.items[selected_row];
-                            if (provider_toggles) |flags| {
-                                _ = flags;
-                                return .{ .selected = option_idx };
-                            } else if (isOptionEnabled(enabled, option_idx)) {
-                                return .{ .selected = option_idx };
-                            }
+                            return .{ .selected = matches.items[selected_row] };
                         }
                         continue;
                     }
                     if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
                         if (selected_row + 1 < matches.items.len) selected_row += 1;
-                        if (provider_toggles == null) {
-                            moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
-                        }
                         continue;
                     }
                     if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
                         if (selected_row > 0) selected_row -= 1;
-                        if (provider_toggles == null) {
-                            moveSelectionToEnabled(matches.items, enabled, &selected_row, .backward);
-                        }
                         continue;
-                    }
-                    if (provider_toggles) |flags| {
-                        if (key.matches(vaxis.Key.space, .{})) {
-                            if (matches.items.len == 0) continue;
-                            const option_idx = matches.items[selected_row];
-                            flags[option_idx] = !flags[option_idx];
-                            continue;
-                        }
                     }
                     if (key.matches(vaxis.Key.page_down, .{}) or key.matches(vaxis.Key.space, .{})) {
                         const win_now = ui.vx.window();
                         const page_now: usize = if (win_now.height > 7) @intCast(win_now.height - 7) else 1;
                         if (matches.items.len > 0) {
                             selected_row = @min(matches.items.len - 1, selected_row + page_now);
-                            moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
                         }
                         continue;
                     }
-                    if (key.matches(vaxis.Key.page_up, .{}) or (provider_toggles == null and key.matches('b', .{}))) {
+                    if (key.matches(vaxis.Key.page_up, .{}) or key.matches('b', .{})) {
                         const win_now = ui.vx.window();
                         const page_now: usize = if (win_now.height > 7) @intCast(win_now.height - 7) else 1;
                         selected_row = selected_row -| page_now;
-                        moveSelectionToEnabled(matches.items, enabled, &selected_row, .backward);
                         continue;
                     }
                     if (key.matches('g', .{})) {
                         selected_row = 0;
-                        moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
                         continue;
                     }
                     if (key.matches(vaxis.Key.end, .{})) {
                         if (matches.items.len > 0) selected_row = matches.items.len - 1;
-                        moveSelectionToEnabled(matches.items, enabled, &selected_row, .backward);
                         continue;
                     }
                 },
@@ -5660,28 +4463,16 @@ fn vaxisSelect(
                             continue;
                         }
                     }
-                    if (handleMouseWheel(mouse, matches.items.len, &selected_row, provider_toggles == null, matches.items, enabled)) continue;
+                    if (mouseWheelDelta(mouse)) |delta| {
+                        applyWheelDelta(&selected_row, matches.items.len, delta, list_mouse_wheel_step);
+                        continue;
+                    }
                     if (mouse.type == .press and mouse.button == .left) {
                         if (mouseRowIndex(mouse, list_top, list_bottom, scroll, matches.items.len)) |row_idx| {
                             const already_selected = row_idx == selected_row;
                             selected_row = row_idx;
-                            if (provider_toggles) |flags| {
-                                // Rows render as: cursor at col 1..2, checkbox
-                                // at col 3..5, then a separating space.
-                                if (mouseColumnInRange(mouse, 3, 6)) {
-                                    const option_idx = matches.items[selected_row];
-                                    flags[option_idx] = !flags[option_idx];
-                                    continue;
-                                }
-                            }
-                            if (provider_toggles == null) {
-                                moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
-                            }
                             if (already_selected and selected_row < matches.items.len) {
-                                const option_idx = matches.items[selected_row];
-                                if (provider_toggles != null or isOptionEnabled(enabled, option_idx)) {
-                                    return .{ .selected = option_idx };
-                                }
+                                return .{ .selected = matches.items[selected_row] };
                             }
                         }
                     }
@@ -5692,9 +4483,6 @@ fn vaxisSelect(
         if (batch.wheel_delta != 0) {
             if (info_menu_open) info_menu_open = false;
             applyWheelDelta(&selected_row, matches.items.len, batch.wheel_delta, list_mouse_wheel_step);
-            if (provider_toggles == null) {
-                moveSelectionToEnabled(matches.items, enabled, &selected_row, if (batch.wheel_delta > 0) .forward else .backward);
-            }
         }
     }
 }
@@ -6156,48 +4944,6 @@ fn renderCompactBottomLine(ui: *Ui, win: anytype, left: []const u8) !void {
     try printFitted(ui, win, row, status_col, status, ui.styleMuted(), status_width);
 }
 
-fn renderProviderPanel(ui: *Ui, win: anytype, col: u16, width: u16) !void {
-    if (width < 18 or win.height < 4) return;
-
-    const title_segments = [_]vaxis.Segment{.{ .text = "Providers", .style = ui.stylePaneTitle() }};
-    _ = win.print(&title_segments, .{ .row_offset = 1, .col_offset = col, .wrap = .none });
-
-    var row: u16 = 3;
-    const max_width: usize = @intCast(width - 1);
-    for (app.providers()) |provider| {
-        if (row >= win.height -| 1) break;
-        const idx = app.providerIndex(provider);
-        const active = if (ui.active_provider) |current| current == provider else false;
-        const enabled = ui.provider_enabled[idx];
-        const marker = if (active) ">" else " ";
-        const checkbox = if (enabled) "[x]" else "[ ]";
-        const media = if (app.providerSupportsMovies(provider) and app.providerSupportsTv(provider))
-            "M+TV"
-        else if (app.providerSupportsMovies(provider))
-            "M"
-        else if (app.providerSupportsTv(provider))
-            "TV"
-        else
-            "-";
-        const paging = if (app.providerSupportsSearchPagination(provider) or app.providerSupportsSubtitlesPagination(provider)) " pages" else "";
-        const browser = if (app.providerRequiresBrowserSession(provider)) " browser" else "";
-        const caps = try frameFmt(ui, "{s}{s}{s}", .{ media, paging, browser });
-        const line = try frameFmt(
-            ui,
-            "{s} {s} {s} {s}",
-            .{ marker, checkbox, app.providerDisplayName(provider), caps },
-        );
-        const style = if (active)
-            ui.styleSelected()
-        else if (enabled)
-            vaxis.Style{}
-        else
-            ui.styleMuted();
-        try printFitted(ui, win, row, col, line, style, max_width);
-        row += 1;
-    }
-}
-
 fn frameFmt(ui: *Ui, comptime fmt: []const u8, args: anytype) ![]const u8 {
     return std.fmt.allocPrint(ui.frameAllocator(), fmt, args);
 }
@@ -6641,13 +5387,6 @@ fn scrollSelection(selected_row: *usize, item_count: usize, direction: SearchDir
         .forward => selected_row.* = @min(item_count - 1, selected_row.* + step),
         .backward => selected_row.* = selected_row.* -| step,
     }
-}
-
-fn firstEnabledProvider(flags: []const bool) ?app.Provider {
-    for (app.providers()) |provider| {
-        if (flags[app.providerIndex(provider)]) return provider;
-    }
-    return null;
 }
 
 fn handleMouseWheel(
