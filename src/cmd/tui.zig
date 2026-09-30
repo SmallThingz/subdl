@@ -959,7 +959,17 @@ fn runTui(ui: *Ui) !void {
                             .wheel_up => scrollSelection(&selected_download, download_count, .backward, list_mouse_wheel_step),
                             .left => {
                                 const win = ui.vx.window();
-                                if (mouseRowIndex(mouse, 4, homeListBottom(win.height), download_scroll, download_count)) |row_idx| selected_download = row_idx;
+                                if (mouseRowIndex(mouse, 4, homeListBottom(win.height), download_scroll, download_count)) |row_idx| {
+                                    const activate = row_idx == selected_download;
+                                    selected_download = row_idx;
+                                    if (activate) {
+                                        switch (try exportHomeCachedDownload(ui, &state, selected_download)) {
+                                            .ok => {},
+                                            .to_query => focus = .query,
+                                            .quit => return,
+                                        }
+                                    }
+                                }
                             },
                             else => {},
                         };
@@ -1046,19 +1056,7 @@ fn runTui(ui: *Ui) !void {
                     if (focus == .downloads and state.settings.download_cache_enabled) {
                         const download_count = state.download_entries.len;
                         if (key.matches(vaxis.Key.enter, .{}) and download_count > 0) {
-                            const input = try vaxisInput(ui, "Export Download", "Destination directory", "Directory", 240);
-                            const out_dir = switch (input) {
-                                .submit => |dir| dir,
-                                .back => continue,
-                                .quit => return,
-                            };
-                            defer ui.allocator.free(out_dir);
-                            const trimmed_dir = std.mem.trim(u8, out_dir, " \t\r\n");
-                            if (selected_download >= state.download_entries.len) continue;
-                            const exported = try exportCachedDownloadEntry(ui.allocator, state.cache_root_path, state.download_entries[selected_download], if (trimmed_dir.len == 0) "downloads" else trimmed_dir);
-                            defer ui.allocator.free(exported);
-                            const msg = try vaxisMessage(ui, "Exported", exported, "Press any key to continue.", ui.styleAccent());
-                            switch (msg) {
+                            switch (try exportHomeCachedDownload(ui, &state, selected_download)) {
                                 .ok => {},
                                 .to_query => focus = .query,
                                 .quit => return,
@@ -4691,6 +4689,29 @@ fn refreshCachedDownloads(allocator: std.mem.Allocator, state: *TuiRuntimeState)
     const next = try cachedDownloadLabels(allocator, state.cache_root_path);
     if (state.download_entries.len > 0) freeOwnedStrings(allocator, state.download_entries);
     state.download_entries = next;
+}
+
+fn exportHomeCachedDownload(ui: *Ui, state: *const TuiRuntimeState, selected_download: usize) !MessageResult {
+    if (selected_download >= state.download_entries.len) return .ok;
+
+    const input = try vaxisInput(ui, "Export Download", "Destination directory", "Directory", 240);
+    const out_dir = switch (input) {
+        .submit => |dir| dir,
+        .back => return .ok,
+        .quit => return .quit,
+    };
+    defer ui.allocator.free(out_dir);
+
+    const trimmed_dir = std.mem.trim(u8, out_dir, " \t\r\n");
+    const exported = exportCachedDownloadEntry(
+        ui.allocator,
+        state.cache_root_path,
+        state.download_entries[selected_download],
+        if (trimmed_dir.len == 0) "downloads" else trimmed_dir,
+    ) catch |err| return showFriendlyError(ui, "Could not export cached download", err);
+    defer ui.allocator.free(exported);
+
+    return vaxisMessage(ui, "Exported", exported, "Press any key to continue.", ui.styleAccent());
 }
 
 fn exportCachedDownloadEntry(
