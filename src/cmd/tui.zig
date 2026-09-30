@@ -1331,7 +1331,7 @@ fn runProviderFirstTui(ui: *Ui) !void {
             defer ui.allocator.free(query_context);
             setContext(ui, query_context);
 
-            const input = try vaxisInput(ui, "Subtitle Downloader", query_hint, "Query", 180);
+            const input = try vaxisInput(ui, "Subtitle Downloader", query_hint, "Query", .{ .max_len = 180 });
             const query = switch (input) {
                 .submit => |q| q,
                 .back => continue :provider_loop,
@@ -4314,7 +4314,7 @@ fn runCombinedSearch(ui: *Ui, provider_enabled: []const bool) !SelectResult {
     query_loop: while (true) {
         ui.active_provider = null;
         setContext(ui, "Combined search • selected providers");
-        const input = try vaxisInput(ui, "Combined Search", "Searches every selected provider. Esc returns to providers.", "Query", 180);
+        const input = try vaxisInput(ui, "Combined Search", "Searches every selected provider. Esc returns to providers.", "Query", .{ .max_len = 180 });
         const query = switch (input) {
             .submit => |q| q,
             .back => return .back,
@@ -4770,7 +4770,13 @@ fn refreshCachedDownloads(allocator: std.mem.Allocator, state: *TuiRuntimeState)
 fn exportHomeCachedDownload(ui: *Ui, state: *TuiRuntimeState, selected_download: usize) !MessageResult {
     if (selected_download >= state.download_entries.len) return .ok;
 
-    const input = try vaxisInput(ui, "Export Download", "Destination directory", "Directory", 240);
+    const input = try vaxisInput(
+        ui,
+        "Export Download",
+        "Destination directory (blank = downloads)",
+        "Directory",
+        .{ .max_len = 240, .allow_empty = true },
+    );
     const out_dir = switch (input) {
         .submit => |dir| dir,
         .back => return .ok,
@@ -4888,12 +4894,17 @@ fn vaxisStatus(ui: *Ui, title: []const u8, message: []const u8, detail: []const 
     try ui.render();
 }
 
+const InputOptions = struct {
+    max_len: usize,
+    allow_empty: bool = false,
+};
+
 fn vaxisInput(
     ui: *Ui,
     title: []const u8,
     hint: []const u8,
     label: []const u8,
-    max_len: usize,
+    options: InputOptions,
 ) !InputResult {
     var query: std.ArrayList(u8) = .empty;
     defer query.deinit(ui.allocator);
@@ -4980,8 +4991,8 @@ fn vaxisInput(
                     }
 
                     if (key.matches(vaxis.Key.enter, .{})) {
-                        if (query.items.len == 0) {
-                            error_text = "Query cannot be empty.";
+                        if (query.items.len == 0 and !options.allow_empty) {
+                            error_text = "Input cannot be empty.";
                         } else {
                             return .{ .submit = try query.toOwnedSlice(ui.allocator) };
                         }
@@ -5012,7 +5023,7 @@ fn vaxisInput(
                         error_text = null;
                     } else if (isTextKey(key)) {
                         const text = key.text orelse continue;
-                        if (query.items.len + text.len <= max_len) {
+                        if (query.items.len + text.len <= options.max_len) {
                             try query.insertSlice(ui.allocator, cursor_pos, text);
                             cursor_pos += text.len;
                             error_text = null;
