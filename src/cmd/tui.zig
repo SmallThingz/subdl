@@ -4088,6 +4088,11 @@ fn nextAvailableExportPath(allocator: std.mem.Allocator, out_dir: []const u8, fi
 
 fn subtitleLanguageAllowed(item: app.SubtitleChoice, settings: TuiSettings) bool {
     if (!settings.language_filter_enabled) return true;
+    // Some providers do not expose language metadata at all. Keep those rows
+    // usable rather than making the default English filter disable an entire
+    // provider. When a provider *does* report a normalizable language, though,
+    // require a positive match instead of letting unmapped languages bypass
+    // the active filter.
     const raw = item.language orelse return true;
     const normalized = scrapers.common.normalizeLanguageCode(raw) orelse return true;
     for (language_options, 0..) |option, idx| {
@@ -4097,7 +4102,7 @@ fn subtitleLanguageAllowed(item: app.SubtitleChoice, settings: TuiSettings) bool
     for (language_options, 0..) |option, idx| {
         if (std.mem.eql(u8, option.code, short)) return settings.languages_enabled[idx];
     }
-    return true;
+    return false;
 }
 
 fn showFriendlyError(ui: *Ui, context: []const u8, err: anyerror) !MessageResult {
@@ -4572,8 +4577,13 @@ fn vaxisSelectSubtitle(
         const list_top: u16 = 1;
         const footer_rows: u16 = 1;
         const list_bottom: u16 = if (win.height > footer_rows) win.height - footer_rows else win.height;
-        const page_size: usize = if (list_bottom > list_top)
-            @intCast(list_bottom - list_top)
+        const has_selectable = hasSelectableMatch(matches.items, enabled);
+        const content_list_top: u16 = if (!has_selectable and matches.items.len > 0 and list_top < list_bottom)
+            list_top + 1
+        else
+            list_top;
+        const page_size: usize = if (list_bottom > content_list_top)
+            @intCast(list_bottom - content_list_top)
         else
             1;
 
@@ -4584,11 +4594,23 @@ fn vaxisSelectSubtitle(
         const list_width: usize = if (left_width > 2) @intCast(left_width - 2) else 0;
         const text_width = list_width -| 10;
 
-        var row = list_top;
+        if (!has_selectable and matches.items.len > 0) {
+            try printFitted(
+                ui,
+                win,
+                list_top,
+                1,
+                "No selectable subtitles for the active language/download settings.",
+                ui.styleWarn(),
+                if (left_width > 2) @intCast(left_width - 2) else 0,
+            );
+        }
+
+        var row = content_list_top;
         var i = scroll;
         while (i < matches.items.len and row < list_bottom) : (i += 1) {
             const sub_idx = matches.items[i];
-            const active = i == selected_row;
+            const active = has_selectable and i == selected_row;
             const style = if (!enabled[sub_idx])
                 ui.styleMuted()
             else if (active)
@@ -4613,9 +4635,19 @@ fn vaxisSelectSubtitle(
             const pane_header = [_]vaxis.Segment{.{ .text = "Details", .style = ui.stylePaneTitle() }};
             _ = win.print(&pane_header, .{ .row_offset = 1, .col_offset = pane_col, .wrap = .none });
 
-            if (matches.items.len > 0) {
+            if (has_selectable and matches.items.len > 0) {
                 const selected_subtitle = subtitles[matches.items[selected_row]];
                 try renderSubtitleDetails(ui, win, pane_col, pane_width, selected_subtitle);
+            } else if (matches.items.len > 0) {
+                try printFitted(
+                    ui,
+                    win,
+                    3,
+                    pane_col,
+                    "No subtitle is selectable under the current settings.",
+                    ui.styleWarn(),
+                    pane_width,
+                );
             }
         }
 
@@ -4631,6 +4663,8 @@ fn vaxisSelectSubtitle(
         const can_page = if (page_nav) |pn| pn.enabled else false;
         const help_line = if (filter_mode)
             "F1 info · type Enter/Esc BS"
+        else if (!has_selectable and matches.items.len > 0)
+            "F1 info · no selectable subtitles · / filter · Esc back"
         else if (can_page)
             "F1 info · j/k Enter s / [ ] Esc"
         else
@@ -4808,7 +4842,7 @@ fn vaxisSelectSubtitle(
                     }
                     if (handleMouseWheel(mouse, matches.items.len, &selected_row, true, matches.items, enabled)) continue;
                     if (mouse.type == .press and mouse.button == .left) {
-                        if (mouseRowIndex(mouse, list_top, list_bottom, scroll, matches.items.len)) |row_idx| {
+                        if (mouseRowIndex(mouse, content_list_top, list_bottom, scroll, matches.items.len)) |row_idx| {
                             const already_selected = row_idx == selected_row;
                             selected_row = row_idx;
                             moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
@@ -5530,6 +5564,50 @@ fn moveSelectionToEnabled(
             }
         },
     }
+}
+
+fn hasSelectableMatch(matches: []const usize, enabled: []const bool) bool {
+    for (matches) |idx| {
+        if (idx < enabled.len and enabled[idx]) return true;
+    }
+    return false;
+}
+
+test "hasSelectableMatch reports disabled-only filtered rows" {
+    const enabled = [_]bool{ false, true, false };
+    try std.testing.expect(!hasSelectableMatch(&.{ 0, 2 }, &enabled));
+    try std.testing.expect(hasSelectableMatch(&.{ 2, 1 }, &enabled));
+    try std.testing.expect(!hasSelectableMatch(&.{4}, &enabled));
+}
+
+test "language filter rejects unmapped languages and keeps missing metadata usable" {
+    var settings = defaultTuiSettings();
+    const english: app.SubtitleChoice = .{
+        .label = "English",
+        .language = "English",
+        .filename = null,
+        .download_url = "https://example.test/en.srt",
+    };
+    const unknown: app.SubtitleChoice = .{
+        .label = "Kurdish",
+        .language = "Kurdish",
+        .filename = null,
+        .download_url = "https://example.test/ku.srt",
+    };
+    const missing: app.SubtitleChoice = .{
+        .label = "Unknown",
+        .language = null,
+        .filename = null,
+        .download_url = "https://example.test/unknown.srt",
+    };
+
+    try std.testing.expect(subtitleLanguageAllowed(english, settings));
+    try std.testing.expect(!subtitleLanguageAllowed(unknown, settings));
+    try std.testing.expect(subtitleLanguageAllowed(missing, settings));
+
+    settings.language_filter_enabled = false;
+    try std.testing.expect(subtitleLanguageAllowed(unknown, settings));
+    try std.testing.expect(subtitleLanguageAllowed(missing, settings));
 }
 
 fn rebuildOptionMatches(
