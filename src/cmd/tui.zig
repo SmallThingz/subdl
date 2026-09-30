@@ -5341,18 +5341,71 @@ test "friendly errors explain common provider network failures" {
     );
 }
 
+const CompactDialogLayout = struct {
+    primary_row: ?u16 = null,
+    secondary_row: ?u16 = null,
+    footer_row: ?u16 = null,
+};
+
+fn compactDialogLayout(height: u16) CompactDialogLayout {
+    if (height <= 1) return .{};
+    const footer_row = height - 1;
+    if (height == 2) return .{ .footer_row = footer_row };
+    if (height == 3) {
+        return .{
+            .primary_row = 1,
+            .footer_row = footer_row,
+        };
+    }
+    if (height == 4) {
+        return .{
+            .primary_row = 1,
+            .secondary_row = 2,
+            .footer_row = footer_row,
+        };
+    }
+    return .{
+        .primary_row = 2,
+        .secondary_row = 3,
+        .footer_row = footer_row,
+    };
+}
+
+test "compact dialog layout keeps content above footer" {
+    try std.testing.expectEqual(CompactDialogLayout{}, compactDialogLayout(0));
+    try std.testing.expectEqual(CompactDialogLayout{}, compactDialogLayout(1));
+    try std.testing.expectEqual(CompactDialogLayout{ .footer_row = 1 }, compactDialogLayout(2));
+    try std.testing.expectEqual(
+        CompactDialogLayout{ .primary_row = 1, .footer_row = 2 },
+        compactDialogLayout(3),
+    );
+    try std.testing.expectEqual(
+        CompactDialogLayout{ .primary_row = 1, .secondary_row = 2, .footer_row = 3 },
+        compactDialogLayout(4),
+    );
+    try std.testing.expectEqual(
+        CompactDialogLayout{ .primary_row = 2, .secondary_row = 3, .footer_row = 4 },
+        compactDialogLayout(5),
+    );
+}
+
 fn vaxisStatus(ui: *Ui, title: []const u8, message: []const u8, detail: []const u8) !void {
     const win = ui.vx.window();
     win.clear();
     win.hideCursor();
 
     try renderTopBar(ui, win, .{ .title = title });
+    const layout = compactDialogLayout(win.height);
 
-    const msg_segments = [_]vaxis.Segment{.{ .text = message, .style = ui.styleWarn() }};
-    _ = win.print(&msg_segments, .{ .row_offset = 2, .col_offset = 1, .wrap = .none });
+    if (layout.primary_row) |row| {
+        const msg_segments = [_]vaxis.Segment{.{ .text = message, .style = ui.styleWarn() }};
+        _ = win.print(&msg_segments, .{ .row_offset = row, .col_offset = 1, .wrap = .none });
+    }
 
-    const detail_segments = [_]vaxis.Segment{.{ .text = detail, .style = ui.styleMuted() }};
-    _ = win.print(&detail_segments, .{ .row_offset = 3, .col_offset = 1, .wrap = .none });
+    if (layout.secondary_row) |row| {
+        const detail_segments = [_]vaxis.Segment{.{ .text = detail, .style = ui.styleMuted() }};
+        _ = win.print(&detail_segments, .{ .row_offset = row, .col_offset = 1, .wrap = .none });
+    }
 
     try renderBottomBar(ui, win, .{ .left = "Ctrl+C/Esc/q cancel" });
     try ui.render();
@@ -5381,40 +5434,53 @@ fn vaxisInput(
         win.clear();
         win.hideCursor();
         win.setCursorShape(.beam);
+        const layout = compactDialogLayout(win.height);
 
         try renderTopBar(ui, win, .{ .title = title });
 
-        const hint_segments = [_]vaxis.Segment{.{ .text = hint }};
-        _ = win.print(&hint_segments, .{ .row_offset = 1, .col_offset = 1, .wrap = .none });
+        const input_row = layout.secondary_row orelse layout.primary_row;
+        if (input_row != null and input_row.? > 1) {
+            const hint_segments = [_]vaxis.Segment{.{ .text = hint }};
+            _ = win.print(&hint_segments, .{ .row_offset = 1, .col_offset = 1, .wrap = .none });
+        }
 
         const prompt_segments = [_]vaxis.Segment{
             .{ .text = label, .style = ui.styleAccent() },
             .{ .text = ": " },
         };
-        _ = win.print(&prompt_segments, .{ .row_offset = 3, .col_offset = 1, .wrap = .none });
+        if (input_row) |row| {
+            _ = win.print(&prompt_segments, .{ .row_offset = row, .col_offset = 1, .wrap = .none });
+        }
 
         const prompt_width: usize = @intCast(win.gwidth(label) + 2);
         const input_col_usize = @as(usize, 1) + prompt_width;
         const input_col: u16 = @intCast(@min(input_col_usize, @as(usize, win.width)));
         const input_width: usize = if (win.width > input_col) @intCast(win.width - input_col) else 0;
         const viewport = queryViewportForCursor(win, query.items, cursor_pos, input_width);
-        if (viewport.start > 0 and input_width > 0) {
-            try printFitted(ui, win, 3, input_col, "‹", ui.styleMuted(), 1);
-            try printFitted(ui, win, 3, input_col + 1, query.items[viewport.start..], vaxis.Style{}, input_width -| 1);
-        } else {
-            try printFitted(ui, win, 3, input_col, query.items, vaxis.Style{}, input_width);
+        if (input_row) |row| {
+            if (viewport.start > 0 and input_width > 0) {
+                try printFitted(ui, win, row, input_col, "‹", ui.styleMuted(), 1);
+                try printFitted(ui, win, row, input_col + 1, query.items[viewport.start..], vaxis.Style{}, input_width -| 1);
+            } else {
+                try printFitted(ui, win, row, input_col, query.items, vaxis.Style{}, input_width);
+            }
         }
 
-        if (win.width > 0) {
+        if (win.width > 0 and input_row != null) {
             const desired_col = input_col + @as(u16, @intCast(@min(viewport.cursor_col, input_width)));
-            win.showCursor(@min(desired_col, win.width -| 1), 3);
+            win.showCursor(@min(desired_col, win.width -| 1), input_row.?);
         }
 
         try renderBottomBar(ui, win, .{ .left = "Enter submit • Esc back • Ctrl+U clear" });
 
         if (error_text) |txt| {
-            const err_segments = [_]vaxis.Segment{.{ .text = txt, .style = ui.styleError() }};
-            _ = win.print(&err_segments, .{ .row_offset = 6, .col_offset = 1, .wrap = .none });
+            if (input_row) |row| {
+                const error_row = row + 1;
+                if (layout.footer_row == null or error_row < layout.footer_row.?) {
+                    const err_segments = [_]vaxis.Segment{.{ .text = txt, .style = ui.styleError() }};
+                    _ = win.print(&err_segments, .{ .row_offset = error_row, .col_offset = 1, .wrap = .none });
+                }
+            }
         }
 
         try ui.render();
@@ -5427,7 +5493,8 @@ fn vaxisInput(
                     if (mouse.type != .press or mouse.button != .left or mouse.row < 0 or mouse.col < 0) continue;
                     const row: u16 = @intCast(mouse.row);
                     const col: u16 = @intCast(mouse.col);
-                    if (row != 3 or col < input_col or col >= input_col + @as(u16, @intCast(input_width))) continue;
+                    const active_input_row = input_row orelse continue;
+                    if (row != active_input_row or col < input_col or col >= input_col + @as(u16, @intCast(input_width))) continue;
                     var target_col: usize = @intCast(col - input_col);
                     if (viewport.start > 0) {
                         if (target_col == 0) {
@@ -6102,14 +6169,19 @@ fn vaxisConfirm(ui: *Ui, title: []const u8, lines: []const []const u8) !ConfirmR
         const win = ui.vx.window();
         win.clear();
         win.hideCursor();
+        const layout = compactDialogLayout(win.height);
 
         try renderTopBar(ui, win, .{ .title = owned_title });
 
-        var row: u16 = 2;
-        for (owned_lines) |line| {
-            const segs = [_]vaxis.Segment{.{ .text = line }};
-            _ = win.print(&segs, .{ .row_offset = row, .col_offset = 1, .wrap = .none });
-            row += 1;
+        if (layout.primary_row) |first_row| {
+            var row = first_row;
+            const body_end = layout.footer_row orelse win.height;
+            for (owned_lines) |line| {
+                if (row >= body_end) break;
+                const segs = [_]vaxis.Segment{.{ .text = line }};
+                _ = win.print(&segs, .{ .row_offset = row, .col_offset = 1, .wrap = .none });
+                row += 1;
+            }
         }
 
         try renderBottomBar(ui, win, .{ .left = "Enter confirm • Esc back" });
@@ -6147,14 +6219,19 @@ fn vaxisMessage(
         const win = ui.vx.window();
         win.clear();
         win.hideCursor();
+        const layout = compactDialogLayout(win.height);
 
         try renderTopBar(ui, win, .{ .title = title, .style = title_style });
 
-        const message_segments = [_]vaxis.Segment{.{ .text = message }};
-        _ = win.print(&message_segments, .{ .row_offset = 2, .col_offset = 1, .wrap = .none });
+        if (layout.primary_row) |row| {
+            const message_segments = [_]vaxis.Segment{.{ .text = message }};
+            _ = win.print(&message_segments, .{ .row_offset = row, .col_offset = 1, .wrap = .none });
+        }
 
-        const detail_segments = [_]vaxis.Segment{.{ .text = detail, .style = ui.styleMuted() }};
-        _ = win.print(&detail_segments, .{ .row_offset = 3, .col_offset = 1, .wrap = .none });
+        if (layout.secondary_row) |row| {
+            const detail_segments = [_]vaxis.Segment{.{ .text = detail, .style = ui.styleMuted() }};
+            _ = win.print(&detail_segments, .{ .row_offset = row, .col_offset = 1, .wrap = .none });
+        }
 
         try renderBottomBar(ui, win, .{ .left = "Enter/Esc continues · Ctrl+C back" });
         try ui.render();
@@ -6226,7 +6303,7 @@ fn renderCompactTopLine(ui: *Ui, win: anytype, title: []const u8, style: vaxis.S
 }
 
 fn renderCompactBottomLine(ui: *Ui, win: anytype, left: []const u8) !void {
-    if (win.height == 0) return;
+    if (win.height <= 1) return;
     const row: u16 = win.height - 1;
     const width: usize = if (win.width > 2) @intCast(win.width - 2) else 0;
     if (width == 0) return;
