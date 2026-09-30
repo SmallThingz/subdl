@@ -3297,7 +3297,11 @@ fn activateSettingsMainRow(
         4 => {
             state.settings.download_cache_enabled = !state.settings.download_cache_enabled;
             if (state.settings.download_cache_enabled) {
-                try refreshCachedDownloads(ui.allocator, state);
+                refreshCachedDownloads(ui.allocator, state) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                };
+            } else {
+                state.download_scan_error = null;
             }
             persist_settings = true;
         },
@@ -3742,9 +3746,23 @@ fn renderSettingsPopup(
         formatPersistenceFailure(&persistence_buf, failure)
     else
         null;
+    var download_error_buf: [160]u8 = undefined;
+    const download_error_banner: ?[]const u8 = if (state.settings.download_cache_enabled)
+        if (state.download_scan_error) |err|
+            std.fmt.bufPrint(
+                &download_error_buf,
+                "Download cache unavailable: {s}",
+                .{@errorName(err)},
+            ) catch "Download cache unavailable"
+        else
+            null
+    else
+        null;
     switch (panel) {
         .main => {
             if (persistence_banner) |banner| {
+                try printFitted(ui, win, y + 2, x + 2, banner, ui.styleWarn(), width -| 4);
+            } else if (download_error_banner) |banner| {
                 try printFitted(ui, win, y + 2, x + 2, banner, ui.styleWarn(), width -| 4);
             }
             var provider_buf: [64]u8 = undefined;
