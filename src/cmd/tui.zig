@@ -4382,8 +4382,63 @@ fn sanitizeExportFilename(allocator: std.mem.Allocator, input: []const u8) ![]u8
         };
         try out.append(allocator, safe);
     }
-    if (out.items.len == 0) try out.appendSlice(allocator, "subtitle.srt");
+
+    while (out.items.len > 0) {
+        const last = out.items[out.items.len - 1];
+        if (last != ' ' and last != '.') break;
+        out.items.len -= 1;
+    }
+    if (out.items.len == 0) {
+        try out.appendSlice(allocator, "subtitle.srt");
+    } else if (isWindowsReservedFilename(out.items)) {
+        try out.insert(allocator, 0, '_');
+    }
     return try out.toOwnedSlice(allocator);
+}
+
+fn isWindowsReservedFilename(name: []const u8) bool {
+    const stem_end = std.mem.indexOfScalar(u8, name, '.') orelse name.len;
+    const stem = name[0..stem_end];
+    if (stem.len == 0) return false;
+    if (std.ascii.eqlIgnoreCase(stem, "CON") or
+        std.ascii.eqlIgnoreCase(stem, "PRN") or
+        std.ascii.eqlIgnoreCase(stem, "AUX") or
+        std.ascii.eqlIgnoreCase(stem, "NUL") or
+        std.ascii.eqlIgnoreCase(stem, "CONIN$") or
+        std.ascii.eqlIgnoreCase(stem, "CONOUT$") or
+        std.ascii.eqlIgnoreCase(stem, "CLOCK$"))
+    {
+        return true;
+    }
+    if (stem.len == 4 and
+        (std.ascii.eqlIgnoreCase(stem[0..3], "COM") or
+            std.ascii.eqlIgnoreCase(stem[0..3], "LPT")) and
+        stem[3] >= '1' and stem[3] <= '9')
+    {
+        return true;
+    }
+    return false;
+}
+
+test "export filenames remain valid on Windows targets" {
+    const cases = [_]struct {
+        input: []const u8,
+        expected: []const u8,
+    }{
+        .{ .input = "movie?.srt", .expected = "movie_.srt" },
+        .{ .input = "movie. ", .expected = "movie" },
+        .{ .input = "...", .expected = "subtitle.srt" },
+        .{ .input = "CON.srt", .expected = "_CON.srt" },
+        .{ .input = "nul", .expected = "_nul" },
+        .{ .input = "Lpt9.ass", .expected = "_Lpt9.ass" },
+        .{ .input = "COM10.srt", .expected = "COM10.srt" },
+        .{ .input = "normal.srt", .expected = "normal.srt" },
+    };
+    for (cases) |case| {
+        const safe = try sanitizeExportFilename(std.testing.allocator, case.input);
+        defer std.testing.allocator.free(safe);
+        try std.testing.expectEqualStrings(case.expected, safe);
+    }
 }
 
 fn nextAvailableExportPath(allocator: std.mem.Allocator, out_dir: []const u8, filename: []const u8) ![]u8 {
