@@ -3676,6 +3676,7 @@ fn editSettingsPopup(
                     if (help_open) {
                         help_open = false;
                         redraw_background = true;
+                        continue;
                     }
                     const win_now = ui.vx.window();
                     const metrics_now = settingsPopupMetrics(win_now.width, win_now.height);
@@ -5587,11 +5588,8 @@ fn vaxisSelect(
                 },
                 .mouse => |mouse| {
                     if (info_menu_open) {
-                        if (mouse.type == .press) {
-                            info_menu_open = false;
-                        } else {
-                            continue;
-                        }
+                        if (mouse.type == .press) info_menu_open = false;
+                        continue;
                     }
                     if (handleMouseWheel(mouse, matches.items.len, &selected_row, provider_toggles == null, matches.items, enabled)) continue;
                     if (mouse.type == .press and mouse.button == .left) {
@@ -5895,11 +5893,8 @@ fn vaxisSelectSubtitle(
                 },
                 .mouse => |mouse| {
                     if (info_menu_open) {
-                        if (mouse.type == .press) {
-                            info_menu_open = false;
-                        } else {
-                            continue;
-                        }
+                        if (mouse.type == .press) info_menu_open = false;
+                        continue;
                     }
                     if (handleMouseWheel(mouse, matches.items.len, &selected_row, true, matches.items, enabled)) continue;
                     if (mouse.type == .press and mouse.button == .left) {
