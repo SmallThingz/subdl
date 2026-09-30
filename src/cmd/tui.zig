@@ -366,6 +366,16 @@ const IncrementalSearchWork = struct {
     task_count: usize = 0,
 };
 
+const SearchReaperJob = struct {
+    work: *IncrementalSearchWork,
+    done: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+};
+
+const SearchReaperEntry = struct {
+    future: std.Io.Future(void),
+    job: *SearchReaperJob,
+};
+
 const SubtitlesTask = struct {
     ref: app.SearchRef,
     page: usize = 1,
@@ -407,7 +417,7 @@ const Ui = struct {
     context_owned: ?[]u8 = null,
     active_provider: ?app.Provider = null,
     provider_enabled: [app.providerCount()]bool = app.providerSelectionNone(),
-    search_reapers: std.ArrayListUnmanaged(std.Io.Future(void)) = .empty,
+    search_reapers: std.ArrayListUnmanaged(SearchReaperEntry) = .empty,
 
     fn writer(self: *Ui) *std.Io.Writer {
         return self.tty.writer();
@@ -439,21 +449,43 @@ const Ui = struct {
 
     fn reapSearchWork(self: *Ui, work: *IncrementalSearchWork) bool {
         if (comptime builtin.single_threaded) return false;
+        self.collectSearchReapers();
+        const job = self.allocator.create(SearchReaperJob) catch return false;
+        job.* = .{ .work = work };
         var future = std.Io.concurrent(
             runtime_io.get(),
-            cancelIncrementalSearchWork,
-            .{work},
-        ) catch return false;
-        self.search_reapers.append(self.allocator, future) catch {
+            runSearchReaper,
+            .{job},
+        ) catch {
+            self.allocator.destroy(job);
+            return false;
+        };
+        self.search_reapers.append(self.allocator, .{ .future = future, .job = job }) catch {
             future.await(runtime_io.get());
+            self.allocator.destroy(job);
             return true;
         };
         return true;
     }
 
+    fn collectSearchReapers(self: *Ui) void {
+        var idx: usize = 0;
+        while (idx < self.search_reapers.items.len) {
+            const entry = &self.search_reapers.items[idx];
+            if (entry.job.done.load(.acquire) == 0) {
+                idx += 1;
+                continue;
+            }
+            entry.future.await(runtime_io.get());
+            self.allocator.destroy(entry.job);
+            _ = self.search_reapers.orderedRemove(idx);
+        }
+    }
+
     fn awaitSearchReapers(self: *Ui) void {
-        for (self.search_reapers.items) |*future| {
-            future.await(runtime_io.get());
+        for (self.search_reapers.items) |*entry| {
+            entry.future.await(runtime_io.get());
+            self.allocator.destroy(entry.job);
         }
         self.search_reapers.deinit(self.allocator);
         self.search_reapers = .empty;
@@ -890,6 +922,7 @@ fn runTui(ui: *Ui) !void {
     defer if (results) |*bundle| bundle.deinit(ui.allocator);
 
     while (true) {
+        ui.collectSearchReapers();
         ui.provider_enabled = state.settings.providers_enabled;
         if (info_open and !canRenderOverlayMenu(ui.vx.window())) info_open = false;
         focus = normalizeQueryFocus(
@@ -2884,6 +2917,11 @@ fn releaseIncrementalSearchWork(work: *IncrementalSearchWork) void {
 fn cancelIncrementalSearchWork(work: *IncrementalSearchWork) void {
     work.group.cancel(runtime_io.get());
     releaseIncrementalSearchWork(work);
+}
+
+fn runSearchReaper(job: *SearchReaperJob) void {
+    cancelIncrementalSearchWork(job.work);
+    job.done.store(1, .release);
 }
 
 fn queryPageSize(ui: *Ui) usize {
