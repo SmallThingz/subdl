@@ -3296,8 +3296,18 @@ fn editSettingsPopup(
                         ui.hardQuit();
                     }
                     if (key.matches('c', .{ .ctrl = true })) {
-                        if (settings_dirty) try saveTuiSettingsState(ui.allocator, state);
-                        return searchSettingsChanged(initial_settings, state.settings);
+                        if (settings_dirty) {
+                            try saveTuiSettingsState(ui.allocator, state);
+                            settings_dirty = false;
+                        }
+                        switch (panel) {
+                            .main => return searchSettingsChanged(initial_settings, state.settings),
+                            .providers, .languages, .cache_ttl => {
+                                panel = .main;
+                                ttl_error = null;
+                                continue;
+                            },
+                        }
                     }
                     switch (panel) {
                         .main => {
