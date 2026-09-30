@@ -4975,7 +4975,7 @@ fn vaxisSelect(
                             continue;
                         }
                         if (key.matches(vaxis.Key.backspace, .{})) {
-                            _ = filter.pop();
+                            popLastUtf8Codepoint(&filter);
                             try rebuildOptionMatches(ui.allocator, options, filter.items, &matches);
                             selected_row = 0;
                             scroll = 0;
@@ -5277,7 +5277,7 @@ fn vaxisSelectSubtitle(
                             continue;
                         }
                         if (key.matches(vaxis.Key.backspace, .{})) {
-                            _ = filter.pop();
+                            popLastUtf8Codepoint(&filter);
                             try rebuildSubtitleMatches(ui.allocator, subtitles, order, filter.items, &matches);
                             selected_row = 0;
                             scroll = 0;
@@ -5643,6 +5643,31 @@ fn prevCodepointStart(text: []const u8, cursor_pos: usize) usize {
     var i = cursor_pos - 1;
     while (i > 0 and (text[i] & 0b1100_0000) == 0b1000_0000) : (i -= 1) {}
     return i;
+}
+
+fn popLastUtf8Codepoint(text: *std.ArrayList(u8)) void {
+    if (text.items.len == 0) return;
+    const prev = prevCodepointStart(text.items, text.items.len);
+    text.items = text.items[0..prev];
+}
+
+test "filter backspace removes complete utf8 codepoints" {
+    var filter: std.ArrayList(u8) = .empty;
+    defer filter.deinit(std.testing.allocator);
+    try filter.appendSlice(std.testing.allocator, "aé界");
+
+    popLastUtf8Codepoint(&filter);
+    try std.testing.expectEqualStrings("aé", filter.items);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(filter.items));
+
+    popLastUtf8Codepoint(&filter);
+    try std.testing.expectEqualStrings("a", filter.items);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(filter.items));
+
+    popLastUtf8Codepoint(&filter);
+    try std.testing.expectEqualStrings("", filter.items);
+    popLastUtf8Codepoint(&filter);
+    try std.testing.expectEqualStrings("", filter.items);
 }
 
 fn nextCodepointEnd(text: []const u8, cursor_pos: usize) usize {
