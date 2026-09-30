@@ -5064,7 +5064,7 @@ fn vaxisSelect(
                         if (mouseRowIndex(mouse, list_top, list_bottom, scroll, matches.items.len)) |row_idx| {
                             const already_selected = row_idx == selected_row;
                             selected_row = row_idx;
-                            if (already_selected and selected_row < matches.items.len) {
+                            if (shouldActivateMouseSelection(filter_mode, already_selected, selected_row < matches.items.len)) {
                                 return .{ .selected = matches.items[selected_row] };
                             }
                         }
@@ -5396,7 +5396,8 @@ fn vaxisSelectSubtitle(
                             const already_selected = row_idx == selected_row;
                             selected_row = row_idx;
                             moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
-                            if (already_selected and selected_row < matches.items.len and enabled[matches.items[selected_row]]) {
+                            const selectable = selected_row < matches.items.len and enabled[matches.items[selected_row]];
+                            if (shouldActivateMouseSelection(filter_mode, already_selected, selectable)) {
                                 return .{ .selected = matches.items[selected_row] };
                             }
                         }
@@ -6275,6 +6276,17 @@ fn handleMouseWheel(
         },
         else => return false,
     }
+}
+
+fn shouldActivateMouseSelection(filter_mode: bool, already_selected: bool, selectable: bool) bool {
+    return !filter_mode and already_selected and selectable;
+}
+
+test "filter mode never activates selection on repeated mouse click" {
+    try std.testing.expect(shouldActivateMouseSelection(false, true, true));
+    try std.testing.expect(!shouldActivateMouseSelection(true, true, true));
+    try std.testing.expect(!shouldActivateMouseSelection(false, false, true));
+    try std.testing.expect(!shouldActivateMouseSelection(false, true, false));
 }
 
 const SearchDirection = enum {
