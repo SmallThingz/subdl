@@ -5555,17 +5555,13 @@ fn vaxisSelect(
                         continue;
                     }
                     if (key.matches(vaxis.Key.page_down, .{}) or key.matches(vaxis.Key.space, .{})) {
-                        const win_now = ui.vx.window();
-                        const page_now: usize = if (win_now.height > 7) @intCast(win_now.height - 7) else 1;
                         if (matches.items.len > 0) {
-                            selected_row = @min(matches.items.len - 1, selected_row + page_now);
+                            selected_row = @min(matches.items.len - 1, selected_row + page_size);
                         }
                         continue;
                     }
                     if (key.matches(vaxis.Key.page_up, .{}) or key.matches('b', .{})) {
-                        const win_now = ui.vx.window();
-                        const page_now: usize = if (win_now.height > 7) @intCast(win_now.height - 7) else 1;
-                        selected_row = selected_row -| page_now;
+                        selected_row = selected_row -| page_size;
                         continue;
                     }
                     if (key.matches('g', .{})) {
@@ -5893,18 +5889,14 @@ fn vaxisSelectSubtitle(
                         continue;
                     }
                     if (key.matches(vaxis.Key.page_down, .{}) or key.matches(vaxis.Key.space, .{})) {
-                        const win_now = ui.vx.window();
-                        const page_now: usize = if (win_now.height > 7) @intCast(win_now.height - 7) else 1;
                         if (matches.items.len > 0) {
-                            selected_row = @min(matches.items.len - 1, selected_row + page_now);
+                            selected_row = @min(matches.items.len - 1, selected_row + page_size);
                             moveSelectionToEnabled(matches.items, enabled, &selected_row, .forward);
                         }
                         continue;
                     }
                     if (key.matches(vaxis.Key.page_up, .{}) or key.matches('b', .{})) {
-                        const win_now = ui.vx.window();
-                        const page_now: usize = if (win_now.height > 7) @intCast(win_now.height - 7) else 1;
-                        selected_row = selected_row -| page_now;
+                        selected_row = selected_row -| page_size;
                         moveSelectionToEnabled(matches.items, enabled, &selected_row, .backward);
                         continue;
                     }
