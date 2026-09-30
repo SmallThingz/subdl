@@ -34,6 +34,7 @@ const Event = union(enum) {
     paste_start,
     paste_end,
     paste: []const u8,
+    search_reaper_done,
 };
 
 const InputResult = union(enum) {
@@ -357,6 +358,7 @@ const IncrementalSearchWork = struct {
 
 const SearchReaperJob = struct {
     work: *IncrementalSearchWork,
+    loop: *vaxis.Loop(Event),
     done: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 };
 
@@ -438,7 +440,7 @@ const Ui = struct {
         if (comptime builtin.single_threaded) return false;
         self.collectSearchReapers();
         const job = self.allocator.create(SearchReaperJob) catch return false;
-        job.* = .{ .work = work };
+        job.* = .{ .work = work, .loop = self.loop };
         var future = std.Io.concurrent(
             runtime_io.get(),
             runSearchReaper,
@@ -2438,6 +2440,7 @@ fn cancelIncrementalSearchWork(work: *IncrementalSearchWork) void {
 fn runSearchReaper(job: *SearchReaperJob) void {
     cancelIncrementalSearchWork(job.work);
     job.done.store(1, .release);
+    _ = job.loop.tryPostEvent(.search_reaper_done) catch false;
 }
 
 fn queryPageSize(ui: *Ui) usize {
@@ -6978,7 +6981,7 @@ test "search reaper backlog guard caps outstanding cleanup jobs" {
 
     while (initialized < jobs.len) : (initialized += 1) {
         const job = try allocator.create(SearchReaperJob);
-        job.* = .{ .work = undefined };
+        job.* = .{ .work = undefined, .loop = undefined };
         jobs[initialized] = job;
         try ui.search_reapers.append(allocator, .{
             .future = undefined,
@@ -6991,6 +6994,20 @@ test "search reaper backlog guard caps outstanding cleanup jobs" {
     }
 
     try std.testing.expect(ui.searchReaperBacklogFull());
+}
+
+test "search reaper completion wakes tui event loop" {
+    var loop: vaxis.Loop(Event) = .init(std.testing.io, undefined, undefined);
+    const work = try createIncrementalSearchWork("matrix");
+    var job: SearchReaperJob = .{
+        .work = work,
+        .loop = &loop,
+    };
+
+    runSearchReaper(&job);
+    try std.testing.expectEqual(@as(u8, 1), job.done.load(.acquire));
+    const event = (try loop.tryEvent()).?;
+    try std.testing.expect(event == .search_reaper_done);
 }
 
 test "settings persist independently from search cache state" {
