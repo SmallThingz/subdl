@@ -1620,8 +1620,8 @@ fn oldestCacheEntryIndex(entries: []const QueryCacheEntry) ?usize {
     return oldest;
 }
 
-fn upsertCacheEntry(allocator: std.mem.Allocator, state: *TuiRuntimeState, provider: app.Provider, query_norm: []const u8, page: u32, fetched_at_unix: i64, response: app.SearchResponse) !void {
-    if (!state.settings.cache_enabled) return;
+fn upsertCacheEntry(allocator: std.mem.Allocator, state: *TuiRuntimeState, provider: app.Provider, query_norm: []const u8, page: u32, fetched_at_unix: i64, response: app.SearchResponse) !bool {
+    if (!state.settings.cache_enabled) return false;
     const a = state.arena.allocator();
     var existing_idx: ?usize = null;
     for (state.cache_entries.items, 0..) |existing, idx| {
@@ -1654,6 +1654,7 @@ fn upsertCacheEntry(allocator: std.mem.Allocator, state: *TuiRuntimeState, provi
     if (state.arena_stale_mutations >= arena_compact_after_stale_mutations) {
         try compactRuntimeArena(allocator, state);
     }
+    return true;
 }
 
 fn cachedResponseFromSearch(allocator: std.mem.Allocator, response: app.SearchResponse) !CachedSearchResponse {
@@ -2337,7 +2338,7 @@ fn executeQuerySearchIncremental(
         }
         for (cache_response_indices[0..cache_response_count]) |response_index| {
             const response = bundle.searches.items[response_index];
-            try upsertCacheEntry(
+            if (try upsertCacheEntry(
                 ui.allocator,
                 state,
                 response.provider,
@@ -2345,8 +2346,9 @@ fn executeQuerySearchIncremental(
                 1,
                 scrapers.common.compatUnixTimestamp(),
                 response,
-            );
-            bundle.cache_changed = true;
+            )) {
+                bundle.cache_changed = true;
+            }
         }
         try runtime_io.get().sleep(.fromMilliseconds(if (dirty) search_active_poll_interval_ms else search_poll_interval_ms), .awake);
     }
@@ -6830,7 +6832,15 @@ test "runtime cache replacement stays bounded and compacts stale arena data" {
             .items = &.{},
         };
         defer response.deinit();
-        try upsertCacheEntry(allocator, &state, .subdl_com, "matrix", 1, @intCast(replacement), response);
+        try std.testing.expect(try upsertCacheEntry(
+            allocator,
+            &state,
+            .subdl_com,
+            "matrix",
+            1,
+            @intCast(replacement),
+            response,
+        ));
     }
     try std.testing.expectEqual(@as(usize, 1), state.cache_entries.items.len);
     try std.testing.expectEqualStrings("matrix", state.cache_entries.items[0].query_norm);
@@ -6844,6 +6854,39 @@ test "runtime cache replacement stays bounded and compacts stale arena data" {
     }
     try std.testing.expectEqual(max_keyword_entries, state.keywords.items.len);
     try std.testing.expect(state.arena_stale_mutations < arena_compact_after_stale_mutations);
+}
+
+test "disabled runtime cache does not mutate persistent search state" {
+    const allocator = std.testing.allocator;
+    var state: TuiRuntimeState = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .settings = defaultTuiSettings(),
+        .state_path = try allocator.dupe(u8, "state.test"),
+        .settings_path = try allocator.dupe(u8, "settings.test"),
+        .keyword_path = try allocator.dupe(u8, "keywords.test"),
+        .cache_root_path = try allocator.dupe(u8, "cache.test"),
+    };
+    defer state.deinit(allocator);
+    state.settings.cache_enabled = false;
+
+    var response: app.SearchResponse = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .provider = .subdl_com,
+        .items = &.{},
+    };
+    defer response.deinit();
+
+    try std.testing.expect(!(try upsertCacheEntry(
+        allocator,
+        &state,
+        .subdl_com,
+        "matrix",
+        1,
+        1,
+        response,
+    )));
+    try std.testing.expectEqual(@as(usize, 0), state.cache_entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.arena_stale_mutations);
 }
 
 test "download cache refresh discovers new files and exports the selected entry" {
