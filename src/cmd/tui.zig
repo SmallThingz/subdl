@@ -935,6 +935,15 @@ fn runTui(ui: *Ui) !void {
         ui.provider_enabled = state.settings.providers_enabled;
         if (info_open and !canRenderOverlayMenu(ui.vx.window())) info_open = false;
         const query_norm_view = normalizeQueryView(query.items);
+        if (query_norm_view.len == 0 and results != null) {
+            if (results) |*bundle| bundle.deinit(ui.allocator);
+            results = null;
+            ui.allocator.free(last_searched_norm);
+            last_searched_norm = try ui.allocator.dupe(u8, "");
+            selected_result = 0;
+            result_scroll = 0;
+            focus = .query;
+        }
         const query_dirty = !std.mem.eql(u8, query_norm_view, last_searched_norm);
         const has_current_results = !query_dirty and results != null and results.?.hits.items.len > 0;
         focus = normalizeQueryFocus(
