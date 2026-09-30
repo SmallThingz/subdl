@@ -3039,6 +3039,9 @@ fn activateSettingsMainRow(
         },
         4 => {
             state.settings.download_cache_enabled = !state.settings.download_cache_enabled;
+            if (state.settings.download_cache_enabled) {
+                try refreshCachedDownloads(ui.allocator, state);
+            }
             persist_settings = true;
         },
         5 => {
