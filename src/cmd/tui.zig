@@ -2060,13 +2060,15 @@ fn executeQuerySearchIncremental(
     startQueuedProviderSearches(search_group, tasks, task_count, &started_count, &in_flight);
     bundle.active_count = in_flight;
     bundle.queued_count = task_count - started_count;
+    var active_focus: QueryFocus = if (bundle.hits.items.len > 0) .results else .query;
+    var focus_explicit = false;
 
     try renderQueryHome(
         ui,
         state,
         query.items,
         cursor_pos.*,
-        if (bundle.hits.items.len > 0) .results else .query,
+        active_focus,
         false,
         &bundle,
         selected_result,
@@ -2109,6 +2111,7 @@ fn executeQuerySearchIncremental(
         startQueuedProviderSearches(search_group, tasks, task_count, &started_count, &in_flight);
         bundle.active_count = in_flight;
         bundle.queued_count = task_count - started_count;
+        if (!focus_explicit and bundle.hits.items.len > 0) active_focus = .results;
 
         var wheel_delta: i32 = 0;
         while (try ui.loop.tryEvent()) |event| {
@@ -2122,11 +2125,17 @@ fn executeQuerySearchIncremental(
                     }
                     if (mouseWheelDelta(mouse)) |delta| {
                         wheel_delta += delta;
+                        if (bundle.display_order.len > 0) {
+                            active_focus = .results;
+                            focus_explicit = true;
+                        }
                     } else if (mouse.type == .press and bundle.display_order.len > 0) switch (mouse.button) {
                         .left => {
                             const win = ui.vx.window();
                             if (mouseRowIndex(mouse, homeListTop(), homeListBottom(win.height), result_scroll.*, bundle.display_order.len)) |row_idx| {
                                 selected_result.* = row_idx;
+                                active_focus = .results;
+                                focus_explicit = true;
                             }
                         },
                         else => {},
@@ -2165,7 +2174,7 @@ fn executeQuerySearchIncremental(
                             state,
                             query.items,
                             cursor_pos.*,
-                            if (bundle.hits.items.len > 0) .results else .query,
+                            active_focus,
                             false,
                             &bundle,
                             selected_result,
@@ -2194,12 +2203,19 @@ fn executeQuerySearchIncremental(
                         if (canRenderOverlayMenu(ui.vx.window())) info_open.* = !info_open.*;
                         continue;
                     }
+                    if (key.matches(vaxis.Key.tab, .{})) {
+                        active_focus = nextQueryFocus(active_focus, bundle.display_order.len > 0, false);
+                        focus_explicit = true;
+                        continue;
+                    }
                     if (applyActiveSearchQueryCursorKey(
                         query.items,
                         cursor_pos,
                         key,
                         bundle.display_order.len > 0,
                     )) {
+                        active_focus = .query;
+                        focus_explicit = true;
                         continue;
                     }
                     if (try applyActiveSearchQueryEditKey(ui.allocator, query, cursor_pos, key)) {
@@ -2218,29 +2234,47 @@ fn executeQuerySearchIncremental(
                     }
                     if (bundle.display_order.len > 0 and key.matches(vaxis.Key.down, .{})) {
                         selected_result.* = @min(bundle.display_order.len - 1, selected_result.* + 1);
+                        active_focus = .results;
+                        focus_explicit = true;
                         continue;
                     }
                     if (bundle.display_order.len > 0 and key.matches(vaxis.Key.up, .{})) {
                         selected_result.* = selected_result.* -| 1;
+                        active_focus = .results;
+                        focus_explicit = true;
                         continue;
                     }
                     if (bundle.display_order.len > 0 and key.matches(vaxis.Key.page_down, .{})) {
                         selected_result.* = @min(bundle.display_order.len - 1, selected_result.* + queryPageSize(ui));
+                        active_focus = .results;
+                        focus_explicit = true;
                         continue;
                     }
                     if (key.matches(vaxis.Key.page_up, .{})) {
                         selected_result.* = selected_result.* -| queryPageSize(ui);
+                        if (bundle.display_order.len > 0) {
+                            active_focus = .results;
+                            focus_explicit = true;
+                        }
                         continue;
                     }
                     if (bundle.display_order.len > 0 and key.matches(vaxis.Key.end, .{})) {
                         selected_result.* = bundle.display_order.len - 1;
+                        active_focus = .results;
+                        focus_explicit = true;
                         continue;
                     }
                     if (key.matches(vaxis.Key.home, .{})) {
                         selected_result.* = 0;
+                        if (bundle.display_order.len > 0) {
+                            active_focus = .results;
+                            focus_explicit = true;
+                        }
                         continue;
                     }
                     if (bundle.display_order.len > 0 and key.matches(vaxis.Key.enter, .{})) {
+                        active_focus = .results;
+                        focus_explicit = true;
                         const visible_order = bundle.display_order;
                         if (selected_result.* >= visible_order.len) continue;
                         switch (try openSearchResult(ui, &bundle, visible_order[selected_result.*], state)) {
@@ -2295,7 +2329,8 @@ fn executeQuerySearchIncremental(
         }
         if (dirty) {
             clampSelection(selected_result, bundle.display_order.len);
-            try renderQueryHome(ui, state, query.items, cursor_pos.*, if (bundle.hits.items.len > 0) .results else .query, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
+            active_focus = normalizeQueryFocus(active_focus, bundle.display_order.len > 0, false);
+            try renderQueryHome(ui, state, query.items, cursor_pos.*, active_focus, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
         }
         for (cache_response_indices[0..cache_response_count]) |response_index| {
             const response = bundle.searches.items[response_index];
@@ -2317,10 +2352,11 @@ fn executeQuerySearchIncremental(
     bundle.searching = false;
     bundle.active_count = 0;
     bundle.queued_count = 0;
-    try renderQueryHome(ui, state, query.items, cursor_pos.*, if (bundle.hits.items.len > 0) .results else .query, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
+    active_focus = normalizeQueryFocus(active_focus, bundle.display_order.len > 0, false);
+    try renderQueryHome(ui, state, query.items, cursor_pos.*, active_focus, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
     return .{
         .bundle = bundle,
-        .focus = if (bundle.hits.items.len > 0) .results else .query,
+        .focus = active_focus,
     };
 }
 
