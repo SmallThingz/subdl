@@ -1296,9 +1296,9 @@ fn runTui(ui: *Ui) !void {
                         cursor_pos = prevCodepointStart(query.items, cursor_pos);
                     } else if (key.matches(vaxis.Key.right, .{})) {
                         cursor_pos = nextCodepointEnd(query.items, cursor_pos);
-                    } else if (key.matches('a', .{ .ctrl = true })) {
+                    } else if (key.matches(vaxis.Key.home, .{}) or key.matches('a', .{ .ctrl = true })) {
                         cursor_pos = 0;
-                    } else if (key.matches('e', .{ .ctrl = true })) {
+                    } else if (key.matches(vaxis.Key.end, .{}) or key.matches('e', .{ .ctrl = true })) {
                         cursor_pos = query.items.len;
                     } else if (key.matches('u', .{ .ctrl = true })) {
                         query.clearRetainingCapacity();
@@ -5306,9 +5306,9 @@ fn vaxisInput(
                         cursor_pos = prevCodepointStart(query.items, cursor_pos);
                     } else if (key.matches(vaxis.Key.right, .{})) {
                         cursor_pos = nextCodepointEnd(query.items, cursor_pos);
-                    } else if (key.matches('a', .{ .ctrl = true })) {
+                    } else if (key.matches(vaxis.Key.home, .{}) or key.matches('a', .{ .ctrl = true })) {
                         cursor_pos = 0;
-                    } else if (key.matches('e', .{ .ctrl = true })) {
+                    } else if (key.matches(vaxis.Key.end, .{}) or key.matches('e', .{ .ctrl = true })) {
                         cursor_pos = query.items.len;
                     } else if (key.matches('u', .{ .ctrl = true })) {
                         query.clearRetainingCapacity();
