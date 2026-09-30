@@ -670,8 +670,10 @@ fn isRemoteSearchFailure(err: anyerror) bool {
         error.InvalidFieldType,
         error.CloudflareChallenge,
         error.CloudflareSessionUnavailable,
+        error.InvalidSessionPayload,
         error.BrowserAutomationFailed,
         error.SessionExpired,
+        error.ProviderAccessBlocked,
         error.InvalidDownloadUrl,
         error.ConnectionRefused,
         error.ConnectionResetByPeer,
@@ -5240,14 +5242,43 @@ fn friendlyErrorMessage(err: anyerror) []const u8 {
         error.AccessDenied => "Permission denied while accessing this file or directory.",
         error.NotDir => "Expected a directory, but found a file instead.",
         error.UnexpectedHttpStatus => "Provider returned an unexpected HTTP status.",
+        error.HttpRequestFailed => "The HTTP request to the provider failed.",
         error.RateLimited => "Provider rate limit hit. Retry in a few moments.",
-        error.MissingField, error.InvalidField, error.InvalidFieldType => "Provider response format was not as expected.",
+        error.ConnectionRefused => "Provider refused the connection.",
+        error.ConnectionResetByPeer => "Provider closed the connection unexpectedly.",
+        error.ConnectionTimedOut => "Provider connection timed out.",
+        error.NetworkUnreachable => "The network is currently unreachable.",
+        error.TemporaryNameServerFailure, error.UnknownHostName => "Could not resolve the provider hostname.",
+        error.EndOfStream, error.ReadFailed => "Provider connection ended while reading the response.",
+        error.ParseFailed, error.MissingField, error.InvalidField, error.InvalidFieldType => "Provider response format was not as expected.",
+        error.InvalidDownloadUrl => "Provider returned an invalid download URL.",
+        error.ProviderAccessBlocked => "Provider blocked access from this connection or region.",
         error.CloudflareChallenge, error.CloudflareSessionUnavailable, error.SessionExpired => "Cloudflare session is missing or expired for this provider.",
+        error.InvalidSessionPayload => "Provider session data was invalid or incomplete.",
         error.BrowserAutomationFailed => "Browser automation failed while acquiring session cookies.",
         error.ArchiveExtractionUnavailable => "Archive extraction is not available for this archive format in this build.",
         error.ArchiveExtractionFailed => "Downloaded archive could not be extracted on this machine.",
         else => "An unexpected error occurred at this step.",
     };
+}
+
+test "friendly errors explain common provider network failures" {
+    try std.testing.expectEqualStrings(
+        "Provider connection timed out.",
+        friendlyErrorMessage(error.ConnectionTimedOut),
+    );
+    try std.testing.expectEqualStrings(
+        "Could not resolve the provider hostname.",
+        friendlyErrorMessage(error.UnknownHostName),
+    );
+    try std.testing.expectEqualStrings(
+        "Provider returned an invalid download URL.",
+        friendlyErrorMessage(error.InvalidDownloadUrl),
+    );
+    try std.testing.expectEqualStrings(
+        "Provider blocked access from this connection or region.",
+        friendlyErrorMessage(error.ProviderAccessBlocked),
+    );
 }
 
 fn vaxisStatus(ui: *Ui, title: []const u8, message: []const u8, detail: []const u8) !void {
@@ -7333,6 +7364,8 @@ test "remote search failures do not count as application failures" {
     try std.testing.expect(isRemoteSearchFailure(error.UnexpectedHttpStatus));
     try std.testing.expect(isRemoteSearchFailure(error.InvalidFieldType));
     try std.testing.expect(isRemoteSearchFailure(error.CloudflareSessionUnavailable));
+    try std.testing.expect(isRemoteSearchFailure(error.InvalidSessionPayload));
+    try std.testing.expect(isRemoteSearchFailure(error.ProviderAccessBlocked));
     try std.testing.expect(!isRemoteSearchFailure(error.OutOfMemory));
 
     const allocator = std.testing.allocator;
