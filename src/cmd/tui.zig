@@ -3165,6 +3165,10 @@ fn settingsPageSize(metrics: SettingsPopupMetrics) usize {
     return if (metrics.row_end > metrics.row_start) @intCast(metrics.row_end - metrics.row_start) else 1;
 }
 
+fn settingsMainItemCount(keyword_count: usize) usize {
+    return if (keyword_count > 0) 7 else 6;
+}
+
 fn settingsTtlCursorForClick(
     metrics: SettingsPopupMetrics,
     input_len: usize,
@@ -3210,6 +3214,11 @@ test "settings main list stays scrollable on short terminals" {
     var scroll: usize = 0;
     ensureVisible(6, &scroll, page_size);
     try std.testing.expectEqual(@as(usize, 5), scroll);
+}
+
+test "settings hides clear history when history is empty" {
+    try std.testing.expectEqual(@as(usize, 6), settingsMainItemCount(0));
+    try std.testing.expectEqual(@as(usize, 7), settingsMainItemCount(1));
 }
 
 fn activateSettingsMainRow(
@@ -3309,6 +3318,7 @@ fn editSettingsPopup(
         }
         const metrics = settingsPopupMetrics(win.width, win.height);
         const page_size = settingsPageSize(metrics);
+        clampSelection(&main_selected, settingsMainItemCount(state.keywords.items.len));
         ensureVisible(main_selected, &main_scroll, page_size);
         ensureVisible(provider_selected, &provider_scroll, page_size);
         ensureVisible(language_selected, &language_scroll, page_size);
@@ -3365,7 +3375,7 @@ fn editSettingsPopup(
                     const metrics_now = settingsPopupMetrics(win_now.width, win_now.height);
                     switch (panel) {
                         .main => {
-                            const item_count: usize = 7;
+                            const item_count = settingsMainItemCount(state.keywords.items.len);
                             switch (mouse.button) {
                                 .wheel_down => scrollSelection(&main_selected, item_count, .forward, 1),
                                 .wheel_up => scrollSelection(&main_selected, item_count, .backward, 1),
@@ -3483,7 +3493,7 @@ fn editSettingsPopup(
                     }
                     switch (panel) {
                         .main => {
-                            const item_count: usize = 7;
+                            const item_count = settingsMainItemCount(state.keywords.items.len);
                             if (key.matches(vaxis.Key.escape, .{})) return searchSettingsChanged(initial_settings, state.settings);
                             if (key.matches(vaxis.Key.down, .{})) {
                                 if (main_selected + 1 < item_count) main_selected += 1;
@@ -3645,7 +3655,7 @@ fn editSettingsPopup(
                 redraw_background = true;
             }
             switch (panel) {
-                .main => applyWheelDelta(&main_selected, 7, batch.wheel_delta, 1),
+                .main => applyWheelDelta(&main_selected, settingsMainItemCount(state.keywords.items.len), batch.wheel_delta, 1),
                 .providers => applyWheelDelta(&provider_selected, app.providerCount(), batch.wheel_delta, list_mouse_wheel_step),
                 .languages => applyWheelDelta(&language_selected, languageCount() + 1, batch.wheel_delta, list_mouse_wheel_step),
                 .cache_ttl => {},
@@ -3669,7 +3679,7 @@ fn renderSettingsPopup(
     ttl_cursor: usize,
     ttl_error: ?[]const u8,
 ) !void {
-    std.debug.assert(main_selected < 7);
+    std.debug.assert(main_selected < settingsMainItemCount(state.keywords.items.len));
     std.debug.assert(provider_selected < app.providerCount());
     std.debug.assert(language_selected <= languageCount());
     const metrics = settingsPopupMetrics(win.width, win.height);
@@ -3708,8 +3718,10 @@ fn renderSettingsPopup(
             var row_count: usize = 5;
             rows[row_count] = std.fmt.bufPrint(&history_buf, "History  {s}", .{if (state.settings.keyword_cache_enabled) "on" else "off"}) catch "History";
             row_count += 1;
-            rows[row_count] = "Clear history";
-            row_count += 1;
+            if (state.keywords.items.len > 0) {
+                rows[row_count] = "Clear history";
+                row_count += 1;
+            }
             var row = row_start;
             var idx = main_scroll;
             while (idx < row_count and row < row_end) : ({
