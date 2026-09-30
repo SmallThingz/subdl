@@ -1038,6 +1038,7 @@ fn runTui(ui: *Ui) !void {
                     if (info_open) {
                         if (mouse.type == .press) {
                             info_open = false;
+                            continue;
                         } else {
                             continue;
                         }
@@ -1157,10 +1158,8 @@ fn runTui(ui: *Ui) !void {
                             info_open = false;
                             continue;
                         }
-                        // Help is informational, not a modal dialog. Dismiss it
-                        // on the next actionable key and process that same key
-                        // so typing/navigation is never swallowed.
                         info_open = false;
+                        continue;
                     }
 
                     if (key.matches(vaxis.Key.f1, .{})) {
@@ -1407,7 +1406,10 @@ fn runTui(ui: *Ui) !void {
             }
         }
         if (batch.wheel_delta != 0) {
-            if (info_open) info_open = false;
+            if (info_open) {
+                info_open = false;
+                continue;
+            }
             if (focus == .downloads and state.settings.download_cache_enabled) {
                 applyWheelDelta(&selected_download, state.download_entries.len, batch.wheel_delta, list_mouse_wheel_step);
             } else if (!query_dirty) {
@@ -2340,6 +2342,7 @@ fn executeQuerySearchIncremental(
                     if (info_open.*) {
                         if (mouse.type == .press) {
                             info_open.* = false;
+                            continue;
                         } else {
                             continue;
                         }
@@ -2407,6 +2410,7 @@ fn executeQuerySearchIncremental(
                             continue;
                         }
                         info_open.* = false;
+                        continue;
                     }
                     if (key.matches(vaxis.Key.escape, .{})) {
                         const search_settings_changed = try editSettingsPopup(
@@ -3829,6 +3833,7 @@ fn editSettingsPopup(
             if (help_open) {
                 help_open = false;
                 redraw_background = true;
+                continue;
             }
             if (!settingsPopupInteractive(settingsPopupMetrics(ui.vx.window().width, ui.vx.window().height))) continue;
             switch (panel) {
