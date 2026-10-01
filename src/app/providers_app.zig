@@ -73,6 +73,7 @@ pub const Provider = enum {
     animesub_info,
     animetosho_xyz,
     kitsunekko_net,
+    thesubtitledb_org,
     subhd_tv,
     fansubs_ru,
     legendei_net,
@@ -118,6 +119,7 @@ const provider_values = [_]Provider{
     .animesub_info,
     .animetosho_xyz,
     .kitsunekko_net,
+    .thesubtitledb_org,
     .fansubs_ru,
     .legendei_net,
     .zoom_lk,
@@ -185,6 +187,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .animesub_info => "animesub_info",
         .animetosho_xyz => "animetosho_xyz",
         .kitsunekko_net => "kitsunekko_net",
+        .thesubtitledb_org => "thesubtitledb_org",
         .subhd_tv => "subhd_tv",
         .fansubs_ru => "fansubs_ru",
         .legendei_net => "legendei_net",
@@ -267,6 +270,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .animesub_info => "AnimeSub.info",
         .animetosho_xyz => "AnimeTosho",
         .kitsunekko_net => "Kitsunekko",
+        .thesubtitledb_org => "TheSubtitleDB",
         .subhd_tv => "SubHD",
         .fansubs_ru => "Fansubs.ru",
         .legendei_net => "Legendei",
@@ -322,6 +326,7 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .animesub_info => "http://animesub.info",
         .animetosho_xyz => "https://animetosho.net",
         .kitsunekko_net => "https://kitsunekko.net",
+        .thesubtitledb_org => "https://thesubtitledb.org",
         .subhd_tv => "https://subhd.tv",
         .fansubs_ru => "http://fansubs.ru",
         .legendei_net => "https://legendei.net",
@@ -672,6 +677,16 @@ pub const SearchRef = union(Provider) {
         language_code: []const u8,
         season: ?u16,
         episode: ?u16,
+        page_url: []const u8,
+    },
+    thesubtitledb_org: struct {
+        title: []const u8,
+        year: ?i64,
+        media_kind: subdl.thesubtitledb_org.MediaKind,
+        imdb_id: []const u8,
+        season: ?u16,
+        episode: ?u16,
+        language_code: []const u8,
         page_url: []const u8,
     },
     subhd_tv: struct {
@@ -1748,6 +1763,39 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                         .language_code = try a.dupe(u8, item.language_code),
                         .season = item.season,
                         .episode = item.episode,
+                        .page_url = try a.dupe(u8, item.page_url),
+                    } },
+                });
+            }
+        },
+        .thesubtitledb_org => {
+            var scraper = subdl.thesubtitledb_org.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+            const requested_language = subdl.thesubtitledb_org.providerLanguageCode(options.language_code orelse "en") orelse "en";
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                const label = if (item.episode) |episode|
+                    if (item.year) |year|
+                        try std.fmt.allocPrint(a, "[tv] {s} S{d:0>2}E{d:0>2} ({d})", .{ title, item.season orelse 1, episode, year })
+                    else
+                        try std.fmt.allocPrint(a, "[tv] {s} S{d:0>2}E{d:0>2}", .{ title, item.season orelse 1, episode })
+                else if (item.year) |year|
+                    try std.fmt.allocPrint(a, "[{s}] {s} ({d})", .{ @tagName(item.media_kind), title, year })
+                else
+                    try std.fmt.allocPrint(a, "[{s}] {s}", .{ @tagName(item.media_kind), title });
+                try out.append(a, .{
+                    .label = label,
+                    .ref = .{ .thesubtitledb_org = .{
+                        .title = title,
+                        .year = item.year,
+                        .media_kind = item.media_kind,
+                        .imdb_id = try a.dupe(u8, item.imdb_id),
+                        .season = item.season,
+                        .episode = item.episode,
+                        .language_code = try a.dupe(u8, requested_language),
                         .page_url = try a.dupe(u8, item.page_url),
                     } },
                 });
@@ -3220,6 +3268,35 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .thesubtitledb_org => |item| {
+            title = try a.dupe(u8, item.title);
+            var scraper = subdl.thesubtitledb_org.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            const query_item: subdl.thesubtitledb_org.SearchItem = .{
+                .title = item.title,
+                .year = item.year,
+                .media_kind = item.media_kind,
+                .imdb_id = item.imdb_id,
+                .season = item.season,
+                .episode = item.episode,
+                .page_url = item.page_url,
+            };
+            var subtitles = try scraper.fetchSubtitlesBySearchItem(query_item, item.language_code);
+            defer subtitles.deinit();
+            for (subtitles.subtitles) |subtitle| {
+                const display_name = if (subtitle.hearing_impaired)
+                    try std.fmt.allocPrint(a, "{s} [HI]", .{subtitle.release_name})
+                else
+                    subtitle.release_name;
+                const label = try subtitleLabel(a, subtitle.language_code, display_name, subtitle.download_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try a.dupe(u8, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
         .subhd_tv => |item| {
             title = try a.dupe(u8, item.title);
             var scraper = subdl.subhd_tv.Scraper.init(allocator, client);
@@ -3626,6 +3703,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .animesub_info => |item| item.title,
         .animetosho_xyz => |item| item.title,
         .kitsunekko_net => |item| item.title,
+        .thesubtitledb_org => |item| item.title,
         .subhd_tv => |item| item.title,
         .fansubs_ru => |item| item.title,
         .legendei_net => |item| item.title,
@@ -4841,6 +4919,7 @@ fn liveQueryForProvider(provider: Provider) []const u8 {
         .animesub_info => "Spirited Away",
         .animetosho_xyz => "Spirited Away",
         .kitsunekko_net => "Spirited Away",
+        .thesubtitledb_org => "Inception",
         .subhd_tv => "The Matrix",
         .fansubs_ru => "Spirited Away",
         .legendei_net => "The Matrix Resurrections",
@@ -4898,6 +4977,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .animesub_info => |item| item.page_url,
         .animetosho_xyz => |item| item.page_url,
         .kitsunekko_net => |item| item.page_url,
+        .thesubtitledb_org => |item| item.page_url,
         .subhd_tv => |item| item.detail_url,
         .fansubs_ru => |item| item.page_url,
         .legendei_net => |item| item.page_url,
@@ -4995,6 +5075,7 @@ test "active provider registry excludes retired providers" {
         "animesub_info",
         "animetosho_xyz",
         "kitsunekko_net",
+        "thesubtitledb_org",
         "fansubs_ru",
         "legendei_net",
         "zoom_lk",
@@ -5061,6 +5142,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("animesub.info") == .animesub_info);
     try std.testing.expect(parseProvider("animetosho.xyz") == .animetosho_xyz);
     try std.testing.expect(parseProvider("kitsunekko.net") == .kitsunekko_net);
+    try std.testing.expect(parseProvider("thesubtitledb.org") == .thesubtitledb_org);
     try std.testing.expect(parseProvider("subhd.tv") == null);
     try std.testing.expect(parseProvider("fansubs.ru") == .fansubs_ru);
     try std.testing.expect(parseProvider("legendei.net") == .legendei_net);
@@ -5107,6 +5189,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("animesub_i") == .animesub_info);
     try std.testing.expect(try resolveProvider("animetosho") == .animetosho_xyz);
     try std.testing.expect(try resolveProvider("kitsunekko") == .kitsunekko_net);
+    try std.testing.expect(try resolveProvider("thesubtitledb") == .thesubtitledb_org);
     try std.testing.expectError(error.AmbiguousProvider, resolveProvider("sub"));
     try std.testing.expectError(error.UnknownProvider, resolveProvider("subhd"));
     try std.testing.expect(try resolveProvider("fansubs") == .fansubs_ru);
@@ -5499,6 +5582,7 @@ fn seriesQueryForProvider(provider: Provider) []const u8 {
         .animesub_info => "Death Note",
         .animetosho_xyz => "Death Note S01E01",
         .kitsunekko_net => "Death Note S01E01",
+        .thesubtitledb_org => "Breaking Bad S01E01",
         .subhd_tv => "Chernobyl S01E01",
         .fansubs_ru => "Death Note",
         .legendei_net => "Chernobyl S01E01",
@@ -5619,6 +5703,7 @@ const tui_smoke_providers = [_]Provider{
     .animesub_info,
     .animetosho_xyz,
     .kitsunekko_net,
+    .thesubtitledb_org,
     .fansubs_ru,
     .legendei_net,
     .zoom_lk,
@@ -5889,6 +5974,10 @@ test "live providers_app tui-path smoke provider: kitsunekko.net" {
     try runSingleProviderSmokeTest(.kitsunekko_net);
 }
 
+test "live providers_app tui-path smoke provider: thesubtitledb.org" {
+    try runSingleProviderSmokeTest(.thesubtitledb_org);
+}
+
 test "live providers_app tui-path smoke provider: subhd.tv" {
     try runSingleProviderSmokeTest(.subhd_tv);
 }
@@ -6051,6 +6140,10 @@ test "live series download path provider: animetosho.xyz" {
 
 test "live series download path provider: kitsunekko.net" {
     try runSingleProviderSeriesTest(.kitsunekko_net);
+}
+
+test "live series download path provider: thesubtitledb.org" {
+    try runSingleProviderSeriesTest(.thesubtitledb_org);
 }
 
 test "live series download path provider: subhd.tv" {

@@ -366,6 +366,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "animesub.info", .timeout_seconds = 180 },
     .{ .name = "animetosho.xyz", .timeout_seconds = 120 },
     .{ .name = "kitsunekko.net", .timeout_seconds = 120 },
+    .{ .name = "thesubtitledb.org", .timeout_seconds = 120 },
     .{ .name = "subhd.tv", .timeout_seconds = 120, .serial = true, .active = false },
     .{ .name = "fansubs.ru" },
     .{ .name = "legendei.net" },

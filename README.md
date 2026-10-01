@@ -3,13 +3,13 @@
 Subtitle scrapers in Zig with a shared provider API and a single `scrapers` binary.
 
 ![Zig](https://img.shields.io/badge/Zig-0.16.0--dev-f7a41d)
-![Providers](https://img.shields.io/badge/Active_Providers-40-2ea44f)
+![Providers](https://img.shields.io/badge/Active_Providers-41-2ea44f)
 ![Runtime](https://img.shields.io/badge/HTTP-std.http%20(Client)-0366d6)
 
 ## Overview
 
-- 40 currently active providers behind one app layer: `providers_app`
-- 50 provider implementations retained and covered by targeted live tests
+- 41 currently active providers behind one app layer: `providers_app`
+- 51 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
 - TUI mode available with `--tui` in the default build
@@ -57,6 +57,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `animesub_info` | `animesub.info` |
 | `animetosho_xyz` | `animetosho.xyz` |
 | `kitsunekko_net` | `kitsunekko.net` |
+| `thesubtitledb_org` | `thesubtitledb.org` |
 | `fansubs_ru` | `fansubs.ru` |
 | `legendei_net` | `legendei.net` |
 | `zoom_lk` | `zoom.lk` |
@@ -99,6 +100,7 @@ be detected without advertising a known-unusable provider in the CLI/TUI.
 `animesub_info` provides Polish anime movie and TV subtitles.
 `animetosho_xyz` provides multi-language anime movie and TV subtitles through AnimeTosho's public feed and verified XZ attachment downloads.
 `kitsunekko_net` provides English and Japanese anime subtitles from the public Kitsunekko title directories; RAR and 7z entries are intentionally excluded.
+`thesubtitledb_org` provides public multi-language movie and TV subtitles via IMDb title resolution and TheSubtitleDB's direct file API; no API key is required.
 `fansubs_ru` provides Russian anime movie and TV subtitles.
 `legendei_net` provides Portuguese movie and TV subtitle archives, with language-specific posts when available.
 `zoom_lk` provides Sinhala movie and TV season subtitle archives.
