@@ -2177,6 +2177,17 @@ fn cloneSearchRef(allocator: std.mem.Allocator, ref: app.SearchRef) !app.SearchR
             .language_code = try allocator.dupe(u8, item.language_code),
             .page_url = try allocator.dupe(u8, item.page_url),
         } },
+        .napisy24_pl => |item| .{ .napisy24_pl = .{
+            .title = try allocator.dupe(u8, item.title),
+            .year = item.year,
+            .media_kind = item.media_kind,
+            .imdb_id = try allocator.dupe(u8, item.imdb_id),
+            .season = item.season,
+            .episode = item.episode,
+            .search_query = try allocator.dupe(u8, item.search_query),
+            .language_code = try allocator.dupe(u8, item.language_code),
+            .page_url = try allocator.dupe(u8, item.page_url),
+        } },
         .subhd_tv => |item| .{ .subhd_tv = .{
             .title = try allocator.dupe(u8, item.title),
             .release_info = try allocator.dupe(u8, item.release_info),

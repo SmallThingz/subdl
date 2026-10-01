@@ -74,6 +74,7 @@ pub const Provider = enum {
     animetosho_xyz,
     kitsunekko_net,
     thesubtitledb_org,
+    napisy24_pl,
     subhd_tv,
     fansubs_ru,
     legendei_net,
@@ -120,6 +121,7 @@ const provider_values = [_]Provider{
     .animetosho_xyz,
     .kitsunekko_net,
     .thesubtitledb_org,
+    .napisy24_pl,
     .fansubs_ru,
     .legendei_net,
     .zoom_lk,
@@ -188,6 +190,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .animetosho_xyz => "animetosho_xyz",
         .kitsunekko_net => "kitsunekko_net",
         .thesubtitledb_org => "thesubtitledb_org",
+        .napisy24_pl => "napisy24_pl",
         .subhd_tv => "subhd_tv",
         .fansubs_ru => "fansubs_ru",
         .legendei_net => "legendei_net",
@@ -271,6 +274,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .animetosho_xyz => "AnimeTosho",
         .kitsunekko_net => "Kitsunekko",
         .thesubtitledb_org => "TheSubtitleDB",
+        .napisy24_pl => "Napisy24",
         .subhd_tv => "SubHD",
         .fansubs_ru => "Fansubs.ru",
         .legendei_net => "Legendei",
@@ -327,6 +331,7 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .animetosho_xyz => "https://animetosho.net",
         .kitsunekko_net => "https://kitsunekko.net",
         .thesubtitledb_org => "https://thesubtitledb.org",
+        .napisy24_pl => "https://napisy24.pl",
         .subhd_tv => "https://subhd.tv",
         .fansubs_ru => "http://fansubs.ru",
         .legendei_net => "https://legendei.net",
@@ -686,6 +691,17 @@ pub const SearchRef = union(Provider) {
         imdb_id: []const u8,
         season: ?u16,
         episode: ?u16,
+        language_code: []const u8,
+        page_url: []const u8,
+    },
+    napisy24_pl: struct {
+        title: []const u8,
+        year: ?i64,
+        media_kind: subdl.napisy24_pl.MediaKind,
+        imdb_id: []const u8,
+        season: ?u16,
+        episode: ?u16,
+        search_query: []const u8,
         language_code: []const u8,
         page_url: []const u8,
     },
@@ -1795,6 +1811,40 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                         .imdb_id = try a.dupe(u8, item.imdb_id),
                         .season = item.season,
                         .episode = item.episode,
+                        .language_code = try a.dupe(u8, requested_language),
+                        .page_url = try a.dupe(u8, item.page_url),
+                    } },
+                });
+            }
+        },
+        .napisy24_pl => {
+            const requested_language = subdl.napisy24_pl.providerLanguageCode(options.language_code orelse "en") orelse "en";
+            var scraper = subdl.napisy24_pl.Scraper.initWithLanguage(allocator, client, requested_language);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                const label = if (item.episode) |episode|
+                    if (item.year) |year|
+                        try std.fmt.allocPrint(a, "[tv] {s} S{d:0>2}E{d:0>2} ({d})", .{ title, item.season orelse 1, episode, year })
+                    else
+                        try std.fmt.allocPrint(a, "[tv] {s} S{d:0>2}E{d:0>2}", .{ title, item.season orelse 1, episode })
+                else if (item.year) |year|
+                    try std.fmt.allocPrint(a, "[movie] {s} ({d})", .{ title, year })
+                else
+                    try std.fmt.allocPrint(a, "[movie] {s}", .{title});
+                try out.append(a, .{
+                    .label = label,
+                    .ref = .{ .napisy24_pl = .{
+                        .title = title,
+                        .year = item.year,
+                        .media_kind = item.media_kind,
+                        .imdb_id = try a.dupe(u8, item.imdb_id),
+                        .season = item.season,
+                        .episode = item.episode,
+                        .search_query = try a.dupe(u8, item.search_query),
                         .language_code = try a.dupe(u8, requested_language),
                         .page_url = try a.dupe(u8, item.page_url),
                     } },
@@ -3297,6 +3347,32 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .napisy24_pl => |item| {
+            title = try a.dupe(u8, item.title);
+            var scraper = subdl.napisy24_pl.Scraper.initWithLanguage(allocator, client, item.language_code);
+            defer scraper.deinit();
+            const query_item: subdl.napisy24_pl.SearchItem = .{
+                .title = item.title,
+                .year = item.year,
+                .media_kind = item.media_kind,
+                .imdb_id = item.imdb_id,
+                .season = item.season,
+                .episode = item.episode,
+                .search_query = item.search_query,
+                .page_url = item.page_url,
+            };
+            var subtitles = try scraper.fetchSubtitlesBySearchItem(query_item, item.language_code);
+            defer subtitles.deinit();
+            for (subtitles.subtitles) |subtitle| {
+                const label = try subtitleLabel(a, subtitle.language_code, subtitle.release_name, subtitle.download_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try a.dupe(u8, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
         .subhd_tv => |item| {
             title = try a.dupe(u8, item.title);
             var scraper = subdl.subhd_tv.Scraper.init(allocator, client);
@@ -3704,6 +3780,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .animetosho_xyz => |item| item.title,
         .kitsunekko_net => |item| item.title,
         .thesubtitledb_org => |item| item.title,
+        .napisy24_pl => |item| item.title,
         .subhd_tv => |item| item.title,
         .fansubs_ru => |item| item.title,
         .legendei_net => |item| item.title,
@@ -4347,8 +4424,8 @@ fn resolveDownloadUrlIfNeeded(allocator: Allocator, client: *std.http.Client, do
 /// Download fetch has provider-specific recovery hooks because several sites
 /// accept normal search requests but protect binary/archive endpoints.
 fn fetchDownloadBytes(client: *std.http.Client, allocator: Allocator, url: []const u8) !common.HttpResponse {
-    const yify_referer = yifyRefererForUrl(url);
-    const provider_headers = if (yify_referer) |referer|
+    const download_referer = downloadRefererForUrl(url);
+    const provider_headers = if (download_referer) |referer|
         &[_]std.http.Header{.{ .name = "referer", .value = referer }}
     else
         &[_]std.http.Header{};
@@ -4366,13 +4443,21 @@ fn fetchDownloadBytes(client: *std.http.Client, allocator: Allocator, url: []con
 
     if (was_forbidden) {
         if (cloudflareTargetForUrl(url)) |target| {
-            const with_cf = try fetchBytesWithCloudflareSession(client, allocator, url, target.domain, target.challenge_url, "*/*", yify_referer);
+            const with_cf = try fetchBytesWithCloudflareSession(client, allocator, url, target.domain, target.challenge_url, "*/*", download_referer);
             if (with_cf.status == .ok) return with_cf;
             allocator.free(with_cf.body);
         }
     }
 
     return error.UnexpectedHttpStatus;
+}
+
+fn downloadRefererForUrl(url: []const u8) ?[]const u8 {
+    if (yifyRefererForUrl(url)) |referer| return referer;
+    if (std.mem.indexOf(u8, url, "://napisy24.pl/run/pages/download.php") != null) {
+        return "https://napisy24.pl/";
+    }
+    return null;
 }
 
 const CloudflareTarget = struct {
@@ -4920,6 +5005,7 @@ fn liveQueryForProvider(provider: Provider) []const u8 {
         .animetosho_xyz => "Spirited Away",
         .kitsunekko_net => "Spirited Away",
         .thesubtitledb_org => "Inception",
+        .napisy24_pl => "Avatar",
         .subhd_tv => "The Matrix",
         .fansubs_ru => "Spirited Away",
         .legendei_net => "The Matrix Resurrections",
@@ -4978,6 +5064,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .animetosho_xyz => |item| item.page_url,
         .kitsunekko_net => |item| item.page_url,
         .thesubtitledb_org => |item| item.page_url,
+        .napisy24_pl => |item| item.page_url,
         .subhd_tv => |item| item.detail_url,
         .fansubs_ru => |item| item.page_url,
         .legendei_net => |item| item.page_url,
@@ -5076,6 +5163,7 @@ test "active provider registry excludes retired providers" {
         "animetosho_xyz",
         "kitsunekko_net",
         "thesubtitledb_org",
+        "napisy24_pl",
         "fansubs_ru",
         "legendei_net",
         "zoom_lk",
@@ -5143,6 +5231,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("animetosho.xyz") == .animetosho_xyz);
     try std.testing.expect(parseProvider("kitsunekko.net") == .kitsunekko_net);
     try std.testing.expect(parseProvider("thesubtitledb.org") == .thesubtitledb_org);
+    try std.testing.expect(parseProvider("napisy24.pl") == .napisy24_pl);
     try std.testing.expect(parseProvider("subhd.tv") == null);
     try std.testing.expect(parseProvider("fansubs.ru") == .fansubs_ru);
     try std.testing.expect(parseProvider("legendei.net") == .legendei_net);
@@ -5190,6 +5279,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("animetosho") == .animetosho_xyz);
     try std.testing.expect(try resolveProvider("kitsunekko") == .kitsunekko_net);
     try std.testing.expect(try resolveProvider("thesubtitledb") == .thesubtitledb_org);
+    try std.testing.expect(try resolveProvider("napisy24") == .napisy24_pl);
     try std.testing.expectError(error.AmbiguousProvider, resolveProvider("sub"));
     try std.testing.expectError(error.UnknownProvider, resolveProvider("subhd"));
     try std.testing.expect(try resolveProvider("fansubs") == .fansubs_ru);
@@ -5327,9 +5417,10 @@ test "google translate result parser extracts text chunks" {
     try std.testing.expectEqualStrings("hello world", text);
 }
 
-test "yify referer is only added for yifysubtitles hosts" {
-    try std.testing.expectEqualStrings("https://yifysubtitles.ch/", yifyRefererForUrl("https://yifysubtitles.ch/subtitle/test.zip").?);
-    try std.testing.expect(yifyRefererForUrl("https://www.opensubtitles.com/file.zip") == null);
+test "download referer is scoped to providers that require it" {
+    try std.testing.expectEqualStrings("https://yifysubtitles.ch/", downloadRefererForUrl("https://yifysubtitles.ch/subtitle/test.zip").?);
+    try std.testing.expectEqualStrings("https://napisy24.pl/", downloadRefererForUrl("https://napisy24.pl/run/pages/download.php?napisId=123&typ=sr").?);
+    try std.testing.expect(downloadRefererForUrl("https://www.opensubtitles.com/file.zip") == null);
 }
 
 test "cloudflare target excludes yify downloads" {
@@ -5583,6 +5674,7 @@ fn seriesQueryForProvider(provider: Provider) []const u8 {
         .animetosho_xyz => "Death Note S01E01",
         .kitsunekko_net => "Death Note S01E01",
         .thesubtitledb_org => "Breaking Bad S01E01",
+        .napisy24_pl => "Breaking Bad S01E01",
         .subhd_tv => "Chernobyl S01E01",
         .fansubs_ru => "Death Note",
         .legendei_net => "Chernobyl S01E01",
@@ -5704,6 +5796,7 @@ const tui_smoke_providers = [_]Provider{
     .animetosho_xyz,
     .kitsunekko_net,
     .thesubtitledb_org,
+    .napisy24_pl,
     .fansubs_ru,
     .legendei_net,
     .zoom_lk,
@@ -5978,6 +6071,10 @@ test "live providers_app tui-path smoke provider: thesubtitledb.org" {
     try runSingleProviderSmokeTest(.thesubtitledb_org);
 }
 
+test "live providers_app tui-path smoke provider: napisy24.pl" {
+    try runSingleProviderSmokeTest(.napisy24_pl);
+}
+
 test "live providers_app tui-path smoke provider: subhd.tv" {
     try runSingleProviderSmokeTest(.subhd_tv);
 }
@@ -6144,6 +6241,10 @@ test "live series download path provider: kitsunekko.net" {
 
 test "live series download path provider: thesubtitledb.org" {
     try runSingleProviderSeriesTest(.thesubtitledb_org);
+}
+
+test "live series download path provider: napisy24.pl" {
+    try runSingleProviderSeriesTest(.napisy24_pl);
 }
 
 test "live series download path provider: subhd.tv" {
