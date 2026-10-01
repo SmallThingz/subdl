@@ -3,12 +3,12 @@
 Subtitle scrapers in Zig with a shared provider API and a single `scrapers` binary.
 
 ![Zig](https://img.shields.io/badge/Zig-0.16.0--dev-f7a41d)
-![Providers](https://img.shields.io/badge/Active_Providers-37-2ea44f)
+![Providers](https://img.shields.io/badge/Active_Providers-40-2ea44f)
 ![Runtime](https://img.shields.io/badge/HTTP-std.http%20(Client)-0366d6)
 
 ## Overview
 
-- 37 currently active providers behind one app layer: `providers_app`
+- 40 currently active providers behind one app layer: `providers_app`
 - 47 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
@@ -27,18 +27,21 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 |---|---|
 | `subdl_com` | `subdl.com` |
 | `opensubtitles_com` | `opensubtitles.com` |
+| `moviesubtitles_org` | `moviesubtitles.org` |
 | `yifysubtitles_ch` | `yifysubtitles.ch` |
 | `subtitlecat_com` | `subtitlecat.com` |
 | `isubtitles_org` | `isubtitles.org` |
 | `subsource_net` | `subsource.net` |
 | `sub_scene_com` | `sub-scene.com` |
 | `gestdown_info` | `gestdown.info` |
+| `greek_subtitles_com` | `greek-subtitles.com` |
 | `subsunacs_net` | `subsunacs.net` |
 | `subtitles_ajatt_top` | `subtitles.ajatt.top` |
 | `greeksubs_net` | `greeksubs.net` |
 | `indexsubtitle_cc` | `indexsubtitle.cc` |
 | `sous_titres_eu` | `sous-titres.eu` |
 | `cc_edatribe_com` | `cc.edatribe.com` |
+| `subtitrari_noi_ro` | `subtitrari-noi.ro` |
 | `subs_ro` | `subs.ro` |
 | `subs4free_info` | `subs4free.info` |
 | `tsukihime_org` | `tsukihime.org` |
@@ -63,14 +66,12 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `grupahatak_pl` | `grupahatak.pl` |
 | `jimaku_cc` | `jimaku.cc` |
 
-Retained inactive implementations are `opensubtitles_org`, `moviesubtitles_org`,
-`moviesubtitlesrt_com`, `my_subs_co` while `my-subs.co` has no resolvable DNS record,
-`podnapisi_net`, `tvsubtitles_net`,
-`greek_subtitles_com` while its movie search is currently unreliable,
-`subtitrari_noi_ro` while its upstream host is intermittently refusing connections,
-`subtis_io` while `api.subt.is` has no DNS A record, and
-`animesubtitle_ir` while both its WordPress REST and HTML title-search paths
-return upstream HTTP 500 responses. They stay in
+Retained inactive implementations are `opensubtitles_org` and `tvsubtitles_net`
+because their current user path is blocked by the Australian website-block page,
+`moviesubtitlesrt_com` because its live search path currently returns a non-success
+HTTP status, and `my_subs_co`, `podnapisi_net`, `subtis_io`, and
+`animesubtitle_ir` because their required upstream hosts currently have no usable
+DNS address. They stay in
 the live-test matrix so upstream recovery can be detected without advertising a
 known-unusable provider in the CLI/TUI.
 

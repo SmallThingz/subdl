@@ -85,18 +85,21 @@ pub const Provider = enum {
 const provider_values = [_]Provider{
     .subdl_com,
     .opensubtitles_com,
+    .moviesubtitles_org,
     .yifysubtitles_ch,
     .subtitlecat_com,
     .isubtitles_org,
     .subsource_net,
     .sub_scene_com,
     .gestdown_info,
+    .greeksubtitles_com,
     .subsunacs_net,
     .subtitles_ajatt_top,
     .greeksubs_net,
     .indexsubtitle_cc,
     .sous_titres_eu,
     .cc_edatribe_com,
+    .subtitrari_noi_ro,
     .subs_ro,
     .subs4free_info,
     .tsukihime_org,
@@ -4751,18 +4754,21 @@ test "active provider registry excludes retired providers" {
     const expected = [_][]const u8{
         "subdl_com",
         "opensubtitles_com",
+        "moviesubtitles_org",
         "yifysubtitles_ch",
         "subtitlecat_com",
         "isubtitles_org",
         "subsource_net",
         "sub_scene_com",
         "gestdown_info",
+        "greek_subtitles_com",
         "subsunacs_net",
         "subtitles_ajatt_top",
         "greeksubs_net",
         "indexsubtitle_cc",
         "sous_titres_eu",
         "cc_edatribe_com",
+        "subtitrari_noi_ro",
         "subs_ro",
         "subs4free_info",
         "tsukihime_org",
@@ -4807,7 +4813,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("subdl.com") == .subdl_com);
     try std.testing.expect(parseProvider("opensubtitles.com") == .opensubtitles_com);
     try std.testing.expect(parseProvider("opensubtitles.org") == null);
-    try std.testing.expect(parseProvider("moviesubtitles.org") == null);
+    try std.testing.expect(parseProvider("moviesubtitles.org") == .moviesubtitles_org);
     try std.testing.expect(parseProvider("moviesubtitlesrt.com") == null);
     try std.testing.expect(parseProvider("podnapisi.net") == null);
     try std.testing.expect(parseProvider("yifysubtitles.ch") == .yifysubtitles_ch);
@@ -4818,7 +4824,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("sub-scene.com") == .sub_scene_com);
     try std.testing.expect(parseProvider("tvsubtitles.net") == null);
     try std.testing.expect(parseProvider("gestdown.info") == .gestdown_info);
-    try std.testing.expect(parseProvider("greek-subtitles.com") == null);
+    try std.testing.expect(parseProvider("greek-subtitles.com") == .greeksubtitles_com);
     try std.testing.expect(parseProvider("subsunacs.net") == .subsunacs_net);
     try std.testing.expect(parseProvider("subtitles.ajatt.top") == .subtitles_ajatt_top);
     try std.testing.expect(parseProvider("subtis.io") == null);
@@ -4826,7 +4832,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("indexsubtitle.cc") == .indexsubtitle_cc);
     try std.testing.expect(parseProvider("sous-titres.eu") == .sous_titres_eu);
     try std.testing.expect(parseProvider("cc.edatribe.com") == .cc_edatribe_com);
-    try std.testing.expect(parseProvider("subtitrari-noi.ro") == null);
+    try std.testing.expect(parseProvider("subtitrari-noi.ro") == .subtitrari_noi_ro);
     try std.testing.expect(parseProvider("subs.ro") == .subs_ro);
     try std.testing.expect(parseProvider("subs4free.info") == .subs4free_info);
     try std.testing.expect(parseProvider("tsukihime.org") == .tsukihime_org);
@@ -4862,7 +4868,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("subsource") == .subsource_net);
     try std.testing.expect(try resolveProvider("sub_scene") == .sub_scene_com);
     try std.testing.expect(try resolveProvider("gestdown") == .gestdown_info);
-    try std.testing.expectError(error.UnknownProvider, resolveProvider("greek_subtitles"));
+    try std.testing.expect(try resolveProvider("greek_subtitles") == .greeksubtitles_com);
     try std.testing.expect(try resolveProvider("subsunacs") == .subsunacs_net);
     try std.testing.expect(try resolveProvider("subtitles_ajatt") == .subtitles_ajatt_top);
     try std.testing.expect(try resolveProvider("greeksubs") == .greeksubs_net);
