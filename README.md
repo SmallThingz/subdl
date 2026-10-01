@@ -3,13 +3,13 @@
 Subtitle scrapers in Zig with a shared provider API and a single `scrapers` binary.
 
 ![Zig](https://img.shields.io/badge/Zig-0.16.0--dev-f7a41d)
-![Providers](https://img.shields.io/badge/Active_Providers-40-2ea44f)
+![Providers](https://img.shields.io/badge/Active_Providers-39-2ea44f)
 ![Runtime](https://img.shields.io/badge/HTTP-std.http%20(Client)-0366d6)
 
 ## Overview
 
-- 40 currently active providers behind one app layer: `providers_app`
-- 47 provider implementations retained and covered by targeted live tests
+- 39 currently active providers behind one app layer: `providers_app`
+- 48 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
 - TUI mode available with `--tui` in the default build
@@ -34,7 +34,6 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `subsource_net` | `subsource.net` |
 | `sub_scene_com` | `sub-scene.com` |
 | `gestdown_info` | `gestdown.info` |
-| `greek_subtitles_com` | `greek-subtitles.com` |
 | `subsunacs_net` | `subsunacs.net` |
 | `subtitles_ajatt_top` | `subtitles.ajatt.top` |
 | `greeksubs_net` | `greeksubs.net` |
@@ -42,6 +41,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `sous_titres_eu` | `sous-titres.eu` |
 | `cc_edatribe_com` | `cc.edatribe.com` |
 | `subtitrari_noi_ro` | `subtitrari-noi.ro` |
+| `subclub_eu` | `subclub.eu` |
 | `subs_ro` | `subs.ro` |
 | `subs4free_info` | `subs4free.info` |
 | `tsukihime_org` | `tsukihime.org` |
@@ -56,7 +56,6 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `subtitulamos_tv` | `subtitulamos.tv` |
 | `feliratok_eu` | `feliratok.eu` |
 | `animesub_info` | `animesub.info` |
-| `subhd_tv` | `subhd.tv` |
 | `fansubs_ru` | `fansubs.ru` |
 | `legendei_net` | `legendei.net` |
 | `zoom_lk` | `zoom.lk` |
@@ -69,17 +68,19 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 Retained inactive implementations are `opensubtitles_org` and `tvsubtitles_net`
 because their current user path is blocked by the Australian website-block page,
 `moviesubtitlesrt_com` because its live search path currently returns a non-success
-HTTP status, and `my_subs_co`, `podnapisi_net`, `subtis_io`, and
+HTTP status, `greeksubtitles_com` because its live search endpoint currently stalls
+and returns non-success responses, `subhd_tv` because its search endpoint currently
+returns HTTP 502, and `my_subs_co`, `podnapisi_net`, `subtis_io`, and
 `animesubtitle_ir` because their required upstream hosts currently have no usable
-DNS address. They stay in
-the live-test matrix so upstream recovery can be detected without advertising a
-known-unusable provider in the CLI/TUI.
+DNS address. They remain covered by focused live tests so upstream recovery can
+be detected without advertising a known-unusable provider in the CLI/TUI.
 
 `gestdown_info` is TV-only. `yifysubtitles_ch` is movie-only.
 `subtitles_ajatt_top` focuses on Japanese subtitles for anime TV and movies.
 `greeksubs_net` provides Greek subtitles for movies and TV.
 `sous_titres_eu` provides French subtitles for movies and TV.
 `cc_edatribe_com` provides English anime movie and TV captions.
+`subclub_eu` provides Estonian subtitles for movies and TV episodes via direct subtitle files.
 `subs_ro` provides Romanian and English subtitles for movies and TV.
 `subs4free_info` is movie-only and provides Greek and English subtitles through a session-bound archive download flow.
 `tsukihime_org` provides anime movie and TV subtitles from TsukiHime native cached subtitle storage; AnimeTosho-mirrored entries are skipped because that redirected storage is not reachable from the live host.
@@ -94,7 +95,6 @@ known-unusable provider in the CLI/TUI.
 `subtitulamos_tv` is TV-only and provides English, Spanish, Portuguese, Catalan, and Galician subtitles.
 `feliratok_eu` is movie-only and provides Hungarian and English subtitles.
 `animesub_info` provides Polish anime movie and TV subtitles.
-`subhd_tv` provides movie and TV subtitles through SubHD's current prepare-download flow.
 `fansubs_ru` provides Russian anime movie and TV subtitles.
 `legendei_net` provides Portuguese movie and TV subtitle archives, with language-specific posts when available.
 `zoom_lk` provides Sinhala movie and TV season subtitle archives.

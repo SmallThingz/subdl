@@ -29,6 +29,7 @@ pub const indexsubtitle_cc = subdl.indexsubtitle_cc;
 pub const sous_titres_eu = subdl.sous_titres_eu;
 pub const cc_edatribe_com = subdl.cc_edatribe_com;
 pub const subtitrari_noi_ro = subdl.subtitrari_noi_ro;
+pub const subclub_eu = subdl.subclub_eu;
 pub const subs_ro = subdl.subs_ro;
 pub const subs4free_info = subdl.subs4free_info;
 pub const tsukihime_org = subdl.tsukihime_org;

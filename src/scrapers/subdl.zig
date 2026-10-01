@@ -26,6 +26,7 @@ pub const indexsubtitle_cc = @import("indexsubtitle.cc.zig");
 pub const sous_titres_eu = @import("sous-titres.eu.zig");
 pub const cc_edatribe_com = @import("cc.edatribe.com.zig");
 pub const subtitrari_noi_ro = @import("subtitrari-noi.ro.zig");
+pub const subclub_eu = @import("subclub.eu.zig");
 pub const subs_ro = @import("subs.ro.zig");
 pub const subs4free_info = @import("subs4free.info.zig");
 pub const tsukihime_org = @import("tsukihime.org.zig");
@@ -96,6 +97,7 @@ test {
     _ = @import("sous-titres.eu.zig");
     _ = @import("cc.edatribe.com.zig");
     _ = @import("subtitrari-noi.ro.zig");
+    _ = @import("subclub.eu.zig");
     _ = @import("subs.ro.zig");
     _ = @import("subtitri.nekur.net.zig");
     _ = @import("subsynchro.com.zig");

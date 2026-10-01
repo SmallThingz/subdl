@@ -56,6 +56,7 @@ pub const Provider = enum {
     sous_titres_eu,
     cc_edatribe_com,
     subtitrari_noi_ro,
+    subclub_eu,
     subs_ro,
     subs4free_info,
     tsukihime_org,
@@ -92,7 +93,6 @@ const provider_values = [_]Provider{
     .subsource_net,
     .sub_scene_com,
     .gestdown_info,
-    .greeksubtitles_com,
     .subsunacs_net,
     .subtitles_ajatt_top,
     .greeksubs_net,
@@ -100,6 +100,7 @@ const provider_values = [_]Provider{
     .sous_titres_eu,
     .cc_edatribe_com,
     .subtitrari_noi_ro,
+    .subclub_eu,
     .subs_ro,
     .subs4free_info,
     .tsukihime_org,
@@ -114,7 +115,6 @@ const provider_values = [_]Provider{
     .subtitulamos_tv,
     .feliratok_eu,
     .animesub_info,
-    .subhd_tv,
     .fansubs_ru,
     .legendei_net,
     .zoom_lk,
@@ -165,6 +165,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .sous_titres_eu => "sous_titres_eu",
         .cc_edatribe_com => "cc_edatribe_com",
         .subtitrari_noi_ro => "subtitrari_noi_ro",
+        .subclub_eu => "subclub_eu",
         .subs_ro => "subs_ro",
         .subs4free_info => "subs4free_info",
         .tsukihime_org => "tsukihime_org",
@@ -244,6 +245,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .sous_titres_eu => "Sous-Titres.eu",
         .cc_edatribe_com => "Closed Caption Browser",
         .subtitrari_noi_ro => "Subtitrari-Noi",
+        .subclub_eu => "SubClub",
         .subs_ro => "Subs.ro",
         .subs4free_info => "Subs4Free",
         .tsukihime_org => "TsukiHime",
@@ -296,6 +298,7 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .sous_titres_eu => "https://www.sous-titres.eu",
         .cc_edatribe_com => "https://cc.edatribe.com",
         .subtitrari_noi_ro => "https://www.subtitrari-noi.ro",
+        .subclub_eu => "https://www.subclub.eu",
         .subs_ro => "https://subs.ro",
         .subs4free_info => "https://www.subs4free.info",
         .tsukihime_org => "https://tsukihime.org",
@@ -531,6 +534,15 @@ pub const SearchRef = union(Provider) {
         year: ?i64,
         page_url: []const u8,
         download_url: []const u8,
+    },
+    subclub_eu: struct {
+        title: []const u8,
+        year: ?i64,
+        media_kind: subdl.subclub_eu.MediaKind,
+        season: ?i64,
+        episode: ?i64,
+        archive_id: []const u8,
+        page_url: []const u8,
     },
     subs_ro: struct {
         title: []const u8,
@@ -1298,6 +1310,37 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                         .year = item.year,
                         .page_url = try a.dupe(u8, item.page_url),
                         .download_url = try a.dupe(u8, item.download_url),
+                    } },
+                });
+            }
+        },
+        .subclub_eu => {
+            var scraper = subdl.subclub_eu.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                const label = if (item.season) |season|
+                    if (item.episode) |episode|
+                        try std.fmt.allocPrint(a, "[tv] {s} S{d}E{d} [et]", .{ title, season, episode })
+                    else
+                        try std.fmt.allocPrint(a, "[tv] {s} S{d} [et]", .{ title, season })
+                else if (item.year) |year|
+                    try std.fmt.allocPrint(a, "[movie] {s} ({d}) [et]", .{ title, year })
+                else
+                    try std.fmt.allocPrint(a, "[{s}] {s} [et]", .{ @tagName(item.media_kind), title });
+                try out.append(a, .{
+                    .label = label,
+                    .ref = .{ .subclub_eu = .{
+                        .title = title,
+                        .year = item.year,
+                        .media_kind = item.media_kind,
+                        .season = item.season,
+                        .episode = item.episode,
+                        .archive_id = try a.dupe(u8, item.archive_id),
+                        .page_url = try a.dupe(u8, item.page_url),
                     } },
                 });
             }
@@ -2679,6 +2722,31 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .subclub_eu => |item| {
+            title = try a.dupe(u8, item.title);
+            var scraper = subdl.subclub_eu.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            const query_item: subdl.subclub_eu.SearchItem = .{
+                .title = item.title,
+                .year = item.year,
+                .media_kind = item.media_kind,
+                .season = item.season,
+                .episode = item.episode,
+                .archive_id = item.archive_id,
+                .page_url = item.page_url,
+            };
+            var subtitles = try scraper.fetchSubtitlesBySearchItem(query_item);
+            defer subtitles.deinit();
+            for (subtitles.subtitles) |subtitle| {
+                const label = try subtitleLabel(a, subtitle.language_code, subtitle.filename, subtitle.download_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try a.dupe(u8, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
         .subs_ro => |item| {
             title = try a.dupe(u8, item.title);
             var scraper = subdl.subs_ro.Scraper.init(allocator, client);
@@ -3412,6 +3480,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .sous_titres_eu => |item| item.title,
         .cc_edatribe_com => |item| item.title,
         .subtitrari_noi_ro => |item| item.title,
+        .subclub_eu => |item| item.title,
         .subs_ro => |item| item.title,
         .subs4free_info => |item| item.title,
         .tsukihime_org => |item| item.title,
@@ -4619,6 +4688,7 @@ fn liveQueryForProvider(provider: Provider) []const u8 {
         .greeksubs_net => "Interstellar",
         .cc_edatribe_com => "Spirited Away",
         .subtitrari_noi_ro => "The Matrix Resurrections",
+        .subclub_eu => "Inception",
         .subs_ro => "The Matrix",
         .subs4free_info => "The Matrix",
         .tsukihime_org => "Akira",
@@ -4673,6 +4743,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .sous_titres_eu => |item| item.page_url,
         .cc_edatribe_com => |item| item.page_url,
         .subtitrari_noi_ro => |item| item.page_url,
+        .subclub_eu => |item| item.page_url,
         .subs_ro => |item| item.page_url,
         .subs4free_info => |item| item.page_url,
         .tsukihime_org => |item| item.page_url,
@@ -4761,7 +4832,6 @@ test "active provider registry excludes retired providers" {
         "subsource_net",
         "sub_scene_com",
         "gestdown_info",
-        "greek_subtitles_com",
         "subsunacs_net",
         "subtitles_ajatt_top",
         "greeksubs_net",
@@ -4769,6 +4839,7 @@ test "active provider registry excludes retired providers" {
         "sous_titres_eu",
         "cc_edatribe_com",
         "subtitrari_noi_ro",
+        "subclub_eu",
         "subs_ro",
         "subs4free_info",
         "tsukihime_org",
@@ -4783,7 +4854,6 @@ test "active provider registry excludes retired providers" {
         "subtitulamos_tv",
         "feliratok_eu",
         "animesub_info",
-        "subhd_tv",
         "fansubs_ru",
         "legendei_net",
         "zoom_lk",
@@ -4824,7 +4894,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("sub-scene.com") == .sub_scene_com);
     try std.testing.expect(parseProvider("tvsubtitles.net") == null);
     try std.testing.expect(parseProvider("gestdown.info") == .gestdown_info);
-    try std.testing.expect(parseProvider("greek-subtitles.com") == .greeksubtitles_com);
+    try std.testing.expect(parseProvider("greek-subtitles.com") == null);
     try std.testing.expect(parseProvider("subsunacs.net") == .subsunacs_net);
     try std.testing.expect(parseProvider("subtitles.ajatt.top") == .subtitles_ajatt_top);
     try std.testing.expect(parseProvider("subtis.io") == null);
@@ -4833,6 +4903,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("sous-titres.eu") == .sous_titres_eu);
     try std.testing.expect(parseProvider("cc.edatribe.com") == .cc_edatribe_com);
     try std.testing.expect(parseProvider("subtitrari-noi.ro") == .subtitrari_noi_ro);
+    try std.testing.expect(parseProvider("subclub.eu") == .subclub_eu);
     try std.testing.expect(parseProvider("subs.ro") == .subs_ro);
     try std.testing.expect(parseProvider("subs4free.info") == .subs4free_info);
     try std.testing.expect(parseProvider("tsukihime.org") == .tsukihime_org);
@@ -4847,7 +4918,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("subtitulamos.tv") == .subtitulamos_tv);
     try std.testing.expect(parseProvider("feliratok.eu") == .feliratok_eu);
     try std.testing.expect(parseProvider("animesub.info") == .animesub_info);
-    try std.testing.expect(parseProvider("subhd.tv") == .subhd_tv);
+    try std.testing.expect(parseProvider("subhd.tv") == null);
     try std.testing.expect(parseProvider("fansubs.ru") == .fansubs_ru);
     try std.testing.expect(parseProvider("legendei.net") == .legendei_net);
     try std.testing.expect(parseProvider("zoom.lk") == .zoom_lk);
@@ -4868,13 +4939,14 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("subsource") == .subsource_net);
     try std.testing.expect(try resolveProvider("sub_scene") == .sub_scene_com);
     try std.testing.expect(try resolveProvider("gestdown") == .gestdown_info);
-    try std.testing.expect(try resolveProvider("greek_subtitles") == .greeksubtitles_com);
+    try std.testing.expectError(error.UnknownProvider, resolveProvider("greek_subtitles"));
     try std.testing.expect(try resolveProvider("subsunacs") == .subsunacs_net);
     try std.testing.expect(try resolveProvider("subtitles_ajatt") == .subtitles_ajatt_top);
     try std.testing.expect(try resolveProvider("greeksubs") == .greeksubs_net);
     try std.testing.expect(try resolveProvider("indexsubtitle") == .indexsubtitle_cc);
     try std.testing.expect(try resolveProvider("sous_titres") == .sous_titres_eu);
     try std.testing.expect(try resolveProvider("cc_edatribe") == .cc_edatribe_com);
+    try std.testing.expect(try resolveProvider("subclub") == .subclub_eu);
     try std.testing.expect(try resolveProvider("subs_ro") == .subs_ro);
     try std.testing.expect(try resolveProvider("subs4free") == .subs4free_info);
     try std.testing.expect(try resolveProvider("tsukihime") == .tsukihime_org);
@@ -4891,7 +4963,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("feliratok") == .feliratok_eu);
     try std.testing.expect(try resolveProvider("animesub_i") == .animesub_info);
     try std.testing.expectError(error.AmbiguousProvider, resolveProvider("sub"));
-    try std.testing.expect(try resolveProvider("subhd") == .subhd_tv);
+    try std.testing.expectError(error.UnknownProvider, resolveProvider("subhd"));
     try std.testing.expect(try resolveProvider("fansubs") == .fansubs_ru);
     try std.testing.expect(try resolveProvider("legendei") == .legendei_net);
     try std.testing.expect(try resolveProvider("zoom") == .zoom_lk);
@@ -5270,6 +5342,7 @@ fn seriesQueryForProvider(provider: Provider) []const u8 {
         .greeksubs_net => "Game of Thrones",
         .cc_edatribe_com => "Attack on Titan",
         .subtitrari_noi_ro => "Reacher",
+        .subclub_eu => "Chernobyl",
         .subs_ro => "Chernobyl",
         .tsukihime_org => "Death Note S01E01",
         .titrari_ro => "Reacher",
@@ -5382,6 +5455,7 @@ const tui_smoke_providers = [_]Provider{
     .indexsubtitle_cc,
     .sous_titres_eu,
     .cc_edatribe_com,
+    .subclub_eu,
     .subs_ro,
     .subs4free_info,
     .tsukihime_org,
@@ -5397,7 +5471,6 @@ const tui_smoke_providers = [_]Provider{
     .subtitulamos_tv,
     .feliratok_eu,
     .animesub_info,
-    .subhd_tv,
     .fansubs_ru,
     .legendei_net,
     .zoom_lk,
@@ -5600,6 +5673,10 @@ test "live providers_app tui-path smoke provider: subtitrari-noi.ro" {
     try runSingleProviderSmokeTest(.subtitrari_noi_ro);
 }
 
+test "live providers_app tui-path smoke provider: subclub.eu" {
+    try runSingleProviderSmokeTest(.subclub_eu);
+}
+
 test "live providers_app tui-path smoke provider: subs.ro" {
     try runSingleProviderSmokeTest(.subs_ro);
 }
@@ -5770,6 +5847,10 @@ test "live series download path provider: cc.edatribe.com" {
 
 test "live series download path provider: subtitrari-noi.ro" {
     try runSingleProviderSeriesTest(.subtitrari_noi_ro);
+}
+
+test "live series download path provider: subclub.eu" {
+    try runSingleProviderSeriesTest(.subclub_eu);
 }
 
 test "live series download path provider: tsukihime.org" {
