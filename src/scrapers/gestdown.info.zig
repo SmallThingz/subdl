@@ -84,9 +84,9 @@ pub const Scraper = struct {
                 .object => |value| value,
                 else => continue,
             };
-            const id = jsonString(obj, "id") orelse continue;
-            const name = jsonString(obj, "name") orelse continue;
-            const slug = jsonString(obj, "slug") orelse "";
+            const id = common.jsonString(obj, "id") orelse continue;
+            const name = common.jsonString(obj, "name") orelse continue;
+            const slug = common.jsonString(obj, "slug") orelse "";
             const seasons_value = obj.get("seasons") orelse continue;
             const seasons_array = switch (seasons_value) {
                 .array => |value| value,
@@ -94,15 +94,15 @@ pub const Scraper = struct {
             };
             var seasons: std.ArrayListUnmanaged(i64) = .empty;
             for (seasons_array.items) |season_value| {
-                if (jsonInt(season_value)) |season| try seasons.append(a, season);
+                if (common.jsonInt(season_value)) |season| try seasons.append(a, season);
             }
 
             try items.append(a, .{
                 .id = try a.dupe(u8, id),
                 .title = try a.dupe(u8, name),
                 .seasons = try seasons.toOwnedSlice(a),
-                .tvdb_id = if (obj.get("tvDbId")) |value| jsonInt(value) else null,
-                .tmdb_id = if (obj.get("tmdbId")) |value| jsonInt(value) else null,
+                .tvdb_id = if (obj.get("tvDbId")) |value| common.jsonInt(value) else null,
+                .tmdb_id = if (obj.get("tmdbId")) |value| common.jsonInt(value) else null,
                 .slug = try a.dupe(u8, slug),
             });
         }
@@ -135,9 +135,9 @@ pub const Scraper = struct {
                     .object => |value| value,
                     else => continue,
                 };
-                const episode_number = if (episode_obj.get("number")) |value| jsonInt(value) orelse 0 else 0;
-                const episode_season = if (episode_obj.get("season")) |value| jsonInt(value) orelse season else season;
-                const episode_title = jsonString(episode_obj, "title") orelse "";
+                const episode_number = if (episode_obj.get("number")) |value| common.jsonInt(value) orelse 0 else 0;
+                const episode_season = if (episode_obj.get("season")) |value| common.jsonInt(value) orelse season else season;
+                const episode_title = common.jsonString(episode_obj, "title") orelse "";
                 const subtitles_value = episode_obj.get("subtitles") orelse continue;
                 const episode_subtitles = switch (subtitles_value) {
                     .array => |value| value,
@@ -149,10 +149,10 @@ pub const Scraper = struct {
                         .object => |value| value,
                         else => continue,
                     };
-                    const download_uri = jsonString(subtitle_obj, "downloadUri") orelse continue;
-                    const version = jsonString(subtitle_obj, "version") orelse "subtitle";
-                    const language = jsonString(subtitle_obj, "language") orelse "English";
-                    const source = jsonString(subtitle_obj, "source");
+                    const download_uri = common.jsonString(subtitle_obj, "downloadUri") orelse continue;
+                    const version = common.jsonString(subtitle_obj, "version") orelse "subtitle";
+                    const language = common.jsonString(subtitle_obj, "language") orelse "English";
+                    const source = common.jsonString(subtitle_obj, "source");
                     const hearing_impaired = if (subtitle_obj.get("hearingImpaired")) |value|
                         switch (value) {
                             .bool => |flag| flag,
@@ -212,23 +212,6 @@ fn fetchJson(client: *std.http.Client, allocator: Allocator, url: []const u8) !c
         return error.UnexpectedHttpStatus;
     }
     return error.UnexpectedHttpStatus;
-}
-
-fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = obj.get(key) orelse return null;
-    return switch (value) {
-        .string => |text| text,
-        else => null,
-    };
-}
-
-fn jsonInt(value: std.json.Value) ?i64 {
-    return switch (value) {
-        .integer => |number| number,
-        .number_string => |number| std.fmt.parseInt(i64, number, 10) catch null,
-        .float => |number| @intFromFloat(number),
-        else => null,
-    };
 }
 
 test "gestdown parses show and episode payloads" {

@@ -184,10 +184,6 @@ fn languageCount() usize {
     return language_options.len;
 }
 
-fn languageSelectionAll() [languageCount()]bool {
-    return [_]bool{true} ** languageCount();
-}
-
 fn languageSelectionEnglish() [languageCount()]bool {
     var out = [_]bool{false} ** languageCount();
     out[0] = true;
@@ -395,17 +391,9 @@ const SearchReaperEntry = struct {
 const SubtitlesTask = struct {
     ref: app.SearchRef,
     page: usize = 1,
-    subdl_season_slug: ?[]const u8 = null,
     done: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     err: ?anyerror = null,
     result: ?app.SubtitlesResponse = null,
-};
-
-const SubdlSeasonsTask = struct {
-    ref: app.SearchRef,
-    done: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
-    err: ?anyerror = null,
-    result: ?app.SubdlSeasonsResponse = null,
 };
 
 const DownloadTask = struct {
@@ -701,24 +689,7 @@ fn subtitlesTaskMain(task: *SubtitlesTask) std.Io.Cancelable!void {
     var client: std.http.Client = .{ .allocator = std.heap.page_allocator, .io = runtime_io.get() };
     defer client.deinit();
 
-    const fetch_result = if (task.subdl_season_slug) |season_slug|
-        app.fetchSubdlSeasonSubtitlesPage(std.heap.page_allocator, &client, task.ref, season_slug, task.page)
-    else
-        app.fetchSubtitlesPage(std.heap.page_allocator, &client, task.ref, task.page);
-
-    task.result = fetch_result catch |err| {
-        if (err == error.Canceled) return error.Canceled;
-        task.err = err;
-        return;
-    };
-}
-
-fn subdlSeasonsTaskMain(task: *SubdlSeasonsTask) std.Io.Cancelable!void {
-    defer task.done.store(1, .release);
-    var client: std.http.Client = .{ .allocator = std.heap.page_allocator, .io = runtime_io.get() };
-    defer client.deinit();
-
-    task.result = app.fetchSubdlSeasons(std.heap.page_allocator, &client, task.ref) catch |err| {
+    task.result = app.fetchSubtitlesPage(std.heap.page_allocator, &client, task.ref, task.page) catch |err| {
         if (err == error.Canceled) return error.Canceled;
         task.err = err;
         return;
@@ -962,25 +933,6 @@ fn setContext(ui: *Ui, context_line: ?[]const u8) void {
     const copied = ui.allocator.dupe(u8, src) catch return;
     ui.context_owned = copied;
     ui.context_line = copied;
-}
-
-fn providerHomeUrl(provider: app.Provider) []const u8 {
-    return app.providerSiteUrl(provider);
-}
-
-fn isSubdlSeriesRef(ref: app.SearchRef) bool {
-    return switch (ref) {
-        .subdl_com => |item| item.media_type == .tv,
-        else => false,
-    };
-}
-
-fn subdlSeasonUrl(allocator: std.mem.Allocator, title_url: []const u8, season_slug: []const u8) ![]u8 {
-    if (season_slug.len == 0) return allocator.dupe(u8, title_url);
-    if (std.mem.endsWith(u8, title_url, "/")) {
-        return std.fmt.allocPrint(allocator, "{s}{s}", .{ title_url, season_slug });
-    }
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ title_url, season_slug });
 }
 
 fn runTui(ui: *Ui) !void {

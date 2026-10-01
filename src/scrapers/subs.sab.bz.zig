@@ -139,7 +139,7 @@ pub const Scraper = struct {
             allocator.free(response.body);
             return error.UnexpectedHttpStatus;
         }
-        if (looksLikeHtml(response.body)) {
+        if (common.looksLikeHtml(response.body)) {
             allocator.free(response.body);
             return error.UnexpectedResponseType;
         }
@@ -159,13 +159,6 @@ pub fn parseDownloadToken(value: []const u8) ?[]const u8 {
     return attach_id;
 }
 
-fn looksLikeHtml(body: []const u8) bool {
-    const trimmed = std.mem.trimStart(u8, body[0..@min(body.len, 1024)], " \t\r\n");
-    return std.ascii.startsWithIgnoreCase(trimmed, "<!doctype html") or
-        std.ascii.startsWithIgnoreCase(trimmed, "<html") or
-        std.mem.indexOf(u8, trimmed, "<body") != null;
-}
-
 fn appendSearchRows(
     allocator: Allocator,
     body: []const u8,
@@ -175,7 +168,7 @@ fn appendSearchRows(
     exact: *std.ArrayListUnmanaged(SearchItem),
     partial: *std.ArrayListUnmanaged(SearchItem),
 ) !void {
-    const wanted = try normalizeTitle(allocator, query);
+    const wanted = try common.normalizeTitle(allocator, query);
     defer allocator.free(wanted);
 
     var cursor: usize = 0;
@@ -210,7 +203,7 @@ fn appendSearchRows(
 
         const year = parseYearAfterAnchor(anchor_tail[close + "</a>".len ..]);
         const canonical = canonicalTitle(raw_title);
-        const normalized = try normalizeTitle(allocator, canonical);
+        const normalized = try common.normalizeTitle(allocator, canonical);
         defer allocator.free(normalized);
         if (normalized.len == 0) continue;
         if (std.mem.indexOf(u8, normalized, wanted) == null and std.mem.indexOf(u8, wanted, normalized) == null) continue;
@@ -278,22 +271,6 @@ fn isTvTitle(raw: []const u8) bool {
         }
     }
     return false;
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 fn slug(allocator: Allocator, input: []const u8) ![]u8 {

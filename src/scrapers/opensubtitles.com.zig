@@ -216,18 +216,6 @@ pub const Scraper = struct {
         return null;
     }
 
-    pub fn resolveAndVerifyDownload(self: *Scraper, remote_endpoint: []const u8) !ResolvedDownload {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
-
-        const resolved = try self.resolveAndVerifyDownloadPublic(a, remote_endpoint);
-        return .{
-            .filename = if (resolved.filename) |name| try self.allocator.dupe(u8, name) else null,
-            .verified_url = if (resolved.verified_url) |url| try self.allocator.dupe(u8, url) else null,
-        };
-    }
-
     fn resolveAndVerifyDownloadPublic(self: *Scraper, allocator: Allocator, remote_endpoint: []const u8) !ResolvedDownload {
         const remote_url = if (std.mem.startsWith(u8, remote_endpoint, "http"))
             remote_endpoint

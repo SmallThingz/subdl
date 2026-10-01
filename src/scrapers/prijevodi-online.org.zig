@@ -85,7 +85,7 @@ pub const Scraper = struct {
             else => return error.InvalidFieldType,
         };
 
-        const wanted = try normalizeTitle(a, trimmed);
+        const wanted = try common.normalizeTitle(a, trimmed);
         var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
         var other: std.ArrayListUnmanaged(SearchItem) = .empty;
 
@@ -94,14 +94,14 @@ pub const Scraper = struct {
                 .object => |value| value,
                 else => continue,
             };
-            const item_type = jsonString(obj, "type") orelse continue;
+            const item_type = common.jsonString(obj, "type") orelse continue;
             if (!std.mem.eql(u8, item_type, "series")) continue;
-            const title = jsonString(obj, "title") orelse continue;
-            const slug = jsonString(obj, "slug") orelse continue;
-            const series_id = jsonIntFromObject(obj, "id") orelse continue;
+            const title = common.jsonString(obj, "title") orelse continue;
+            const slug = common.jsonString(obj, "slug") orelse continue;
+            const series_id = common.jsonIntField(obj, "id") orelse continue;
             if (series_id <= 0) continue;
 
-            const normalized = try normalizeTitle(a, title);
+            const normalized = try common.normalizeTitle(a, title);
             if (normalized.len == 0) continue;
             if (std.mem.indexOf(u8, normalized, wanted) == null and
                 std.mem.indexOf(u8, wanted, normalized) == null) continue;
@@ -112,7 +112,7 @@ pub const Scraper = struct {
                 .slug = try a.dupe(u8, slug),
                 .page_url = try std.fmt.allocPrint(a, "{s}/series/view/{s}", .{ site, slug }),
             };
-            const match_kind = jsonString(obj, "matchKind");
+            const match_kind = common.jsonString(obj, "matchKind");
             if ((match_kind != null and std.mem.eql(u8, match_kind.?, "exact")) or std.mem.eql(u8, normalized, wanted))
                 try exact.append(a, item)
             else
@@ -161,11 +161,11 @@ pub const Scraper = struct {
                 .object => |value| value,
                 else => continue,
             };
-            const translation_id = jsonIntFromObject(obj, "id") orelse continue;
-            const season = jsonIntFromObject(obj, "seasonNumber") orelse continue;
-            const episode = jsonIntFromObject(obj, "episodeNumber") orelse continue;
-            const language_code = jsonString(obj, "languageCode") orelse continue;
-            const filename = jsonString(obj, "fileName") orelse continue;
+            const translation_id = common.jsonIntField(obj, "id") orelse continue;
+            const season = common.jsonIntField(obj, "seasonNumber") orelse continue;
+            const episode = common.jsonIntField(obj, "episodeNumber") orelse continue;
+            const language_code = common.jsonString(obj, "languageCode") orelse continue;
+            const filename = common.jsonString(obj, "fileName") orelse continue;
             if (translation_id <= 0 or season < 0 or episode <= 0 or filename.len == 0) continue;
             if (obj.get("isPublished")) |published| {
                 if (published == .bool and !published.bool) continue;
@@ -197,40 +197,6 @@ fn subtitleLessThan(_: void, lhs: SubtitleItem, rhs: SubtitleItem) bool {
     const language_order = std.mem.order(u8, lhs.language_code, rhs.language_code);
     if (language_order != .eq) return language_order == .lt;
     return std.mem.lessThan(u8, lhs.filename, rhs.filename);
-}
-
-fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = obj.get(key) orelse return null;
-    return switch (value) {
-        .string => |text| text,
-        else => null,
-    };
-}
-
-fn jsonIntFromObject(obj: std.json.ObjectMap, key: []const u8) ?i64 {
-    const value = obj.get(key) orelse return null;
-    return switch (value) {
-        .integer => |number| number,
-        .number_string => |number| std.fmt.parseInt(i64, number, 10) catch null,
-        .float => |number| @intFromFloat(number),
-        else => null,
-    };
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "prijevodi orders episode subtitles deterministically" {

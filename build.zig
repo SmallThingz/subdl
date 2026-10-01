@@ -1,4 +1,5 @@
 const std = @import("std");
+const provider_registry = @import("src/provider_registry.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -24,7 +25,6 @@ pub fn build(b: *std.Build) void {
     const enable_unarr = b.option(bool, "enable-unarr", "Enable archive extraction support via unarr") orelse true;
     const live_mode = b.option([]const u8, "live", "Live test mode: off | smoke | named | extensive | all") orelse "off";
     const live_providers = b.option([]const u8, "live-providers", "Comma-separated provider filter for live tests, or '*' for all") orelse "*";
-    const live_include_captcha = b.option(bool, "live-include-captcha", "Include captcha/cloudflare providers in live test runs") orelse false;
     const live_parallel_on_all = b.option(bool, "live-parallel-on-all", "Run one live subprocess per provider when -Dlive-providers=all/*") orelse true;
     const live_timeout_seconds = b.option(u32, "live-timeout-seconds", "Hard deadline for each parallel live provider") orelse 60;
 
@@ -50,7 +50,6 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "live_extensive_suite", live_extensive_suite);
     build_options.addOption(bool, "live_tui_suite", live_tui_suite);
     build_options.addOption(bool, "live_named_tests_enabled", live_named_tests_enabled);
-    build_options.addOption(bool, "live_include_captcha", live_include_captcha);
     build_options.addOption(bool, "enable_tui", enable_tui);
     build_options.addOption(bool, "enable_alldriver", enable_alldriver);
     build_options.addOption(bool, "enable_unarr", enable_unarr);
@@ -274,14 +273,12 @@ pub fn build(b: *std.Build) void {
     const test_live_single_step = b.step("test-live-single", "Run live tests for the current provider filter");
     test_live_single_step.dependOn(&run_scrapers_mod_tests_live.step);
 
-    const test_live_step = b.step("test-live", "Run live tests using -Dlive, -Dlive-providers, -Dlive-include-captcha");
+    const test_live_step = b.step("test-live", "Run live tests using -Dlive and -Dlive-providers");
     if (live_tests_enabled and live_parallel_on_all and
         (isAllLiveProviderSelection(live_providers) or isActiveLiveProviderSelection(live_providers)))
     {
-        const include_captcha_arg = if (live_include_captcha) "true" else "false";
         const script = makeParallelLiveRunScript(
             b,
-            include_captcha_arg,
             live_timeout_seconds,
             isActiveLiveProviderSelection(live_providers),
         );
@@ -293,14 +290,13 @@ pub fn build(b: *std.Build) void {
         test_live_step.dependOn(&run_scrapers_mod_tests_live.step);
     }
 
-    const test_live_all_step = b.step("test-live-all", "Run all providers live (including captcha providers)");
+    const test_live_all_step = b.step("test-live-all", "Run all providers live");
     const live_all_cmd = b.addSystemCommand(&.{
         "zig",
         "build",
         "test-live",
         "-Dlive=all",
         "-Dlive-providers=*",
-        "-Dlive-include-captcha=true",
     });
     live_all_cmd.setCwd(b.path("."));
     test_live_all_step.dependOn(&live_all_cmd.step);
@@ -317,70 +313,6 @@ pub fn build(b: *std.Build) void {
     test_live_active_step.dependOn(&live_active_cmd.step);
 }
 
-const LiveProviderTarget = struct {
-    name: []const u8,
-    captcha: bool = false,
-    timeout_seconds: ?u32 = null,
-    active: bool = true,
-    serial: bool = false,
-};
-
-const live_provider_targets = [_]LiveProviderTarget{
-    .{ .name = "subdl.com" },
-    .{ .name = "isubtitles.org", .timeout_seconds = 120 },
-    .{ .name = "moviesubtitles.org" },
-    .{ .name = "moviesubtitlesrt.com", .active = false },
-    .{ .name = "my-subs.co", .active = false },
-    .{ .name = "podnapisi.net", .active = false },
-    .{ .name = "subtitlecat.com" },
-    .{ .name = "subsource.net" },
-    .{ .name = "sub-scene.com", .timeout_seconds = 120, .serial = true },
-    .{ .name = "tvsubtitles.net", .active = false },
-    .{ .name = "yifysubtitles.ch", .timeout_seconds = 120 },
-    .{ .name = "opensubtitles.org", .active = false },
-    .{ .name = "opensubtitles.com" },
-    .{ .name = "gestdown.info" },
-    .{ .name = "greek-subtitles.com", .timeout_seconds = 240, .active = false },
-    .{ .name = "subsunacs.net" },
-    .{ .name = "subtitles.ajatt.top" },
-    .{ .name = "subtis.io", .active = false },
-    .{ .name = "greeksubs.net" },
-    .{ .name = "indexsubtitle.cc", .serial = true },
-    .{ .name = "sous-titres.eu" },
-    .{ .name = "cc.edatribe.com" },
-    .{ .name = "subtitrari-noi.ro", .active = false },
-    .{ .name = "subclub.eu" },
-    .{ .name = "subs.ro", .serial = true },
-    .{ .name = "subs4free.info", .serial = true },
-    .{ .name = "tsukihime.org", .timeout_seconds = 120 },
-    .{ .name = "subtitri.nekur.net" },
-    .{ .name = "subsynchro.com", .serial = true },
-    .{ .name = "titrari.ro" },
-    .{ .name = "subs.sab.bz" },
-    .{ .name = "subtitri.do.am" },
-    .{ .name = "prijevodi-online.org" },
-    .{ .name = "animekalesi.com" },
-    .{ .name = "subcentral.de", .timeout_seconds = 120 },
-    .{ .name = "subtitulamos.tv", .serial = true },
-    .{ .name = "feliratok.eu" },
-    .{ .name = "animesub.info", .timeout_seconds = 180 },
-    .{ .name = "animetosho.xyz", .timeout_seconds = 120 },
-    .{ .name = "kitsunekko.net", .timeout_seconds = 120 },
-    .{ .name = "thesubtitledb.org", .timeout_seconds = 120 },
-    .{ .name = "napisy24.pl", .timeout_seconds = 120 },
-    .{ .name = "nyasub.cz", .timeout_seconds = 240, .serial = true },
-    .{ .name = "subhd.tv", .timeout_seconds = 120, .serial = true, .active = false },
-    .{ .name = "fansubs.ru", .timeout_seconds = 120, .serial = true },
-    .{ .name = "legendei.net" },
-    .{ .name = "zoom.lk", .timeout_seconds = 120, .serial = true },
-    .{ .name = "justsubtitles.com" },
-    .{ .name = "wizdom.xyz" },
-    .{ .name = "miraianime.net" },
-    .{ .name = "animesubtitle.ir", .active = false },
-    .{ .name = "grupahatak.pl" },
-    .{ .name = "jimaku.cc" },
-};
-
 fn isAllLiveProviderSelection(raw_filter: []const u8) bool {
     const trimmed = std.mem.trim(u8, raw_filter, " \t\r\n");
     if (trimmed.len == 0) return true;
@@ -395,7 +327,6 @@ fn isActiveLiveProviderSelection(raw_filter: []const u8) bool {
 
 fn makeParallelLiveRunScript(
     b: *std.Build,
-    include_captcha_arg: []const u8,
     timeout_seconds: u32,
     active_only: bool,
 ) []const u8 {
@@ -413,18 +344,17 @@ fn makeParallelLiveRunScript(
         \\
     ) catch @panic("oom");
 
-    for (live_provider_targets) |target_info| {
+    for (provider_registry.all) |target_info| {
         if (active_only and !target_info.active) continue;
-        if (target_info.captcha and !std.mem.eql(u8, include_captcha_arg, "true")) continue;
-        if (target_info.serial) continue;
-        const provider_timeout_seconds = target_info.timeout_seconds orelse timeout_seconds;
+        if (target_info.live_serial) continue;
+        const provider_timeout_seconds = target_info.live_timeout_seconds orelse timeout_seconds;
         out.print(b.allocator,
             \\echo "[live][runner] START {s}"
             \\
             \\(
             \\  set -o pipefail
             \\  set +e
-            \\  SCRAPERS_LIVE_PROVIDER_FILTER="{s}" SCRAPERS_LIVE_INCLUDE_CAPTCHA="{s}" timeout --signal=TERM --kill-after=5s {d}s "$test_bin" 2>&1 | sed -u 's/^/[live][{s}] /'
+            \\  SCRAPERS_LIVE_PROVIDER_FILTER="{s}" timeout --signal=TERM --kill-after=5s {d}s "$test_bin" 2>&1 | sed -u 's/^/[live][{s}] /'
             \\  rc=${{PIPESTATUS[0]}}
             \\  set -e
             \\  echo "$rc" > "$tmpdir/{s}.rc"
@@ -435,14 +365,13 @@ fn makeParallelLiveRunScript(
             \\pids+=("$!")
             \\
         , .{
-            target_info.name,
-            target_info.name,
-            include_captcha_arg,
+            target_info.live_name,
+            target_info.live_name,
             provider_timeout_seconds,
-            target_info.name,
-            target_info.name,
-            target_info.name,
-            target_info.name,
+            target_info.live_name,
+            target_info.live_name,
+            target_info.live_name,
+            target_info.live_name,
         }) catch @panic("oom");
     }
 
@@ -490,15 +419,14 @@ fn makeParallelLiveRunScript(
         \\
     ) catch @panic("oom");
 
-    for (live_provider_targets) |target_info| {
-        if (!target_info.serial) continue;
+    for (provider_registry.all) |target_info| {
+        if (!target_info.live_serial) continue;
         if (active_only and !target_info.active) continue;
-        if (target_info.captcha and !std.mem.eql(u8, include_captcha_arg, "true")) continue;
-        const provider_timeout_seconds = target_info.timeout_seconds orelse timeout_seconds;
+        const provider_timeout_seconds = target_info.live_timeout_seconds orelse timeout_seconds;
         out.print(b.allocator,
             \\echo "[live][runner] START {s} mode=serial"
             \\set +e
-            \\SCRAPERS_LIVE_PROVIDER_FILTER="{s}" SCRAPERS_LIVE_INCLUDE_CAPTCHA="{s}" timeout --signal=TERM --kill-after=5s {d}s "$test_bin" 2>&1 | sed -u 's/^/[live][{s}] /'
+            \\SCRAPERS_LIVE_PROVIDER_FILTER="{s}" timeout --signal=TERM --kill-after=5s {d}s "$test_bin" 2>&1 | sed -u 's/^/[live][{s}] /'
             \\rc=${{PIPESTATUS[0]}}
             \\set -e
             \\echo "[live][runner] END {s} rc=$rc mode=serial"
@@ -507,12 +435,11 @@ fn makeParallelLiveRunScript(
             \\fi
             \\
         , .{
-            target_info.name,
-            target_info.name,
-            include_captcha_arg,
+            target_info.live_name,
+            target_info.live_name,
             provider_timeout_seconds,
-            target_info.name,
-            target_info.name,
+            target_info.live_name,
+            target_info.live_name,
         }) catch @panic("oom");
     }
 

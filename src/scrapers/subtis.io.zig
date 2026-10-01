@@ -122,11 +122,11 @@ fn parseSearchJson(arena: std.heap.ArenaAllocator, body: []const u8) !SearchResp
             .object => |value| value,
             else => continue,
         };
-        const media_type = jsonString(entry_obj, "type") orelse continue;
+        const media_type = common.jsonString(entry_obj, "type") orelse continue;
         if (!std.mem.eql(u8, media_type, "movie")) continue;
-        const title = jsonString(entry_obj, "title_name") orelse continue;
-        const slug = jsonString(entry_obj, "slug") orelse continue;
-        const year = if (entry_obj.get("year")) |value| jsonInt(value) else null;
+        const title = common.jsonString(entry_obj, "title_name") orelse continue;
+        const slug = common.jsonString(entry_obj, "slug") orelse continue;
+        const year = if (entry_obj.get("year")) |value| common.jsonInt(value) else null;
 
         try items.append(a, .{
             .title = try a.dupe(u8, title),
@@ -137,23 +137,6 @@ fn parseSearchJson(arena: std.heap.ArenaAllocator, body: []const u8) !SearchResp
     }
 
     return .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) };
-}
-
-fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = obj.get(key) orelse return null;
-    return switch (value) {
-        .string => |text| text,
-        else => null,
-    };
-}
-
-fn jsonInt(value: std.json.Value) ?i64 {
-    return switch (value) {
-        .integer => |number| number,
-        .number_string => |number| std.fmt.parseInt(i64, number, 10) catch null,
-        .float => |number| @intFromFloat(number),
-        else => null,
-    };
 }
 
 fn trailingPathSegment(url: []const u8) ?[]const u8 {

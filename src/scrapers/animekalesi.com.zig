@@ -146,7 +146,7 @@ fn parseSeriesIndex(arena: std.heap.ArenaAllocator, body: []const u8, query: []c
     const a = owned_arena.allocator();
     var parsed = try common.parseHtmlStable(a, body);
 
-    const wanted = try normalizeTitle(a, query);
+    const wanted = try common.normalizeTitle(a, query);
     var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
     var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
     var seen = std.StringHashMapUnmanaged(void).empty;
@@ -158,7 +158,7 @@ fn parseSeriesIndex(arena: std.heap.ArenaAllocator, body: []const u8, query: []c
         const title = trimDisplaySpace(raw_title);
         if (title.len == 0) continue;
 
-        const normalized = try normalizeTitle(a, title);
+        const normalized = try common.normalizeTitle(a, title);
         if (normalized.len == 0) continue;
         if (std.mem.indexOf(u8, normalized, wanted) == null and
             std.mem.indexOf(u8, wanted, normalized) == null) continue;
@@ -443,22 +443,6 @@ fn isRedirect(status: std.http.Status) bool {
         status == .see_other or
         status == .temporary_redirect or
         status == .permanent_redirect;
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 fn slug(allocator: Allocator, input: []const u8) ![]u8 {

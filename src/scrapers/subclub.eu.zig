@@ -98,7 +98,7 @@ pub const Scraper = struct {
         while (anchors.next()) |anchor| {
             const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
             const filename = try common.innerTextTrimmedOwned(a, anchor);
-            if (filename.len == 0 or !isSubtitleFilename(filename)) continue;
+            if (filename.len == 0 or !common.isSubtitleFilename(filename)) continue;
 
             const download_url = try resolveSubclubHref(a, href);
             if (seen.contains(download_url)) continue;
@@ -132,7 +132,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     const a = owned_arena.allocator();
 
     var parsed = try common.parseHtmlStable(a, body);
-    const wanted = try normalizeTitle(a, query);
+    const wanted = try common.normalizeTitle(a, query);
     var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
     var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
     var seen = std.StringHashMapUnmanaged(void).empty;
@@ -161,7 +161,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
             .page_url = page_url,
         };
 
-        const normalized = try normalizeTitle(a, title);
+        const normalized = try common.normalizeTitle(a, title);
         if (std.mem.eql(u8, normalized, wanted))
             try exact.append(a, item)
         else
@@ -238,31 +238,6 @@ fn resolveSubclubHref(allocator: Allocator, href: []const u8) ![]const u8 {
     if (std.mem.startsWith(u8, href, "/"))
         return std.fmt.allocPrint(allocator, "{s}{s}", .{ site, href });
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ site, href });
-}
-
-fn isSubtitleFilename(filename: []const u8) bool {
-    return std.ascii.endsWithIgnoreCase(filename, ".srt") or
-        std.ascii.endsWithIgnoreCase(filename, ".ass") or
-        std.ascii.endsWithIgnoreCase(filename, ".ssa") or
-        std.ascii.endsWithIgnoreCase(filename, ".sub") or
-        std.ascii.endsWithIgnoreCase(filename, ".vtt");
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "subclub parses movie and episode rows and archive files" {

@@ -54,11 +54,8 @@ pub const SubtitlesResponse = struct {
     }
 };
 
-const ParsedQuery = struct {
-    title: []const u8,
-    season: ?u16,
-    episode: ?u16,
-};
+const ParsedQuery = common.EpisodeQuery;
+const parseQuery = common.parseEpisodeQuery;
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -91,26 +88,26 @@ pub const Scraper = struct {
         });
 
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, search_response.body, .{});
-        const root_obj = valueObject(root) orelse return error.InvalidFieldType;
-        const results = valueArray(root_obj.get("results") orelse return error.MissingField) orelse
+        const root_obj = common.jsonObject(root) orelse return error.InvalidFieldType;
+        const results = common.jsonArray(root_obj.get("results") orelse return error.MissingField) orelse
             return error.InvalidFieldType;
 
-        const wanted = try normalizeTitle(a, parsed_query.title);
+        const wanted = try common.normalizeTitle(a, parsed_query.title);
         var exact_ids: std.ArrayListUnmanaged(i64) = .empty;
         var partial_ids: std.ArrayListUnmanaged(i64) = .empty;
         var seen_ids = std.AutoHashMapUnmanaged(i64, void).empty;
 
         for (results.items) |value| {
-            const obj = valueObject(value) orelse continue;
+            const obj = common.jsonObject(value) orelse continue;
             if (!isCompletedNativeResult(obj)) continue;
-            const anime = valueObject(obj.get("anime") orelse continue) orelse continue;
+            const anime = common.jsonObject(obj.get("anime") orelse continue) orelse continue;
             const anime_id = objectInt(anime, "id") orelse continue;
             if (seen_ids.contains(anime_id)) continue;
 
-            const title = objectString(anime, "title") orelse "";
-            const english_title = objectString(anime, "english_title") orelse "";
-            const normalized_title = try normalizeTitle(a, title);
-            const normalized_english = try normalizeTitle(a, english_title);
+            const title = common.jsonString(anime, "title") orelse "";
+            const english_title = common.jsonString(anime, "english_title") orelse "";
+            const normalized_title = try common.normalizeTitle(a, title);
+            const normalized_english = try common.normalizeTitle(a, english_title);
             const exact_match = std.mem.eql(u8, normalized_title, wanted) or
                 std.mem.eql(u8, normalized_english, wanted);
             const partial_match = containsEither(normalized_title, wanted) or
@@ -141,22 +138,22 @@ pub const Scraper = struct {
                 .max_attempts = 2,
             });
             const meta_root = try std.json.parseFromSliceLeaky(std.json.Value, a, meta_response.body, .{});
-            const meta_obj = valueObject(meta_root) orelse continue;
-            const anime = valueObject(meta_obj.get("anime") orelse continue) orelse continue;
+            const meta_obj = common.jsonObject(meta_root) orelse continue;
+            const anime = common.jsonObject(meta_obj.get("anime") orelse continue) orelse continue;
             const media_kind: MediaKind = if ((objectInt(anime, "is_movie") orelse 0) == 1) .movie else .tv;
             if (parsed_query.episode != null and media_kind != .tv) continue;
 
             const display_title = blk: {
-                const english = objectString(anime, "english_title") orelse "";
+                const english = common.jsonString(anime, "english_title") orelse "";
                 if (std.mem.trim(u8, english, " \t\r\n").len > 0) break :blk english;
-                break :blk objectString(anime, "title") orelse parsed_query.title;
+                break :blk common.jsonString(anime, "title") orelse parsed_query.title;
             };
             const year = objectInt(anime, "release_year");
-            const anime_results = valueArray(meta_obj.get("results") orelse continue) orelse continue;
+            const anime_results = common.jsonArray(meta_obj.get("results") orelse continue) orelse continue;
 
             for (anime_results.items) |torrent_value| {
                 if (items.items.len >= max_search_items) break;
-                const torrent = valueObject(torrent_value) orelse continue;
+                const torrent = common.jsonObject(torrent_value) orelse continue;
                 if (!isCompletedNativeResult(torrent)) continue;
                 if (!hasSubtitleLanguages(torrent)) continue;
 
@@ -170,7 +167,7 @@ pub const Scraper = struct {
                 }
 
                 const torrent_id = objectInt(torrent, "id") orelse continue;
-                const release = objectString(torrent, "name") orelse continue;
+                const release = common.jsonString(torrent, "name") orelse continue;
                 const page_url = try std.fmt.allocPrint(a, "{s}/torrents/{d}", .{ api, torrent_id });
                 try items.append(a, .{
                     .title = try a.dupe(u8, display_title),
@@ -199,32 +196,32 @@ pub const Scraper = struct {
             .max_attempts = 2,
         });
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
-        const root_obj = valueObject(root) orelse return error.InvalidFieldType;
+        const root_obj = common.jsonObject(root) orelse return error.InvalidFieldType;
         if (jsonTruthy(root_obj.get("animetosho"))) return error.ProviderAccessBlocked;
 
-        const files = valueArray(root_obj.get("files") orelse return error.MissingField) orelse
+        const files = common.jsonArray(root_obj.get("files") orelse return error.MissingField) orelse
             return error.InvalidFieldType;
         var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
         var seen = std.AutoHashMapUnmanaged(i64, void).empty;
 
         for (files.items) |file_value| {
-            const file_obj = valueObject(file_value) orelse continue;
-            const attachments = valueArray(file_obj.get("attachments") orelse continue) orelse continue;
+            const file_obj = common.jsonObject(file_value) orelse continue;
+            const attachments = common.jsonArray(file_obj.get("attachments") orelse continue) orelse continue;
             for (attachments.items) |attachment_value| {
-                const attachment = valueObject(attachment_value) orelse continue;
+                const attachment = common.jsonObject(attachment_value) orelse continue;
                 if ((objectInt(attachment, "type") orelse -1) != 1) continue;
                 const attachment_id = objectInt(attachment, "id") orelse continue;
                 if (seen.contains(attachment_id)) continue;
 
-                const info = valueObject(attachment.get("info") orelse continue) orelse continue;
+                const info = common.jsonObject(attachment.get("info") orelse continue) orelse continue;
                 if ((objectInt(info, "cached") orelse 1) == 0) continue;
                 if (jsonTruthy(info.get("forced"))) continue;
-                const codec = objectString(info, "codec") orelse continue;
+                const codec = common.jsonString(info, "codec") orelse continue;
                 const extension = supportedSubtitleCodec(codec) orelse continue;
-                const track_name = objectString(info, "name") orelse "";
+                const track_name = common.jsonString(info, "name") orelse "";
                 if (looksSignsOnly(track_name)) continue;
 
-                const raw_language = objectString(info, "lang") orelse "en";
+                const raw_language = common.jsonString(info, "lang") orelse "en";
                 const language = common.normalizeLanguageCode(raw_language) orelse raw_language;
                 try seen.put(a, attachment_id, {});
                 try subtitles.append(a, .{
@@ -324,37 +321,15 @@ fn decompressXz(allocator: Allocator, compressed: []const u8) ![]u8 {
     return output.toOwnedSlice(allocator);
 }
 
-fn parseQuery(input: []const u8) ParsedQuery {
-    const trimmed = std.mem.trim(u8, input, " \t\r\n");
-    var i: usize = 0;
-    while (i < trimmed.len) : (i += 1) {
-        if (std.ascii.toLower(trimmed[i]) != 's') continue;
-        var cursor = i + 1;
-        const season_start = cursor;
-        while (cursor < trimmed.len and std.ascii.isDigit(trimmed[cursor]) and cursor - season_start < 2) : (cursor += 1) {}
-        if (cursor == season_start or cursor >= trimmed.len or std.ascii.toLower(trimmed[cursor]) != 'e') continue;
-        const season = std.fmt.parseInt(u16, trimmed[season_start..cursor], 10) catch continue;
-        cursor += 1;
-        const episode_start = cursor;
-        while (cursor < trimmed.len and std.ascii.isDigit(trimmed[cursor]) and cursor - episode_start < 3) : (cursor += 1) {}
-        if (cursor == episode_start) continue;
-        const episode = std.fmt.parseInt(u16, trimmed[episode_start..cursor], 10) catch continue;
-        const title = std.mem.trim(u8, trimmed[0..i], " \t\r\n-._");
-        if (title.len == 0) continue;
-        return .{ .title = title, .season = season, .episode = episode };
-    }
-    return .{ .title = trimmed, .season = null, .episode = null };
-}
-
 fn isCompletedNativeResult(obj: std.json.ObjectMap) bool {
-    const state = objectString(obj, "state") orelse return false;
+    const state = common.jsonString(obj, "state") orelse return false;
     if (!std.mem.eql(u8, state, "completed")) return false;
     if (jsonTruthy(obj.get("animetosho"))) return false;
     return (objectInt(obj, "is_adult") orelse 0) == 0;
 }
 
 fn hasSubtitleLanguages(obj: std.json.ObjectMap) bool {
-    const langs = valueArray(obj.get("sublangs") orelse return false) orelse return false;
+    const langs = common.jsonArray(obj.get("sublangs") orelse return false) orelse return false;
     return langs.items.len > 0;
 }
 
@@ -376,28 +351,6 @@ fn containsEither(a: []const u8, b: []const u8) bool {
     return std.mem.indexOf(u8, a, b) != null or std.mem.indexOf(u8, b, a) != null;
 }
 
-fn valueObject(value: std.json.Value) ?std.json.ObjectMap {
-    return switch (value) {
-        .object => |obj| obj,
-        else => null,
-    };
-}
-
-fn valueArray(value: std.json.Value) ?std.json.Array {
-    return switch (value) {
-        .array => |array| array,
-        else => null,
-    };
-}
-
-fn objectString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = obj.get(key) orelse return null;
-    return switch (value) {
-        .string => |text| text,
-        else => null,
-    };
-}
-
 fn objectInt(obj: std.json.ObjectMap, key: []const u8) ?i64 {
     const value = obj.get(key) orelse return null;
     return switch (value) {
@@ -417,22 +370,6 @@ fn jsonTruthy(value: ?std.json.Value) bool {
         .string => |text| std.ascii.eqlIgnoreCase(text, "true") or std.mem.eql(u8, text, "1"),
         else => false,
     };
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "tsukihime parses episode query" {

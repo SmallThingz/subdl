@@ -81,7 +81,7 @@ pub const Scraper = struct {
             else => return error.InvalidFieldType,
         };
 
-        const wanted = try normalizeTitle(a, trimmed);
+        const wanted = try common.normalizeTitle(a, trimmed);
         var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
         var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
         var inspected: usize = 0;
@@ -92,11 +92,11 @@ pub const Scraper = struct {
                 .object => |value| value,
                 else => continue,
             };
-            const subtype = jsonString(obj, "subtype") orelse continue;
+            const subtype = common.jsonString(obj, "subtype") orelse continue;
             if (!std.mem.eql(u8, subtype, "anime")) continue;
-            const anime_id = jsonIntFromObject(obj, "id") orelse continue;
-            const search_title = jsonString(obj, "title") orelse continue;
-            const page_url = jsonString(obj, "url") orelse continue;
+            const anime_id = common.jsonIntField(obj, "id") orelse continue;
+            const search_title = common.jsonString(obj, "title") orelse continue;
+            const page_url = common.jsonString(obj, "url") orelse continue;
             if (anime_id <= 0 or search_title.len == 0 or page_url.len == 0) continue;
             inspected += 1;
 
@@ -134,8 +134,8 @@ pub const Scraper = struct {
                 .subtitle_page_url = subtitle_page_url,
             };
 
-            const normalized_title = try normalizeTitle(a, title);
-            const normalized_english = if (english_title) |value| try normalizeTitle(a, value) else "";
+            const normalized_title = try common.normalizeTitle(a, title);
+            const normalized_english = if (english_title) |value| try common.normalizeTitle(a, value) else "";
             if (std.mem.eql(u8, normalized_title, wanted) or
                 (normalized_english.len > 0 and std.mem.eql(u8, normalized_english, wanted)))
             {
@@ -191,28 +191,6 @@ pub const Scraper = struct {
     }
 };
 
-fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = obj.get(key) orelse return null;
-    return switch (value) {
-        .string => |text| text,
-        else => null,
-    };
-}
-
-fn jsonIntFromObject(obj: std.json.ObjectMap, key: []const u8) ?i64 {
-    const value = obj.get(key) orelse return null;
-    return jsonInt(value);
-}
-
-fn jsonInt(value: std.json.Value) ?i64 {
-    return switch (value) {
-        .integer => |number| number,
-        .number_string => |number| std.fmt.parseInt(i64, number, 10) catch null,
-        .float => |number| @intFromFloat(number),
-        else => null,
-    };
-}
-
 fn nestedValue(root: std.json.ObjectMap, path: []const []const u8) ?std.json.Value {
     if (path.len == 0) return null;
     var value = root.get(path[0]) orelse return null;
@@ -236,7 +214,7 @@ fn nestedString(root: std.json.ObjectMap, path: []const []const u8) ?[]const u8 
 
 fn nestedInt(root: std.json.ObjectMap, path: []const []const u8) ?i64 {
     const value = nestedValue(root, path) orelse return null;
-    return jsonInt(value);
+    return common.jsonInt(value);
 }
 
 fn pageSlug(page_url: []const u8) ?[]const u8 {
@@ -264,22 +242,6 @@ fn filenameFromUrl(allocator: Allocator, url: []const u8, fallback_title: []cons
         if (filename.len > 0) return allocator.dupe(u8, filename);
     }
     return std.fmt.allocPrint(allocator, "{s}.zip", .{fallback_title});
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "miraianime parses anime media kind metadata" {

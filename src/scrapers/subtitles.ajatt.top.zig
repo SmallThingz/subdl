@@ -87,7 +87,7 @@ pub const Scraper = struct {
                 try a.dupe(u8, download)
             else
                 try common.innerTextTrimmedOwned(a, anchor);
-            if (!isSubtitleFilename(filename)) continue;
+            if (!common.isSubtitleFilename(filename)) continue;
             if (seen.contains(href)) continue;
             try seen.put(a, href, {});
             try subtitles.append(a, .{
@@ -189,14 +189,6 @@ fn normalizeForSearch(allocator: Allocator, input: []const u8) ![]const u8 {
         pending_space = out.items.len > 0;
     }
     return out.toOwnedSlice(allocator);
-}
-
-fn isSubtitleFilename(filename: []const u8) bool {
-    return std.ascii.endsWithIgnoreCase(filename, ".srt") or
-        std.ascii.endsWithIgnoreCase(filename, ".ass") or
-        std.ascii.endsWithIgnoreCase(filename, ".ssa") or
-        std.ascii.endsWithIgnoreCase(filename, ".vtt") or
-        std.ascii.endsWithIgnoreCase(filename, ".sub");
 }
 
 test "ajatt parses movie and tv catalog rows" {

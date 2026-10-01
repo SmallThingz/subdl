@@ -99,7 +99,7 @@ pub const Scraper = struct {
             const filename = try common.innerTextTrimmedOwned(a, filename_node);
             if (filename.len == 0) continue;
             const language_code = if (anchor.queryOne("span.lang img[alt]")) |img|
-                try dupOptional(a, common.getAttributeValueSafe(img, "alt"))
+                try common.dupOptional(a, common.getAttributeValueSafe(img, "alt"))
             else
                 null;
 
@@ -124,7 +124,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     const a = owned_arena.allocator();
     var parsed = try common.parseHtmlStable(a, body);
 
-    const wanted = try normalizeTitle(a, query);
+    const wanted = try common.normalizeTitle(a, query);
     var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
     var other: std.ArrayListUnmanaged(SearchItem) = .empty;
 
@@ -151,7 +151,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
             .media_kind = media_kind,
             .page_url = try common.resolveUrl(a, site, href),
         };
-        const normalized = try normalizeTitle(a, title);
+        const normalized = try common.normalizeTitle(a, title);
         if (std.mem.eql(u8, normalized, wanted))
             try exact.append(a, item)
         else
@@ -168,27 +168,6 @@ fn hasClassToken(classes: []const u8, token: []const u8) bool {
     var it = std.mem.tokenizeAny(u8, classes, " \t\r\n");
     while (it.next()) |value| if (std.mem.eql(u8, value, token)) return true;
     return false;
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn dupOptional(allocator: Allocator, value: ?[]const u8) !?[]const u8 {
-    if (value) |text| return try allocator.dupe(u8, text);
-    return null;
 }
 
 test "sous-titres parses exact movie and series rows" {

@@ -110,7 +110,7 @@ fn parseCatalog(arena: std.heap.ArenaAllocator, body: []const u8, query: []const
     var owned_arena = arena;
     errdefer owned_arena.deinit();
     const a = owned_arena.allocator();
-    const wanted = try normalizeTitle(a, query);
+    const wanted = try common.normalizeTitle(a, query);
 
     var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
     var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
@@ -132,7 +132,7 @@ fn parseCatalog(arena: std.heap.ArenaAllocator, body: []const u8, query: []const
         const title = std.mem.trim(u8, body[gt + 1 .. close], " \t\r\n");
         if (title.len == 0 or std.mem.indexOfScalar(u8, title, '<') != null) continue;
 
-        const normalized = try normalizeTitle(a, title);
+        const normalized = try common.normalizeTitle(a, title);
         if (normalized.len == 0) continue;
         if (std.mem.indexOf(u8, normalized, wanted) == null and
             std.mem.indexOf(u8, wanted, normalized) == null) continue;
@@ -243,22 +243,6 @@ pub fn parseDownloadToken(value: []const u8) ?DownloadToken {
     const sep = std.mem.indexOfScalar(u8, payload, '|') orelse return null;
     if (sep == 0 or sep + 1 >= payload.len) return null;
     return .{ .page_url = payload[0..sep], .download_url = payload[sep + 1 ..] };
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 fn slug(allocator: Allocator, input: []const u8) ![]u8 {

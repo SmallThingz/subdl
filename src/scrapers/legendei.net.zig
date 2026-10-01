@@ -74,7 +74,7 @@ pub const Scraper = struct {
             .array => |value| value,
             else => return error.InvalidFieldType,
         };
-        const wanted = try normalizeTitle(a, stripReleaseNoise(trimmed));
+        const wanted = try common.normalizeTitle(a, stripReleaseNoise(trimmed));
         var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
         var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
 
@@ -84,14 +84,14 @@ pub const Scraper = struct {
                 else => continue,
             };
             const post_id = jsonInt(obj, "id") orelse continue;
-            const title = jsonString(obj, "title") orelse continue;
-            const page_url = jsonString(obj, "url") orelse continue;
+            const title = common.jsonString(obj, "title") orelse continue;
+            const page_url = common.jsonString(obj, "url") orelse continue;
             if (post_id <= 0 or title.len == 0 or page_url.len == 0) continue;
 
             const se = parseSeasonEpisode(title);
             const media_kind: MediaKind = if (se.episode != null) .tv else .movie;
             const canonical = stripReleaseNoise(title);
-            const normalized = try normalizeTitle(a, canonical);
+            const normalized = try common.normalizeTitle(a, canonical);
             if (normalized.len == 0) continue;
             if (std.mem.indexOf(u8, normalized, wanted) == null and
                 std.mem.indexOf(u8, wanted, normalized) == null) continue;
@@ -244,14 +244,6 @@ fn stripReleaseNoise(value: []const u8) []const u8 {
     return std.mem.trim(u8, value[0..end], " \t-._");
 }
 
-fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = obj.get(key) orelse return null;
-    return switch (value) {
-        .string => |text| text,
-        else => null,
-    };
-}
-
 fn jsonInt(obj: std.json.ObjectMap, key: []const u8) ?i64 {
     const value = obj.get(key) orelse return null;
     return switch (value) {
@@ -259,22 +251,6 @@ fn jsonInt(obj: std.json.ObjectMap, key: []const u8) ?i64 {
         .number_string => |number| std.fmt.parseInt(i64, number, 10) catch null,
         else => null,
     };
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "legendei parses media hints and download anchor" {

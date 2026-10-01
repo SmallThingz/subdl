@@ -348,7 +348,7 @@ fn printProviders(writer: *std.Io.Writer) !void {
     for (app.providers()) |provider| {
         const info = app.providerInfo(provider);
         try writer.print(
-            "  {s} - {s} ({s}) movies={any} tv={any} search_pages={any} subtitle_pages={any} protected={any}\n",
+            "  {s} - {s} ({s}) movies={any} tv={any} search_pages={any} subtitle_pages={any}\n",
             .{
                 info.id,
                 info.display_name,
@@ -357,7 +357,6 @@ fn printProviders(writer: *std.Io.Writer) !void {
                 info.supports_tv,
                 info.supports_search_pagination,
                 info.supports_subtitles_pagination,
-                info.protected,
             },
         );
     }

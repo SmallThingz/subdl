@@ -612,15 +612,6 @@ fn getStringOrDefault(obj: std.json.ObjectMap, field: []const u8, default: []con
     };
 }
 
-fn getOptionalString(obj: std.json.ObjectMap, field: []const u8) !?[]const u8 {
-    const value = obj.get(field) orelse return null;
-    return switch (value) {
-        .null => null,
-        .string => |s| s,
-        else => error.InvalidFieldType,
-    };
-}
-
 fn getRequiredInt(obj: std.json.ObjectMap, field: []const u8) !i64 {
     const value = try getRequiredField(obj, field);
     return asInt(value);
@@ -631,17 +622,6 @@ fn getIntOrDefault(obj: std.json.ObjectMap, field: []const u8, default: i64) !i6
     return switch (value) {
         .null => default,
         else => asInt(value),
-    };
-}
-
-fn getOptionalFloat(obj: std.json.ObjectMap, field: []const u8) !?f64 {
-    const value = obj.get(field) orelse return null;
-    return switch (value) {
-        .null => null,
-        .integer => |i| @as(f64, @floatFromInt(i)),
-        .float => |f| f,
-        .number_string => |s| try std.fmt.parseFloat(f64, s),
-        else => error.InvalidFieldType,
     };
 }
 
@@ -671,15 +651,6 @@ fn asInt(value: std.json.Value) !i64 {
         .integer => |i| i,
         .float => |f| @as(i64, @intFromFloat(f)),
         .number_string => |n| std.fmt.parseInt(i64, n, 10) catch error.InvalidFieldType,
-        else => error.InvalidFieldType,
-    };
-}
-
-fn asBoolOrInt(value: std.json.Value) !bool {
-    return switch (value) {
-        .bool => |b| b,
-        .integer => |i| i != 0,
-        .number_string => |n| (std.fmt.parseInt(i64, n, 10) catch return error.InvalidFieldType) != 0,
         else => error.InvalidFieldType,
     };
 }

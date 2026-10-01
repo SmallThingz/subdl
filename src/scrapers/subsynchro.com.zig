@@ -119,7 +119,7 @@ fn parseSearchJson(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
         else => return error.InvalidFieldType,
     };
 
-    const wanted = try normalizeTitle(a, query);
+    const wanted = try common.normalizeTitle(a, query);
     var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
     var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
     var seen = std.StringHashMapUnmanaged(void).empty;
@@ -129,16 +129,16 @@ fn parseSearchJson(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
             .object => |value| value,
             else => continue,
         };
-        const local_title = jsonString(entry_obj, "titre") orelse continue;
-        const original_title = jsonString(entry_obj, "titre_original");
+        const local_title = common.jsonString(entry_obj, "titre") orelse continue;
+        const original_title = common.jsonString(entry_obj, "titre_original");
         const display_title = if (original_title) |value|
             if (std.mem.trim(u8, value, " \t\r\n").len > 0) value else local_title
         else
             local_title;
         const year = if (entry_obj.get("date")) |value| jsonInt(value) else null;
 
-        const local_normalized = try normalizeTitle(a, local_title);
-        const original_normalized = if (original_title) |value| try normalizeTitle(a, value) else "";
+        const local_normalized = try common.normalizeTitle(a, local_title);
+        const original_normalized = if (original_title) |value| try common.normalizeTitle(a, value) else "";
         const exact_match = std.mem.eql(u8, local_normalized, wanted) or
             (original_normalized.len > 0 and std.mem.eql(u8, original_normalized, wanted));
         const partial_match = std.mem.indexOf(u8, local_normalized, wanted) != null or
@@ -189,7 +189,7 @@ fn parseSubtitlesJson(arena: std.heap.ArenaAllocator, body: []const u8, item: Se
         else => return error.InvalidFieldType,
     };
 
-    const wanted = try normalizeTitle(a, item.title);
+    const wanted = try common.normalizeTitle(a, item.title);
     var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
     var seen = std.StringHashMapUnmanaged(void).empty;
     for (data.items) |entry| {
@@ -197,10 +197,10 @@ fn parseSubtitlesJson(arena: std.heap.ArenaAllocator, body: []const u8, item: Se
             .object => |value| value,
             else => continue,
         };
-        const local_title = jsonString(entry_obj, "titre") orelse continue;
-        const original_title = jsonString(entry_obj, "titre_original");
-        const local_normalized = try normalizeTitle(a, local_title);
-        const original_normalized = if (original_title) |value| try normalizeTitle(a, value) else "";
+        const local_title = common.jsonString(entry_obj, "titre") orelse continue;
+        const original_title = common.jsonString(entry_obj, "titre_original");
+        const local_normalized = try common.normalizeTitle(a, local_title);
+        const original_normalized = if (original_title) |value| try common.normalizeTitle(a, value) else "";
         if (!std.mem.eql(u8, local_normalized, wanted) and
             !(original_normalized.len > 0 and std.mem.eql(u8, original_normalized, wanted))) continue;
 
@@ -209,8 +209,8 @@ fn parseSubtitlesJson(arena: std.heap.ArenaAllocator, body: []const u8, item: Se
             if (year == null or year.? != wanted_year) continue;
         }
 
-        const filename = jsonString(entry_obj, "filename") orelse continue;
-        const raw_download_url = jsonString(entry_obj, "telechargement") orelse continue;
+        const filename = common.jsonString(entry_obj, "filename") orelse continue;
+        const raw_download_url = common.jsonString(entry_obj, "telechargement") orelse continue;
         const download_url = try normalizeProviderUrl(a, raw_download_url);
         if (seen.contains(download_url)) continue;
         try seen.put(a, download_url, {});
@@ -295,14 +295,6 @@ fn extractHeader(allocator: Allocator, headers: []const u8, wanted: []const u8) 
     return null;
 }
 
-fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = obj.get(key) orelse return null;
-    return switch (value) {
-        .string => |text| text,
-        else => null,
-    };
-}
-
 fn jsonInt(value: std.json.Value) ?i64 {
     return switch (value) {
         .integer => |number| number,
@@ -311,22 +303,6 @@ fn jsonInt(value: std.json.Value) ?i64 {
         .string => |number| std.fmt.parseInt(i64, number, 10) catch null,
         else => null,
     };
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "subsynchro parses and deduplicates movie search results" {

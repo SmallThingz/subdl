@@ -58,8 +58,6 @@ pub const grupahatak_pl = @import("grupahatak.pl.zig");
 pub const jimaku_cc = @import("jimaku.cc.zig");
 pub const opensubtitles_com_cf = @import("opensubtitles_com_cf.zig");
 
-pub const provider_union = @import("provider_union.zig");
-
 pub const Scraper = subdl_impl.Scraper;
 pub const Error = subdl_impl.Error;
 pub const SubtitlePath = subdl_impl.SubtitlePath;
@@ -131,7 +129,6 @@ test {
     _ = @import("grupahatak.pl.zig");
     _ = @import("jimaku.cc.zig");
     _ = @import("opensubtitles_com_cf.zig");
-    _ = @import("provider_union.zig");
     _ = @import("test_suite.zig");
     _ = @import("providers.extensive.live.test.zig");
 }

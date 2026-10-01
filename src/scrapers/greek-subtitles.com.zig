@@ -104,7 +104,7 @@ pub const Scraper = struct {
         const filename = try a.dupe(u8, item.title);
         const subtitles = try a.alloc(SubtitleItem, 1);
         subtitles[0] = .{
-            .language_code = try dupOptional(a, item.language_code),
+            .language_code = try common.dupOptional(a, item.language_code),
             .filename = filename,
             .page_url = try a.dupe(u8, item.page_url),
             .download_url = try a.dupe(u8, item.download_url),
@@ -139,11 +139,6 @@ fn parseOptionalInt(value: []const u8) ?i64 {
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
     if (trimmed.len == 0) return null;
     return std.fmt.parseInt(i64, trimmed, 10) catch null;
-}
-
-fn dupOptional(allocator: Allocator, value: ?[]const u8) !?[]const u8 {
-    if (value) |text| return try allocator.dupe(u8, text);
-    return null;
 }
 
 fn parseSearchFixture(allocator: Allocator, body: []const u8) ![]const SearchItem {

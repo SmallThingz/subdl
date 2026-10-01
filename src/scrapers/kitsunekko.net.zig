@@ -43,11 +43,8 @@ pub const SubtitlesResponse = struct {
     }
 };
 
-const ParsedQuery = struct {
-    title: []const u8,
-    season: ?u16,
-    episode: ?u16,
-};
+const ParsedQuery = common.EpisodeQuery;
+const parseQuery = common.parseEpisodeQuery;
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -66,7 +63,7 @@ pub const Scraper = struct {
 
         const parsed_query = parseQuery(query);
         if (parsed_query.title.len == 0) return .{ .arena = arena, .items = &.{} };
-        const wanted = try normalizeTitle(a, parsed_query.title);
+        const wanted = try common.normalizeTitle(a, parsed_query.title);
 
         var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
         var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
@@ -112,7 +109,7 @@ pub const Scraper = struct {
 
             const raw_title = try common.innerTextTrimmedOwned(allocator, anchor);
             if (raw_title.len == 0) continue;
-            const normalized = try normalizeTitle(allocator, raw_title);
+            const normalized = try common.normalizeTitle(allocator, raw_title);
             if (normalized.len == 0) continue;
 
             const is_exact = std.mem.eql(u8, normalized, wanted);
@@ -219,60 +216,7 @@ fn filenameMatchesEpisode(filename: []const u8, season: u16, episode: u16) bool 
     return indexOfIgnoreCase(filename, episode_text) != null;
 }
 
-fn parseQuery(input: []const u8) ParsedQuery {
-    const trimmed = std.mem.trim(u8, input, " \\t\\r\\n");
-    var i: usize = 0;
-    while (i < trimmed.len) : (i += 1) {
-        if (std.ascii.toLower(trimmed[i]) != 's') continue;
-        var cursor = i + 1;
-        const season_start = cursor;
-        while (cursor < trimmed.len and std.ascii.isDigit(trimmed[cursor]) and cursor - season_start < 2) : (cursor += 1) {}
-        if (cursor == season_start or cursor >= trimmed.len or std.ascii.toLower(trimmed[cursor]) != 'e') continue;
-        const season = std.fmt.parseInt(u16, trimmed[season_start..cursor], 10) catch continue;
-        cursor += 1;
-        const episode_start = cursor;
-        while (cursor < trimmed.len and std.ascii.isDigit(trimmed[cursor]) and cursor - episode_start < 3) : (cursor += 1) {}
-        if (cursor == episode_start) continue;
-        const episode = std.fmt.parseInt(u16, trimmed[episode_start..cursor], 10) catch continue;
-        const title = std.mem.trim(u8, trimmed[0..i], " \\t\\r\\n-._");
-        if (title.len == 0) continue;
-        return .{ .title = title, .season = season, .episode = episode };
-    }
-    return .{ .title = trimmed, .season = null, .episode = null };
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0) return 0;
-    if (needle.len > haystack.len) return null;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        var matches = true;
-        for (needle, 0..) |c, j| {
-            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(c)) {
-                matches = false;
-                break;
-            }
-        }
-        if (matches) return i;
-    }
-    return null;
-}
+const indexOfIgnoreCase = std.ascii.indexOfIgnoreCase;
 
 fn findResult(items: []const SearchItem, title: []const u8, language_code: []const u8) ?usize {
     for (items, 0..) |item, idx| {

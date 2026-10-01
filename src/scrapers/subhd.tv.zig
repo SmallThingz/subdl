@@ -128,7 +128,7 @@ pub const Scraper = struct {
                 .cache = false,
                 .max_attempts = 1,
             });
-            if (direct.status == .ok and direct.body.len > 0 and !looksLikeHtml(direct.body)) return direct;
+            if (direct.status == .ok and direct.body.len > 0 and !common.looksLikeHtml(direct.body)) return direct;
             allocator.free(direct.body);
         }
 
@@ -198,16 +198,9 @@ fn directCdnUrlFromFilename(allocator: Allocator, filename: []const u8) !?[]u8 {
     );
 }
 
-fn looksLikeHtml(body: []const u8) bool {
-    const head = std.mem.trimStart(u8, body[0..@min(body.len, 1024)], " \t\r\n");
-    return std.ascii.startsWithIgnoreCase(head, "<!doctype html") or
-        std.ascii.startsWithIgnoreCase(head, "<html") or
-        std.mem.indexOf(u8, head, "<body") != null;
-}
-
 fn parseSearchItems(allocator: Allocator, body: []const u8, query: []const u8) ![]const SearchItem {
     const wanted_title = std.mem.trim(u8, stripEpisodeTag(query), " \t\r\n");
-    const wanted = try normalizeTitle(allocator, wanted_title);
+    const wanted = try common.normalizeTitle(allocator, wanted_title);
     const requested_episode = parseSeasonEpisode(query);
 
     var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
@@ -231,7 +224,7 @@ fn parseSearchItems(allocator: Allocator, body: []const u8, query: []const u8) !
             asciiTitleSuffix(alt)
         else
             wanted_title;
-        const normalized_title = try normalizeTitle(allocator, result_title);
+        const normalized_title = try common.normalizeTitle(allocator, result_title);
         if (normalized_title.len == 0) continue;
         if (std.mem.indexOf(u8, normalized_title, wanted) == null and
             std.mem.indexOf(u8, wanted, normalized_title) == null)
@@ -309,24 +302,6 @@ fn searchCardExtension(card: []const u8) []const u8 {
     if (std.mem.indexOf(u8, card, ">SUB<") != null) return "sub";
     if (std.mem.indexOf(u8, card, ">ZIP<") != null) return "zip";
     return "srt";
-}
-
-fn parseDetailUrls(allocator: Allocator, body: []const u8) ![]const []const u8 {
-    var out: std.ArrayListUnmanaged([]const u8) = .empty;
-    var seen = std.StringHashMapUnmanaged(void).empty;
-    var cursor: usize = 0;
-    const marker = "href='/a/";
-    while (std.mem.indexOfPos(u8, body, cursor, marker)) |pos| {
-        const start = pos + "href='".len;
-        const tail = body[start..];
-        const end = std.mem.indexOfScalar(u8, tail, '\'') orelse break;
-        const href = tail[0..end];
-        cursor = start + end + 1;
-        if (seen.contains(href)) continue;
-        try seen.put(allocator, try allocator.dupe(u8, href), {});
-        try out.append(allocator, try common.resolveUrl(allocator, site, href));
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 fn parseDetail(body: []const u8) !?Detail {
@@ -577,22 +552,6 @@ fn isDownloadRateLimit(body: []const u8) bool {
     return std.mem.indexOf(u8, body, "下载频率过高") != null or
         std.mem.indexOf(u8, body, "try again later") != null or
         std.mem.indexOf(u8, body, "too frequent") != null;
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "subhd parses detail and session token" {

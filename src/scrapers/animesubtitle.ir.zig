@@ -80,7 +80,7 @@ pub const Scraper = struct {
             else => return error.InvalidFieldType,
         };
 
-        const wanted = try normalizeTitle(a, trimmed);
+        const wanted = try common.normalizeTitle(a, trimmed);
         var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
         var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
 
@@ -89,14 +89,14 @@ pub const Scraper = struct {
                 .object => |value| value,
                 else => continue,
             };
-            const post_id = jsonInt(obj.get("id") orelse continue) orelse continue;
-            const raw_title = jsonString(obj, "title") orelse continue;
-            const page_url = jsonString(obj, "url") orelse continue;
+            const post_id = common.jsonInt(obj.get("id") orelse continue) orelse continue;
+            const raw_title = common.jsonString(obj, "title") orelse continue;
+            const page_url = common.jsonString(obj, "url") orelse continue;
             if (post_id <= 0 or page_url.len == 0) continue;
 
             const title = extractLatinTitle(raw_title);
             if (title.len == 0) continue;
-            const normalized = try normalizeTitle(a, title);
+            const normalized = try common.normalizeTitle(a, title);
             if (std.mem.indexOf(u8, normalized, wanted) == null and
                 std.mem.indexOf(u8, wanted, normalized) == null) continue;
 
@@ -211,23 +211,6 @@ fn htmlUnescapeUrl(allocator: Allocator, input: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = obj.get(key) orelse return null;
-    return switch (value) {
-        .string => |text| text,
-        else => null,
-    };
-}
-
-fn jsonInt(value: std.json.Value) ?i64 {
-    return switch (value) {
-        .integer => |number| number,
-        .number_string => |number| std.fmt.parseInt(i64, number, 10) catch null,
-        .float => |number| @intFromFloat(number),
-        else => null,
-    };
-}
-
 fn nestedString(root: std.json.ObjectMap, path: []const []const u8) ?[]const u8 {
     if (path.len == 0) return null;
     var value = root.get(path[0]) orelse return null;
@@ -242,22 +225,6 @@ fn nestedString(root: std.json.ObjectMap, path: []const []const u8) ?[]const u8 
         .string => |text| text,
         else => null,
     };
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "animesubtitle ir extracts latin titles and media kind hints" {

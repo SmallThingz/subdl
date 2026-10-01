@@ -93,7 +93,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     errdefer owned_arena.deinit();
     const a = owned_arena.allocator();
 
-    const wanted = try normalizeTitle(a, query);
+    const wanted = try common.normalizeTitle(a, query);
     var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
     var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
     var seen = std.StringHashMapUnmanaged(void).empty;
@@ -130,7 +130,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
         const split = splitTitleYear(clean_original);
         if (split.title.len == 0) continue;
 
-        const normalized = try normalizeTitle(a, split.title);
+        const normalized = try common.normalizeTitle(a, split.title);
         if (std.mem.indexOf(u8, normalized, wanted) == null and
             std.mem.indexOf(u8, wanted, normalized) == null) continue;
 
@@ -221,22 +221,6 @@ fn percentDecode(allocator: Allocator, input: []const u8) ![]u8 {
         }
         try out.append(allocator, if (input[i] == '+') ' ' else input[i]);
         i += 1;
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
     }
     return out.toOwnedSlice(allocator);
 }

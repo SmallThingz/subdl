@@ -205,7 +205,7 @@ fn appendSearchRows(
     partial: *std.ArrayListUnmanaged(SearchItem),
 ) !void {
     const marker = "<table cellspacing=\"2\" cellpadding=\"2\" width=\"100%\" class=\"Napisy\" style=\"text-align:center\">";
-    const wanted = try normalizeTitle(allocator, query);
+    const wanted = try common.normalizeTitle(allocator, query);
     defer allocator.free(wanted);
 
     var cursor: usize = 0;
@@ -224,11 +224,11 @@ fn appendSearchRows(
         const title_eng = titles[1] orelse "";
         const title_alt = titles[2] orelse "";
 
-        const normalized_org = try normalizeTitle(allocator, title_org);
+        const normalized_org = try common.normalizeTitle(allocator, title_org);
         defer allocator.free(normalized_org);
-        const normalized_eng = try normalizeTitle(allocator, title_eng);
+        const normalized_eng = try common.normalizeTitle(allocator, title_eng);
         defer allocator.free(normalized_eng);
-        const normalized_alt = try normalizeTitle(allocator, title_alt);
+        const normalized_alt = try common.normalizeTitle(allocator, title_alt);
         defer allocator.free(normalized_alt);
 
         const matches = containsTitle(normalized_org, wanted) or
@@ -241,7 +241,7 @@ fn appendSearchRows(
         const season = parseSeason(display_title) orelse parseSeason(title_org) orelse parseSeason(title_alt);
         const media_kind: MediaKind = if (episode != null) .tv else .movie;
         const base_title = stripEpisodeSuffix(display_title);
-        const normalized_base = try normalizeTitle(allocator, base_title);
+        const normalized_base = try common.normalizeTitle(allocator, base_title);
         defer allocator.free(normalized_base);
 
         try seen.put(allocator, try allocator.dupe(u8, subtitle_id), {});
@@ -456,22 +456,6 @@ fn extractCookie(allocator: Allocator, headers: []const u8) !?[]u8 {
         return @as(?[]u8, try allocator.dupe(u8, value[0..end]));
     }
     return null;
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "animesubinfo parses movie and episode rows" {

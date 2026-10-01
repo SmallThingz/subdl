@@ -132,7 +132,7 @@ pub const Scraper = struct {
                 allocator.free(response.body);
                 return error.UnexpectedHttpStatus;
             }
-            if (looksLikeHtml(response.body)) {
+            if (common.looksLikeHtml(response.body)) {
                 allocator.free(response.body);
                 return error.UnexpectedResponseType;
             }
@@ -190,7 +190,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     var owned_arena = arena;
     errdefer owned_arena.deinit();
     const a = owned_arena.allocator();
-    const wanted = try normalizeTitle(a, query);
+    const wanted = try common.normalizeTitle(a, query);
 
     var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
     var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
@@ -211,7 +211,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
             try a.dupe(u8, visible)
         else
             try a.dupe(u8, query);
-        const normalized = try normalizeTitle(a, title);
+        const normalized = try common.normalizeTitle(a, title);
         const page_url = try std.fmt.allocPrint(a, "{s}/base.php?id={s}", .{ site, link.id });
         const item: SearchItem = .{
             .title = title,
@@ -320,29 +320,6 @@ fn isRateLimited(body: []const u8) bool {
     if (std.mem.indexOf(u8, body, "repeat the search in 5 seconds") != null) return true;
     // CP1251 bytes for "Повторите запрос через 5 секунд".
     return std.mem.indexOf(u8, body, "\xCF\xEE\xE2\xF2\xEE\xF0\xE8\xF2\xE5 \xE7\xE0\xEF\xF0\xEE\xF1 \xF7\xE5\xF0\xE5\xE7 5 \xF1\xE5\xEA\xF3\xED\xE4") != null;
-}
-
-fn looksLikeHtml(body: []const u8) bool {
-    const head = std.mem.trimStart(u8, body[0..@min(body.len, 1024)], " \t\r\n");
-    return std.ascii.startsWithIgnoreCase(head, "<!doctype html") or
-        std.ascii.startsWithIgnoreCase(head, "<html") or
-        std.mem.indexOf(u8, head, "<body") != null;
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "fansubs parses search and subtitle rows" {

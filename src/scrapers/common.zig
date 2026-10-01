@@ -518,25 +518,125 @@ pub fn innerTextTrimmedOwned(arena_alloc: Allocator, node: anytype) ![]const u8 
     return innerTextOwnedWithOptions(arena_alloc, node, .{ .normalize_whitespace = true });
 }
 
-pub fn collapseWhitespace(allocator: Allocator, input: []const u8) ![]const u8 {
+pub fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
-
-    var had_space = false;
+    var pending_space = false;
     for (input) |c| {
-        const is_space = c == ' ' or c == '\t' or c == '\r' or c == '\n';
-        if (is_space) {
-            had_space = true;
-            continue;
+        if (std.ascii.isAlphanumeric(c)) {
+            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
+            pending_space = false;
+            try out.append(allocator, std.ascii.toLower(c));
+        } else {
+            pending_space = out.items.len > 0;
         }
-        if (had_space and out.items.len > 0) {
-            try out.append(allocator, ' ');
-        }
-        had_space = false;
-        try out.append(allocator, c);
     }
+    return out.toOwnedSlice(allocator);
+}
 
-    return try out.toOwnedSlice(allocator);
+pub fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+pub fn jsonInt(value: std.json.Value) ?i64 {
+    return switch (value) {
+        .integer => |number| number,
+        .number_string => |number| std.fmt.parseInt(i64, number, 10) catch null,
+        .float => |number| @intFromFloat(number),
+        else => null,
+    };
+}
+
+pub fn jsonIntField(obj: std.json.ObjectMap, key: []const u8) ?i64 {
+    return jsonInt(obj.get(key) orelse return null);
+}
+
+pub fn jsonObject(value: std.json.Value) ?std.json.ObjectMap {
+    return switch (value) {
+        .object => |obj| obj,
+        else => null,
+    };
+}
+
+pub fn jsonArray(value: std.json.Value) ?std.json.Array {
+    return switch (value) {
+        .array => |array| array,
+        else => null,
+    };
+}
+
+pub fn looksLikeHtml(body: []const u8) bool {
+    const head = std.mem.trimStart(u8, body[0..@min(body.len, 1024)], " \t\r\n");
+    return std.ascii.startsWithIgnoreCase(head, "<!doctype html") or
+        std.ascii.startsWithIgnoreCase(head, "<html") or
+        std.mem.indexOf(u8, head, "<body") != null;
+}
+
+pub fn isSubtitleFilename(filename: []const u8) bool {
+    return std.ascii.endsWithIgnoreCase(filename, ".srt") or
+        std.ascii.endsWithIgnoreCase(filename, ".ass") or
+        std.ascii.endsWithIgnoreCase(filename, ".ssa") or
+        std.ascii.endsWithIgnoreCase(filename, ".vtt") or
+        std.ascii.endsWithIgnoreCase(filename, ".sub");
+}
+
+pub fn dupOptional(allocator: Allocator, value: ?[]const u8) !?[]const u8 {
+    return if (value) |text| try allocator.dupe(u8, text) else null;
+}
+
+pub const EpisodeQuery = struct {
+    title: []const u8,
+    season: ?u16,
+    episode: ?u16,
+};
+
+pub const TitleYear = struct {
+    title: []const u8,
+    year: ?i64,
+};
+
+pub fn splitTrailingYear(input: []const u8) TitleYear {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    if (trimmed.len < 6 or trimmed[trimmed.len - 1] != ')') return .{ .title = trimmed, .year = null };
+    const open = std.mem.lastIndexOfScalar(u8, trimmed, '(') orelse return .{ .title = trimmed, .year = null };
+    const inside = trimmed[open + 1 .. trimmed.len - 1];
+    if (inside.len != 4) return .{ .title = trimmed, .year = null };
+    for (inside) |c| if (!std.ascii.isDigit(c)) return .{ .title = trimmed, .year = null };
+    const year = std.fmt.parseInt(i64, inside, 10) catch return .{ .title = trimmed, .year = null };
+    return .{ .title = std.mem.trimEnd(u8, trimmed[0..open], " \t"), .year = year };
+}
+
+pub fn parseEpisodeQuery(input: []const u8) EpisodeQuery {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    var i: usize = 0;
+    while (i < trimmed.len) : (i += 1) {
+        if (std.ascii.toLower(trimmed[i]) != 's') continue;
+        var cursor = i + 1;
+        const season_start = cursor;
+        while (cursor < trimmed.len and std.ascii.isDigit(trimmed[cursor]) and cursor - season_start < 2) : (cursor += 1) {}
+        if (cursor == season_start or cursor >= trimmed.len or std.ascii.toLower(trimmed[cursor]) != 'e') continue;
+        const season = std.fmt.parseInt(u16, trimmed[season_start..cursor], 10) catch continue;
+        cursor += 1;
+        const episode_start = cursor;
+        while (cursor < trimmed.len and std.ascii.isDigit(trimmed[cursor]) and cursor - episode_start < 3) : (cursor += 1) {}
+        if (cursor == episode_start) continue;
+        const episode = std.fmt.parseInt(u16, trimmed[episode_start..cursor], 10) catch continue;
+        const title = std.mem.trim(u8, trimmed[0..i], " \t\r\n-._");
+        if (title.len == 0) continue;
+        return .{ .title = title, .season = season, .episode = episode };
+    }
+    return .{ .title = trimmed, .season = null, .episode = null };
+}
+
+test "episode query trims real whitespace" {
+    const query = parseEpisodeQuery("\tTitan S01E02\n");
+    try std.testing.expectEqualStrings("Titan", query.title);
+    try std.testing.expectEqual(@as(?u16, 1), query.season);
+    try std.testing.expectEqual(@as(?u16, 2), query.episode);
 }
 
 pub fn normalizeLanguageCode(language_or_code: []const u8) ?[]const u8 {
@@ -653,7 +753,6 @@ pub fn shouldRunNamedLiveTest(allocator: Allocator, name: []const u8) bool {
     if (!build_options.live_named_tests_enabled) return false;
 
     const provider_name = namedLiveProvider(name) orelse return false;
-    if (isCaptchaProviderName(provider_name) and !liveIncludeCaptchaEnabled()) return false;
     return providerMatchesLiveFilter(liveProviderFilter(), provider_name);
 }
 
@@ -663,11 +762,6 @@ pub fn liveExtensiveSuiteEnabled() bool {
 
 pub fn liveTuiSuiteEnabled() bool {
     return build_options.live_tui_suite;
-}
-
-pub fn liveIncludeCaptchaEnabled() bool {
-    if (envBool("SCRAPERS_LIVE_INCLUDE_CAPTCHA")) |value| return value;
-    return build_options.live_include_captcha;
 }
 
 pub fn liveProviderFilter() ?[]const u8 {
@@ -684,21 +778,6 @@ pub fn liveProviderFilter() ?[]const u8 {
     const trimmed = std.mem.trim(u8, build_options.live_provider_filter, " \t\r\n");
     if (trimmed.len == 0) return null;
     return trimmed;
-}
-
-fn envBool(name: []const u8) ?bool {
-    const raw = getenv(name) orelse return null;
-    const value = std.mem.trim(u8, raw, " \t\r\n");
-    if (value.len == 0) return null;
-    if (std.mem.eql(u8, value, "1")) return true;
-    if (std.mem.eql(u8, value, "0")) return false;
-    if (std.ascii.eqlIgnoreCase(value, "true")) return true;
-    if (std.ascii.eqlIgnoreCase(value, "false")) return false;
-    if (std.ascii.eqlIgnoreCase(value, "yes")) return true;
-    if (std.ascii.eqlIgnoreCase(value, "no")) return false;
-    if (std.ascii.eqlIgnoreCase(value, "on")) return true;
-    if (std.ascii.eqlIgnoreCase(value, "off")) return false;
-    return null;
 }
 
 pub fn getenv(name: []const u8) ?[]const u8 {
@@ -949,11 +1028,6 @@ fn namedLiveProvider(name: []const u8) ?[]const u8 {
     if (std.ascii.eqlIgnoreCase(name, "OPENSUBTITLES_ORG")) return "opensubtitles.org";
     if (std.ascii.eqlIgnoreCase(name, "OPENSUBTITLES_COM")) return "opensubtitles.com";
     return null;
-}
-
-fn isCaptchaProviderName(provider_name: []const u8) bool {
-    _ = provider_name;
-    return false;
 }
 
 fn providerNameEq(a: []const u8, b: []const u8) bool {

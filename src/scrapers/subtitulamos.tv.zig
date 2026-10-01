@@ -157,7 +157,7 @@ fn chooseShow(allocator: Allocator, body: []const u8, query: []const u8) !?ShowH
         .array => |value| value,
         else => return error.InvalidFieldType,
     };
-    const wanted = try normalizeTitle(allocator, query);
+    const wanted = try common.normalizeTitle(allocator, query);
 
     var partial: ?ShowHit = null;
     for (array.items) |entry| {
@@ -169,7 +169,7 @@ fn chooseShow(allocator: Allocator, body: []const u8, query: []const u8) !?ShowH
         const name = jsonString(obj.get("show_name") orelse continue) orelse continue;
         if (id <= 0 or name.len == 0) continue;
 
-        const normalized = try normalizeTitle(allocator, name);
+        const normalized = try common.normalizeTitle(allocator, name);
         const hit: ShowHit = .{
             .id = id,
             .name = try allocator.dupe(u8, name),
@@ -357,22 +357,6 @@ fn jsonInt(value: std.json.Value) ?i64 {
         .float => |number| @intFromFloat(number),
         else => null,
     };
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 fn slug(allocator: Allocator, input: []const u8) ![]u8 {

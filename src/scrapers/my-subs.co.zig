@@ -13,9 +13,7 @@ pub const MediaKind = enum {
     tv,
 };
 
-pub const SearchOptions = struct {
-    _unused: void = {},
-};
+pub const SearchOptions = struct {};
 
 pub const SubtitlesOptions = struct {
     include_seasons: bool = true,
@@ -79,12 +77,10 @@ pub const Scraper = struct {
         return self.searchWithOptions(query, .{});
     }
 
-    pub fn searchWithOptions(self: *Scraper, query: []const u8, options: SearchOptions) !SearchResponse {
+    pub fn searchWithOptions(self: *Scraper, query: []const u8, _: SearchOptions) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
-        _ = options;
-
         var out: std.ArrayListUnmanaged(SearchItem) = .empty;
         var seen = std.StringHashMapUnmanaged(void).empty;
 

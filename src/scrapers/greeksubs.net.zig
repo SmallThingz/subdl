@@ -163,7 +163,7 @@ fn collectSubtitleRows(
         try seen.put(allocator, try allocator.dupe(u8, id), {});
 
         const language_code = if (row.queryOne("img[alt]")) |img|
-            try dupOptional(allocator, common.getAttributeValueSafe(img, "alt"))
+            try common.dupOptional(allocator, common.getAttributeValueSafe(img, "alt"))
         else
             null;
         const filename_base = try tableCellText(allocator, row, 6) orelse continue;
@@ -383,11 +383,6 @@ fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
         }
     }
     return out.toOwnedSlice(allocator);
-}
-
-fn dupOptional(allocator: Allocator, value: ?[]const u8) !?[]const u8 {
-    if (value) |text| return try allocator.dupe(u8, text);
-    return null;
 }
 
 test "greeksubs token and download id parsing" {

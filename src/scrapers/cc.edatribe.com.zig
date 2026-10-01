@@ -68,7 +68,7 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        const wanted = try normalizeTitle(a, query);
+        const wanted = try common.normalizeTitle(a, query);
         if (wanted.len == 0) return .{ .arena = arena, .items = &.{} };
 
         var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
@@ -112,10 +112,10 @@ pub const Scraper = struct {
                 .object => |value| value,
                 else => continue,
             };
-            const entry_type = jsonString(obj, "type") orelse continue;
+            const entry_type = common.jsonString(obj, "type") orelse continue;
             if (!std.mem.eql(u8, entry_type, "file")) continue;
-            const filename = jsonString(obj, "name") orelse continue;
-            if (!isSubtitleFilename(filename)) continue;
+            const filename = common.jsonString(obj, "name") orelse continue;
+            if (!common.isSubtitleFilename(filename)) continue;
             const encoded_filename = try common.encodeUriComponent(a, filename);
             const download_url = try std.fmt.allocPrint(a, "{s}{s}", .{ item.page_url, encoded_filename });
 
@@ -156,13 +156,13 @@ fn appendCatalogMatches(
             .object => |value| value,
             else => continue,
         };
-        const entry_type = jsonString(obj, "type") orelse continue;
+        const entry_type = common.jsonString(obj, "type") orelse continue;
         if (!std.mem.eql(u8, entry_type, "directory") and !std.mem.eql(u8, entry_type, "other")) continue;
-        const raw_name = jsonString(obj, "name") orelse continue;
+        const raw_name = common.jsonString(obj, "name") orelse continue;
         const title = stripCatalogPrefix(raw_name);
         if (title.len == 0) continue;
 
-        const normalized = try normalizeTitle(allocator, title);
+        const normalized = try common.normalizeTitle(allocator, title);
         defer allocator.free(normalized);
         if (std.mem.indexOf(u8, normalized, wanted) == null and std.mem.indexOf(u8, wanted, normalized) == null) continue;
 
@@ -191,45 +191,12 @@ fn stripCatalogPrefix(name: []const u8) []const u8 {
     return std.mem.trim(u8, name[close + 1 ..], " \t\r\n");
 }
 
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = obj.get(key) orelse return null;
-    return switch (value) {
-        .string => |text| text,
-        else => null,
-    };
-}
-
-fn isSubtitleFilename(filename: []const u8) bool {
-    return std.ascii.endsWithIgnoreCase(filename, ".srt") or
-        std.ascii.endsWithIgnoreCase(filename, ".ass") or
-        std.ascii.endsWithIgnoreCase(filename, ".ssa") or
-        std.ascii.endsWithIgnoreCase(filename, ".vtt") or
-        std.ascii.endsWithIgnoreCase(filename, ".sub");
-}
-
 test "closed caption browser parses catalog prefixes and exact matches" {
     try std.testing.expectEqualStrings("Spirited Away", stripCatalogPrefix("[M008]Spirited Away"));
     try std.testing.expectEqualStrings("Attack on Titan", stripCatalogPrefix("[0010]Attack on Titan"));
 
     const allocator = std.testing.allocator;
-    const wanted = try normalizeTitle(allocator, "Attack on Titan");
+    const wanted = try common.normalizeTitle(allocator, "Attack on Titan");
     defer allocator.free(wanted);
     var seen = std.StringHashMapUnmanaged(void).empty;
     defer seen.deinit(allocator);

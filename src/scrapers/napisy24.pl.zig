@@ -52,11 +52,8 @@ pub const SubtitlesResponse = struct {
     }
 };
 
-const ParsedQuery = struct {
-    title: []const u8,
-    season: ?u16,
-    episode: ?u16,
-};
+const ParsedQuery = common.EpisodeQuery;
+const parseQuery = common.parseEpisodeQuery;
 
 const SubtitleRecord = struct {
     id: i64,
@@ -153,7 +150,7 @@ fn buildSearchItems(
     parsed_query: ParsedQuery,
     requested_language: []const u8,
 ) ![]const SearchItem {
-    const wanted = try normalizeTitle(allocator, parsed_query.title);
+    const wanted = try common.normalizeTitle(allocator, parsed_query.title);
     var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
     var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
 
@@ -161,7 +158,7 @@ fn buildSearchItems(
         if (exact.items.len + partial.items.len >= max_search_items * 4) break;
         if (!std.ascii.eqlIgnoreCase(record.language_code, requested_language)) continue;
         const base_title = stripEpisodeSuffix(record.title, record.season, record.episode);
-        const normalized = try normalizeTitle(allocator, base_title);
+        const normalized = try common.normalizeTitle(allocator, base_title);
         const is_exact = wanted.len > 0 and std.mem.eql(u8, normalized, wanted);
         const is_partial = wanted.len > 0 and std.mem.indexOf(u8, normalized, wanted) != null;
         if (!is_exact and !is_partial) continue;
@@ -270,15 +267,7 @@ fn extractTag(block: []const u8, tag: []const u8) ?[]const u8 {
     return block[value_start .. value_start + end_relative];
 }
 
-fn findIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0) return 0;
-    if (needle.len > haystack.len) return null;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
-    }
-    return null;
-}
+const findIgnoreCase = std.ascii.indexOfIgnoreCase;
 
 fn searchUrl(allocator: Allocator, query: []const u8) ![]u8 {
     const encoded = try common.encodeUriComponent(allocator, query);
@@ -294,28 +283,6 @@ pub fn providerLanguageCode(input: []const u8) ?[]const u8 {
     if (std.ascii.eqlIgnoreCase(input, "eng")) return "en";
     if (std.ascii.eqlIgnoreCase(input, "pol")) return "pl";
     return null;
-}
-
-fn parseQuery(input: []const u8) ParsedQuery {
-    const trimmed = std.mem.trim(u8, input, " \t\r\n");
-    var i: usize = 0;
-    while (i < trimmed.len) : (i += 1) {
-        if (std.ascii.toLower(trimmed[i]) != 's') continue;
-        var cursor = i + 1;
-        const season_start = cursor;
-        while (cursor < trimmed.len and std.ascii.isDigit(trimmed[cursor]) and cursor - season_start < 2) : (cursor += 1) {}
-        if (cursor == season_start or cursor >= trimmed.len or std.ascii.toLower(trimmed[cursor]) != 'e') continue;
-        const season = std.fmt.parseInt(u16, trimmed[season_start..cursor], 10) catch continue;
-        cursor += 1;
-        const episode_start = cursor;
-        while (cursor < trimmed.len and std.ascii.isDigit(trimmed[cursor]) and cursor - episode_start < 3) : (cursor += 1) {}
-        if (cursor == episode_start) continue;
-        const episode = std.fmt.parseInt(u16, trimmed[episode_start..cursor], 10) catch continue;
-        const title = std.mem.trim(u8, trimmed[0..i], " \t\r\n-._");
-        if (title.len == 0) continue;
-        return .{ .title = title, .season = season, .episode = episode };
-    }
-    return .{ .title = trimmed, .season = null, .episode = null };
 }
 
 const SeasonEpisode = struct {
@@ -348,22 +315,6 @@ fn stripEpisodeSuffix(title: []const u8, season: ?u16, episode: ?u16) []const u8
     const parsed = parseRecordSeasonEpisode(title);
     const marker = parsed.marker_start orelse return std.mem.trim(u8, title, " \t\r\n");
     return std.mem.trimEnd(u8, title[0..marker], " \t\r\n-:._");
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 fn decodeEntities(allocator: Allocator, input: []const u8) ![]u8 {

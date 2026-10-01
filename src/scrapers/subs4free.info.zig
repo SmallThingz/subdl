@@ -204,7 +204,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     const a = owned_arena.allocator();
     var parsed = try common.parseHtmlStable(a, body);
 
-    const wanted = try normalizeTitle(a, query);
+    const wanted = try common.normalizeTitle(a, query);
     var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
     var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
     var seen = std.StringHashMapUnmanaged(void).empty;
@@ -217,7 +217,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
         const release = try common.innerTextTrimmedOwned(a, anchor);
         if (release.len == 0) continue;
         const split = splitTitleYear(release) orelse continue;
-        const normalized = try normalizeTitle(a, split.title);
+        const normalized = try common.normalizeTitle(a, split.title);
         const exact_match = std.mem.eql(u8, normalized, wanted);
         const partial_match = std.mem.indexOf(u8, normalized, wanted) != null or
             std.mem.indexOf(u8, wanted, normalized) != null;
@@ -279,22 +279,6 @@ fn parseDownloadId(allocator: Allocator, body: []const u8) !?[]u8 {
     const value = common.getAttributeValueSafe(node, "value") orelse return null;
     if (value.len == 0) return null;
     return try allocator.dupe(u8, value);
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "subs4free parses exact movie rows before partial matches" {

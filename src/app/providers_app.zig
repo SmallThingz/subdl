@@ -3,6 +3,7 @@ const subdl = @import("../scrapers/subdl.zig");
 const runtime_alloc = @import("runtime_alloc");
 const runtime_io = @import("runtime_io");
 const unarr = @import("unarr");
+const provider_registry = @import("../provider_registry.zig");
 
 const Allocator = std.mem.Allocator;
 const common = subdl.common;
@@ -32,107 +33,8 @@ pub const DownloadOptions = struct {
     extract_archive: bool = false,
 };
 
-pub const Provider = enum {
-    subdl_com,
-    opensubtitles_com,
-    opensubtitles_org,
-    moviesubtitles_org,
-    moviesubtitlesrt_com,
-    podnapisi_net,
-    yifysubtitles_ch,
-    subtitlecat_com,
-    isubtitles_org,
-    my_subs_co,
-    subsource_net,
-    sub_scene_com,
-    tvsubtitles_net,
-    gestdown_info,
-    greeksubtitles_com,
-    subsunacs_net,
-    subtitles_ajatt_top,
-    subtis_io,
-    greeksubs_net,
-    indexsubtitle_cc,
-    sous_titres_eu,
-    cc_edatribe_com,
-    subtitrari_noi_ro,
-    subclub_eu,
-    subs_ro,
-    subs4free_info,
-    tsukihime_org,
-    subtitri_nekur_net,
-    subsynchro_com,
-    titrari_ro,
-    subs_sab_bz,
-    subtitri_do_am,
-    prijevodi_online_org,
-    animekalesi_com,
-    subcentral_de,
-    subtitulamos_tv,
-    feliratok_eu,
-    animesub_info,
-    animetosho_xyz,
-    kitsunekko_net,
-    thesubtitledb_org,
-    napisy24_pl,
-    nyasub_cz,
-    subhd_tv,
-    fansubs_ru,
-    legendei_net,
-    zoom_lk,
-    justsubtitles_com,
-    wizdom_xyz,
-    miraianime_net,
-    animesubtitle_ir,
-    grupahatak_pl,
-    jimaku_cc,
-};
-
-const provider_values = [_]Provider{
-    .subdl_com,
-    .opensubtitles_com,
-    .moviesubtitles_org,
-    .yifysubtitles_ch,
-    .subtitlecat_com,
-    .isubtitles_org,
-    .subsource_net,
-    .sub_scene_com,
-    .gestdown_info,
-    .subsunacs_net,
-    .subtitles_ajatt_top,
-    .greeksubs_net,
-    .indexsubtitle_cc,
-    .sous_titres_eu,
-    .cc_edatribe_com,
-    .subclub_eu,
-    .subs_ro,
-    .subs4free_info,
-    .tsukihime_org,
-    .subtitri_nekur_net,
-    .subsynchro_com,
-    .titrari_ro,
-    .subs_sab_bz,
-    .subtitri_do_am,
-    .prijevodi_online_org,
-    .animekalesi_com,
-    .subcentral_de,
-    .subtitulamos_tv,
-    .feliratok_eu,
-    .animesub_info,
-    .animetosho_xyz,
-    .kitsunekko_net,
-    .thesubtitledb_org,
-    .napisy24_pl,
-    .nyasub_cz,
-    .fansubs_ru,
-    .legendei_net,
-    .zoom_lk,
-    .justsubtitles_com,
-    .wizdom_xyz,
-    .miraianime_net,
-    .grupahatak_pl,
-    .jimaku_cc,
-};
+pub const Provider = provider_registry.Provider;
+const provider_values = provider_registry.active_providers;
 
 pub fn providers() []const Provider {
     return &provider_values;
@@ -150,237 +52,29 @@ pub fn providerIndex(provider: Provider) usize {
 }
 
 pub fn providerName(provider: Provider) []const u8 {
-    return switch (provider) {
-        .subdl_com => "subdl_com",
-        .opensubtitles_com => "opensubtitles_com",
-        .opensubtitles_org => "opensubtitles_org",
-        .moviesubtitles_org => "moviesubtitles_org",
-        .moviesubtitlesrt_com => "moviesubtitlesrt_com",
-        .podnapisi_net => "podnapisi_net",
-        .yifysubtitles_ch => "yifysubtitles_ch",
-        .subtitlecat_com => "subtitlecat_com",
-        .isubtitles_org => "isubtitles_org",
-        .my_subs_co => "my_subs_co",
-        .subsource_net => "subsource_net",
-        .sub_scene_com => "sub_scene_com",
-        .tvsubtitles_net => "tvsubtitles_net",
-        .gestdown_info => "gestdown_info",
-        .greeksubtitles_com => "greek_subtitles_com",
-        .subsunacs_net => "subsunacs_net",
-        .subtitles_ajatt_top => "subtitles_ajatt_top",
-        .subtis_io => "subtis_io",
-        .greeksubs_net => "greeksubs_net",
-        .indexsubtitle_cc => "indexsubtitle_cc",
-        .sous_titres_eu => "sous_titres_eu",
-        .cc_edatribe_com => "cc_edatribe_com",
-        .subtitrari_noi_ro => "subtitrari_noi_ro",
-        .subclub_eu => "subclub_eu",
-        .subs_ro => "subs_ro",
-        .subs4free_info => "subs4free_info",
-        .tsukihime_org => "tsukihime_org",
-        .subtitri_nekur_net => "subtitri_nekur_net",
-        .subsynchro_com => "subsynchro_com",
-        .titrari_ro => "titrari_ro",
-        .subs_sab_bz => "subs_sab_bz",
-        .subtitri_do_am => "subtitri_do_am",
-        .prijevodi_online_org => "prijevodi_online_org",
-        .animekalesi_com => "animekalesi_com",
-        .subcentral_de => "subcentral_de",
-        .subtitulamos_tv => "subtitulamos_tv",
-        .feliratok_eu => "feliratok_eu",
-        .animesub_info => "animesub_info",
-        .animetosho_xyz => "animetosho_xyz",
-        .kitsunekko_net => "kitsunekko_net",
-        .thesubtitledb_org => "thesubtitledb_org",
-        .napisy24_pl => "napisy24_pl",
-        .nyasub_cz => "nyasub_cz",
-        .subhd_tv => "subhd_tv",
-        .fansubs_ru => "fansubs_ru",
-        .legendei_net => "legendei_net",
-        .zoom_lk => "zoom_lk",
-        .justsubtitles_com => "justsubtitles_com",
-        .wizdom_xyz => "wizdom_xyz",
-        .miraianime_net => "miraianime_net",
-        .animesubtitle_ir => "animesubtitle_ir",
-        .grupahatak_pl => "grupahatak_pl",
-        .jimaku_cc => "jimaku_cc",
-    };
+    return provider_registry.info(provider).id;
 }
 
-pub const ProviderInfo = struct {
-    id: []const u8,
-    display_name: []const u8,
-    site_url: []const u8,
-    supports_search_pagination: bool,
-    supports_subtitles_pagination: bool,
-    protected: bool,
-    supports_movies: bool,
-    supports_tv: bool,
-};
+pub const ProviderInfo = provider_registry.Info;
 
-/// User-facing provider metadata is derived from the enum, not copied into
-/// scraper-specific structs. This keeps CLI/TUI provider lists consistent with
-/// the actual dispatch table below.
 pub fn providerInfo(provider: Provider) ProviderInfo {
-    return .{
-        .id = providerName(provider),
-        .display_name = providerDisplayName(provider),
-        .site_url = providerSiteUrl(provider),
-        .supports_search_pagination = providerSupportsSearchPagination(provider),
-        .supports_subtitles_pagination = providerSupportsSubtitlesPagination(provider),
-        .protected = providerRequiresBrowserSession(provider),
-        .supports_movies = providerSupportsMovies(provider),
-        .supports_tv = providerSupportsTv(provider),
-    };
+    return provider_registry.info(provider);
 }
 
 pub fn providerDisplayName(provider: Provider) []const u8 {
-    return switch (provider) {
-        .subdl_com => "SubDL",
-        .opensubtitles_com => "OpenSubtitles.com",
-        .opensubtitles_org => "OpenSubtitles.org",
-        .moviesubtitles_org => "MovieSubtitles.org",
-        .moviesubtitlesrt_com => "MovieSubtitlesRT",
-        .podnapisi_net => "Podnapisi",
-        .yifysubtitles_ch => "YIFY Subtitles",
-        .subtitlecat_com => "Subtitle Cat",
-        .isubtitles_org => "iSubtitles",
-        .my_subs_co => "My Subs",
-        .subsource_net => "SubSource",
-        .sub_scene_com => "Sub-Scene",
-        .tvsubtitles_net => "TVSubtitles",
-        .gestdown_info => "Gestdown",
-        .greeksubtitles_com => "GreekSubtitles",
-        .subsunacs_net => "SubsUnacs",
-        .subtitles_ajatt_top => "AJATT Subtitles",
-        .subtis_io => "Subtis",
-        .greeksubs_net => "GreekSubs",
-        .indexsubtitle_cc => "IndexSubtitle",
-        .sous_titres_eu => "Sous-Titres.eu",
-        .cc_edatribe_com => "Closed Caption Browser",
-        .subtitrari_noi_ro => "Subtitrari-Noi",
-        .subclub_eu => "SubClub",
-        .subs_ro => "Subs.ro",
-        .subs4free_info => "Subs4Free",
-        .tsukihime_org => "TsukiHime",
-        .subtitri_nekur_net => "Nekur",
-        .subsynchro_com => "Subsynchro",
-        .titrari_ro => "Titrari",
-        .subs_sab_bz => "Subs.SAB",
-        .subtitri_do_am => "Subtitri",
-        .prijevodi_online_org => "Prijevodi Online",
-        .animekalesi_com => "AnimeKalesi",
-        .subcentral_de => "SubCentral",
-        .subtitulamos_tv => "Subtitulamos",
-        .feliratok_eu => "SuperSubtitles",
-        .animesub_info => "AnimeSub.info",
-        .animetosho_xyz => "AnimeTosho",
-        .kitsunekko_net => "Kitsunekko",
-        .thesubtitledb_org => "TheSubtitleDB",
-        .napisy24_pl => "Napisy24",
-        .nyasub_cz => "NyaSub",
-        .subhd_tv => "SubHD",
-        .fansubs_ru => "Fansubs.ru",
-        .legendei_net => "Legendei",
-        .zoom_lk => "Zoom.LK",
-        .justsubtitles_com => "JustSubtitles",
-        .wizdom_xyz => "Wizdom",
-        .miraianime_net => "MiraiAnime",
-        .animesubtitle_ir => "AnimeSubtitle.ir",
-        .grupahatak_pl => "GrupaHatak",
-        .jimaku_cc => "Jimaku",
-    };
-}
-
-pub fn providerSiteUrl(provider: Provider) []const u8 {
-    return switch (provider) {
-        .subdl_com => "https://subdl.com",
-        .opensubtitles_com => "https://www.opensubtitles.com",
-        .opensubtitles_org => "https://www.opensubtitles.org",
-        .moviesubtitles_org => "https://www.moviesubtitles.org",
-        .moviesubtitlesrt_com => "https://moviesubtitlesrt.com",
-        .podnapisi_net => "https://www.podnapisi.net",
-        .yifysubtitles_ch => "https://yifysubtitles.ch",
-        .subtitlecat_com => "https://www.subtitlecat.com",
-        .isubtitles_org => "https://isubtitles.org",
-        .my_subs_co => "https://my-subs.co",
-        .subsource_net => "https://subsource.net",
-        .sub_scene_com => "https://sub-scene.com",
-        .tvsubtitles_net => "https://www.tvsubtitles.net",
-        .gestdown_info => "https://www.gestdown.info",
-        .greeksubtitles_com => "https://gr.greek-subtitles.com",
-        .subsunacs_net => "https://subsunacs.net",
-        .subtitles_ajatt_top => "https://subtitles.ajatt.top",
-        .subtis_io => "https://subtis.io",
-        .greeksubs_net => "https://greeksubs.net",
-        .indexsubtitle_cc => "https://indexsubtitle.cc",
-        .sous_titres_eu => "https://www.sous-titres.eu",
-        .cc_edatribe_com => "https://cc.edatribe.com",
-        .subtitrari_noi_ro => "https://www.subtitrari-noi.ro",
-        .subclub_eu => "https://www.subclub.eu",
-        .subs_ro => "https://subs.ro",
-        .subs4free_info => "https://www.subs4free.info",
-        .tsukihime_org => "https://tsukihime.org",
-        .subtitri_nekur_net => "https://subtitri.nekur.net",
-        .subsynchro_com => "http://www.subsynchro.com",
-        .titrari_ro => "https://www.titrari.ro",
-        .subs_sab_bz => "http://subs.sab.bz",
-        .subtitri_do_am => "https://subtitri.do.am",
-        .prijevodi_online_org => "https://www.prijevodi-online.org",
-        .animekalesi_com => "https://animekalesi.com",
-        .subcentral_de => "https://www.subcentral.de",
-        .subtitulamos_tv => "https://www.subtitulamos.tv",
-        .feliratok_eu => "https://feliratok.eu",
-        .animesub_info => "http://animesub.info",
-        .animetosho_xyz => "https://animetosho.net",
-        .kitsunekko_net => "https://kitsunekko.net",
-        .thesubtitledb_org => "https://thesubtitledb.org",
-        .napisy24_pl => "https://napisy24.pl",
-        .nyasub_cz => "https://nyasub.cz",
-        .subhd_tv => "https://subhd.tv",
-        .fansubs_ru => "http://fansubs.ru",
-        .legendei_net => "https://legendei.net",
-        .zoom_lk => "https://zoom.lk",
-        .justsubtitles_com => "https://www.justsubtitles.com",
-        .wizdom_xyz => "https://wizdom.xyz",
-        .miraianime_net => "https://miraianime.net",
-        .animesubtitle_ir => "https://animesubtitle.ir",
-        .grupahatak_pl => "https://grupahatak.pl",
-        .jimaku_cc => "https://jimaku.cc",
-    };
-}
-
-pub fn providerRequiresBrowserSession(provider: Provider) bool {
-    _ = provider;
-    return false;
-}
-
-pub fn providerSupportsMovies(provider: Provider) bool {
-    return switch (provider) {
-        .tvsubtitles_net, .gestdown_info, .prijevodi_online_org, .animekalesi_com, .subcentral_de, .subtitulamos_tv, .grupahatak_pl => false,
-        else => true,
-    };
+    return providerInfo(provider).display_name;
 }
 
 pub fn providerSupportsTv(provider: Provider) bool {
-    return switch (provider) {
-        .moviesubtitles_org, .moviesubtitlesrt_com, .yifysubtitles_ch, .subtis_io, .subtitri_do_am, .subtitri_nekur_net, .subsynchro_com, .subs4free_info, .feliratok_eu, .justsubtitles_com => false,
-        else => true,
-    };
+    return providerInfo(provider).supports_tv;
 }
 
 pub fn providerSupportsSearchPagination(provider: Provider) bool {
-    return switch (provider) {
-        .opensubtitles_org, .moviesubtitlesrt_com, .podnapisi_net, .isubtitles_org => true,
-        else => false,
-    };
+    return providerInfo(provider).supports_search_pagination;
 }
 
 pub fn providerSupportsSubtitlesPagination(provider: Provider) bool {
-    return switch (provider) {
-        .opensubtitles_org, .isubtitles_org => true,
-        else => false,
-    };
+    return providerInfo(provider).supports_subtitles_pagination;
 }
 
 pub fn parseProvider(value: []const u8) ?Provider {
@@ -435,10 +129,6 @@ fn normalizeProviderChar(c: u8) u8 {
 
 pub fn providerSelectionAll() [provider_values.len]bool {
     return [_]bool{true} ** provider_values.len;
-}
-
-pub fn providerSelectionNone() [provider_values.len]bool {
-    return [_]bool{false} ** provider_values.len;
 }
 
 /// SearchRef is the durable provider-specific handle returned by search and
@@ -813,22 +503,6 @@ pub const SearchResponse = struct {
     has_next_page: bool = false,
 
     pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubdlSeasonChoice = struct {
-    label: []const u8,
-    season_slug: []const u8,
-};
-
-pub const SubdlSeasonsResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    items: []const SubdlSeasonChoice,
-
-    pub fn deinit(self: *SubdlSeasonsResponse) void {
         self.arena.deinit();
         self.* = undefined;
     }
@@ -2276,117 +1950,6 @@ pub fn searchPageWithOptions(allocator: Allocator, client: *std.http.Client, pro
         .page = requested_page,
         .has_prev_page = requested_page > 1,
         .has_next_page = has_next_page,
-    };
-}
-
-pub fn fetchSubdlSeasons(allocator: Allocator, client: *std.http.Client, ref: SearchRef) !SubdlSeasonsResponse {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-    const a = arena.allocator();
-
-    var out: std.ArrayListUnmanaged(SubdlSeasonChoice) = .empty;
-    var title: []const u8 = "";
-
-    switch (ref) {
-        .subdl_com => |item| {
-            if (item.media_type != .tv) return error.UnexpectedTitleType;
-            var scraper = subdl.subdl_com.Scraper.init(allocator, client);
-            defer scraper.deinit();
-
-            var seasons = try scraper.fetchTvSeasonsByLink(item.link);
-            defer seasons.deinit();
-            title = try a.dupe(u8, seasons.tv.name);
-
-            for (seasons.seasons) |season| {
-                const season_slug = try a.dupe(u8, season.number);
-                const label = if (season.name.len == 0 or std.mem.eql(u8, season.name, season.number))
-                    try a.dupe(u8, season.number)
-                else
-                    try std.fmt.allocPrint(a, "{s} ({s})", .{ season.name, season.number });
-                try out.append(a, .{
-                    .label = label,
-                    .season_slug = season_slug,
-                });
-            }
-        },
-        else => return error.UnsupportedProvider,
-    }
-
-    return .{
-        .arena = arena,
-        .title = title,
-        .items = try out.toOwnedSlice(a),
-    };
-}
-
-pub fn fetchSubdlSeasonSubtitles(allocator: Allocator, client: *std.http.Client, ref: SearchRef, season_slug: []const u8) !SubtitlesResponse {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-    const a = arena.allocator();
-
-    var out: std.ArrayListUnmanaged(SubtitleChoice) = .empty;
-    var title: []const u8 = "";
-
-    switch (ref) {
-        .subdl_com => |item| {
-            if (item.media_type != .tv) return error.UnexpectedTitleType;
-            var scraper = subdl.subdl_com.Scraper.init(allocator, client);
-            defer scraper.deinit();
-
-            var season_data = try scraper.fetchTvSeasonByLink(item.link, season_slug);
-            defer season_data.deinit();
-            title = try std.fmt.allocPrint(a, "{s} • {s}", .{ season_data.tv.name, season_slug });
-
-            for (season_data.languages) |group| {
-                for (group.subtitles) |subtitle| {
-                    const download_url = try std.fmt.allocPrint(a, "https://dl.subdl.com/subtitle/{s}", .{subtitle.link});
-                    const label = try std.fmt.allocPrint(a, "{s} • {s}", .{ group.language, subtitle.title });
-                    try out.append(a, .{
-                        .label = label,
-                        .language = try a.dupe(u8, group.language),
-                        .filename = try a.dupe(u8, subtitle.title),
-                        .download_url = download_url,
-                    });
-                }
-            }
-        },
-        else => return error.UnsupportedProvider,
-    }
-
-    return .{
-        .arena = arena,
-        .provider = .subdl_com,
-        .title = title,
-        .items = try out.toOwnedSlice(a),
-    };
-}
-
-pub fn fetchSubdlSeasonSubtitlesPage(
-    allocator: Allocator,
-    client: *std.http.Client,
-    ref: SearchRef,
-    season_slug: []const u8,
-    page: usize,
-) !SubtitlesResponse {
-    const requested_page = if (page == 0) 1 else page;
-    if (requested_page == 1) {
-        var first = try fetchSubdlSeasonSubtitles(allocator, client, ref, season_slug);
-        first.page = 1;
-        first.has_prev_page = false;
-        first.has_next_page = false;
-        return first;
-    }
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-    return .{
-        .arena = arena,
-        .provider = .subdl_com,
-        .title = titleFromRef(ref),
-        .items = &.{},
-        .page = requested_page,
-        .has_prev_page = true,
-        .has_next_page = false,
     };
 }
 
@@ -5159,19 +4722,6 @@ fn firstDownloadCandidate(subtitles: []const SubtitleChoice) ?usize {
     return null;
 }
 
-fn iterDownloadCandidates(subtitles: []const SubtitleChoice, prefer_archive: bool, cursor: usize) ?usize {
-    var seen: usize = 0;
-    for (subtitles, 0..) |sub, idx| {
-        const url = sub.download_url orelse continue;
-        const is_archive_hint = likelyArchiveSource(url, sub.filename);
-        if (prefer_archive and !is_archive_hint) continue;
-        if (!prefer_archive and is_archive_hint) continue;
-        if (seen == cursor) return idx;
-        seen += 1;
-    }
-    return null;
-}
-
 fn likelyArchiveSource(url: []const u8, filename: ?[]const u8) bool {
     if (std.ascii.endsWithIgnoreCase(url, ".zip") or std.ascii.endsWithIgnoreCase(url, ".rar") or std.ascii.endsWithIgnoreCase(url, ".7z")) return true;
     if (std.mem.indexOf(u8, url, ".zip?") != null or std.mem.indexOf(u8, url, ".rar?") != null or std.mem.indexOf(u8, url, ".7z?") != null) return true;
@@ -5925,14 +5475,8 @@ fn liveBatchEnabled() bool {
     return value.len > 0 and !std.mem.eql(u8, value, "0");
 }
 
-fn isCaptchaProvider(provider: Provider) bool {
-    _ = provider;
-    return false;
-}
-
 fn shouldRunSingleProviderSmoke(provider: Provider) bool {
     if (!shouldRunTuiLiveSmoke(std.testing.allocator)) return false;
-    if (isCaptchaProvider(provider) and !common.liveIncludeCaptchaEnabled()) return false;
     return common.providerMatchesLiveFilter(common.liveProviderFilter(), providerName(provider));
 }
 
@@ -5944,7 +5488,7 @@ fn runSingleProviderSmokeTest(provider: Provider) !void {
     try runProvidersSmokeBatch(std.testing.allocator, &selected);
 }
 
-test "live providers_app tui-path smoke: non-captcha providers" {
+test "live providers_app tui-path smoke" {
     if (!shouldRunTuiLiveSmoke(std.testing.allocator)) return error.SkipZigTest;
     if (!liveBatchEnabled()) return error.SkipZigTest;
     std.debug.print("[live][providers_app] tui-path smoke enabled\n", .{});
@@ -5961,7 +5505,6 @@ test "live providers_app tui-path smoke: non-captcha providers" {
     var selected: std.ArrayListUnmanaged(Provider) = .empty;
     defer selected.deinit(std.testing.allocator);
     for (tui_smoke_providers) |provider| {
-        if (isCaptchaProvider(provider) and !common.liveIncludeCaptchaEnabled()) continue;
         if (!common.providerMatchesLiveFilter(filter, providerName(provider))) continue;
         try selected.append(std.testing.allocator, provider);
     }

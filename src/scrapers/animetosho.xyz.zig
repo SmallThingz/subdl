@@ -53,11 +53,8 @@ pub const SubtitlesResponse = struct {
     }
 };
 
-const ParsedQuery = struct {
-    title: []const u8,
-    season: ?u16,
-    episode: ?u16,
-};
+const ParsedQuery = common.EpisodeQuery;
+const parseQuery = common.parseEpisodeQuery;
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -101,24 +98,24 @@ pub const Scraper = struct {
         });
 
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
-        const obj = valueObject(root) orelse return error.InvalidFieldType;
+        const obj = common.jsonObject(root) orelse return error.InvalidFieldType;
 
         var normal: std.ArrayListUnmanaged(SubtitleItem) = .empty;
         var forced: std.ArrayListUnmanaged(SubtitleItem) = .empty;
         var seen = std.AutoHashMapUnmanaged(i64, void).empty;
 
-        if (valueArray(obj.get("attachments") orelse .null)) |attachments| {
+        if (common.jsonArray(obj.get("attachments") orelse .null)) |attachments| {
             try appendAttachments(a, &normal, &forced, &seen, item, attachments, null);
         }
 
-        if (valueArray(obj.get("files") orelse .null)) |files| {
+        if (common.jsonArray(obj.get("files") orelse .null)) |files| {
             for (files.items) |file_value| {
                 if (normal.items.len + forced.items.len >= max_subtitle_items) break;
-                const file_obj = valueObject(file_value) orelse continue;
-                const filename = objectString(file_obj, "filename") orelse "";
+                const file_obj = common.jsonObject(file_value) orelse continue;
+                const filename = common.jsonString(file_obj, "filename") orelse "";
                 if (item.episode != null and !fileMatchesEpisode(filename, item.season orelse 1, item.episode.?)) continue;
 
-                const attachments = valueArray(file_obj.get("attachments") orelse .null) orelse continue;
+                const attachments = common.jsonArray(file_obj.get("attachments") orelse .null) orelse continue;
                 try appendAttachments(a, &normal, &forced, &seen, item, attachments, filename);
 
                 // For a TV season/batch search without a requested episode, avoid
@@ -177,32 +174,32 @@ fn parseSearchBody(arena: std.heap.ArenaAllocator, body: []const u8, parsed_quer
     const a = owned_arena.allocator();
 
     const root = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
-    const values = valueArray(root) orelse return error.InvalidFieldType;
-    const wanted = try normalizeTitle(a, parsed_query.title);
+    const values = common.jsonArray(root) orelse return error.InvalidFieldType;
+    const wanted = try common.normalizeTitle(a, parsed_query.title);
 
     var items: std.ArrayListUnmanaged(SearchItem) = .empty;
     var seen = std.AutoHashMapUnmanaged(i64, void).empty;
 
     for (values.items) |value| {
         if (items.items.len >= max_search_items) break;
-        const obj = valueObject(value) orelse continue;
-        const status = objectString(obj, "status") orelse "";
+        const obj = common.jsonObject(value) orelse continue;
+        const status = common.jsonString(obj, "status") orelse "";
         if (!std.ascii.eqlIgnoreCase(status, "complete")) continue;
 
         const release_id = objectInt(obj, "id") orelse continue;
         if (release_id <= 0 or seen.contains(release_id)) continue;
-        const release = objectString(obj, "title") orelse continue;
+        const release = common.jsonString(obj, "title") orelse continue;
 
-        const normalized_release = try normalizeTitle(a, release);
+        const normalized_release = try common.normalizeTitle(a, release);
         if (wanted.len > 0 and std.mem.indexOf(u8, normalized_release, wanted) == null) continue;
 
         const media_kind: MediaKind = if (parsed_query.episode != null or looksLikeTvRelease(release)) .tv else .movie;
         if (parsed_query.episode == null and media_kind == .tv) {
             const marker = seasonMarkerIndex(release) orelse continue;
-            const normalized_prefix = try normalizeTitle(a, release[0..marker]);
+            const normalized_prefix = try common.normalizeTitle(a, release[0..marker]);
             if (std.mem.indexOf(u8, normalized_prefix, wanted) == null) continue;
         }
-        const page_url = if (objectString(obj, "link")) |link|
+        const page_url = if (common.jsonString(obj, "link")) |link|
             try a.dupe(u8, link)
         else
             try std.fmt.allocPrint(a, "{s}/view/{d}", .{ site, release_id });
@@ -234,17 +231,17 @@ fn appendAttachments(
 ) !void {
     for (attachments.items) |attachment_value| {
         if (normal.items.len + forced.items.len >= max_subtitle_items) break;
-        const attachment = valueObject(attachment_value) orelse continue;
+        const attachment = common.jsonObject(attachment_value) orelse continue;
         if (!isSubtitleAttachment(attachment)) continue;
 
         const attachment_id = objectInt(attachment, "id") orelse continue;
         if (attachment_id <= 0 or seen.contains(attachment_id)) continue;
-        const info = valueObject(attachment.get("info") orelse .null) orelse continue;
-        const format = objectString(info, "format") orelse continue;
+        const info = common.jsonObject(attachment.get("info") orelse .null) orelse continue;
+        const format = common.jsonString(info, "format") orelse continue;
         const extension = supportedTextFormat(format) orelse continue;
 
-        const raw_code = objectString(info, "language_code") orelse objectString(info, "lang") orelse "";
-        const language_name = objectString(info, "language") orelse "";
+        const raw_code = common.jsonString(info, "language_code") orelse common.jsonString(info, "lang") orelse "";
+        const language_name = common.jsonString(info, "language") orelse "";
         const language_code = normalizeLanguage(raw_code, language_name);
         const is_forced = jsonTruthy(info.get("forced"));
 
@@ -369,28 +366,6 @@ fn normalizeLanguage(code: []const u8, name: []const u8) []const u8 {
     return "und";
 }
 
-fn parseQuery(input: []const u8) ParsedQuery {
-    const trimmed = std.mem.trim(u8, input, " \t\r\n");
-    var i: usize = 0;
-    while (i < trimmed.len) : (i += 1) {
-        if (std.ascii.toLower(trimmed[i]) != 's') continue;
-        var cursor = i + 1;
-        const season_start = cursor;
-        while (cursor < trimmed.len and std.ascii.isDigit(trimmed[cursor]) and cursor - season_start < 2) : (cursor += 1) {}
-        if (cursor == season_start or cursor >= trimmed.len or std.ascii.toLower(trimmed[cursor]) != 'e') continue;
-        const season = std.fmt.parseInt(u16, trimmed[season_start..cursor], 10) catch continue;
-        cursor += 1;
-        const episode_start = cursor;
-        while (cursor < trimmed.len and std.ascii.isDigit(trimmed[cursor]) and cursor - episode_start < 3) : (cursor += 1) {}
-        if (cursor == episode_start) continue;
-        const episode = std.fmt.parseInt(u16, trimmed[episode_start..cursor], 10) catch continue;
-        const title = std.mem.trim(u8, trimmed[0..i], " \t\r\n-._");
-        if (title.len == 0) continue;
-        return .{ .title = title, .season = season, .episode = episode };
-    }
-    return .{ .title = trimmed, .season = null, .episode = null };
-}
-
 fn looksLikeTvRelease(title: []const u8) bool {
     return seasonMarkerIndex(title) != null;
 }
@@ -420,22 +395,7 @@ fn isReleaseBoundary(c: u8) bool {
     return c == ' ' or c == '.' or c == '-' or c == '_' or c == '[' or c == '(';
 }
 
-fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0) return 0;
-    if (needle.len > haystack.len) return null;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        var match = true;
-        for (needle, 0..) |c, j| {
-            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(c)) {
-                match = false;
-                break;
-            }
-        }
-        if (match) return i;
-    }
-    return null;
-}
+const indexOfIgnoreCase = std.ascii.indexOfIgnoreCase;
 
 fn parseYear(input: []const u8) ?i64 {
     if (input.len < 4) return null;
@@ -454,22 +414,6 @@ fn parseYear(input: []const u8) ?i64 {
         if (year >= 1900 and year <= 2100) return year;
     }
     return null;
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 fn decompressXz(allocator: Allocator, compressed: []const u8) ![]u8 {
@@ -491,28 +435,6 @@ fn decompressXz(allocator: Allocator, compressed: []const u8) ![]u8 {
         try output.appendSlice(allocator, buffer[0..n]);
     }
     return output.toOwnedSlice(allocator);
-}
-
-fn valueObject(value: std.json.Value) ?std.json.ObjectMap {
-    return switch (value) {
-        .object => |obj| obj,
-        else => null,
-    };
-}
-
-fn valueArray(value: std.json.Value) ?std.json.Array {
-    return switch (value) {
-        .array => |array| array,
-        else => null,
-    };
-}
-
-fn objectString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = obj.get(key) orelse return null;
-    return switch (value) {
-        .string => |s| s,
-        else => null,
-    };
 }
 
 fn objectInt(obj: std.json.ObjectMap, key: []const u8) ?i64 {

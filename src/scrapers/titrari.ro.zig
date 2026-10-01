@@ -116,7 +116,7 @@ pub const Scraper = struct {
             allocator.free(response.body);
             return error.UnexpectedHttpStatus;
         }
-        if (looksLikeHtml(response.body)) {
+        if (common.looksLikeHtml(response.body)) {
             allocator.free(response.body);
             return error.UnexpectedResponseType;
         }
@@ -210,19 +210,12 @@ pub fn parseDownloadToken(value: []const u8) ?DownloadToken {
     return .{ .subtitle_id = subtitle_id, .page_url = payload[sep + 1 ..] };
 }
 
-fn looksLikeHtml(body: []const u8) bool {
-    const trimmed = std.mem.trimStart(u8, body[0..@min(body.len, 1024)], " \t\r\n");
-    return std.ascii.startsWithIgnoreCase(trimmed, "<!doctype html") or
-        std.ascii.startsWithIgnoreCase(trimmed, "<html") or
-        std.mem.indexOf(u8, trimmed, "<body") != null;
-}
-
 fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []const u8) !SearchResponse {
     var owned_arena = arena;
     errdefer owned_arena.deinit();
     const a = owned_arena.allocator();
 
-    const wanted = try normalizeTitle(a, query);
+    const wanted = try common.normalizeTitle(a, query);
     var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
     var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
     var seen = std.StringHashMapUnmanaged(void).empty;
@@ -257,9 +250,9 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
         else
             continue;
 
-        const split = splitTitleYear(raw_title);
+        const split = common.splitTrailingYear(raw_title);
         const clean_title = stripSeasonSuffix(split.title);
-        const normalized = try normalizeTitle(a, clean_title);
+        const normalized = try common.normalizeTitle(a, clean_title);
         if (normalized.len == 0) continue;
         if (std.mem.indexOf(u8, normalized, wanted) == null and std.mem.indexOf(u8, wanted, normalized) == null) continue;
 
@@ -288,25 +281,6 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     return .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) };
 }
 
-const TitleYear = struct {
-    title: []const u8,
-    year: ?i64,
-};
-
-fn splitTitleYear(input: []const u8) TitleYear {
-    const trimmed = std.mem.trim(u8, input, " \t\r\n");
-    if (trimmed.len < 6 or trimmed[trimmed.len - 1] != ')') return .{ .title = trimmed, .year = null };
-    const open = std.mem.lastIndexOfScalar(u8, trimmed, '(') orelse return .{ .title = trimmed, .year = null };
-    const inside = trimmed[open + 1 .. trimmed.len - 1];
-    if (inside.len != 4) return .{ .title = trimmed, .year = null };
-    for (inside) |c| if (!std.ascii.isDigit(c)) return .{ .title = trimmed, .year = null };
-    const year = std.fmt.parseInt(i64, inside, 10) catch return .{ .title = trimmed, .year = null };
-    return .{
-        .title = std.mem.trimEnd(u8, trimmed[0..open], " \t"),
-        .year = year,
-    };
-}
-
 fn hasSeasonSuffix(title: []const u8) bool {
     return std.ascii.indexOfIgnoreCase(title, " - Sezonul ") != null or
         std.ascii.indexOfIgnoreCase(title, " - Sezoanele ") != null;
@@ -316,22 +290,6 @@ fn stripSeasonSuffix(title: []const u8) []const u8 {
     if (std.ascii.indexOfIgnoreCase(title, " - Sezonul ")) |idx| return std.mem.trimEnd(u8, title[0..idx], " \t");
     if (std.ascii.indexOfIgnoreCase(title, " - Sezoanele ")) |idx| return std.mem.trimEnd(u8, title[0..idx], " \t");
     return std.mem.trim(u8, title, " \t\r\n");
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 fn slug(allocator: Allocator, input: []const u8) ![]u8 {

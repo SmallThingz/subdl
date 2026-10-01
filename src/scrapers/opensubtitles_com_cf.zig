@@ -4,8 +4,6 @@ const common = @import("common.zig");
 const runtime_io = @import("runtime_io");
 
 const Allocator = std.mem.Allocator;
-const opensubtitles_domain = "www.opensubtitles.com";
-const opensubtitles_challenge_url = "https://www.opensubtitles.com/en";
 const shared_cache_relpath = ".cache/subdl/cloudflare_shared_sessions.json";
 const fallback_user_agent = "subdl-zig-scrapers/0.2 (+https://subdl.com)";
 const session_ttl_seconds: i64 = 5 * 60 * 60;
@@ -52,10 +50,6 @@ pub const Session = struct {
     }
 };
 
-pub const EnsureOptions = struct {
-    force_refresh: bool = false,
-};
-
 pub const EnsureDomainOptions = struct {
     domain: []const u8,
     challenge_url: ?[]const u8 = null,
@@ -70,14 +64,6 @@ const CacheRecord = struct {
     csrf_token: ?[]const u8,
     acquired_at_unix: i64,
 };
-
-pub fn ensureSession(allocator: Allocator, options: EnsureOptions) !Session {
-    return ensureDomainSession(allocator, .{
-        .domain = opensubtitles_domain,
-        .challenge_url = opensubtitles_challenge_url,
-        .force_refresh = options.force_refresh,
-    });
-}
 
 pub fn ensureDomainSession(allocator: Allocator, options: EnsureDomainOptions) !Session {
     const acquire_guard = SessionAcquireGuard.lock();
@@ -107,14 +93,6 @@ pub fn ensureDomainSession(allocator: Allocator, options: EnsureDomainOptions) !
     const acquired = try acquireSessionViaAllDriver(allocator, normalized_domain, challenge_url);
     try saveSessionForDomain(allocator, normalized_domain, acquired);
     return acquired;
-}
-
-pub fn loadSession(allocator: Allocator) !?Session {
-    return loadSessionForDomain(allocator, opensubtitles_domain);
-}
-
-pub fn saveSession(allocator: Allocator, session: Session) !void {
-    try saveSessionForDomain(allocator, opensubtitles_domain, session);
 }
 
 fn isUsableSession(session: Session) bool {

@@ -164,7 +164,7 @@ pub const Scraper = struct {
         };
         if (results.items.len == 0) return null;
 
-        const wanted = try normalizeTitle(allocator, title);
+        const wanted = try common.normalizeTitle(allocator, title);
         var chosen: ?std.json.ObjectMap = null;
         var chosen_score: i32 = -1;
         for (results.items[0..@min(results.items.len, @as(usize, 10))]) |entry| {
@@ -173,21 +173,21 @@ pub const Scraper = struct {
                 else => continue,
             };
             const candidate_title = switch (media_kind) {
-                .movie => jsonString(obj, "title") orelse continue,
-                .tv => jsonString(obj, "name") orelse continue,
+                .movie => common.jsonString(obj, "title") orelse continue,
+                .tv => common.jsonString(obj, "name") orelse continue,
             };
-            const normalized = try normalizeTitle(allocator, candidate_title);
+            const normalized = try common.normalizeTitle(allocator, candidate_title);
             var score: i32 = 0;
             if (std.mem.eql(u8, normalized, wanted)) score += 100;
             if (std.mem.indexOf(u8, normalized, wanted) != null) score += 30;
-            score += @intCast(@min(@as(i64, 20), jsonIntFromObject(obj, "popularity") orelse 0));
+            score += @intCast(@min(@as(i64, 20), common.jsonIntField(obj, "popularity") orelse 0));
             if (score > chosen_score) {
                 chosen = obj;
                 chosen_score = score;
             }
         }
         const chosen_obj = chosen orelse return null;
-        const tmdb_id = jsonIntFromObject(chosen_obj, "id") orelse return null;
+        const tmdb_id = common.jsonIntField(chosen_obj, "id") orelse return null;
         if (tmdb_id <= 0) return null;
 
         const detail_path = switch (media_kind) {
@@ -211,16 +211,16 @@ pub const Scraper = struct {
             .object => |value| value,
             else => return null,
         };
-        const imdb_id = jsonString(detail_obj, "imdb_id") orelse return null;
+        const imdb_id = common.jsonString(detail_obj, "imdb_id") orelse return null;
         if (!std.mem.startsWith(u8, imdb_id, "tt")) return null;
 
         const candidate_title = switch (media_kind) {
-            .movie => jsonString(chosen_obj, "title") orelse title,
-            .tv => jsonString(chosen_obj, "name") orelse title,
+            .movie => common.jsonString(chosen_obj, "title") orelse title,
+            .tv => common.jsonString(chosen_obj, "name") orelse title,
         };
         const date = switch (media_kind) {
-            .movie => jsonString(chosen_obj, "release_date"),
-            .tv => jsonString(chosen_obj, "first_air_date"),
+            .movie => common.jsonString(chosen_obj, "release_date"),
+            .tv => common.jsonString(chosen_obj, "first_air_date"),
         };
         const year = if (date) |value| parseYear(value) else null;
 
@@ -307,9 +307,9 @@ fn appendRelease(
     episode: ?i64,
     out: *std.ArrayListUnmanaged(SubtitleItem),
 ) !void {
-    const id = jsonIntFromObject(obj, "id") orelse return;
+    const id = common.jsonIntField(obj, "id") orelse return;
     if (id <= 0) return;
-    const release = jsonString(obj, "version") orelse return;
+    const release = common.jsonString(obj, "version") orelse return;
     const filename = try std.fmt.allocPrint(allocator, "wizdom-{d}.zip", .{id});
     try out.append(allocator, .{
         .language_code = "he",
@@ -363,40 +363,6 @@ fn parseYear(date: []const u8) ?i64 {
     if (date.len < 4) return null;
     for (date[0..4]) |c| if (!std.ascii.isDigit(c)) return null;
     return std.fmt.parseInt(i64, date[0..4], 10) catch null;
-}
-
-fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = obj.get(key) orelse return null;
-    return switch (value) {
-        .string => |text| text,
-        else => null,
-    };
-}
-
-fn jsonIntFromObject(obj: std.json.ObjectMap, key: []const u8) ?i64 {
-    const value = obj.get(key) orelse return null;
-    return switch (value) {
-        .integer => |number| number,
-        .number_string => |number| std.fmt.parseInt(i64, number, 10) catch null,
-        .float => |number| @intFromFloat(number),
-        else => null,
-    };
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "wizdom parses SxxExx query and release ordering" {

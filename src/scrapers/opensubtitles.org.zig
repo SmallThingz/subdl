@@ -7,7 +7,6 @@ const HtmlNode = HtmlParseOptions.GetNode();
 
 const Allocator = std.mem.Allocator;
 const site = "https://www.opensubtitles.org";
-const opensubtitles_host = "www.opensubtitles.org";
 const default_page_size: usize = 40;
 
 pub const SearchOptions = struct {
@@ -111,7 +110,7 @@ pub const Scraper = struct {
         while (traversed < max_pages) : (traversed += 1) {
             last_page = page;
             const page_url = if (next_url) |u| u else if (page == 1) base_url else try addOrReplaceOffsetPage(a, base_url, page);
-            const response = try self.fetchHtmlWithDoh(a, page_url);
+            const response = try self.fetchHtml(a, page_url);
             var parsed = try common.parseHtmlStable(a, response.body);
 
             var anchors = parsed.doc.queryAll("table#search_results td[id^='main'] strong a.bnone[href*='/search/'][href*='idmovie-']");
@@ -171,7 +170,7 @@ pub const Scraper = struct {
         while (traversed < max_pages) : (traversed += 1) {
             last_page = page;
             const url = if (next_url) |u| u else if (page == 1) page_url else try addOrReplaceOffsetPage(a, page_url, page);
-            const response = try self.fetchHtmlWithDoh(a, url);
+            const response = try self.fetchHtml(a, url);
             var parsed = try common.parseHtmlStable(a, response.body);
 
             if (title.len == 0) {
@@ -210,7 +209,7 @@ pub const Scraper = struct {
         };
     }
 
-    fn fetchHtmlWithDoh(self: *Scraper, allocator: Allocator, url: []const u8) !common.HttpResponse {
+    fn fetchHtml(self: *Scraper, allocator: Allocator, url: []const u8) !common.HttpResponse {
         const response = common.fetchBytes(self.client, self.allocator, url, .{
             .accept = "text/html",
             .allow_non_ok = true,
@@ -235,195 +234,7 @@ pub const Scraper = struct {
         }
         return response;
     }
-
-    fn resolveHostViaDoh(self: *Scraper, allocator: Allocator, host: []const u8) ![]const u8 {
-        _ = self;
-        _ = allocator;
-        _ = host;
-        return error.TemporaryNameServerFailure;
-    }
 };
-
-const RawHttpResponse = struct {
-    status: std.http.Status,
-    location: ?[]const u8,
-    body: []u8,
-};
-
-fn fetchHttpsByIp(
-    allocator: Allocator,
-    host: []const u8,
-    ip: []const u8,
-    path: []const u8,
-    accept: []const u8,
-) !RawHttpResponse {
-    _ = allocator;
-    _ = host;
-    _ = ip;
-    _ = path;
-    _ = accept;
-    return error.TemporaryNameServerFailure;
-}
-
-fn readHttpResponse(allocator: Allocator, reader: *std.Io.Reader) !RawHttpResponse {
-    const status_line = try readLine(allocator, reader);
-    const status_code = parseHttpStatusCode(status_line) orelse {
-        if (common.getenv("SCRAPERS_DEBUG_OPENSUB_ORG_DOH") != null) {
-            std.debug.print("[opensubtitles.org][doh] invalid status line: {s}\n", .{status_line});
-        }
-        return error.UnexpectedHttpStatus;
-    };
-
-    var content_length: ?usize = null;
-    var chunked = false;
-    var location: ?[]const u8 = null;
-
-    while (true) {
-        const line = try readLine(allocator, reader);
-        if (line.len == 0) break;
-
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const name = std.mem.trim(u8, line[0..colon], " \t");
-        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-
-        if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-            content_length = std.fmt.parseInt(usize, value, 10) catch null;
-            continue;
-        }
-        if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
-            chunked = std.ascii.indexOfIgnoreCase(value, "chunked") != null;
-            continue;
-        }
-        if (std.ascii.eqlIgnoreCase(name, "location")) {
-            location = try allocator.dupe(u8, value);
-            continue;
-        }
-    }
-
-    const body = if (chunked)
-        try readChunkedBody(allocator, reader)
-    else if (content_length) |len|
-        try readFixedBody(allocator, reader, len)
-    else
-        try readBodyToEof(allocator, reader);
-
-    return .{
-        .status = @enumFromInt(status_code),
-        .location = location,
-        .body = body,
-    };
-}
-
-fn readFixedBody(allocator: Allocator, reader: *std.Io.Reader, len: usize) ![]u8 {
-    const body = try allocator.alloc(u8, len);
-    if (len == 0) return body;
-    try reader.readSliceAll(body);
-    return body;
-}
-
-fn readBodyToEof(allocator: Allocator, reader: *std.Io.Reader) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    var buf: [8192]u8 = undefined;
-    while (true) {
-        const n = reader.readSliceShort(&buf) catch return error.ReadFailed;
-        if (n == 0) break;
-        try out.appendSlice(allocator, buf[0..n]);
-    }
-
-    return try out.toOwnedSlice(allocator);
-}
-
-fn readChunkedBody(allocator: Allocator, reader: *std.Io.Reader) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    var tmp: [4096]u8 = undefined;
-
-    while (true) {
-        const size_line = try readLine(allocator, reader);
-        const chunk_size = parseChunkSize(size_line) orelse return error.InvalidFieldType;
-        if (chunk_size == 0) {
-            while (true) {
-                const trailer = try readLine(allocator, reader);
-                if (trailer.len == 0) break;
-            }
-            break;
-        }
-
-        var remaining = chunk_size;
-        while (remaining > 0) {
-            const n = @min(remaining, tmp.len);
-            try reader.readSliceAll(tmp[0..n]);
-            try out.appendSlice(allocator, tmp[0..n]);
-            remaining -= n;
-        }
-
-        _ = try reader.takeArray(2);
-    }
-
-    return try out.toOwnedSlice(allocator);
-}
-
-fn parseChunkSize(line: []const u8) ?usize {
-    const trimmed = std.mem.trim(u8, line, " \t\r\n");
-    if (trimmed.len == 0) return null;
-    const semi = std.mem.indexOfScalar(u8, trimmed, ';') orelse trimmed.len;
-    return std.fmt.parseInt(usize, trimmed[0..semi], 16) catch null;
-}
-
-fn readLine(allocator: Allocator, reader: *std.Io.Reader) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    while (true) {
-        const byte = reader.takeByte() catch |err| switch (err) {
-            error.EndOfStream => break,
-            error.ReadFailed => return error.ReadFailed,
-        };
-        if (byte == '\n') break;
-        try out.append(allocator, byte);
-    }
-
-    if (out.items.len > 0 and out.items[out.items.len - 1] == '\r') {
-        out.items.len -= 1;
-    }
-
-    return try out.toOwnedSlice(allocator);
-}
-
-fn parseHttpStatusCode(status_line: []const u8) ?u16 {
-    var it = std.mem.tokenizeAny(u8, status_line, " \t");
-    _ = it.next() orelse return null;
-    const code_text = it.next() orelse return null;
-    return std.fmt.parseInt(u16, code_text, 10) catch null;
-}
-
-fn pathFromOpenSubtitlesUrl(allocator: Allocator, url: []const u8) ![]const u8 {
-    if (!std.mem.startsWith(u8, url, site)) return error.InvalidFieldType;
-    const raw = url[site.len..];
-    if (raw.len == 0) return try allocator.dupe(u8, "/");
-    if (raw[0] == '/') return try allocator.dupe(u8, raw);
-    return try std.fmt.allocPrint(allocator, "/{s}", .{raw});
-}
-
-fn pathFromRedirectLocation(allocator: Allocator, location: []const u8) ![]const u8 {
-    if (std.mem.startsWith(u8, location, "http://") or std.mem.startsWith(u8, location, "https://")) {
-        return pathFromOpenSubtitlesUrl(allocator, location);
-    }
-    if (location.len == 0) return try allocator.dupe(u8, "/");
-    if (location[0] == '/') return try allocator.dupe(u8, location);
-    return try std.fmt.allocPrint(allocator, "/{s}", .{location});
-}
-
-fn isRedirectStatus(status: std.http.Status) bool {
-    return status == .moved_permanently or
-        status == .found or
-        status == .see_other or
-        status == .temporary_redirect or
-        status == .permanent_redirect;
-}
 
 fn dedupeSearchItems(allocator: Allocator, items: []const SearchItem) ![]const SearchItem {
     var seen = std.StringHashMapUnmanaged(void).empty;

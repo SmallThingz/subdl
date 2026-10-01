@@ -127,7 +127,7 @@ const Board = struct {
 };
 
 fn findBoard(allocator: Allocator, body: []const u8, query: []const u8) !?Board {
-    const wanted = try normalizeTitle(allocator, query);
+    const wanted = try common.normalizeTitle(allocator, query);
     defer allocator.free(wanted);
 
     var partial: ?Board = null;
@@ -144,7 +144,7 @@ fn findBoard(allocator: Allocator, body: []const u8, query: []const u8) !?Board 
         const title = std.mem.trim(u8, stripSimpleTags(raw_title), " \t\r\n");
         if (title.len == 0) continue;
 
-        const normalized = try normalizeTitle(allocator, title);
+        const normalized = try common.normalizeTitle(allocator, title);
         defer allocator.free(normalized);
         if (normalized.len == 0) continue;
 
@@ -437,22 +437,6 @@ fn allDigits(value: []const u8) bool {
     if (value.len == 0) return false;
     for (value) |c| if (!std.ascii.isDigit(c)) return false;
     return true;
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 fn slug(allocator: Allocator, input: []const u8) ![]u8 {

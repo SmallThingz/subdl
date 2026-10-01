@@ -78,8 +78,8 @@ pub const Scraper = struct {
                 .object => |value| value,
                 else => continue,
             };
-            const title = jsonString(obj, "title") orelse continue;
-            const url = jsonString(obj, "url") orelse continue;
+            const title = common.jsonString(obj, "title") orelse continue;
+            const url = common.jsonString(obj, "url") orelse continue;
             if (url.len == 0 or std.mem.eql(u8, url, "#")) continue;
             const item: SearchItem = .{
                 .title = try a.dupe(u8, title),
@@ -124,9 +124,9 @@ pub const Scraper = struct {
                 .object => |value| value,
                 else => continue,
             };
-            const title = jsonString(obj, "title") orelse continue;
-            const language = jsonString(obj, "language") orelse continue;
-            const row_url = jsonString(obj, "url") orelse continue;
+            const title = common.jsonString(obj, "title") orelse continue;
+            const language = common.jsonString(obj, "language") orelse continue;
+            const row_url = common.jsonString(obj, "url") orelse continue;
             if (row_url.len == 0 or seen.contains(row_url)) continue;
             try seen.put(a, try a.dupe(u8, row_url), {});
 
@@ -193,7 +193,7 @@ pub const Scraper = struct {
             .object => |value| value,
             else => return error.InvalidFieldType,
         };
-        const access_token = jsonString(info_obj, "token") orelse return error.MissingField;
+        const access_token = common.jsonString(info_obj, "token") orelse return error.MissingField;
 
         const zip_name = try downloadZipName(allocator, parts.row_url);
         defer allocator.free(zip_name);
@@ -338,14 +338,6 @@ pub fn parseDownloadToken(value: []const u8) ?DownloadToken {
         .row_url = payload[a + 1 .. b],
         .language = payload[b + 1 .. c],
         .title = payload[c + 1 ..],
-    };
-}
-
-fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = obj.get(key) orelse return null;
-    return switch (value) {
-        .string => |text| text,
-        else => null,
     };
 }
 

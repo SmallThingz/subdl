@@ -86,10 +86,10 @@ pub const Scraper = struct {
                 .object => |value| value,
                 else => continue,
             };
-            const title = jsonString(item_obj, "title") orelse continue;
+            const title = common.jsonString(item_obj, "title") orelse continue;
             const movie_id = jsonInt(item_obj, "id") orelse continue;
             if (movie_id <= 0) continue;
-            const release_date = jsonString(item_obj, "release_date");
+            const release_date = common.jsonString(item_obj, "release_date");
             const year = release_dateToYear(release_date);
             const slugged = try movieSlug(a, title, year);
             const page_url = try std.fmt.allocPrint(a, "{s}/movie/{d}/{s}", .{ site, movie_id, slugged });
@@ -185,14 +185,14 @@ fn parseInitialSubtitles(allocator: Allocator, flight: []const u8) ![]const Subt
             .object => |value| value,
             else => continue,
         };
-        const relative_url = jsonString(obj, "url") orelse continue;
+        const relative_url = common.jsonString(obj, "url") orelse continue;
         if (!std.mem.startsWith(u8, relative_url, "/subtitle/")) continue;
         if (seen.contains(relative_url)) continue;
         try seen.put(allocator, relative_url, {});
 
-        const release_name = jsonString(obj, "release_name") orelse "subtitle";
-        const raw_name = jsonString(obj, "name") orelse release_name;
-        const language = jsonString(obj, "language") orelse jsonString(obj, "lang") orelse "und";
+        const release_name = common.jsonString(obj, "release_name") orelse "subtitle";
+        const raw_name = common.jsonString(obj, "name") orelse release_name;
+        const language = common.jsonString(obj, "language") orelse common.jsonString(obj, "lang") orelse "und";
         const language_code = try lowerAscii(allocator, language);
         const filename = if (std.ascii.endsWithIgnoreCase(raw_name, ".zip"))
             try allocator.dupe(u8, raw_name)
@@ -265,14 +265,6 @@ fn release_dateToYear(value: ?[]const u8) ?i64 {
     const text = value orelse return null;
     if (text.len < 4) return null;
     return std.fmt.parseInt(i64, text[0..4], 10) catch null;
-}
-
-fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = obj.get(key) orelse return null;
-    return switch (value) {
-        .string => |text| text,
-        else => null,
-    };
 }
 
 fn jsonInt(obj: std.json.ObjectMap, key: []const u8) ?i64 {

@@ -113,7 +113,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     const a = owned_arena.allocator();
     var parsed = try common.parseHtmlStable(a, body);
 
-    const wanted = try normalizeTitle(a, query);
+    const wanted = try common.normalizeTitle(a, query);
     var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
     var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
 
@@ -124,7 +124,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
         const raw_title = try common.innerTextTrimmedOwned(a, anchor);
         if (raw_title.len == 0) continue;
 
-        const split = splitTitleYear(raw_title);
+        const split = common.splitTrailingYear(raw_title);
         const title = try a.dupe(u8, split.title);
         const page_url = try common.resolveUrl(a, site, href);
 
@@ -156,7 +156,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
             .download_url = try a.dupe(u8, page_url),
         };
 
-        const normalized = try normalizeTitle(a, title);
+        const normalized = try common.normalizeTitle(a, title);
         if (std.mem.eql(u8, normalized, wanted))
             try exact.append(a, item)
         else
@@ -169,26 +169,6 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     return .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) };
 }
 
-const TitleYear = struct {
-    title: []const u8,
-    year: ?i64,
-};
-
-fn splitTitleYear(input: []const u8) TitleYear {
-    const trimmed = std.mem.trim(u8, input, " \t\r\n");
-    if (trimmed.len < 6 or trimmed[trimmed.len - 1] != ')') return .{ .title = trimmed, .year = null };
-
-    const open = std.mem.lastIndexOfScalar(u8, trimmed, '(') orelse return .{ .title = trimmed, .year = null };
-    const inside = trimmed[open + 1 .. trimmed.len - 1];
-    if (inside.len != 4) return .{ .title = trimmed, .year = null };
-    for (inside) |c| if (!std.ascii.isDigit(c)) return .{ .title = trimmed, .year = null };
-    const year = std.fmt.parseInt(i64, inside, 10) catch return .{ .title = trimmed, .year = null };
-    return .{
-        .title = std.mem.trimEnd(u8, trimmed[0..open], " \t"),
-        .year = year,
-    };
-}
-
 fn parseImdbId(allocator: Allocator, url: []const u8) !?[]const u8 {
     const marker = "/title/";
     const start = std.mem.indexOf(u8, url, marker) orelse return null;
@@ -198,22 +178,6 @@ fn parseImdbId(allocator: Allocator, url: []const u8) !?[]const u8 {
     if (id.len < 3 or !std.mem.startsWith(u8, id, "tt")) return null;
     for (id[2..]) |c| if (!std.ascii.isDigit(c)) return null;
     return try allocator.dupe(u8, id);
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 fn hasSearchTable(body: []const u8) bool {

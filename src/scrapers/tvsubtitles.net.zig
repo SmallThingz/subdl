@@ -8,9 +8,7 @@ const HtmlNode = HtmlParseOptions.GetNode();
 const Allocator = std.mem.Allocator;
 const site = "http://www.tvsubtitles.net";
 
-pub const SearchOptions = struct {
-    _unused: void = {},
-};
+pub const SearchOptions = struct {};
 
 pub const SubtitlesOptions = struct {
     include_all_seasons: bool = true,
@@ -72,12 +70,10 @@ pub const Scraper = struct {
         return self.searchWithOptions(query, .{});
     }
 
-    pub fn searchWithOptions(self: *Scraper, query: []const u8, options: SearchOptions) !SearchResponse {
+    pub fn searchWithOptions(self: *Scraper, query: []const u8, _: SearchOptions) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
-        _ = options;
-
         var out: std.ArrayListUnmanaged(SearchItem) = .empty;
         var seen = std.StringHashMapUnmanaged(void).empty;
 
@@ -97,10 +93,6 @@ pub const Scraper = struct {
             .has_prev_page = false,
             .has_next_page = false,
         };
-    }
-
-    pub fn fetchSubtitlesByShowLink(self: *Scraper, show_url: []const u8) !SubtitlesResponse {
-        return self.fetchSubtitlesByShowLinkWithOptions(show_url, .{});
     }
 
     pub fn fetchSubtitlesByShowLinkWithOptions(self: *Scraper, show_url: []const u8, options: SubtitlesOptions) !SubtitlesResponse {
