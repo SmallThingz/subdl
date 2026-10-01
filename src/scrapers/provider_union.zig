@@ -42,6 +42,7 @@ pub const animetosho_xyz = @import("animetosho.xyz.zig");
 pub const kitsunekko_net = @import("kitsunekko.net.zig");
 pub const thesubtitledb_org = @import("thesubtitledb.org.zig");
 pub const napisy24_pl = @import("napisy24.pl.zig");
+pub const nyasub_cz = @import("nyasub.cz.zig");
 pub const subhd_tv = @import("subhd.tv.zig");
 pub const fansubs_ru = @import("fansubs.ru.zig");
 pub const legendei_net = @import("legendei.net.zig");
@@ -96,6 +97,7 @@ pub const ProviderTag = enum {
     kitsunekko_net,
     thesubtitledb_org,
     napisy24_pl,
+    nyasub_cz,
     subhd_tv,
     fansubs_ru,
     legendei_net,
@@ -151,6 +153,7 @@ pub const SearchItemUnion = union(ProviderTag) {
     kitsunekko_net: kitsunekko_net.SearchItem,
     thesubtitledb_org: thesubtitledb_org.SearchItem,
     napisy24_pl: napisy24_pl.SearchItem,
+    nyasub_cz: nyasub_cz.SearchItem,
     subhd_tv: subhd_tv.SearchItem,
     fansubs_ru: fansubs_ru.SearchItem,
     legendei_net: legendei_net.SearchItem,
@@ -206,6 +209,7 @@ pub const SubtitleUnion = union(ProviderTag) {
     kitsunekko_net: kitsunekko_net.SubtitleItem,
     thesubtitledb_org: thesubtitledb_org.SubtitleItem,
     napisy24_pl: napisy24_pl.SubtitleItem,
+    nyasub_cz: nyasub_cz.SubtitleItem,
     subhd_tv: subhd_tv.SubtitleItem,
     fansubs_ru: fansubs_ru.SubtitleItem,
     legendei_net: legendei_net.SubtitleItem,
@@ -261,6 +265,7 @@ pub const TitleUnion = union(ProviderTag) {
     kitsunekko_net: kitsunekko_net.SearchItem,
     thesubtitledb_org: thesubtitledb_org.SearchItem,
     napisy24_pl: napisy24_pl.SearchItem,
+    nyasub_cz: nyasub_cz.SearchItem,
     subhd_tv: subhd_tv.SearchItem,
     fansubs_ru: fansubs_ru.SearchItem,
     legendei_net: legendei_net.SearchItem,
@@ -564,6 +569,13 @@ pub fn fromNapisy24Search(allocator: std.mem.Allocator, items: []const napisy24_
     var out: std.ArrayListUnmanaged(SearchItemUnion) = .empty;
     errdefer out.deinit(allocator);
     for (items) |item| try out.append(allocator, .{ .napisy24_pl = item });
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn fromNyaSubSearch(allocator: std.mem.Allocator, items: []const nyasub_cz.SearchItem) ![]SearchItemUnion {
+    var out: std.ArrayListUnmanaged(SearchItemUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .nyasub_cz = item });
     return try out.toOwnedSlice(allocator);
 }
 
@@ -928,6 +940,13 @@ pub fn fromNapisy24Subtitles(allocator: std.mem.Allocator, items: []const napisy
     var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
     errdefer out.deinit(allocator);
     for (items) |item| try out.append(allocator, .{ .napisy24_pl = item });
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn fromNyaSubSubtitles(allocator: std.mem.Allocator, items: []const nyasub_cz.SubtitleItem) ![]SubtitleUnion {
+    var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .nyasub_cz = item });
     return try out.toOwnedSlice(allocator);
 }
 

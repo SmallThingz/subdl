@@ -3,13 +3,13 @@
 Subtitle scrapers in Zig with a shared provider API and a single `scrapers` binary.
 
 ![Zig](https://img.shields.io/badge/Zig-0.16.0--dev-f7a41d)
-![Providers](https://img.shields.io/badge/Active_Providers-42-2ea44f)
+![Providers](https://img.shields.io/badge/Active_Providers-43-2ea44f)
 ![Runtime](https://img.shields.io/badge/HTTP-std.http%20(Client)-0366d6)
 
 ## Overview
 
-- 42 currently active providers behind one app layer: `providers_app`
-- 52 provider implementations retained and covered by targeted live tests
+- 43 currently active providers behind one app layer: `providers_app`
+- 53 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
 - TUI mode available with `--tui` in the default build
@@ -59,6 +59,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `kitsunekko_net` | `kitsunekko.net` |
 | `thesubtitledb_org` | `thesubtitledb.org` |
 | `napisy24_pl` | `napisy24.pl` |
+| `nyasub_cz` | `nyasub.cz` |
 | `fansubs_ru` | `fansubs.ru` |
 | `legendei_net` | `legendei.net` |
 | `zoom_lk` | `zoom.lk` |
@@ -103,6 +104,7 @@ be detected without advertising a known-unusable provider in the CLI/TUI.
 `kitsunekko_net` provides English and Japanese anime subtitles from the public Kitsunekko title directories; RAR and 7z entries are intentionally excluded.
 `thesubtitledb_org` provides public multi-language movie and TV subtitles via IMDb title resolution and TheSubtitleDB's direct file API; no API key is required.
 `napisy24_pl` provides Polish and selected English movie/TV subtitles through Napisy24's anonymous XML API and direct ZIP download endpoint.
+`nyasub_cz` provides Czech anime movie/OVA and TV subtitles from NyaSub's public finished-translations catalog and direct WPDM subtitle links.
 `fansubs_ru` provides Russian anime movie and TV subtitles.
 `legendei_net` provides Portuguese movie and TV subtitle archives, with language-specific posts when available.
 `zoom_lk` provides Sinhala movie and TV season subtitle archives.

@@ -48,6 +48,7 @@ pub const animetosho_xyz = subdl.animetosho_xyz;
 pub const kitsunekko_net = subdl.kitsunekko_net;
 pub const thesubtitledb_org = subdl.thesubtitledb_org;
 pub const napisy24_pl = subdl.napisy24_pl;
+pub const nyasub_cz = subdl.nyasub_cz;
 pub const subhd_tv = subdl.subhd_tv;
 pub const fansubs_ru = subdl.fansubs_ru;
 pub const legendei_net = subdl.legendei_net;
