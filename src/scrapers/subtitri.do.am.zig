@@ -6,37 +6,13 @@ const Allocator = std.mem.Allocator;
 const HtmlParseOptions: html.ParseOptions = .{};
 const site = "https://subtitri.do.am";
 
-pub const SearchItem = struct {
-    title: []const u8,
-    page_url: []const u8,
-};
+pub const SearchItem = common.SearchLink;
 
-pub const SubtitleItem = struct {
-    language_code: []const u8,
-    filename: []const u8,
-    download_url: []const u8,
-};
+pub const SubtitleItem = common.SubtitleFile;
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -45,8 +21,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -82,7 +56,7 @@ pub const Scraper = struct {
         const href = common.getAttributeValueSafe(link, "href") orelse return error.MissingField;
         const download_url = try common.resolveUrl(a, site, href);
 
-        const slugged = try slug(a, item.title);
+        const slugged = try common.asciiSlug(a, item.title);
         const filename = try std.fmt.allocPrint(a, "subtitri-{s}.zip", .{slugged});
         const subtitles = try a.alloc(SubtitleItem, 1);
         subtitles[0] = .{
@@ -138,22 +112,6 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     try items.appendSlice(a, exact.items);
     try items.appendSlice(a, partial.items);
     return .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) };
-}
-
-fn slug(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var dash = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (dash and out.items.len > 0) try out.append(allocator, '-');
-            dash = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            dash = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "subtitri parses exact movie search result" {

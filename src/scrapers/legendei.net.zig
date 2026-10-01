@@ -5,7 +5,7 @@ const Allocator = std.mem.Allocator;
 const site = "https://legendei.net";
 const api_search = site ++ "/wp-json/wp/v2/search";
 
-pub const MediaKind = enum { movie, tv };
+pub const MediaKind = common.MediaKind;
 
 pub const SearchItem = struct {
     title: []const u8,
@@ -17,32 +17,11 @@ pub const SearchItem = struct {
     page_url: []const u8,
 };
 
-pub const SubtitleItem = struct {
-    language_code: []const u8,
-    filename: []const u8,
-    download_url: []const u8,
-};
+pub const SubtitleItem = common.SubtitleFile;
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -51,8 +30,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -88,7 +65,7 @@ pub const Scraper = struct {
             const page_url = common.jsonString(obj, "url") orelse continue;
             if (post_id <= 0 or title.len == 0 or page_url.len == 0) continue;
 
-            const se = parseSeasonEpisode(title);
+            const se = common.parseSeasonEpisode(title);
             const media_kind: MediaKind = if (se.episode != null) .tv else .movie;
             const canonical = stripReleaseNoise(title);
             const normalized = try common.normalizeTitle(a, canonical);
@@ -196,34 +173,8 @@ fn languageCodeFromTitle(title: []const u8) []const u8 {
     return "pt";
 }
 
-const SeasonEpisode = struct {
-    season: ?i64,
-    episode: ?i64,
-};
-
-fn parseSeasonEpisode(value: []const u8) SeasonEpisode {
-    var i: usize = 0;
-    while (i + 4 < value.len) : (i += 1) {
-        if (value[i] != 's' and value[i] != 'S') continue;
-        var p = i + 1;
-        while (p < value.len and value[p] == '0') : (p += 1) {}
-        const season_start = p;
-        while (p < value.len and std.ascii.isDigit(value[p])) : (p += 1) {}
-        if (p == season_start or p >= value.len or (value[p] != 'e' and value[p] != 'E')) continue;
-        const season = std.fmt.parseInt(i64, value[season_start..p], 10) catch continue;
-        p += 1;
-        while (p < value.len and value[p] == '0') : (p += 1) {}
-        const episode_start = p;
-        while (p < value.len and std.ascii.isDigit(value[p])) : (p += 1) {}
-        if (p == episode_start) continue;
-        const episode = std.fmt.parseInt(i64, value[episode_start..p], 10) catch continue;
-        return .{ .season = season, .episode = episode };
-    }
-    return .{ .season = null, .episode = null };
-}
-
 fn stripReleaseNoise(value: []const u8) []const u8 {
-    const se = parseSeasonEpisode(value);
+    const se = common.parseSeasonEpisode(value);
     if (se.episode != null) {
         var i: usize = 0;
         while (i + 4 < value.len) : (i += 1) {
@@ -255,7 +206,7 @@ fn jsonInt(obj: std.json.ObjectMap, key: []const u8) ?i64 {
 
 test "legendei parses media hints and download anchor" {
     const allocator = std.testing.allocator;
-    const se = parseSeasonEpisode("Chernobyl S01E01 1080p");
+    const se = common.parseSeasonEpisode("Chernobyl S01E01 1080p");
     try std.testing.expectEqual(@as(?i64, 1), se.season);
     try std.testing.expectEqual(@as(?i64, 1), se.episode);
     try std.testing.expectEqualStrings("pt", languageCodeFromTitle("Chernobyl S01E01"));

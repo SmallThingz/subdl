@@ -13,33 +13,11 @@ pub const SearchItem = struct {
     page_url: []const u8,
 };
 
-pub const SubtitleItem = struct {
-    language_code: []const u8,
-    filename: []const u8,
-    release_name: []const u8,
-    download_url: []const u8,
-};
+pub const SubtitleItem = common.ReleaseSubtitleFile;
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -48,8 +26,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -77,7 +53,7 @@ pub const Scraper = struct {
             else => return error.InvalidFieldType,
         };
 
-        const wanted = try normalizeTitle(a, trimmed);
+        const wanted = try common.normalizeTitle(a, trimmed);
         var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
         var other: std.ArrayListUnmanaged(SearchItem) = .empty;
 
@@ -87,13 +63,13 @@ pub const Scraper = struct {
                 else => continue,
             };
             const title = common.jsonString(item_obj, "title") orelse continue;
-            const movie_id = jsonInt(item_obj, "id") orelse continue;
+            const movie_id = common.jsonIntField(item_obj, "id") orelse continue;
             if (movie_id <= 0) continue;
             const release_date = common.jsonString(item_obj, "release_date");
             const year = release_dateToYear(release_date);
             const slugged = try movieSlug(a, title, year);
             const page_url = try std.fmt.allocPrint(a, "{s}/movie/{d}/{s}", .{ site, movie_id, slugged });
-            const normalized = try normalizeTitle(a, title);
+            const normalized = try common.normalizeTitle(a, title);
 
             const item: SearchItem = .{
                 .title = try a.dupe(u8, title),
@@ -267,35 +243,10 @@ fn release_dateToYear(value: ?[]const u8) ?i64 {
     return std.fmt.parseInt(i64, text[0..4], 10) catch null;
 }
 
-fn jsonInt(obj: std.json.ObjectMap, key: []const u8) ?i64 {
-    const value = obj.get(key) orelse return null;
-    return switch (value) {
-        .integer => |number| number,
-        .number_string => |number| std.fmt.parseInt(i64, number, 10) catch null,
-        .float => |number| @intFromFloat(number),
-        else => null,
-    };
-}
-
 fn lowerAscii(allocator: Allocator, value: []const u8) ![]u8 {
     const out = try allocator.alloc(u8, value.len);
     for (value, 0..) |c, i| out[i] = std.ascii.toLower(c);
     return out;
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
-            pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            pending_space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "justsubtitles parses next flight subtitle rows" {

@@ -109,7 +109,6 @@ fn phaseDone(provider: []const u8, phase: []const u8, started_ms: i64) void {
 
 fn runSubdl(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     var scraper = subdl_com.Scraper.initWithOptions(allocator, client, .{ .include_empty_subtitle_groups = false });
-    defer scraper.deinit();
 
     const search_started_ms = phaseStart("subdl.com", "search");
     var search = try scraper.search("The Matrix");

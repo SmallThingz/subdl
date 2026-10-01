@@ -70,7 +70,103 @@ pub const ParsedHtml = struct {
     }
 };
 
-fn debugTimingEnabled() bool {
+pub fn SearchResponse(comptime Item: type) type {
+    return struct {
+        arena: std.heap.ArenaAllocator,
+        items: []const Item,
+
+        pub fn deinit(self: *@This()) void {
+            self.arena.deinit();
+            self.* = undefined;
+        }
+    };
+}
+
+pub fn PagedSearchResponse(comptime Item: type) type {
+    return struct {
+        arena: std.heap.ArenaAllocator,
+        items: []const Item,
+        page: usize = 1,
+        has_prev_page: bool = false,
+        has_next_page: bool = false,
+
+        pub fn deinit(self: *@This()) void {
+            self.arena.deinit();
+            self.* = undefined;
+        }
+    };
+}
+
+pub fn NextSearchResponse(comptime Item: type) type {
+    return struct {
+        arena: std.heap.ArenaAllocator,
+        items: []const Item,
+        has_next_page: bool = false,
+
+        pub fn deinit(self: *@This()) void {
+            self.arena.deinit();
+            self.* = undefined;
+        }
+    };
+}
+
+pub fn TitledSubtitlesResponse(comptime Item: type) type {
+    return struct {
+        arena: std.heap.ArenaAllocator,
+        title: []const u8,
+        subtitles: []const Item,
+
+        pub fn deinit(self: *@This()) void {
+            self.arena.deinit();
+            self.* = undefined;
+        }
+    };
+}
+
+pub fn SubtitlesResponse(comptime Item: type) type {
+    return struct {
+        arena: std.heap.ArenaAllocator,
+        subtitles: []const Item,
+
+        pub fn deinit(self: *@This()) void {
+            self.arena.deinit();
+            self.* = undefined;
+        }
+    };
+}
+
+pub fn PagedTitledSubtitlesResponse(comptime Item: type) type {
+    return struct {
+        arena: std.heap.ArenaAllocator,
+        title: []const u8,
+        subtitles: []const Item,
+        page: usize = 1,
+        has_prev_page: bool = false,
+        has_next_page: bool = false,
+
+        pub fn deinit(self: *@This()) void {
+            self.arena.deinit();
+            self.* = undefined;
+        }
+    };
+}
+
+pub fn PagedSubtitlesResponse(comptime Item: type) type {
+    return struct {
+        arena: std.heap.ArenaAllocator,
+        subtitles: []const Item,
+        page: usize = 1,
+        has_prev_page: bool = false,
+        has_next_page: bool = false,
+
+        pub fn deinit(self: *@This()) void {
+            self.arena.deinit();
+            self.* = undefined;
+        }
+    };
+}
+
+pub fn debugTimingEnabled() bool {
     const value = getenv("SCRAPERS_DEBUG_TIMING") orelse return false;
     return value.len > 0 and !std.mem.eql(u8, value, "0");
 }
@@ -306,7 +402,7 @@ fn fetchCachePath(allocator: Allocator, root: []const u8, url: []const u8, opts:
     return std.fmt.allocPrint(allocator, "{s}/http/{s}.cache", .{ root, &hex });
 }
 
-fn ensureParentDir(path: []const u8) !void {
+pub fn ensureParentDir(path: []const u8) !void {
     const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return;
     if (slash == 0) return;
     try std.Io.Dir.cwd().createDirPath(runtime_io.get(), path[0..slash]);
@@ -518,6 +614,15 @@ pub fn innerTextTrimmedOwned(arena_alloc: Allocator, node: anytype) ![]const u8 
     return innerTextOwnedWithOptions(arena_alloc, node, .{ .normalize_whitespace = true });
 }
 
+pub fn findDescendantByTag(node: HtmlNode, tag_name: []const u8) ?HtmlNode {
+    var children = node.children();
+    while (children.next()) |child| {
+        if (std.mem.eql(u8, child.tagName(), tag_name)) return child;
+        if (findDescendantByTag(child, tag_name)) |nested| return nested;
+    }
+    return null;
+}
+
 pub fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -529,6 +634,22 @@ pub fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
             try out.append(allocator, std.ascii.toLower(c));
         } else {
             pending_space = out.items.len > 0;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn asciiSlug(allocator: Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var dash = false;
+    for (input) |c| {
+        if (std.ascii.isAlphanumeric(c)) {
+            if (dash and out.items.len > 0) try out.append(allocator, '-');
+            dash = false;
+            try out.append(allocator, std.ascii.toLower(c));
+        } else {
+            dash = out.items.len > 0;
         }
     }
     return out.toOwnedSlice(allocator);
@@ -553,6 +674,23 @@ pub fn jsonInt(value: std.json.Value) ?i64 {
 
 pub fn jsonIntField(obj: std.json.ObjectMap, key: []const u8) ?i64 {
     return jsonInt(obj.get(key) orelse return null);
+}
+
+pub fn countTrue(flags: []const bool) usize {
+    var count: usize = 0;
+    for (flags) |enabled| {
+        if (enabled) count += 1;
+    }
+    return count;
+}
+
+pub fn seasonEpisodeLessThan(comptime T: type) fn (void, T, T) bool {
+    return struct {
+        fn lessThan(_: void, lhs: T, rhs: T) bool {
+            if (lhs.season != rhs.season) return lhs.season < rhs.season;
+            return lhs.episode < rhs.episode;
+        }
+    }.lessThan;
 }
 
 pub fn jsonObject(value: std.json.Value) ?std.json.ObjectMap {
@@ -588,15 +726,156 @@ pub fn dupOptional(allocator: Allocator, value: ?[]const u8) !?[]const u8 {
     return if (value) |text| try allocator.dupe(u8, text) else null;
 }
 
+pub fn pathBaseName(path: []const u8) []const u8 {
+    const slash = std.mem.lastIndexOfAny(u8, path, "/\\") orelse return path;
+    return path[slash + 1 ..];
+}
+
+pub fn isRedirectStatus(status: std.http.Status) bool {
+    return status == .moved_permanently or
+        status == .found or
+        status == .see_other or
+        status == .temporary_redirect or
+        status == .permanent_redirect;
+}
+
+pub fn extractPhpSessionCookie(allocator: Allocator, headers: []const u8) !?[]u8 {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.ascii.eqlIgnoreCase(name, "set-cookie")) continue;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        const start = std.mem.indexOf(u8, value, "PHPSESSID=") orelse continue;
+        const tail = value[start..];
+        const end = std.mem.indexOfScalar(u8, tail, ';') orelse tail.len;
+        return try allocator.dupe(u8, tail[0..end]);
+    }
+    return null;
+}
+
+pub const SeasonEpisode = struct {
+    season: ?i64,
+    episode: ?i64,
+};
+
+pub fn parseSeasonEpisode(value: []const u8) SeasonEpisode {
+    var i: usize = 0;
+    while (i + 4 < value.len) : (i += 1) {
+        if (value[i] != 's' and value[i] != 'S') continue;
+        var p = i + 1;
+        while (p < value.len and value[p] == '0') : (p += 1) {}
+        const season_start = p;
+        while (p < value.len and std.ascii.isDigit(value[p])) : (p += 1) {}
+        if (p == season_start or p >= value.len or (value[p] != 'e' and value[p] != 'E')) continue;
+        const season = std.fmt.parseInt(i64, value[season_start..p], 10) catch continue;
+        p += 1;
+        while (p < value.len and value[p] == '0') : (p += 1) {}
+        const episode_start = p;
+        while (p < value.len and std.ascii.isDigit(value[p])) : (p += 1) {}
+        if (p == episode_start) continue;
+        const episode = std.fmt.parseInt(i64, value[episode_start..p], 10) catch continue;
+        return .{ .season = season, .episode = episode };
+    }
+    return .{ .season = null, .episode = null };
+}
+
+pub fn decompressXz(allocator: Allocator, compressed: []const u8, max_output_bytes: usize) ![]u8 {
+    var input: std.Io.Reader = .fixed(compressed);
+    const scratch = try allocator.alloc(u8, 8192);
+    var xz = std.compress.xz.Decompress.init(&input, allocator, scratch) catch |err| {
+        allocator.free(scratch);
+        return err;
+    };
+    defer xz.deinit();
+
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    var buffer: [8192]u8 = undefined;
+    while (true) {
+        const n = try xz.reader.readSliceShort(&buffer);
+        if (n == 0) break;
+        if (output.items.len + n > max_output_bytes) return error.ResponseTooLarge;
+        try output.appendSlice(allocator, buffer[0..n]);
+    }
+    return output.toOwnedSlice(allocator);
+}
+
 pub const EpisodeQuery = struct {
     title: []const u8,
     season: ?u16,
     episode: ?u16,
 };
 
+pub const MediaKind = enum { movie, tv };
+
+pub const SearchLink = struct {
+    title: []const u8,
+    page_url: []const u8,
+};
+
+pub const MediaSearchLink = struct {
+    title: []const u8,
+    media_kind: MediaKind,
+    page_url: []const u8,
+};
+
+pub const SubtitleFile = struct {
+    language_code: []const u8,
+    filename: []const u8,
+    download_url: []const u8,
+};
+
+pub const EpisodeSubtitleFile = struct {
+    language_code: []const u8,
+    filename: []const u8,
+    download_url: []const u8,
+    season: i64,
+    episode: i64,
+};
+
+pub const DownloadSubtitleFile = struct {
+    filename: []const u8,
+    download_url: []const u8,
+};
+
+pub const ReleaseSubtitleFile = struct {
+    language_code: []const u8,
+    filename: []const u8,
+    release_name: []const u8,
+    download_url: []const u8,
+};
+
+pub const PageOptions = struct {
+    page_start: usize = 1,
+    max_pages: usize = 1,
+};
+
+pub const RawResponse = struct {
+    status: std.http.Status,
+    body: []u8,
+    cookie: ?[]u8,
+
+    pub fn deinit(self: *RawResponse, allocator: Allocator) void {
+        allocator.free(self.body);
+        if (self.cookie) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
 pub const TitleYear = struct {
     title: []const u8,
     year: ?i64,
+};
+
+pub const RequiredTitleYear = struct {
+    title: []const u8,
+    year: i64,
+};
+
+pub const SubtitleDownloadToken = struct {
+    subtitle_id: []const u8,
+    page_url: []const u8,
 };
 
 pub fn splitTrailingYear(input: []const u8) TitleYear {
@@ -1013,7 +1292,7 @@ fn sleepBackoff(initial_ms: u64, attempt: usize) void {
     sleepMilliseconds(initial_ms * multiplier);
 }
 
-fn appendHexEscape(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), value: u8) !void {
+pub fn appendHexEscape(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), value: u8) !void {
     const hex = "0123456789ABCDEF";
     try out.appendSlice(allocator, &.{ '\\', 'x', hex[value >> 4], hex[value & 0x0F] });
 }
@@ -1057,7 +1336,7 @@ fn providerNameContains(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn normalizeProviderChar(c: u8) u8 {
+pub fn normalizeProviderChar(c: u8) u8 {
     return switch (c) {
         '.', '-' => '_',
         else => std.ascii.toLower(c),

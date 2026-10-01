@@ -22,25 +22,9 @@ pub const SubtitleItem = struct {
     verified_download_url: ?[]const u8,
 };
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.SubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     pub const Options = struct {
@@ -63,8 +47,6 @@ pub const Scraper = struct {
     pub fn initWithOptions(allocator: Allocator, client: *std.http.Client, options: Options) Scraper {
         return .{ .allocator = allocator, .client = client, .options = options };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);

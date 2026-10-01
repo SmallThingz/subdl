@@ -23,26 +23,9 @@ pub const SubtitleItem = struct {
     rating_bad: ?[]const u8,
 };
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -52,13 +35,11 @@ pub const Scraper = struct {
         return .{ .allocator = allocator, .client = client };
     }
 
-    pub fn deinit(_: *Scraper) void {}
-
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
-        const debug_timing = debugTimingEnabled();
+        const debug_timing = common.debugTimingEnabled();
         const started_ns = if (debug_timing) common.compatNanoTimestamp() else 0;
         if (debug_timing) std.debug.print("[moviesubtitles.org] search start query='{s}'\n", .{query});
 
@@ -119,7 +100,7 @@ pub const Scraper = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
-        const debug_timing = debugTimingEnabled();
+        const debug_timing = common.debugTimingEnabled();
         const started_ns = if (debug_timing) common.compatNanoTimestamp() else 0;
         if (debug_timing) std.debug.print("[moviesubtitles.org] subtitles start url={s}\n", .{movie_link});
 
@@ -256,11 +237,6 @@ fn detailToDownloadUrl(allocator: Allocator, details_url: []const u8) ?[]const u
     var out = allocator.dupe(u8, details_url) catch return null;
     std.mem.copyForwards(u8, out[idx + 1 .. idx + "subtitle".len + 1], "download");
     return out;
-}
-
-fn debugTimingEnabled() bool {
-    const value = common.getenv("SCRAPERS_DEBUG_TIMING") orelse return false;
-    return value.len > 0 and !std.mem.eql(u8, value, "0");
 }
 
 test "moviesubtitles.org detail url rewrite" {

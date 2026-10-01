@@ -7,6 +7,7 @@ const runtime_io = @import("runtime_io");
 const oneserial = @import("oneserial");
 
 const app = scrapers.providers_app;
+const common = scrapers.common;
 
 pub const panic = std.debug.FullPanic(tuiPanic);
 
@@ -1489,7 +1490,7 @@ fn loadTuiRuntimeState(allocator: std.mem.Allocator, environ_map: *std.process.E
 
 fn sanitizeSettings(settings: TuiSettings) TuiSettings {
     var out = settings;
-    if (countEnabledFlags(&out.providers_enabled) == 0) out.providers_enabled = app.providerSelectionAll();
+    if (common.countTrue(&out.providers_enabled) == 0) out.providers_enabled = app.providerSelectionAll();
     if (singleEnabledIndex(&out.languages_enabled) == null) out.languages_enabled = languageSelectionEnglish();
     if (out.cache_ttl_seconds < 0) out.cache_ttl_seconds = default_cache_ttl_seconds;
     return out;
@@ -1673,7 +1674,7 @@ fn saveUiPreferences(
 }
 
 fn saveOneSerial(comptime T: type, allocator: std.mem.Allocator, path: []const u8, magic: []const u8, value: *const T) !void {
-    try ensureParentDir(path);
+    try common.ensureParentDir(path);
     const encoded = try oneserial.serializeAlloc(T, .{}, value, allocator);
     defer allocator.free(encoded);
     var file = try std.Io.Dir.cwd().createFile(runtime_io.get(), path, .{});
@@ -1683,12 +1684,6 @@ fn saveOneSerial(comptime T: type, allocator: std.mem.Allocator, path: []const u
     try writer.interface.writeAll(magic);
     try writer.interface.writeAll(encoded);
     try writer.interface.flush();
-}
-
-fn ensureParentDir(path: []const u8) !void {
-    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return;
-    if (slash == 0) return;
-    try std.Io.Dir.cwd().createDirPath(runtime_io.get(), path[0..slash]);
 }
 
 fn tuiCachePath(allocator: std.mem.Allocator, environ_map: *std.process.Environ.Map, basename: []const u8) ![]u8 {
@@ -3936,7 +3931,7 @@ fn renderSettingsPopup(
             var ttl_buf: [64]u8 = undefined;
             var history_buf: [64]u8 = undefined;
             var rows: [7][]const u8 = undefined;
-            rows[0] = std.fmt.bufPrint(&provider_buf, "Providers  {d}/{d}", .{ countEnabledFlags(&state.settings.providers_enabled), app.providerCount() }) catch "Providers";
+            rows[0] = std.fmt.bufPrint(&provider_buf, "Providers  {d}/{d}", .{ common.countTrue(&state.settings.providers_enabled), app.providerCount() }) catch "Providers";
             rows[1] = formatLanguageSetting(&language_buf, state.settings) catch "Language";
             rows[2] = std.fmt.bufPrint(&cache_buf, "URL cache  {s}", .{if (state.settings.cache_enabled) "on" else "off"}) catch "URL cache";
             rows[3] = formatCacheTtlSetting(&ttl_buf, state.settings.cache_ttl_seconds) catch "Retention";
@@ -4109,7 +4104,7 @@ fn renderQueryHome(
     win.hideCursor();
     win.setCursorShape(.beam);
 
-    const provider_count = countEnabledFlags(&state.settings.providers_enabled);
+    const provider_count = common.countTrue(&state.settings.providers_enabled);
     const download_count = if (state.settings.download_cache_enabled) state.download_entries.len else 0;
     const query_norm = normalizeQueryView(query);
     const visible_order: ?[]const usize = if (results) |bundle|
@@ -4809,7 +4804,7 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
             .has_next = subtitles.has_next_page,
         };
         const page_nav_opt: ?PageNav = if (page_nav.enabled) page_nav else null;
-        if (subtitlePageHasNoSelectableExit(countEnabledFlags(subtitle_enabled), page_nav_opt)) {
+        if (subtitlePageHasNoSelectableExit(common.countTrue(subtitle_enabled), page_nav_opt)) {
             const msg = try vaxisMessage(
                 ui,
                 "No Selectable Subtitles",
@@ -5076,7 +5071,7 @@ fn cachedDownloadCandidateFiles(
 }
 
 fn isLikelySubtitlePath(path: []const u8) bool {
-    const name = pathBaseName(path);
+    const name = common.pathBaseName(path);
     const extensions = [_][]const u8{
         ".srt",  ".ass",  ".ssa", ".sub", ".vtt", ".smi", ".sami",
         ".ttml", ".dfxp", ".sbv", ".mpl", ".sup", ".idx",
@@ -5114,11 +5109,11 @@ test "cached download candidates prefer subtitle files but retain fallback paylo
 fn buildCachedDownloadLabels(allocator: std.mem.Allocator, files: []const []const u8) ![][]const u8 {
     const labels = try allocator.alloc([]const u8, files.len);
     for (files, 0..) |path, idx| {
-        const basename = pathBaseName(path);
+        const basename = common.pathBaseName(path);
         var duplicate = false;
         for (files, 0..) |other, other_idx| {
             if (idx == other_idx) continue;
-            if (std.mem.eql(u8, basename, pathBaseName(other))) {
+            if (std.mem.eql(u8, basename, common.pathBaseName(other))) {
                 duplicate = true;
                 break;
             }
@@ -5161,7 +5156,7 @@ fn selectedCachedFile(files: []const []const u8, idx: usize) ![]const u8 {
 
 fn exportCachedFile(allocator: std.mem.Allocator, source_path: []const u8, out_dir: []const u8) ![]u8 {
     try std.Io.Dir.cwd().createDirPath(runtime_io.get(), out_dir);
-    const safe = try sanitizeExportFilename(allocator, pathBaseName(source_path));
+    const safe = try sanitizeExportFilename(allocator, common.pathBaseName(source_path));
     defer allocator.free(safe);
     const out_path = try nextAvailableExportPath(allocator, out_dir, safe);
     errdefer allocator.free(out_path);
@@ -5302,11 +5297,6 @@ fn exportCachedDownloadEntry(
     const source = try std.fmt.allocPrint(allocator, "{s}/downloads/{s}", .{ cache_root_path, relative_path });
     defer allocator.free(source);
     return exportCachedFile(allocator, source, out_dir);
-}
-
-fn pathBaseName(path: []const u8) []const u8 {
-    const slash = std.mem.lastIndexOfAny(u8, path, "/\\") orelse return path;
-    return path[slash + 1 ..];
 }
 
 fn sanitizeExportFilename(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
@@ -7129,17 +7119,9 @@ fn isOptionEnabled(enabled: anytype, option_idx: usize) bool {
     return true;
 }
 
-fn countEnabledFlags(flags: []const bool) usize {
-    var count: usize = 0;
-    for (flags) |enabled| {
-        if (enabled) count += 1;
-    }
-    return count;
-}
-
 fn toggleProviderSetting(flags: []bool, idx: usize) bool {
     if (idx >= flags.len) return false;
-    if (flags[idx] and countEnabledFlags(flags) == 1) return false;
+    if (flags[idx] and common.countTrue(flags) == 1) return false;
     flags[idx] = !flags[idx];
     return true;
 }
@@ -7649,19 +7631,19 @@ fn sanitizeUtf8ForDisplay(allocator: std.mem.Allocator, input: []const u8) ![]u8
     while (i < input.len) {
         const first = input[i];
         const seq_len = std.unicode.utf8ByteSequenceLength(first) catch {
-            try appendHexEscape(allocator, &out, first);
+            try common.appendHexEscape(allocator, &out, first);
             i += 1;
             continue;
         };
         if (i + seq_len > input.len) {
-            try appendHexEscape(allocator, &out, first);
+            try common.appendHexEscape(allocator, &out, first);
             i += 1;
             continue;
         }
 
         const segment = input[i .. i + seq_len];
         _ = std.unicode.utf8Decode(segment) catch {
-            try appendHexEscape(allocator, &out, first);
+            try common.appendHexEscape(allocator, &out, first);
             i += 1;
             continue;
         };
@@ -7671,7 +7653,7 @@ fn sanitizeUtf8ForDisplay(allocator: std.mem.Allocator, input: []const u8) ![]u8
                 '\n' => try out.appendSlice(allocator, "\\n"),
                 '\r' => try out.appendSlice(allocator, "\\r"),
                 '\t' => try out.appendSlice(allocator, "\\t"),
-                else => try appendHexEscape(allocator, &out, first),
+                else => try common.appendHexEscape(allocator, &out, first),
             }
             i += 1;
             continue;
@@ -7682,11 +7664,6 @@ fn sanitizeUtf8ForDisplay(allocator: std.mem.Allocator, input: []const u8) ![]u8
     }
 
     return try out.toOwnedSlice(allocator);
-}
-
-fn appendHexEscape(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: u8) !void {
-    const hex = "0123456789ABCDEF";
-    try out.appendSlice(allocator, &.{ '\\', 'x', hex[value >> 4], hex[value & 0x0F] });
 }
 
 fn utf8PrefixForDisplayWidth(win: anytype, text: []const u8, max_width: usize) []const u8 {
@@ -7886,8 +7863,8 @@ test "query cache helpers trim and expire predictably" {
     const settings = defaultTuiSettings();
     try std.testing.expect(settings.cache_enabled);
     try std.testing.expect(settings.keyword_cache_enabled);
-    try std.testing.expectEqual(@as(usize, app.providerCount()), countEnabledFlags(&settings.providers_enabled));
-    try std.testing.expectEqual(@as(usize, 1), countEnabledFlags(&settings.languages_enabled));
+    try std.testing.expectEqual(@as(usize, app.providerCount()), common.countTrue(&settings.providers_enabled));
+    try std.testing.expectEqual(@as(usize, 1), common.countTrue(&settings.languages_enabled));
     try std.testing.expect(settings.languages_enabled[0]);
     try std.testing.expectEqual(@as(i64, 12 * 60 * 60), settings.cache_ttl_seconds);
 
@@ -8289,7 +8266,7 @@ test "corrupt settings fall back and surface a load warning" {
 
     const settings_path = try std.fmt.allocPrint(allocator, "{s}/subdl/settings.oneserial", .{test_root});
     defer allocator.free(settings_path);
-    try ensureParentDir(settings_path);
+    try common.ensureParentDir(settings_path);
     {
         var file = try std.Io.Dir.cwd().createFile(runtime_io.get(), settings_path, .{});
         defer file.close(runtime_io.get());
@@ -8307,7 +8284,7 @@ test "corrupt settings fall back and surface a load warning" {
     try std.testing.expectEqual(PersistenceOperation.load, state.persistence_error.?.operation);
     try std.testing.expectEqual(error.InvalidPersistentData, state.persistence_error.?.err);
     try std.testing.expect(state.settings.cache_enabled);
-    try std.testing.expectEqual(app.providerCount(), countEnabledFlags(&state.settings.providers_enabled));
+    try std.testing.expectEqual(app.providerCount(), common.countTrue(&state.settings.providers_enabled));
 
     var warning_buf: [128]u8 = undefined;
     const warning = formatPersistenceFailure(&warning_buf, state.persistence_error.?);
@@ -8357,7 +8334,7 @@ test "corrupt ui preferences report an error instead of silently resetting" {
     defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
     const path = try std.fmt.allocPrint(allocator, "{s}/ui-preferences.oneserial", .{test_root});
     defer allocator.free(path);
-    try ensureParentDir(path);
+    try common.ensureParentDir(path);
     {
         var file = try std.Io.Dir.cwd().createFile(runtime_io.get(), path, .{});
         defer file.close(runtime_io.get());

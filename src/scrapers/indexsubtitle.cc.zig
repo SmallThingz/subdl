@@ -5,10 +5,7 @@ const Allocator = std.mem.Allocator;
 const site = "https://indexsubtitle.cc";
 pub const download_token_prefix = "indexsubtitle:";
 
-pub const SearchItem = struct {
-    title: []const u8,
-    page_url: []const u8,
-};
+pub const SearchItem = common.SearchLink;
 
 pub const SubtitleItem = struct {
     title: []const u8,
@@ -17,26 +14,9 @@ pub const SubtitleItem = struct {
     download_url: []const u8,
 };
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -45,8 +25,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -62,7 +40,7 @@ pub const Scraper = struct {
             .{ .name = "x-requested-with", .value = "XMLHttpRequest" },
             .{ .name = "referer", .value = site ++ "/" },
         };
-        const response = try fetchSearchWithStatusRetry(self.client, a, payload, &headers);
+        const response = try fetchPostWithStatusRetry(self.client, a, site ++ "/search", payload, &headers);
 
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
         const array = switch (root) {
@@ -175,17 +153,8 @@ pub const Scraper = struct {
             .{ .name = "x-requested-with", .value = "XMLHttpRequest" },
             .{ .name = "referer", .value = parts.page_url },
         };
-        const info = try common.fetchBytes(self.client, allocator, site ++ "/subtitlesInfo", .{
-            .method = .POST,
-            .payload = payload,
-            .content_type = "application/x-www-form-urlencoded",
-            .accept = "application/json, text/javascript, */*; q=0.01",
-            .extra_headers = &headers,
-            .cache = false,
-            .max_attempts = 2,
-        });
+        const info = try fetchPostWithStatusRetry(self.client, allocator, site ++ "/subtitlesInfo", payload, &headers);
         defer allocator.free(info.body);
-        if (info.status != .ok) return error.UnexpectedHttpStatus;
 
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, info.body, .{});
         defer parsed.deinit();
@@ -213,16 +182,17 @@ pub const Scraper = struct {
     }
 };
 
-fn fetchSearchWithStatusRetry(
+fn fetchPostWithStatusRetry(
     client: *std.http.Client,
     allocator: Allocator,
+    url: []const u8,
     payload: []const u8,
     headers: []const std.http.Header,
 ) !common.HttpResponse {
     const max_status_attempts: usize = 4;
     var attempt: usize = 0;
     while (attempt < max_status_attempts) : (attempt += 1) {
-        const response = try common.fetchBytes(client, allocator, site ++ "/search", .{
+        const response = try common.fetchBytes(client, allocator, url, .{
             .method = .POST,
             .payload = payload,
             .content_type = "application/x-www-form-urlencoded",
@@ -230,11 +200,11 @@ fn fetchSearchWithStatusRetry(
             .extra_headers = headers,
             .cache = false,
             .allow_non_ok = true,
-            .max_attempts = 1,
+            .max_attempts = 2,
         });
         if (response.status == .ok) return response;
 
-        const retry = isTransientSearchStatus(response.status) and attempt + 1 < max_status_attempts;
+        const retry = isTransientStatus(response.status) and attempt + 1 < max_status_attempts;
         allocator.free(response.body);
         if (!retry) return error.UnexpectedHttpStatus;
 
@@ -248,7 +218,7 @@ fn fetchSearchWithStatusRetry(
     return error.UnexpectedHttpStatus;
 }
 
-fn isTransientSearchStatus(status: std.http.Status) bool {
+fn isTransientStatus(status: std.http.Status) bool {
     const code = @intFromEnum(status);
     return code == 403 or
         code == 408 or
@@ -376,10 +346,10 @@ test "indexsubtitle extracts embedded rows and ttl" {
 }
 
 test "indexsubtitle retries transient search statuses" {
-    try std.testing.expect(isTransientSearchStatus(.forbidden));
-    try std.testing.expect(isTransientSearchStatus(.too_many_requests));
-    try std.testing.expect(isTransientSearchStatus(.service_unavailable));
-    try std.testing.expect(!isTransientSearchStatus(.not_found));
+    try std.testing.expect(isTransientStatus(.forbidden));
+    try std.testing.expect(isTransientStatus(.too_many_requests));
+    try std.testing.expect(isTransientStatus(.service_unavailable));
+    try std.testing.expect(!isTransientStatus(.not_found));
 }
 
 test "live indexsubtitle movie and tv search/list/download" {

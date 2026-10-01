@@ -7,7 +7,7 @@ const prepare_url = site ++ "/api/sub/prepare-download";
 const download_api_url = site ++ "/api/sub/down";
 pub const download_token_prefix = "subhd-session:";
 
-pub const MediaKind = enum { movie, tv };
+pub const MediaKind = common.MediaKind;
 
 pub const SearchItem = struct {
     title: []const u8,
@@ -21,32 +21,11 @@ pub const SearchItem = struct {
     detail_url: []const u8,
 };
 
-pub const SubtitleItem = struct {
-    language_code: []const u8,
-    filename: []const u8,
-    download_url: []const u8,
-};
+pub const SubtitleItem = common.SubtitleFile;
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 const Detail = struct {
     title: []const u8,
@@ -63,8 +42,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -201,7 +178,7 @@ fn directCdnUrlFromFilename(allocator: Allocator, filename: []const u8) !?[]u8 {
 fn parseSearchItems(allocator: Allocator, body: []const u8, query: []const u8) ![]const SearchItem {
     const wanted_title = std.mem.trim(u8, stripEpisodeTag(query), " \t\r\n");
     const wanted = try common.normalizeTitle(allocator, wanted_title);
-    const requested_episode = parseSeasonEpisode(query);
+    const requested_episode = common.parseSeasonEpisode(query);
 
     var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
     var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
@@ -232,7 +209,7 @@ fn parseSearchItems(allocator: Allocator, body: []const u8, query: []const u8) !
             continue;
         }
 
-        const release_episode = parseSeasonEpisode(release_info);
+        const release_episode = common.parseSeasonEpisode(release_info);
         const season = release_episode.season orelse requested_episode.season;
         const episode = release_episode.episode orelse requested_episode.episode;
         const media_kind: MediaKind = if (episode != null) .tv else .movie;
@@ -369,34 +346,8 @@ fn stripTags(value: []const u8) []const u8 {
     return value[0..lt];
 }
 
-const SeasonEpisode = struct {
-    season: ?i64,
-    episode: ?i64,
-};
-
-fn parseSeasonEpisode(value: []const u8) SeasonEpisode {
-    var i: usize = 0;
-    while (i + 4 < value.len) : (i += 1) {
-        if (value[i] != 's' and value[i] != 'S') continue;
-        var p = i + 1;
-        while (p < value.len and value[p] == '0') : (p += 1) {}
-        const season_start = p;
-        while (p < value.len and std.ascii.isDigit(value[p])) : (p += 1) {}
-        if (p == season_start or p >= value.len or (value[p] != 'e' and value[p] != 'E')) continue;
-        const season = std.fmt.parseInt(i64, value[season_start..p], 10) catch continue;
-        p += 1;
-        while (p < value.len and value[p] == '0') : (p += 1) {}
-        const episode_start = p;
-        while (p < value.len and std.ascii.isDigit(value[p])) : (p += 1) {}
-        if (p == episode_start) continue;
-        const episode = std.fmt.parseInt(i64, value[episode_start..p], 10) catch continue;
-        return .{ .season = season, .episode = episode };
-    }
-    return .{ .season = null, .episode = null };
-}
-
 fn stripEpisodeTag(value: []const u8) []const u8 {
-    const se = parseSeasonEpisode(value);
+    const se = common.parseSeasonEpisode(value);
     if (se.episode == null) return value;
     var i: usize = 0;
     while (i + 4 < value.len) : (i += 1) {
@@ -434,17 +385,7 @@ pub fn parseDownloadToken(value: []const u8) ?DownloadToken {
     };
 }
 
-const RawResponse = struct {
-    status: std.http.Status,
-    body: []u8,
-    cookie: ?[]u8,
-
-    fn deinit(self: *RawResponse, allocator: Allocator) void {
-        allocator.free(self.body);
-        if (self.cookie) |value| allocator.free(value);
-        self.* = undefined;
-    }
-};
+const RawResponse = common.RawResponse;
 
 fn fetchRaw(
     client: *std.http.Client,
@@ -565,7 +506,7 @@ test "subhd parses detail and session token" {
     try std.testing.expectEqualStrings("Chernobyl", detail.title);
     try std.testing.expectEqualStrings("abc123", detail.subtitle_id);
     try std.testing.expectEqualStrings("en", detail.language_code);
-    const se = parseSeasonEpisode(detail.release_info);
+    const se = common.parseSeasonEpisode(detail.release_info);
     try std.testing.expectEqual(@as(?i64, 1), se.season);
     try std.testing.expectEqual(@as(?i64, 1), se.episode);
 }

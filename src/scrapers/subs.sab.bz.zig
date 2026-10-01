@@ -6,10 +6,7 @@ const site = "http://subs.sab.bz";
 const search_url = site ++ "/index.php?";
 pub const download_token_prefix = "subs-sab-referer:";
 
-pub const MediaKind = enum {
-    movie,
-    tv,
-};
+pub const MediaKind = common.MediaKind;
 
 pub const SearchItem = struct {
     title: []const u8,
@@ -21,32 +18,11 @@ pub const SearchItem = struct {
     download_url: []const u8,
 };
 
-pub const SubtitleItem = struct {
-    language_code: []const u8,
-    filename: []const u8,
-    download_url: []const u8,
-};
+pub const SubtitleItem = common.SubtitleFile;
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 const SearchLanguage = struct {
     form_code: []const u8,
@@ -65,8 +41,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -110,7 +84,7 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        const slugged = try slug(a, item.title);
+        const slugged = try common.asciiSlug(a, item.title);
         const filename = try std.fmt.allocPrint(a, "subs-sab-{s}-{s}", .{ item.attach_id, slugged });
         const subtitles = try a.alloc(SubtitleItem, 1);
         subtitles[0] = .{
@@ -271,22 +245,6 @@ fn isTvTitle(raw: []const u8) bool {
         }
     }
     return false;
-}
-
-fn slug(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var dash = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (dash and out.items.len > 0) try out.append(allocator, '-');
-            dash = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            dash = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "subs sab parses movie and tv rows" {

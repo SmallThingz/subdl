@@ -8,39 +8,13 @@ const site = "https://animekalesi.com";
 const series_index_url = site ++ "/tum-anime-serileri.html";
 pub const download_token_prefix = "animekalesi-session:";
 
-pub const SearchItem = struct {
-    title: []const u8,
-    page_url: []const u8,
-};
+pub const SearchItem = common.SearchLink;
 
-pub const SubtitleItem = struct {
-    language_code: []const u8,
-    filename: []const u8,
-    download_url: []const u8,
-    season: i64,
-    episode: i64,
-};
+pub const SubtitleItem = common.EpisodeSubtitleFile;
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -49,8 +23,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -93,7 +65,7 @@ pub const Scraper = struct {
             const episode = parseLastPositiveInt(title_attr) orelse continue;
             const season: i64 = parseSeason(title_attr) orelse 1;
             const episode_url = try common.resolveUrl(a, site, href);
-            const slugged = try slug(a, item.title);
+            const slugged = try common.asciiSlug(a, item.title);
 
             try subtitles.append(a, .{
                 .language_code = "tr",
@@ -105,7 +77,7 @@ pub const Scraper = struct {
         }
 
         const owned = try subtitles.toOwnedSlice(a);
-        std.mem.sort(SubtitleItem, owned, {}, subtitleLessThan);
+        std.mem.sort(SubtitleItem, owned, {}, common.seasonEpisodeLessThan(SubtitleItem));
         return .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
@@ -224,11 +196,6 @@ fn parseSeason(value: []const u8) ?i64 {
         return std.fmt.parseInt(i64, value[start..i], 10) catch null;
     }
     return null;
-}
-
-fn subtitleLessThan(_: void, lhs: SubtitleItem, rhs: SubtitleItem) bool {
-    if (lhs.season != rhs.season) return lhs.season < rhs.season;
-    return lhs.episode < rhs.episode;
 }
 
 pub fn makeDownloadToken(allocator: Allocator, listing_url: []const u8, episode_url: []const u8) ![]u8 {
@@ -408,7 +375,7 @@ fn fetchRedirectChain(
         var response = try fetchRaw(client, allocator, current_url, cookie, referer);
         try updateSessionCookie(allocator, &cookie, response.cookie);
 
-        if (!isRedirect(response.status)) {
+        if (!common.isRedirectStatus(response.status)) {
             if (response.status != .ok) {
                 response.deinit(allocator);
                 return error.UnexpectedHttpStatus;
@@ -435,30 +402,6 @@ fn fetchRedirectChain(
         current_url = next_url;
         redirects += 1;
     }
-}
-
-fn isRedirect(status: std.http.Status) bool {
-    return status == .moved_permanently or
-        status == .found or
-        status == .see_other or
-        status == .temporary_redirect or
-        status == .permanent_redirect;
-}
-
-fn slug(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var dash = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (dash and out.items.len > 0) try out.append(allocator, '-');
-            dash = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            dash = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "animekalesi builds subtitle listing URL and token" {

@@ -70,19 +70,7 @@ pub const SearchResponse = struct {
     }
 };
 
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-    page: usize = 1,
-    has_prev_page: bool = false,
-    has_next_page: bool = false,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.PagedTitledSubtitlesResponse(SubtitleItem);
 
 const Auth = struct {
     cf_clearance: ?[]const u8,
@@ -96,8 +84,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         return self.searchWithOptions(query, .{});
@@ -307,10 +293,7 @@ pub const Scraper = struct {
     }
 };
 
-const RankedQuery = struct {
-    title: []const u8,
-    year: ?i64,
-};
+const RankedQuery = common.TitleYear;
 
 fn parseRankedQuery(raw: []const u8) RankedQuery {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");

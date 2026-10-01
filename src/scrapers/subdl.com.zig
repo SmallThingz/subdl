@@ -165,15 +165,7 @@ pub const LanguageSubtitles = struct {
     subtitles: []const SubtitleItem,
 };
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
-
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
 pub const MovieSubtitlesResponse = struct {
     arena: std.heap.ArenaAllocator,
@@ -230,8 +222,6 @@ pub const Scraper = struct {
             .options = options,
         };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn parseSubtitleLink(link: []const u8) Error!SubtitlePath {
         const marker = "/subtitle/";
@@ -692,7 +682,6 @@ test "movie scraping works for The Thing" {
     defer client.deinit();
 
     var scraper = Scraper.init(std.testing.allocator, &client);
-    defer scraper.deinit();
 
     var result = try scraper.fetchMovieByLink("https://subdl.com/subtitle/sd32997/the-thing");
     defer result.deinit();
@@ -711,7 +700,6 @@ test "tv scraping works for Shadowhunters seasons and season subtitles" {
     defer client.deinit();
 
     var scraper = Scraper.init(std.testing.allocator, &client);
-    defer scraper.deinit();
 
     var seasons = try scraper.fetchTvSeasonsByLink("https://subdl.com/subtitle/sd1300002/shadowhunters");
     defer seasons.deinit();
@@ -734,14 +722,12 @@ test "scraper options default and opt-in include-empty-subtitle-groups" {
     var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer client.deinit();
 
-    var default_scraper = Scraper.init(std.testing.allocator, &client);
-    defer default_scraper.deinit();
+    const default_scraper = Scraper.init(std.testing.allocator, &client);
     try std.testing.expect(default_scraper.options.include_empty_subtitle_groups == false);
 
-    var include_empty_scraper = Scraper.initWithOptions(std.testing.allocator, &client, .{
+    const include_empty_scraper = Scraper.initWithOptions(std.testing.allocator, &client, .{
         .include_empty_subtitle_groups = true,
     });
-    defer include_empty_scraper.deinit();
     try std.testing.expect(include_empty_scraper.options.include_empty_subtitle_groups);
 }
 

@@ -87,7 +87,7 @@ pub const all = [_]Info{
     .{ .provider = .tvsubtitles_net, .id = "tvsubtitles_net", .live_name = "tvsubtitles.net", .display_name = "TVSubtitles", .site_url = "https://www.tvsubtitles.net", .active = false, .supports_movies = false },
     .{ .provider = .gestdown_info, .id = "gestdown_info", .live_name = "gestdown.info", .display_name = "Gestdown", .site_url = "https://www.gestdown.info", .supports_movies = false },
     .{ .provider = .greeksubtitles_com, .id = "greek_subtitles_com", .live_name = "greek-subtitles.com", .display_name = "GreekSubtitles", .site_url = "https://gr.greek-subtitles.com", .active = false, .live_timeout_seconds = 240 },
-    .{ .provider = .subsunacs_net, .id = "subsunacs_net", .live_name = "subsunacs.net", .display_name = "SubsUnacs", .site_url = "https://subsunacs.net", .live_serial = true },
+    .{ .provider = .subsunacs_net, .id = "subsunacs_net", .live_name = "subsunacs.net", .display_name = "SubsUnacs", .site_url = "https://subsunacs.net", .live_timeout_seconds = 120, .live_serial = true },
     .{ .provider = .subtitles_ajatt_top, .id = "subtitles_ajatt_top", .live_name = "subtitles.ajatt.top", .display_name = "AJATT Subtitles", .site_url = "https://subtitles.ajatt.top" },
     .{ .provider = .subtis_io, .id = "subtis_io", .live_name = "subtis.io", .display_name = "Subtis", .site_url = "https://subtis.io", .active = false, .supports_tv = false },
     .{ .provider = .greeksubs_net, .id = "greeksubs_net", .live_name = "greeksubs.net", .display_name = "GreekSubs", .site_url = "https://greeksubs.net" },

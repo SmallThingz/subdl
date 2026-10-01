@@ -17,32 +17,11 @@ pub const SearchItem = struct {
     page_url: []const u8,
 };
 
-pub const SubtitleItem = struct {
-    language_code: []const u8,
-    filename: []const u8,
-    download_url: []const u8,
-};
+pub const SubtitleItem = common.SubtitleFile;
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 const ShowHit = struct {
     id: i64,
@@ -61,8 +40,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -126,7 +103,7 @@ pub const Scraper = struct {
         }
 
         const owned = try items.toOwnedSlice(a);
-        std.mem.sort(SearchItem, owned, {}, searchLessThan);
+        std.mem.sort(SearchItem, owned, {}, common.seasonEpisodeLessThan(SearchItem));
         return .{ .arena = arena, .items = owned };
     }
 
@@ -274,7 +251,7 @@ fn parseEpisodeSubtitles(allocator: Allocator, body: []const u8, item: SearchIte
 
         const download_url = try common.resolveUrl(allocator, site, href);
         const id = subtitleIdFromHref(href) orelse "subtitle";
-        const slugged = try slug(allocator, item.title);
+        const slugged = try common.asciiSlug(allocator, item.title);
         try out.append(allocator, .{
             .language_code = try allocator.dupe(u8, language),
             .filename = try std.fmt.allocPrint(
@@ -357,27 +334,6 @@ fn jsonInt(value: std.json.Value) ?i64 {
         .float => |number| @intFromFloat(number),
         else => null,
     };
-}
-
-fn slug(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var dash = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (dash and out.items.len > 0) try out.append(allocator, '-');
-            dash = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            dash = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn searchLessThan(_: void, lhs: SearchItem, rhs: SearchItem) bool {
-    if (lhs.season != rhs.season) return lhs.season < rhs.season;
-    return lhs.episode < rhs.episode;
 }
 
 test "subtitulamos parses search hit and direct subtitle href" {

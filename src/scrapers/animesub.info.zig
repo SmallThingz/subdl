@@ -7,7 +7,7 @@ const search_path = site ++ "/szukaj.php";
 const download_path = site ++ "/sciagnij.php";
 pub const download_token_prefix = "animesubinfo-session:";
 
-pub const MediaKind = enum { movie, tv };
+pub const MediaKind = common.MediaKind;
 
 pub const SearchItem = struct {
     title: []const u8,
@@ -22,32 +22,11 @@ pub const SearchItem = struct {
     page_url: []const u8,
 };
 
-pub const SubtitleItem = struct {
-    language_code: []const u8,
-    filename: []const u8,
-    download_url: []const u8,
-};
+pub const SubtitleItem = common.SubtitleFile;
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -56,8 +35,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -397,19 +374,21 @@ pub fn parseDownloadToken(value: []const u8) ?DownloadToken {
     };
 }
 
-const RawResponse = struct {
-    status: std.http.Status,
-    body: []u8,
-    cookie: ?[]u8,
-
-    fn deinit(self: *RawResponse, allocator: Allocator) void {
-        allocator.free(self.body);
-        if (self.cookie) |value| allocator.free(value);
-        self.* = undefined;
-    }
-};
+const RawResponse = common.RawResponse;
 
 fn fetchRawGet(client: *std.http.Client, allocator: Allocator, url: []const u8) !RawResponse {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        return fetchRawGetOnce(client, allocator, url) catch |err| {
+            if (attempt + 1 >= 4) return err;
+            const shift: u6 = @intCast(@min(attempt, 4));
+            common.sleepMilliseconds(@as(u64, 250) << shift);
+            continue;
+        };
+    }
+}
+
+fn fetchRawGetOnce(client: *std.http.Client, allocator: Allocator, url: []const u8) !RawResponse {
     try common.ensureClientTlsReady(client);
     const normalized = try common.normalizeUrlForFetch(allocator, url);
     defer allocator.free(normalized);

@@ -15,32 +15,11 @@ pub const SearchItem = struct {
     page_url: []const u8,
 };
 
-pub const SubtitleItem = struct {
-    language_code: []const u8,
-    filename: []const u8,
-    download_url: []const u8,
-};
+pub const SubtitleItem = common.SubtitleFile;
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -49,8 +28,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -157,7 +134,7 @@ fn fetchDetailPage(client: *std.http.Client, allocator: Allocator, url: []const 
 
     var head_buffer: [16 * 1024]u8 = undefined;
     var response = try req.receiveHead(&head_buffer);
-    const cookie = try extractPhpSessionCookie(allocator, response.head.bytes);
+    const cookie = try common.extractPhpSessionCookie(allocator, response.head.bytes);
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
@@ -169,22 +146,6 @@ fn fetchDetailPage(client: *std.http.Client, allocator: Allocator, url: []const 
         .body = try allocator.dupe(u8, writer.writer.buffered()),
         .cookie = cookie,
     };
-}
-
-fn extractPhpSessionCookie(allocator: Allocator, headers: []const u8) !?[]u8 {
-    var lines = std.mem.splitSequence(u8, headers, "\r\n");
-    while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const name = std.mem.trim(u8, line[0..colon], " \t");
-        if (!std.ascii.eqlIgnoreCase(name, "set-cookie")) continue;
-        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        const marker = "PHPSESSID=";
-        const start = std.mem.indexOf(u8, value, marker) orelse continue;
-        const tail = value[start..];
-        const end = std.mem.indexOfScalar(u8, tail, ';') orelse tail.len;
-        return try allocator.dupe(u8, tail[0..end]);
-    }
-    return null;
 }
 
 pub fn makeDownloadToken(allocator: Allocator, page_url: []const u8) ![]u8 {
@@ -245,10 +206,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     return .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) };
 }
 
-const TitleYear = struct {
-    title: []const u8,
-    year: i64,
-};
+const TitleYear = common.RequiredTitleYear;
 
 fn splitTitleYear(input: []const u8) ?TitleYear {
     var i: usize = 0;

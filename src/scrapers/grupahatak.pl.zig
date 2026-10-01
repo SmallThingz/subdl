@@ -6,39 +6,13 @@ const site = "https://grupahatak.pl";
 const catalog_url = site ++ "/napisy/";
 pub const download_token_prefix = "grupahatak-referer:";
 
-pub const SearchItem = struct {
-    title: []const u8,
-    page_url: []const u8,
-};
+pub const SearchItem = common.SearchLink;
 
-pub const SubtitleItem = struct {
-    language_code: []const u8,
-    filename: []const u8,
-    download_url: []const u8,
-    season: i64,
-    episode: i64,
-};
+pub const SubtitleItem = common.EpisodeSubtitleFile;
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -47,8 +21,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -187,7 +159,7 @@ fn parseEpisodes(allocator: Allocator, body: []const u8, title: []const u8, page
         try seen.put(allocator, try allocator.dupe(u8, href), {});
 
         const actual_url = try common.resolveUrl(allocator, site, href);
-        const slugged = try slug(allocator, title);
+        const slugged = try common.asciiSlug(allocator, title);
         try out.append(allocator, .{
             .language_code = "pl",
             .filename = try std.fmt.allocPrint(
@@ -202,7 +174,7 @@ fn parseEpisodes(allocator: Allocator, body: []const u8, title: []const u8, page
     }
 
     const owned = try out.toOwnedSlice(allocator);
-    std.mem.sort(SubtitleItem, owned, {}, subtitleLessThan);
+    std.mem.sort(SubtitleItem, owned, {}, common.seasonEpisodeLessThan(SubtitleItem));
     return owned;
 }
 
@@ -223,11 +195,6 @@ fn parseSeasonEpisode(value: []const u8) ?SeasonEpisode {
     return .{ .season = season, .episode = episode };
 }
 
-fn subtitleLessThan(_: void, lhs: SubtitleItem, rhs: SubtitleItem) bool {
-    if (lhs.season != rhs.season) return lhs.season < rhs.season;
-    return lhs.episode < rhs.episode;
-}
-
 pub fn makeDownloadToken(allocator: Allocator, page_url: []const u8, download_url: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}{s}|{s}", .{ download_token_prefix, page_url, download_url });
 }
@@ -243,22 +210,6 @@ pub fn parseDownloadToken(value: []const u8) ?DownloadToken {
     const sep = std.mem.indexOfScalar(u8, payload, '|') orelse return null;
     if (sep == 0 or sep + 1 >= payload.len) return null;
     return .{ .page_url = payload[0..sep], .download_url = payload[sep + 1 ..] };
-}
-
-fn slug(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var dash = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (dash and out.items.len > 0) try out.append(allocator, '-');
-            dash = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            dash = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "grupahatak parses catalog and episode rows" {

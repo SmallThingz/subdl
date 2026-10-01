@@ -9,7 +9,7 @@ const search_url = site ++ "/en/search";
 
 pub const download_token_prefix = "greeksubs-session:";
 
-pub const MediaKind = enum { movie, tv };
+pub const MediaKind = common.MediaKind;
 
 pub const SearchItem = struct {
     title: []const u8,
@@ -25,24 +25,9 @@ pub const SubtitleItem = struct {
     download_url: []const u8,
 };
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -51,8 +36,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -182,17 +165,7 @@ fn collectSubtitleRows(
     }
 }
 
-const RawResponse = struct {
-    status: std.http.Status,
-    body: []u8,
-    cookie: ?[]u8,
-
-    fn deinit(self: *RawResponse, allocator: Allocator) void {
-        allocator.free(self.body);
-        if (self.cookie) |value| allocator.free(value);
-        self.* = undefined;
-    }
-};
+const RawResponse = common.RawResponse;
 
 fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, extra_headers: []const std.http.Header) !RawResponse {
     try common.ensureClientTlsReady(client);
@@ -214,7 +187,7 @@ fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, ext
     var head_buffer: [16 * 1024]u8 = undefined;
     var response = try req.receiveHead(&head_buffer);
     const status = response.head.status;
-    const cookie = try extractPhpSessionCookie(allocator, response.head.bytes);
+    const cookie = try common.extractPhpSessionCookie(allocator, response.head.bytes);
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
@@ -229,29 +202,13 @@ fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, ext
     };
 }
 
-fn extractPhpSessionCookie(allocator: Allocator, headers: []const u8) !?[]u8 {
-    var lines = std.mem.splitSequence(u8, headers, "\r\n");
-    while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const name = std.mem.trim(u8, line[0..colon], " \t");
-        if (!std.ascii.eqlIgnoreCase(name, "set-cookie")) continue;
-        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        const marker = "PHPSESSID=";
-        const start = std.mem.indexOf(u8, value, marker) orelse continue;
-        const tail = value[start..];
-        const end = std.mem.indexOfScalar(u8, tail, ';') orelse tail.len;
-        return try allocator.dupe(u8, tail[0..end]);
-    }
-    return null;
-}
-
 fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []const u8) !SearchResponse {
     var owned_arena = arena;
     errdefer owned_arena.deinit();
     const a = owned_arena.allocator();
     var parsed = try common.parseHtmlStable(a, body);
 
-    const normalized_query = try normalizeTitle(a, query);
+    const normalized_query = try common.normalizeTitle(a, query);
     var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
     var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
     var anchors = parsed.doc.queryAll("a[href*='/en/view/']");
@@ -261,7 +218,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
         if (title.len == 0) continue;
         const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
         const media_kind = try cardMediaKind(a, anchor) orelse continue;
-        const normalized_title = try normalizeTitle(a, title);
+        const normalized_title = try common.normalizeTitle(a, title);
         if (normalized_title.len == 0) continue;
         if (std.mem.indexOf(u8, normalized_title, normalized_query) == null and
             std.mem.indexOf(u8, normalized_query, normalized_title) == null) continue;
@@ -340,10 +297,7 @@ pub fn makeDownloadToken(allocator: Allocator, subtitle_id: []const u8, page_url
     return std.fmt.allocPrint(allocator, "{s}{s}|{s}", .{ download_token_prefix, subtitle_id, page_url });
 }
 
-const DownloadToken = struct {
-    subtitle_id: []const u8,
-    page_url: []const u8,
-};
+const DownloadToken = common.SubtitleDownloadToken;
 
 pub fn parseDownloadToken(value: []const u8) ?DownloadToken {
     if (!std.mem.startsWith(u8, value, download_token_prefix)) return null;
@@ -367,22 +321,6 @@ fn parseYear(value: []const u8) ?i64 {
         if (year >= 1900 and year <= 2100) return year;
     }
     return null;
-}
-
-fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (space and out.items.len > 0) try out.append(allocator, ' ');
-            space = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            space = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "greeksubs token and download id parsing" {

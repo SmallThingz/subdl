@@ -29,25 +29,9 @@ pub const SubtitleItem = struct {
     translate_spec: ?TranslateSpec,
 };
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.SubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -56,8 +40,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -108,7 +90,7 @@ pub const Scraper = struct {
 
             const language_code = blk: {
                 const first_span = spans[0] orelse break :blk null;
-                const img = findDescendantByTag(first_span, "img") orelse break :blk null;
+                const img = common.findDescendantByTag(first_span, "img") orelse break :blk null;
                 const raw = common.getAttributeValueSafe(img, "alt") orelse break :blk null;
                 break :blk try a.dupe(u8, raw);
             };
@@ -246,15 +228,6 @@ fn inferTranslatedFilename(allocator: Allocator, source: ?[]const u8, lang_code:
         return try std.fmt.allocPrint(allocator, "{s}-{s}.srt", .{ base, lang });
     }
     return try std.fmt.allocPrint(allocator, "subtitle-{s}.srt", .{lang});
-}
-
-fn findDescendantByTag(node: HtmlNode, tag_name: []const u8) ?HtmlNode {
-    var children = node.children();
-    while (children.next()) |child| {
-        if (std.mem.eql(u8, child.tagName(), tag_name)) return child;
-        if (findDescendantByTag(child, tag_name)) |nested| return nested;
-    }
-    return null;
 }
 
 fn findDescendantByTagWithAttr(node: HtmlNode, tag_name: []const u8, attr_name: []const u8) ?HtmlNode {

@@ -11,10 +11,7 @@ const max_decoded_subtitle_bytes = 16 * 1024 * 1024;
 
 pub const download_token_prefix = "tsukihime-xz:";
 
-pub const MediaKind = enum {
-    movie,
-    tv,
-};
+pub const MediaKind = common.MediaKind;
 
 pub const SearchItem = struct {
     title: []const u8,
@@ -27,32 +24,11 @@ pub const SearchItem = struct {
     page_url: []const u8,
 };
 
-pub const SubtitleItem = struct {
-    language_code: []const u8,
-    filename: []const u8,
-    download_url: []const u8,
-};
+pub const SubtitleItem = common.SubtitleFile;
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 const ParsedQuery = common.EpisodeQuery;
 const parseQuery = common.parseEpisodeQuery;
@@ -64,8 +40,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -258,7 +232,7 @@ pub const Scraper = struct {
         if (response.body.len < 6 or !std.mem.eql(u8, response.body[0..6], &.{ 0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00 })) {
             return error.UnexpectedResponseType;
         }
-        const decoded = try decompressXz(allocator, response.body);
+        const decoded = try common.decompressXz(allocator, response.body, max_decoded_subtitle_bytes);
         if (decoded.len == 0) {
             allocator.free(decoded);
             return error.UnexpectedResponseType;
@@ -298,27 +272,6 @@ fn nativeStorageUrl(allocator: Allocator, attachment_id: i64) ![]u8 {
         hex[idx] = digits[@as(usize, @intCast((value >> shift) & 0x0f))];
     }
     return std.fmt.allocPrint(allocator, "{s}/attach/{s}/{d}.xz", .{ storage, &hex, attachment_id });
-}
-
-fn decompressXz(allocator: Allocator, compressed: []const u8) ![]u8 {
-    var input: std.Io.Reader = .fixed(compressed);
-    const scratch = try allocator.alloc(u8, 8192);
-    var xz = std.compress.xz.Decompress.init(&input, allocator, scratch) catch |err| {
-        allocator.free(scratch);
-        return err;
-    };
-    defer xz.deinit();
-
-    var output: std.ArrayList(u8) = .empty;
-    errdefer output.deinit(allocator);
-    var buffer: [8192]u8 = undefined;
-    while (true) {
-        const n = try xz.reader.readSliceShort(&buffer);
-        if (n == 0) break;
-        if (output.items.len + n > max_decoded_subtitle_bytes) return error.ResponseTooLarge;
-        try output.appendSlice(allocator, buffer[0..n]);
-    }
-    return output.toOwnedSlice(allocator);
 }
 
 fn isCompletedNativeResult(obj: std.json.ObjectMap) bool {

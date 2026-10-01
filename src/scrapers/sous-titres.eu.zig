@@ -6,16 +6,9 @@ const Allocator = std.mem.Allocator;
 const HtmlParseOptions: html.ParseOptions = .{};
 const site = "https://www.sous-titres.eu";
 
-pub const MediaKind = enum {
-    movie,
-    tv,
-};
+pub const MediaKind = common.MediaKind;
 
-pub const SearchItem = struct {
-    title: []const u8,
-    media_kind: MediaKind,
-    page_url: []const u8,
-};
+pub const SearchItem = common.MediaSearchLink;
 
 pub const SubtitleItem = struct {
     language_code: ?[]const u8,
@@ -23,26 +16,9 @@ pub const SubtitleItem = struct {
     download_url: []const u8,
 };
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -51,8 +27,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);

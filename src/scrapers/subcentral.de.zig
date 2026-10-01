@@ -19,26 +19,9 @@ pub const SubtitleItem = struct {
     episode: i64,
 };
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -47,8 +30,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -302,7 +283,7 @@ fn parseRevealedAttachments(allocator: Allocator, body: []const u8, series_title
 
                     const decoded_href = try htmlUnescapeUrl(allocator, href_raw);
                     const download_url = try common.resolveUrl(allocator, site, decoded_href);
-                    const slugged = try slug(allocator, series_title);
+                    const slugged = try common.asciiSlug(allocator, series_title);
                     try out.append(allocator, .{
                         .language_code = try allocator.dupe(u8, language),
                         .filename = try std.fmt.allocPrint(allocator, "subcentral-{s}-s{d}e{d}-{s}", .{ slugged, season, episode, language }),
@@ -439,33 +420,7 @@ fn allDigits(value: []const u8) bool {
     return true;
 }
 
-fn slug(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var dash = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (dash and out.items.len > 0) try out.append(allocator, '-');
-            dash = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            dash = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-const RawResponse = struct {
-    status: std.http.Status,
-    body: []u8,
-    cookie: ?[]u8,
-
-    fn deinit(self: *RawResponse, allocator: Allocator) void {
-        allocator.free(self.body);
-        if (self.cookie) |value| allocator.free(value);
-        self.* = undefined;
-    }
-};
+const RawResponse = common.RawResponse;
 
 fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, cookie: ?[]const u8, referer: ?[]const u8) !RawResponse {
     try common.ensureClientTlsReady(client);

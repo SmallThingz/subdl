@@ -4,6 +4,7 @@ const runtime_alloc = @import("runtime_alloc");
 const runtime_io = @import("runtime_io");
 
 const app = scrapers.providers_app;
+const common = scrapers.common;
 
 const Config = struct {
     providers_enabled: [app.providerCount()]bool = app.providerSelectionAll(),
@@ -75,7 +76,7 @@ pub fn main(init: std.process.Init) !void {
         try stderr.flush();
         std.process.exit(2);
     };
-    if (countEnabledProviders(&config.providers_enabled) == 0) {
+    if (common.countTrue(&config.providers_enabled) == 0) {
         try stderr.print("no providers selected\n", .{});
         try stderr.flush();
         std.process.exit(2);
@@ -96,7 +97,7 @@ pub fn main(init: std.process.Init) !void {
     var hits: std.ArrayListUnmanaged(SearchHit) = .empty;
     defer hits.deinit(allocator);
 
-    const enabled_provider_count = countEnabledProviders(&config.providers_enabled);
+    const enabled_provider_count = common.countTrue(&config.providers_enabled);
     const tasks = try allocator.alloc(SearchTask, enabled_provider_count);
     defer {
         for (tasks) |*task| {
@@ -326,14 +327,6 @@ fn addProviderFilter(cfg: *Config, value: []const u8) !void {
 
 fn isNoneProviderSelector(value: []const u8) bool {
     return std.ascii.eqlIgnoreCase(value, "none");
-}
-
-fn countEnabledProviders(flags: []const bool) usize {
-    var count: usize = 0;
-    for (flags) |enabled| {
-        if (enabled) count += 1;
-    }
-    return count;
 }
 
 fn findFirstDownloadable(items: []const app.SubtitleChoice) ?usize {

@@ -9,20 +9,11 @@ const Allocator = std.mem.Allocator;
 const site = "https://www.opensubtitles.org";
 const default_page_size: usize = 40;
 
-pub const SearchOptions = struct {
-    page_start: usize = 1,
-    max_pages: usize = 1,
-};
+pub const SearchOptions = common.PageOptions;
 
-pub const SubtitlesOptions = struct {
-    page_start: usize = 1,
-    max_pages: usize = 1,
-};
+pub const SubtitlesOptions = common.PageOptions;
 
-pub const SearchItem = struct {
-    title: []const u8,
-    page_url: []const u8,
-};
+pub const SearchItem = common.SearchLink;
 
 pub const SubtitleItem = struct {
     language_code: ?[]const u8,
@@ -40,32 +31,9 @@ pub const SubtitleItem = struct {
     direct_zip_url: []const u8,
 };
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
-    page: usize = 1,
-    has_prev_page: bool = false,
-    has_next_page: bool = false,
+pub const SearchResponse = common.PagedSearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-    page: usize = 1,
-    has_prev_page: bool = false,
-    has_next_page: bool = false,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.PagedTitledSubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     pub const Options = struct {
@@ -83,8 +51,6 @@ pub const Scraper = struct {
     pub fn initWithOptions(allocator: Allocator, client: *std.http.Client, options: Options) Scraper {
         return .{ .allocator = allocator, .client = client, .options = options };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         return self.searchWithOptions(query, .{});

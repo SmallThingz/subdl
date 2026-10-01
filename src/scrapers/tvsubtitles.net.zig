@@ -30,31 +30,9 @@ pub const SubtitleItem = struct {
     direct_zip_url: ?[]const u8,
 };
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
-    page: usize = 1,
-    has_prev_page: bool = false,
-    has_next_page: bool = false,
+pub const SearchResponse = common.PagedSearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    subtitles: []const SubtitleItem,
-    page: usize = 1,
-    has_prev_page: bool = false,
-    has_next_page: bool = false,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.PagedSubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -63,8 +41,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         return self.searchWithOptions(query, .{});
@@ -150,7 +126,7 @@ pub const Scraper = struct {
                         direct_zip_url = self.resolveDownloadUrl(a, download_page_url) catch null;
                     }
 
-                    const lang = try dupOptionalSlice(a, languageFromSubtitleAnchor(anchor, href));
+                    const lang = try common.dupOptional(a, languageFromSubtitleAnchor(anchor, href));
                     const filename = buildFilename(a, episode_title, lang) catch "subtitle.zip";
 
                     try subtitles.append(a, .{
@@ -335,11 +311,6 @@ fn mapLanguageCode(raw: []const u8) []const u8 {
     if (std.ascii.eqlIgnoreCase(raw, "es")) return "es";
     if (std.ascii.eqlIgnoreCase(raw, "de")) return "de";
     return raw;
-}
-
-fn dupOptionalSlice(allocator: Allocator, value: ?[]const u8) !?[]const u8 {
-    if (value) |v| return try allocator.dupe(u8, v);
-    return null;
 }
 
 fn buildFilename(allocator: Allocator, episode_title: ?[]const u8, language_code: ?[]const u8) ![]const u8 {

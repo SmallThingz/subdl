@@ -28,32 +28,12 @@ pub const SubtitleItem = struct {
     download_url: []const u8,
 };
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
-    has_next_page: bool = false,
+pub const SearchResponse = common.NextSearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.SubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
-    pub const SearchOptions = struct {
-        page_start: usize = 1,
-        max_pages: usize = 1,
-    };
+    pub const SearchOptions = common.PageOptions;
 
     allocator: Allocator,
     client: *std.http.Client,
@@ -61,8 +41,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         return self.searchWithOptions(query, .{});
@@ -239,7 +217,7 @@ pub const Scraper = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
-        const debug_timing = debugTimingEnabled();
+        const debug_timing = common.debugTimingEnabled();
         const started_ns = if (debug_timing) common.compatNanoTimestamp() else 0;
         if (debug_timing) std.debug.print("[podnapisi.net] subtitles start url={s}\n", .{subtitles_page_url});
 
@@ -273,7 +251,7 @@ pub const Scraper = struct {
             const href = common.getAttributeValueSafe(download_anchor, "href") orelse continue;
             const download_url = try common.resolveUrl(a, site, href);
 
-            const language = if (findDescendantByTag(row, "abbr")) |node|
+            const language = if (common.findDescendantByTag(row, "abbr")) |node|
                 try common.innerTextTrimmedOwned(a, node)
             else
                 null;
@@ -468,20 +446,6 @@ fn dedupeSearchItemsById(items: *std.ArrayListUnmanaged(SearchItem)) void {
         write_idx += 1;
     }
     items.items.len = write_idx;
-}
-
-fn debugTimingEnabled() bool {
-    const value = common.getenv("SCRAPERS_DEBUG_TIMING") orelse return false;
-    return value.len > 0 and !std.mem.eql(u8, value, "0");
-}
-
-fn findDescendantByTag(node: HtmlNode, tag_name: []const u8) ?HtmlNode {
-    var children = node.children();
-    while (children.next()) |child| {
-        if (std.mem.eql(u8, child.tagName(), tag_name)) return child;
-        if (findDescendantByTag(child, tag_name)) |nested| return nested;
-    }
-    return null;
 }
 
 fn findDescendantAnchorByRelNoFollow(node: HtmlNode) ?HtmlNode {

@@ -9,10 +9,7 @@ const suite = @import("test_suite.zig");
 const Allocator = std.mem.Allocator;
 const site = "https://moviesubtitlesrt.com";
 
-pub const SearchItem = struct {
-    title: []const u8,
-    page_url: []const u8,
-};
+pub const SearchItem = common.SearchLink;
 
 pub const SubtitleInfo = struct {
     title: []const u8,
@@ -26,16 +23,7 @@ pub const SubtitleInfo = struct {
     download_url: []const u8,
 };
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
-    has_next_page: bool = false,
-
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SearchResponse = common.NextSearchResponse(SearchItem);
 
 pub const SubtitleResponse = struct {
     arena: std.heap.ArenaAllocator,
@@ -48,10 +36,7 @@ pub const SubtitleResponse = struct {
 };
 
 pub const Scraper = struct {
-    pub const SearchOptions = struct {
-        page_start: usize = 1,
-        max_pages: usize = 1,
-    };
+    pub const SearchOptions = common.PageOptions;
 
     allocator: Allocator,
     client: *std.http.Client,
@@ -59,8 +44,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         return self.searchWithOptions(query, .{});

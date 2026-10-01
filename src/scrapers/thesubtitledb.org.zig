@@ -8,10 +8,7 @@ const download_base = "https://api.thesubtitledb.org/get";
 const max_search_items = 8;
 const max_subtitle_items = 30;
 
-pub const MediaKind = enum {
-    movie,
-    tv,
-};
+pub const MediaKind = common.MediaKind;
 
 pub const SearchItem = struct {
     title: []const u8,
@@ -32,26 +29,9 @@ pub const SubtitleItem = struct {
     download_url: []const u8,
 };
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 const ParsedQuery = common.EpisodeQuery;
 const parseQuery = common.parseEpisodeQuery;
@@ -63,8 +43,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -158,7 +136,7 @@ fn parseSearchBody(
         try seen.put(allocator, owned_id, {});
         const item: SearchItem = .{
             .title = try allocator.dupe(u8, title),
-            .year = objectInt(obj, "y"),
+            .year = common.jsonIntField(obj, "y"),
             .media_kind = media_kind,
             .imdb_id = owned_id,
             .season = if (media_kind == .tv) parsed_query.season else null,
@@ -203,7 +181,7 @@ fn parseSubtitlesBody(
     for (values.items) |value| {
         if (subtitles.items.len >= max_subtitle_items) break;
         const obj = common.jsonObject(value) orelse continue;
-        const id = objectInt(obj, "id") orelse continue;
+        const id = common.jsonIntField(obj, "id") orelse continue;
         if (id <= 0) continue;
         const raw_format = common.jsonString(obj, "format") orelse continue;
         const format = supportedTextFormat(raw_format) orelse continue;
@@ -299,16 +277,6 @@ fn supportedTextFormat(value: []const u8) ?[]const u8 {
 fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
     if (prefix.len > value.len) return false;
     return std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
-}
-
-fn objectInt(obj: std.json.ObjectMap, key: []const u8) ?i64 {
-    const value = obj.get(key) orelse return null;
-    return switch (value) {
-        .integer => |number| number,
-        .number_string => |number| std.fmt.parseInt(i64, number, 10) catch null,
-        .float => |number| @intFromFloat(number),
-        else => null,
-    };
 }
 
 fn objectBool(obj: std.json.ObjectMap, key: []const u8) ?bool {

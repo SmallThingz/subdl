@@ -4,7 +4,7 @@ const common = @import("common.zig");
 const Allocator = std.mem.Allocator;
 const site = "https://zoom.lk";
 
-pub const MediaKind = enum { movie, tv };
+pub const MediaKind = common.MediaKind;
 
 pub const SearchItem = struct {
     title: []const u8,
@@ -14,32 +14,11 @@ pub const SearchItem = struct {
     page_url: []const u8,
 };
 
-pub const SubtitleItem = struct {
-    language_code: []const u8,
-    filename: []const u8,
-    download_url: []const u8,
-};
+pub const SubtitleItem = common.SubtitleFile;
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -48,8 +27,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -86,7 +63,7 @@ pub const Scraper = struct {
         const subtitles = try a.alloc(SubtitleItem, 1);
         subtitles[0] = .{
             .language_code = "si",
-            .filename = try std.fmt.allocPrint(a, "zoom-{s}-{s}", .{ download_id, try slug(a, item.title) }),
+            .filename = try std.fmt.allocPrint(a, "zoom-{s}-{s}", .{ download_id, try common.asciiSlug(a, item.title) }),
             .download_url = download_url,
         };
         return .{
@@ -199,10 +176,7 @@ fn parsePostTitle(raw: []const u8) ParsedTitle {
     };
 }
 
-const YearInfo = struct {
-    title: []const u8,
-    year: i64,
-};
+const YearInfo = common.RequiredTitleYear;
 
 fn parseTrailingYear(value: []const u8) ?YearInfo {
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
@@ -273,22 +247,6 @@ fn attributeValue(tag: []const u8, name: []const u8) ?[]const u8 {
         return tag[start .. start + end_rel];
     }
     return null;
-}
-
-fn slug(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var dash = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (dash and out.items.len > 0) try out.append(allocator, '-');
-            dash = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            dash = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "zoom parses movie and tv titles" {

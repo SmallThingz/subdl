@@ -11,32 +11,11 @@ pub const SearchItem = struct {
     page_url: []const u8,
 };
 
-pub const SubtitleItem = struct {
-    language_code: []const u8,
-    filename: []const u8,
-    download_url: []const u8,
-};
+pub const SubtitleItem = common.SubtitleFile;
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -45,8 +24,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -261,7 +238,7 @@ fn resolveDownloadRedirect(client: *std.http.Client, allocator: Allocator, url: 
     var head_buffer: [16 * 1024]u8 = undefined;
     const response = try req.receiveHead(&head_buffer);
     if (response.head.status == .ok) return try allocator.dupe(u8, url);
-    if (!isRedirect(response.head.status)) return error.UnexpectedHttpStatus;
+    if (!common.isRedirectStatus(response.head.status)) return error.UnexpectedHttpStatus;
 
     const location = try extractHeader(allocator, response.head.bytes, "location") orelse return error.MissingField;
     defer allocator.free(location);
@@ -273,14 +250,6 @@ fn resolveDownloadRedirect(client: *std.http.Client, allocator: Allocator, url: 
         try std.fmt.allocPrint(allocator, "/{s}", .{location});
     const resolved = try common.resolveUrl(allocator, site, location_for_resolve);
     return try normalizeProviderUrl(allocator, resolved);
-}
-
-fn isRedirect(status: std.http.Status) bool {
-    return status == .moved_permanently or
-        status == .found or
-        status == .see_other or
-        status == .temporary_redirect or
-        status == .permanent_redirect;
 }
 
 fn extractHeader(allocator: Allocator, headers: []const u8, wanted: []const u8) !?[]u8 {

@@ -8,10 +8,7 @@ const download_endpoint = site ++ "/run/pages/download.php";
 const max_search_items = 8;
 const max_subtitle_items = 40;
 
-pub const MediaKind = enum {
-    movie,
-    tv,
-};
+pub const MediaKind = common.MediaKind;
 
 pub const SearchItem = struct {
     title: []const u8,
@@ -24,33 +21,11 @@ pub const SearchItem = struct {
     page_url: []const u8,
 };
 
-pub const SubtitleItem = struct {
-    language_code: []const u8,
-    filename: []const u8,
-    release_name: []const u8,
-    download_url: []const u8,
-};
+pub const SubtitleItem = common.ReleaseSubtitleFile;
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 const ParsedQuery = common.EpisodeQuery;
 const parseQuery = common.parseEpisodeQuery;
@@ -82,8 +57,6 @@ pub const Scraper = struct {
             .language_code = providerLanguageCode(language_code) orelse "en",
         };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);

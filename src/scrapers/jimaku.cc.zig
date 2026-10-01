@@ -6,10 +6,7 @@ const Allocator = std.mem.Allocator;
 const site = "https://jimaku.cc";
 const catalog_url = site ++ "/";
 
-pub const MediaKind = enum {
-    movie,
-    tv,
-};
+pub const MediaKind = common.MediaKind;
 
 pub const SearchItem = struct {
     title: []const u8,
@@ -20,32 +17,11 @@ pub const SearchItem = struct {
     page_url: []const u8,
 };
 
-pub const SubtitleItem = struct {
-    language_code: []const u8,
-    filename: []const u8,
-    download_url: []const u8,
-};
+pub const SubtitleItem = common.SubtitleFile;
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -54,8 +30,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -141,7 +115,7 @@ fn parseCatalog(arena: std.heap.ArenaAllocator, body: []const u8, query: []const
         const name = jsonString(obj, "name") orelse try common.innerTextTrimmedOwned(a, anchor);
         const english_name = jsonString(obj, "english_name");
         const japanese_name = jsonString(obj, "japanese_name");
-        const flags = jsonInt(obj, "flags") orelse 0;
+        const flags = common.jsonIntField(obj, "flags") orelse 0;
         const media_kind: MediaKind = if ((flags & 8) != 0) .movie else .tv;
 
         const norm_name = try normalizeTitle(a, name);
@@ -192,16 +166,6 @@ fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = obj.get(key) orelse return null;
     return switch (value) {
         .string => |text| if (text.len > 0) text else null,
-        else => null,
-    };
-}
-
-fn jsonInt(obj: std.json.ObjectMap, key: []const u8) ?i64 {
-    const value = obj.get(key) orelse return null;
-    return switch (value) {
-        .integer => |number| number,
-        .number_string => |number| std.fmt.parseInt(i64, number, 10) catch null,
-        .float => |number| @intFromFloat(number),
         else => null,
     };
 }

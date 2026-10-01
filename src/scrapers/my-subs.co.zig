@@ -8,10 +8,7 @@ const HtmlNode = HtmlParseOptions.GetNode();
 const Allocator = std.mem.Allocator;
 const site = "https://my-subs.co";
 
-pub const MediaKind = enum {
-    movie,
-    tv,
-};
+pub const MediaKind = common.MediaKind;
 
 pub const SearchOptions = struct {};
 
@@ -37,31 +34,9 @@ pub const SubtitleItem = struct {
     is_archive: ?bool,
 };
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
-    page: usize = 1,
-    has_prev_page: bool = false,
-    has_next_page: bool = false,
+pub const SearchResponse = common.PagedSearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    subtitles: []const SubtitleItem,
-    page: usize = 1,
-    has_prev_page: bool = false,
-    has_next_page: bool = false,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.PagedSubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -70,8 +45,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         return self.searchWithOptions(query, .{});

@@ -6,10 +6,7 @@ const site = "https://www.titrari.ro";
 const search_page = "cautamainaltaparte";
 pub const download_token_prefix = "titrari-referer:";
 
-pub const MediaKind = enum {
-    movie,
-    tv,
-};
+pub const MediaKind = common.MediaKind;
 
 pub const SearchItem = struct {
     title: []const u8,
@@ -21,32 +18,11 @@ pub const SearchItem = struct {
     download_url: []const u8,
 };
 
-pub const SubtitleItem = struct {
-    language_code: []const u8,
-    filename: []const u8,
-    download_url: []const u8,
-};
+pub const SubtitleItem = common.SubtitleFile;
 
-pub const SearchResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const SearchItem,
+pub const SearchResponse = common.SearchResponse(SearchItem);
 
-    pub fn deinit(self: *SearchResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-pub const SubtitlesResponse = struct {
-    arena: std.heap.ArenaAllocator,
-    title: []const u8,
-    subtitles: []const SubtitleItem,
-
-    pub fn deinit(self: *SubtitlesResponse) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const SubtitlesResponse = common.TitledSubtitlesResponse(SubtitleItem);
 
 pub const Scraper = struct {
     allocator: Allocator,
@@ -55,8 +31,6 @@ pub const Scraper = struct {
     pub fn init(allocator: Allocator, client: *std.http.Client) Scraper {
         return .{ .allocator = allocator, .client = client };
     }
-
-    pub fn deinit(_: *Scraper) void {}
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -88,7 +62,7 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        const filename = try std.fmt.allocPrint(a, "titrari-{s}-{s}", .{ item.subtitle_id, try slug(a, item.title) });
+        const filename = try std.fmt.allocPrint(a, "titrari-{s}-{s}", .{ item.subtitle_id, try common.asciiSlug(a, item.title) });
         const subtitles = try a.alloc(SubtitleItem, 1);
         subtitles[0] = .{
             .language_code = try a.dupe(u8, item.language_code),
@@ -195,10 +169,7 @@ pub fn makeDownloadToken(allocator: Allocator, subtitle_id: []const u8, page_url
     return std.fmt.allocPrint(allocator, "{s}{s}|{s}", .{ download_token_prefix, subtitle_id, page_url });
 }
 
-const DownloadToken = struct {
-    subtitle_id: []const u8,
-    page_url: []const u8,
-};
+const DownloadToken = common.SubtitleDownloadToken;
 
 pub fn parseDownloadToken(value: []const u8) ?DownloadToken {
     if (!std.mem.startsWith(u8, value, download_token_prefix)) return null;
@@ -290,22 +261,6 @@ fn stripSeasonSuffix(title: []const u8) []const u8 {
     if (std.ascii.indexOfIgnoreCase(title, " - Sezonul ")) |idx| return std.mem.trimEnd(u8, title[0..idx], " \t");
     if (std.ascii.indexOfIgnoreCase(title, " - Sezoanele ")) |idx| return std.mem.trimEnd(u8, title[0..idx], " \t");
     return std.mem.trim(u8, title, " \t\r\n");
-}
-
-fn slug(allocator: Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var dash = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
-            if (dash and out.items.len > 0) try out.append(allocator, '-');
-            dash = false;
-            try out.append(allocator, std.ascii.toLower(c));
-        } else {
-            dash = out.items.len > 0;
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 test "titrari parses movie and season pack results" {
