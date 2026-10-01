@@ -44,6 +44,7 @@ pub const subcentral_de = subdl.subcentral_de;
 pub const subtitulamos_tv = subdl.subtitulamos_tv;
 pub const feliratok_eu = subdl.feliratok_eu;
 pub const animesub_info = subdl.animesub_info;
+pub const animetosho_xyz = subdl.animetosho_xyz;
 pub const subhd_tv = subdl.subhd_tv;
 pub const fansubs_ru = subdl.fansubs_ru;
 pub const legendei_net = subdl.legendei_net;

@@ -364,6 +364,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "subtitulamos.tv", .serial = true },
     .{ .name = "feliratok.eu" },
     .{ .name = "animesub.info", .timeout_seconds = 180 },
+    .{ .name = "animetosho.xyz", .timeout_seconds = 120 },
     .{ .name = "subhd.tv", .timeout_seconds = 120, .serial = true, .active = false },
     .{ .name = "fansubs.ru" },
     .{ .name = "legendei.net" },

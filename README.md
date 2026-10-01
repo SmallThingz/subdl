@@ -3,13 +3,13 @@
 Subtitle scrapers in Zig with a shared provider API and a single `scrapers` binary.
 
 ![Zig](https://img.shields.io/badge/Zig-0.16.0--dev-f7a41d)
-![Providers](https://img.shields.io/badge/Active_Providers-39-2ea44f)
+![Providers](https://img.shields.io/badge/Active_Providers-40-2ea44f)
 ![Runtime](https://img.shields.io/badge/HTTP-std.http%20(Client)-0366d6)
 
 ## Overview
 
-- 39 currently active providers behind one app layer: `providers_app`
-- 48 provider implementations retained and covered by targeted live tests
+- 40 currently active providers behind one app layer: `providers_app`
+- 49 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
 - TUI mode available with `--tui` in the default build
@@ -56,6 +56,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `subtitulamos_tv` | `subtitulamos.tv` |
 | `feliratok_eu` | `feliratok.eu` |
 | `animesub_info` | `animesub.info` |
+| `animetosho_xyz` | `animetosho.xyz` |
 | `fansubs_ru` | `fansubs.ru` |
 | `legendei_net` | `legendei.net` |
 | `zoom_lk` | `zoom.lk` |
@@ -95,6 +96,7 @@ be detected without advertising a known-unusable provider in the CLI/TUI.
 `subtitulamos_tv` is TV-only and provides English, Spanish, Portuguese, Catalan, and Galician subtitles.
 `feliratok_eu` is movie-only and provides Hungarian and English subtitles.
 `animesub_info` provides Polish anime movie and TV subtitles.
+`animetosho_xyz` provides multi-language anime movie and TV subtitles through AnimeTosho's public feed and verified XZ attachment downloads.
 `fansubs_ru` provides Russian anime movie and TV subtitles.
 `legendei_net` provides Portuguese movie and TV subtitle archives, with language-specific posts when available.
 `zoom_lk` provides Sinhala movie and TV season subtitle archives.

@@ -38,6 +38,7 @@ pub const subcentral_de = @import("subcentral.de.zig");
 pub const subtitulamos_tv = @import("subtitulamos.tv.zig");
 pub const feliratok_eu = @import("feliratok.eu.zig");
 pub const animesub_info = @import("animesub.info.zig");
+pub const animetosho_xyz = @import("animetosho.xyz.zig");
 pub const subhd_tv = @import("subhd.tv.zig");
 pub const fansubs_ru = @import("fansubs.ru.zig");
 pub const legendei_net = @import("legendei.net.zig");
@@ -88,6 +89,7 @@ pub const ProviderTag = enum {
     subtitulamos_tv,
     feliratok_eu,
     animesub_info,
+    animetosho_xyz,
     subhd_tv,
     fansubs_ru,
     legendei_net,
@@ -139,6 +141,7 @@ pub const SearchItemUnion = union(ProviderTag) {
     subtitulamos_tv: subtitulamos_tv.SearchItem,
     feliratok_eu: feliratok_eu.SearchItem,
     animesub_info: animesub_info.SearchItem,
+    animetosho_xyz: animetosho_xyz.SearchItem,
     subhd_tv: subhd_tv.SearchItem,
     fansubs_ru: fansubs_ru.SearchItem,
     legendei_net: legendei_net.SearchItem,
@@ -190,6 +193,7 @@ pub const SubtitleUnion = union(ProviderTag) {
     subtitulamos_tv: subtitulamos_tv.SubtitleItem,
     feliratok_eu: feliratok_eu.SubtitleItem,
     animesub_info: animesub_info.SubtitleItem,
+    animetosho_xyz: animetosho_xyz.SubtitleItem,
     subhd_tv: subhd_tv.SubtitleItem,
     fansubs_ru: fansubs_ru.SubtitleItem,
     legendei_net: legendei_net.SubtitleItem,
@@ -241,6 +245,7 @@ pub const TitleUnion = union(ProviderTag) {
     subtitulamos_tv: subtitulamos_tv.SearchItem,
     feliratok_eu: feliratok_eu.SearchItem,
     animesub_info: animesub_info.SearchItem,
+    animetosho_xyz: animetosho_xyz.SearchItem,
     subhd_tv: subhd_tv.SearchItem,
     fansubs_ru: fansubs_ru.SearchItem,
     legendei_net: legendei_net.SearchItem,
@@ -516,6 +521,13 @@ pub fn fromAnimeSubInfoSearch(allocator: std.mem.Allocator, items: []const anime
     var out: std.ArrayListUnmanaged(SearchItemUnion) = .empty;
     errdefer out.deinit(allocator);
     for (items) |item| try out.append(allocator, .{ .animesub_info = item });
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn fromAnimeToshoSearch(allocator: std.mem.Allocator, items: []const animetosho_xyz.SearchItem) ![]SearchItemUnion {
+    var out: std.ArrayListUnmanaged(SearchItemUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .animetosho_xyz = item });
     return try out.toOwnedSlice(allocator);
 }
 
@@ -852,6 +864,13 @@ pub fn fromAnimeSubInfoSubtitles(allocator: std.mem.Allocator, items: []const an
     var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
     errdefer out.deinit(allocator);
     for (items) |item| try out.append(allocator, .{ .animesub_info = item });
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn fromAnimeToshoSubtitles(allocator: std.mem.Allocator, items: []const animetosho_xyz.SubtitleItem) ![]SubtitleUnion {
+    var out: std.ArrayListUnmanaged(SubtitleUnion) = .empty;
+    errdefer out.deinit(allocator);
+    for (items) |item| try out.append(allocator, .{ .animetosho_xyz = item });
     return try out.toOwnedSlice(allocator);
 }
 
