@@ -1299,7 +1299,21 @@ fn runTui(ui: *Ui) !void {
                     if (key.matches(vaxis.Key.enter, .{})) {
                         const current_query_norm = normalizeQueryView(query.items);
                         if (current_query_norm.len == 0) continue;
-                        if (ui.searchReaperBacklogFull()) continue;
+                        if (ui.searchReaperBacklogFull()) {
+                            const msg = try vaxisMessage(
+                                ui,
+                                "Search cleanup in progress",
+                                "Previous canceled searches are still shutting down.",
+                                "Press Enter/Esc to return, then retry shortly.",
+                                ui.styleWarn(),
+                            );
+                            switch (msg) {
+                                .ok => {},
+                                .to_query => focus = .query,
+                                .quit => return,
+                            }
+                            continue;
+                        }
                         resetHistoryBrowse(&history_pick, &history_draft, &history_draft_cursor);
                         if (results) |*bundle| bundle.deinit(ui.allocator);
                         results = null;
