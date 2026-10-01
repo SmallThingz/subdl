@@ -72,6 +72,7 @@ pub const Provider = enum {
     feliratok_eu,
     animesub_info,
     animetosho_xyz,
+    kitsunekko_net,
     subhd_tv,
     fansubs_ru,
     legendei_net,
@@ -100,7 +101,6 @@ const provider_values = [_]Provider{
     .indexsubtitle_cc,
     .sous_titres_eu,
     .cc_edatribe_com,
-    .subtitrari_noi_ro,
     .subclub_eu,
     .subs_ro,
     .subs4free_info,
@@ -117,6 +117,7 @@ const provider_values = [_]Provider{
     .feliratok_eu,
     .animesub_info,
     .animetosho_xyz,
+    .kitsunekko_net,
     .fansubs_ru,
     .legendei_net,
     .zoom_lk,
@@ -183,6 +184,7 @@ pub fn providerName(provider: Provider) []const u8 {
         .feliratok_eu => "feliratok_eu",
         .animesub_info => "animesub_info",
         .animetosho_xyz => "animetosho_xyz",
+        .kitsunekko_net => "kitsunekko_net",
         .subhd_tv => "subhd_tv",
         .fansubs_ru => "fansubs_ru",
         .legendei_net => "legendei_net",
@@ -264,6 +266,7 @@ pub fn providerDisplayName(provider: Provider) []const u8 {
         .feliratok_eu => "SuperSubtitles",
         .animesub_info => "AnimeSub.info",
         .animetosho_xyz => "AnimeTosho",
+        .kitsunekko_net => "Kitsunekko",
         .subhd_tv => "SubHD",
         .fansubs_ru => "Fansubs.ru",
         .legendei_net => "Legendei",
@@ -318,6 +321,7 @@ pub fn providerSiteUrl(provider: Provider) []const u8 {
         .feliratok_eu => "https://feliratok.eu",
         .animesub_info => "http://animesub.info",
         .animetosho_xyz => "https://animetosho.net",
+        .kitsunekko_net => "https://kitsunekko.net",
         .subhd_tv => "https://subhd.tv",
         .fansubs_ru => "http://fansubs.ru",
         .legendei_net => "https://legendei.net",
@@ -661,6 +665,13 @@ pub const SearchRef = union(Provider) {
         episode: ?u16,
         release_id: i64,
         release: []const u8,
+        page_url: []const u8,
+    },
+    kitsunekko_net: struct {
+        title: []const u8,
+        language_code: []const u8,
+        season: ?u16,
+        episode: ?u16,
         page_url: []const u8,
     },
     subhd_tv: struct {
@@ -1713,6 +1724,30 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
                         .episode = item.episode,
                         .release_id = item.release_id,
                         .release = release,
+                        .page_url = try a.dupe(u8, item.page_url),
+                    } },
+                });
+            }
+        },
+        .kitsunekko_net => {
+            var scraper = subdl.kitsunekko_net.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            var response = try scraper.search(query);
+            defer response.deinit();
+
+            for (response.items) |item| {
+                const title = try a.dupe(u8, item.title);
+                const label = if (item.episode) |episode|
+                    try std.fmt.allocPrint(a, "[{s}] {s} S{d}E{d}", .{ item.language_code, title, item.season orelse 1, episode })
+                else
+                    try std.fmt.allocPrint(a, "[{s}] {s}", .{ item.language_code, title });
+                try out.append(a, .{
+                    .label = label,
+                    .ref = .{ .kitsunekko_net = .{
+                        .title = title,
+                        .language_code = try a.dupe(u8, item.language_code),
+                        .season = item.season,
+                        .episode = item.episode,
                         .page_url = try a.dupe(u8, item.page_url),
                     } },
                 });
@@ -3162,6 +3197,29 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 });
             }
         },
+        .kitsunekko_net => |item| {
+            title = try a.dupe(u8, item.title);
+            var scraper = subdl.kitsunekko_net.Scraper.init(allocator, client);
+            defer scraper.deinit();
+            const query_item: subdl.kitsunekko_net.SearchItem = .{
+                .title = item.title,
+                .language_code = item.language_code,
+                .season = item.season,
+                .episode = item.episode,
+                .page_url = item.page_url,
+            };
+            var subtitles = try scraper.fetchSubtitlesBySearchItem(query_item);
+            defer subtitles.deinit();
+            for (subtitles.subtitles) |subtitle| {
+                const label = try subtitleLabel(a, subtitle.language_code, subtitle.filename, subtitle.download_url);
+                try out.append(a, .{
+                    .label = label,
+                    .language = try a.dupe(u8, subtitle.language_code),
+                    .filename = try a.dupe(u8, subtitle.filename),
+                    .download_url = try a.dupe(u8, subtitle.download_url),
+                });
+            }
+        },
         .subhd_tv => |item| {
             title = try a.dupe(u8, item.title);
             var scraper = subdl.subhd_tv.Scraper.init(allocator, client);
@@ -3567,6 +3625,7 @@ pub fn titleFromRef(ref: SearchRef) []const u8 {
         .feliratok_eu => |item| item.title,
         .animesub_info => |item| item.title,
         .animetosho_xyz => |item| item.title,
+        .kitsunekko_net => |item| item.title,
         .subhd_tv => |item| item.title,
         .fansubs_ru => |item| item.title,
         .legendei_net => |item| item.title,
@@ -4781,6 +4840,7 @@ fn liveQueryForProvider(provider: Provider) []const u8 {
         .feliratok_eu => "The Matrix",
         .animesub_info => "Spirited Away",
         .animetosho_xyz => "Spirited Away",
+        .kitsunekko_net => "Spirited Away",
         .subhd_tv => "The Matrix",
         .fansubs_ru => "Spirited Away",
         .legendei_net => "The Matrix Resurrections",
@@ -4837,6 +4897,7 @@ pub fn searchRefUrl(ref: SearchRef) []const u8 {
         .feliratok_eu => |item| item.page_url,
         .animesub_info => |item| item.page_url,
         .animetosho_xyz => |item| item.page_url,
+        .kitsunekko_net => |item| item.page_url,
         .subhd_tv => |item| item.detail_url,
         .fansubs_ru => |item| item.page_url,
         .legendei_net => |item| item.page_url,
@@ -4917,7 +4978,6 @@ test "active provider registry excludes retired providers" {
         "indexsubtitle_cc",
         "sous_titres_eu",
         "cc_edatribe_com",
-        "subtitrari_noi_ro",
         "subclub_eu",
         "subs_ro",
         "subs4free_info",
@@ -4934,6 +4994,7 @@ test "active provider registry excludes retired providers" {
         "feliratok_eu",
         "animesub_info",
         "animetosho_xyz",
+        "kitsunekko_net",
         "fansubs_ru",
         "legendei_net",
         "zoom_lk",
@@ -4982,7 +5043,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("indexsubtitle.cc") == .indexsubtitle_cc);
     try std.testing.expect(parseProvider("sous-titres.eu") == .sous_titres_eu);
     try std.testing.expect(parseProvider("cc.edatribe.com") == .cc_edatribe_com);
-    try std.testing.expect(parseProvider("subtitrari-noi.ro") == .subtitrari_noi_ro);
+    try std.testing.expect(parseProvider("subtitrari-noi.ro") == null);
     try std.testing.expect(parseProvider("subclub.eu") == .subclub_eu);
     try std.testing.expect(parseProvider("subs.ro") == .subs_ro);
     try std.testing.expect(parseProvider("subs4free.info") == .subs4free_info);
@@ -4999,6 +5060,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("feliratok.eu") == .feliratok_eu);
     try std.testing.expect(parseProvider("animesub.info") == .animesub_info);
     try std.testing.expect(parseProvider("animetosho.xyz") == .animetosho_xyz);
+    try std.testing.expect(parseProvider("kitsunekko.net") == .kitsunekko_net);
     try std.testing.expect(parseProvider("subhd.tv") == null);
     try std.testing.expect(parseProvider("fansubs.ru") == .fansubs_ru);
     try std.testing.expect(parseProvider("legendei.net") == .legendei_net);
@@ -5044,6 +5106,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("feliratok") == .feliratok_eu);
     try std.testing.expect(try resolveProvider("animesub_i") == .animesub_info);
     try std.testing.expect(try resolveProvider("animetosho") == .animetosho_xyz);
+    try std.testing.expect(try resolveProvider("kitsunekko") == .kitsunekko_net);
     try std.testing.expectError(error.AmbiguousProvider, resolveProvider("sub"));
     try std.testing.expectError(error.UnknownProvider, resolveProvider("subhd"));
     try std.testing.expect(try resolveProvider("fansubs") == .fansubs_ru);
@@ -5435,6 +5498,7 @@ fn seriesQueryForProvider(provider: Provider) []const u8 {
         .subtitulamos_tv => "Chernobyl",
         .animesub_info => "Death Note",
         .animetosho_xyz => "Death Note S01E01",
+        .kitsunekko_net => "Death Note S01E01",
         .subhd_tv => "Chernobyl S01E01",
         .fansubs_ru => "Death Note",
         .legendei_net => "Chernobyl S01E01",
@@ -5544,7 +5608,6 @@ const tui_smoke_providers = [_]Provider{
     .tsukihime_org,
     .subtitri_nekur_net,
     .subsynchro_com,
-    .subtitrari_noi_ro,
     .titrari_ro,
     .subs_sab_bz,
     .subtitri_do_am,
@@ -5555,6 +5618,7 @@ const tui_smoke_providers = [_]Provider{
     .feliratok_eu,
     .animesub_info,
     .animetosho_xyz,
+    .kitsunekko_net,
     .fansubs_ru,
     .legendei_net,
     .zoom_lk,
@@ -5821,6 +5885,10 @@ test "live providers_app tui-path smoke provider: animetosho.xyz" {
     try runSingleProviderSmokeTest(.animetosho_xyz);
 }
 
+test "live providers_app tui-path smoke provider: kitsunekko.net" {
+    try runSingleProviderSmokeTest(.kitsunekko_net);
+}
+
 test "live providers_app tui-path smoke provider: subhd.tv" {
     try runSingleProviderSmokeTest(.subhd_tv);
 }
@@ -5979,6 +6047,10 @@ test "live series download path provider: animesub.info" {
 
 test "live series download path provider: animetosho.xyz" {
     try runSingleProviderSeriesTest(.animetosho_xyz);
+}
+
+test "live series download path provider: kitsunekko.net" {
+    try runSingleProviderSeriesTest(.kitsunekko_net);
 }
 
 test "live series download path provider: subhd.tv" {

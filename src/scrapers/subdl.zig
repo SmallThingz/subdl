@@ -42,6 +42,7 @@ pub const subtitulamos_tv = @import("subtitulamos.tv.zig");
 pub const feliratok_eu = @import("feliratok.eu.zig");
 pub const animesub_info = @import("animesub.info.zig");
 pub const animetosho_xyz = @import("animetosho.xyz.zig");
+pub const kitsunekko_net = @import("kitsunekko.net.zig");
 pub const subhd_tv = @import("subhd.tv.zig");
 pub const fansubs_ru = @import("fansubs.ru.zig");
 pub const legendei_net = @import("legendei.net.zig");
@@ -112,6 +113,7 @@ test {
     _ = @import("feliratok.eu.zig");
     _ = @import("animesub.info.zig");
     _ = @import("animetosho.xyz.zig");
+    _ = @import("kitsunekko.net.zig");
     _ = @import("subhd.tv.zig");
     _ = @import("fansubs.ru.zig");
     _ = @import("legendei.net.zig");
