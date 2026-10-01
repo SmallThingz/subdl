@@ -330,7 +330,7 @@ const live_provider_targets = [_]LiveProviderTarget{
     .{ .name = "isubtitles.org", .timeout_seconds = 120 },
     .{ .name = "moviesubtitles.org", .active = false },
     .{ .name = "moviesubtitlesrt.com", .active = false },
-    .{ .name = "my-subs.co" },
+    .{ .name = "my-subs.co", .active = false },
     .{ .name = "podnapisi.net", .active = false },
     .{ .name = "subtitlecat.com" },
     .{ .name = "subsource.net" },

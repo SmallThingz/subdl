@@ -88,7 +88,6 @@ const provider_values = [_]Provider{
     .yifysubtitles_ch,
     .subtitlecat_com,
     .isubtitles_org,
-    .my_subs_co,
     .subsource_net,
     .sub_scene_com,
     .gestdown_info,
@@ -4755,7 +4754,6 @@ test "active provider registry excludes retired providers" {
         "yifysubtitles_ch",
         "subtitlecat_com",
         "isubtitles_org",
-        "my_subs_co",
         "subsource_net",
         "sub_scene_com",
         "gestdown_info",
@@ -4815,7 +4813,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("yifysubtitles.ch") == .yifysubtitles_ch);
     try std.testing.expect(parseProvider("subtitlecat.com") == .subtitlecat_com);
     try std.testing.expect(parseProvider("isubtitles.org") == .isubtitles_org);
-    try std.testing.expect(parseProvider("my-subs.co") == .my_subs_co);
+    try std.testing.expect(parseProvider("my-subs.co") == null);
     try std.testing.expect(parseProvider("subsource.net") == .subsource_net);
     try std.testing.expect(parseProvider("sub-scene.com") == .sub_scene_com);
     try std.testing.expect(parseProvider("tvsubtitles.net") == null);
@@ -4860,7 +4858,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("yify") == .yifysubtitles_ch);
     try std.testing.expect(try resolveProvider("subtitlecat") == .subtitlecat_com);
     try std.testing.expect(try resolveProvider("isubtitles") == .isubtitles_org);
-    try std.testing.expect(try resolveProvider("my_subs") == .my_subs_co);
+    try std.testing.expectError(error.UnknownProvider, resolveProvider("my_subs"));
     try std.testing.expect(try resolveProvider("subsource") == .subsource_net);
     try std.testing.expect(try resolveProvider("sub_scene") == .sub_scene_com);
     try std.testing.expect(try resolveProvider("gestdown") == .gestdown_info);

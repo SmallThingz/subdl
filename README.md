@@ -3,12 +3,12 @@
 Subtitle scrapers in Zig with a shared provider API and a single `scrapers` binary.
 
 ![Zig](https://img.shields.io/badge/Zig-0.16.0--dev-f7a41d)
-![Providers](https://img.shields.io/badge/Active_Providers-38-2ea44f)
+![Providers](https://img.shields.io/badge/Active_Providers-37-2ea44f)
 ![Runtime](https://img.shields.io/badge/HTTP-std.http%20(Client)-0366d6)
 
 ## Overview
 
-- 38 currently active providers behind one app layer: `providers_app`
+- 37 currently active providers behind one app layer: `providers_app`
 - 47 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
@@ -30,7 +30,6 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `yifysubtitles_ch` | `yifysubtitles.ch` |
 | `subtitlecat_com` | `subtitlecat.com` |
 | `isubtitles_org` | `isubtitles.org` |
-| `my_subs_co` | `my-subs.co` |
 | `subsource_net` | `subsource.net` |
 | `sub_scene_com` | `sub-scene.com` |
 | `gestdown_info` | `gestdown.info` |
@@ -65,7 +64,8 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `jimaku_cc` | `jimaku.cc` |
 
 Retained inactive implementations are `opensubtitles_org`, `moviesubtitles_org`,
-`moviesubtitlesrt_com`, `podnapisi_net`, `tvsubtitles_net`,
+`moviesubtitlesrt_com`, `my_subs_co` while `my-subs.co` has no resolvable DNS record,
+`podnapisi_net`, `tvsubtitles_net`,
 `greek_subtitles_com` while its movie search is currently unreliable,
 `subtitrari_noi_ro` while its upstream host is intermittently refusing connections,
 `subtis_io` while `api.subt.is` has no DNS A record, and
