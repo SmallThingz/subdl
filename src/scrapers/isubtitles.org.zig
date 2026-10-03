@@ -403,13 +403,13 @@ fn maybeDebugDumpFirstPage(status: std.http.Status, page_url: []const u8, body: 
     if (traversed != 0) return;
     if (common.getenv("SCRAPERS_DEBUG_ISUB") == null) return;
 
-    std.debug.print("[isubtitles] status={d} body_len={d} url={s}\n", .{ @intFromEnum(status), body.len, page_url });
+    std.debug.print("[isubtitles] status={d} body_len={d} url={s}\n", .{ @backingInt(status), body.len, page_url });
     if (status != .ok) std.debug.print("[isubtitles] response={s}\n", .{body[0..@min(body.len, 1200)]});
 }
 
 fn isLikelyNextText(text: []const u8) bool {
     if (text.len == 0) return false;
-    if (std.ascii.indexOfIgnoreCase(text, "next") != null) return true;
+    if (std.ascii.findIgnoreCase(text, "next") != null) return true;
     return std.mem.eql(u8, text, ">") or std.mem.eql(u8, text, "›") or std.mem.eql(u8, text, "»");
 }
 

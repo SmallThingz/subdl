@@ -423,8 +423,8 @@ fn slugify(allocator: Allocator, input: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-const findIgnoreCase = std.ascii.indexOfIgnoreCase;
-const indexOfIgnoreCase = std.ascii.indexOfIgnoreCase;
+const findIgnoreCase = std.ascii.findIgnoreCase;
+const indexOfIgnoreCase = std.ascii.findIgnoreCase;
 
 test "nyasub parses catalog titles and release links" {
     const fixture =

@@ -320,7 +320,7 @@ fn searchItemRank(item: SearchItem, query: RankedQuery) u16 {
 
     if (std.ascii.eqlIgnoreCase(candidate, query.title)) {
         score += 1000;
-    } else if (std.ascii.indexOfIgnoreCase(candidate, query.title) != null) {
+    } else if (std.ascii.findIgnoreCase(candidate, query.title) != null) {
         score += 200;
     }
 

@@ -369,7 +369,7 @@ fn isReleaseBoundary(c: u8) bool {
     return c == ' ' or c == '.' or c == '-' or c == '_' or c == '[' or c == '(';
 }
 
-const indexOfIgnoreCase = std.ascii.indexOfIgnoreCase;
+const indexOfIgnoreCase = std.ascii.findIgnoreCase;
 
 fn parseYear(input: []const u8) ?i64 {
     if (input.len < 4) return null;

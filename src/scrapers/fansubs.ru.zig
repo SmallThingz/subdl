@@ -259,7 +259,7 @@ fn parseSubtitleRows(allocator: Allocator, body: []const u8) ![]const SubtitleIt
         const form_end = std.mem.indexOfPos(u8, body, cursor, "</form>") orelse body.len;
         const form = body[pos..form_end];
         const format = parseRowFormat(form);
-        const ext = if (std.ascii.indexOfIgnoreCase(format, "ASS") != null or std.ascii.indexOfIgnoreCase(format, "SSA") != null)
+        const ext = if (std.ascii.findIgnoreCase(format, "ASS") != null or std.ascii.findIgnoreCase(format, "SSA") != null)
             "ass"
         else
             "srt";

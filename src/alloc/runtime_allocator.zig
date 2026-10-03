@@ -1,9 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const RuntimeAllocator = if (builtin.mode == .Debug)
+pub const RuntimeAllocator = if (builtin.mode == .debug)
     struct {
-        gpa: std.heap.DebugAllocator(.{}) = .{},
+        gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{}),
 
         pub fn init() @This() {
             return .{};
@@ -14,7 +14,7 @@ pub const RuntimeAllocator = if (builtin.mode == .Debug)
         }
 
         pub fn deinit(self: *@This()) void {
-            std.debug.assert(self.gpa.deinit() == .ok);
+            std.debug.assert(self.gpa.deinit() == 0);
         }
     }
 else

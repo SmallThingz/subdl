@@ -166,8 +166,8 @@ fn parseBoardThreads(allocator: Allocator, body: []const u8, series_title: []con
         const close = std.mem.indexOfPos(u8, body, gt + 1, "</a>") orelse continue;
         if (close - gt > 600) continue;
         const title = std.mem.trim(u8, stripSimpleTags(body[gt + 1 .. close]), " \t\r\n");
-        if (std.ascii.indexOfIgnoreCase(title, "DE-Subs") == null and
-            std.ascii.indexOfIgnoreCase(title, "VO-Subs") == null) continue;
+        if (std.ascii.findIgnoreCase(title, "DE-Subs") == null and
+            std.ascii.findIgnoreCase(title, "VO-Subs") == null) continue;
         const season = parseSeason(title) orelse continue;
 
         try seen.put(allocator, try allocator.dupe(u8, thread_id), {});
@@ -310,7 +310,7 @@ fn subtitleLessThan(_: void, lhs: SubtitleItem, rhs: SubtitleItem) bool {
 fn parseSeason(value: []const u8) ?i64 {
     const markers = [_][]const u8{ "Staffel ", "Season " };
     for (markers) |marker| {
-        const pos = std.ascii.indexOfIgnoreCase(value, marker) orelse continue;
+        const pos = std.ascii.findIgnoreCase(value, marker) orelse continue;
         const tail = value[pos + marker.len ..];
         var end: usize = 0;
         while (end < tail.len and std.ascii.isDigit(tail[end])) : (end += 1) {}
@@ -475,7 +475,7 @@ fn extractCookie(allocator: Allocator, headers: []const u8) !?[]u8 {
         const name = std.mem.trim(u8, line[0..colon], " \t");
         if (!std.ascii.eqlIgnoreCase(name, "set-cookie")) continue;
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        if (std.ascii.indexOfIgnoreCase(value, "wcf_cookieHash=") != 0) continue;
+        if (std.ascii.findIgnoreCase(value, "wcf_cookieHash=") != 0) continue;
         const end = std.mem.indexOfScalar(u8, value, ';') orelse value.len;
         return @as(?[]u8, try allocator.dupe(u8, value[0..end]));
     }

@@ -194,5 +194,5 @@ test "live sous-titres movie and tv downloads" {
     var tv_subtitles = try scraper.fetchSubtitlesBySearchItem(tv.items[0]);
     defer tv_subtitles.deinit();
     try std.testing.expect(tv_subtitles.subtitles.len > 0);
-    try std.testing.expect(std.ascii.indexOfIgnoreCase(tv_subtitles.subtitles[0].filename, "Chernobyl") != null);
+    try std.testing.expect(std.ascii.findIgnoreCase(tv_subtitles.subtitles[0].filename, "Chernobyl") != null);
 }

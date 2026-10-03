@@ -14,14 +14,14 @@ Default behavior:
 
 - CLI is enabled by default
 - TUI is enabled by default and can be disabled with `-Denable-tui=false`
-- Archive extraction is compiled out by default
+- Archive extraction is enabled by default and can be disabled with `-Denable-unarr=false`
 - Browser automation support is compiled out by default
 
-Those features are opt-in because some upstream projects are not fully settled on the current Zig dev toolchain. See [ISSUES.md](./ISSUES.md).
+Browser automation remains opt-in. TUI dependencies include narrowly patched official upstream sources for Zig 0.17; see [vendor provenance](./vendor/README.md).
 
 ## Requirements
 
-- Zig `0.16.0-dev.2905+`
+- Zig `0.17.0`
 - Network access for normal provider use
 
 ## Build Commands
@@ -61,7 +61,7 @@ Build all target binaries into `zig-out/bin`:
 
 ```bash
 zig build build-all-targets
-zig build build-all-targets -Doptimize=ReleaseFast -Dstrip=true
+zig build build-all-targets -Doptimize=fast -Dstrip=true
 ```
 
 Outputs:
@@ -76,7 +76,7 @@ Outputs:
 
 General:
 
-- `-Doptimize=Debug|ReleaseSafe|ReleaseFast|ReleaseSmall`
+- `-Doptimize=debug|safe|fast|small`
 - `-Dstrip=true|false`
 - `-Dsingle-threaded=true|false`
 - `-Domit-frame-pointer=true|false`
@@ -92,10 +92,10 @@ Feature gates:
 
 Notes:
 
-- `build-all-targets` defaults to `-Doptimize=ReleaseFast`
+- `build-all-targets` defaults to `-Doptimize=fast`
 - `build-all-targets` defaults to `-Dstrip=true`
 - `-Dllvm=true` works around native GNU host CRT `.sframe` relocation failures seen with Zig self-hosted codegen/linking
-- default host builds keep archive extraction and browser automation off unless you opt in
+- default host builds enable TUI and archive extraction; browser automation remains opt-in
 
 ## Provider IDs
 
@@ -469,14 +469,14 @@ zig build test-live -Dlive=all -Dlive-providers=* -Dlive-include-captcha=true -D
 
 ## Upstream Dependencies
 
-Current upstream selections:
+Owned dependencies use immutable commit and content-hash pins in `build.zig.zon`:
 
-- `libvaxis`: `main`
-- `htmlparser`: `main` from renamed repo `SmallThingz/htmlparser`
-- `alldriver`: `main`
-- `unarr`: `main`
+- `htmlparser`: `SmallThingz/zhtml`
+- `alldriver`: `SmallThingz/alldriver`
+- `unarr`: `SmallThingz/unarr.zig`
+- `oneserial`: `SmallThingz/oneserial`
 
-If any of those upstreams cause integration issues on current Zig, they should be recorded in [ISSUES.md](./ISSUES.md).
+The TUI uses official-source `libvaxis` and `zigimg` copies with narrow Zig 0.17 compatibility changes. Exact source commits, licenses, and local changes are recorded in [vendor provenance](./vendor/README.md).
 
 ## Project Structure
 

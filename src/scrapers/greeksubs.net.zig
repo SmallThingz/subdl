@@ -80,7 +80,7 @@ pub const Scraper = struct {
                 if (followed >= 8 or subtitles.items.len >= 24) break;
                 const href = common.getAttributeValueSafe(link, "href") orelse continue;
                 const text = try common.innerTextTrimmedOwned(a, link);
-                if (std.ascii.indexOfIgnoreCase(text, "Season") == null) continue;
+                if (std.ascii.findIgnoreCase(text, "Season") == null) continue;
                 const page_url = try common.resolveUrl(a, site, href);
                 if (seen_pages.contains(page_url)) continue;
                 try seen_pages.put(a, page_url, {});

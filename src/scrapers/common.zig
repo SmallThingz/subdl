@@ -332,7 +332,7 @@ fn loadFetchCache(allocator: Allocator, url: []const u8, opts: FetchOptions) !?H
     if (body.len != body_len) return null;
 
     return .{
-        .status = @enumFromInt(status_int),
+        .status = @fromBackingInt(@intCast(status_int)),
         .body = try allocator.dupe(u8, body),
     };
 }
@@ -352,7 +352,7 @@ fn storeFetchCache(allocator: Allocator, url: []const u8, opts: FetchOptions, re
     const header = try std.fmt.allocPrint(allocator, "{s}{d}\n{d}\n{d}\n", .{
         fetch_cache_magic,
         compatUnixTimestamp(),
-        @intFromEnum(response.status),
+        @backingInt(response.status),
         response.body.len,
     });
     defer allocator.free(header);

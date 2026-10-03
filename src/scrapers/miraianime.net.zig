@@ -144,7 +144,7 @@ pub const Scraper = struct {
         var anchors = parsed.doc.queryAll("a.download-file[href]");
         while (anchors.next()) |anchor| {
             const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
-            if (std.ascii.indexOfIgnoreCase(href, "font") != null) continue;
+            if (std.ascii.findIgnoreCase(href, "font") != null) continue;
             if (!hasArchiveExtension(href)) continue;
             if (seen.contains(href)) continue;
             try seen.put(a, try a.dupe(u8, href), {});

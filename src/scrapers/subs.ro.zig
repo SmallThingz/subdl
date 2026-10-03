@@ -189,8 +189,8 @@ fn parseRelease(allocator: Allocator, title_anchor: anytype, fallback: []const u
 }
 
 fn inferMediaKind(title: []const u8, page_url: []const u8) MediaKind {
-    if (std.ascii.indexOfIgnoreCase(title, "sezonul") != null) return .tv;
-    if (std.ascii.indexOfIgnoreCase(page_url, "-sezonul-") != null) return .tv;
+    if (std.ascii.findIgnoreCase(title, "sezonul") != null) return .tv;
+    if (std.ascii.findIgnoreCase(page_url, "-sezonul-") != null) return .tv;
     return .movie;
 }
 

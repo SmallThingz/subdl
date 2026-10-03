@@ -296,7 +296,7 @@ fn supportedSubtitleCodec(codec: []const u8) ?[]const u8 {
 }
 
 fn looksSignsOnly(name: []const u8) bool {
-    return std.ascii.indexOfIgnoreCase(name, "sign") != null;
+    return std.ascii.findIgnoreCase(name, "sign") != null;
 }
 
 fn containsEither(a: []const u8, b: []const u8) bool {

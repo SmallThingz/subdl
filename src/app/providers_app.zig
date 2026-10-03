@@ -121,7 +121,7 @@ fn matchesProvider(input: []const u8, canonical: []const u8) bool {
 }
 
 pub fn providerSelectionAll() [provider_values.len]bool {
-    return [_]bool{true} ** provider_values.len;
+    return @splat(true);
 }
 
 /// SearchRef is the durable provider-specific handle returned by search and
