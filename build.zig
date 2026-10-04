@@ -3,15 +3,15 @@ const provider_registry = @import("src/provider_registry.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize_opt = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode");
+    const optimize_opt = b.option(std.lang.Optimize, "optimize", "Optimization mode");
     // The primary artifact is an interactive terminal app. Debug mode makes
     // libvaxis walk and compare the full terminal grid with safety checks on
     // every navigation frame, which is visibly sluggish even for modest lists.
-    // Keep Debug available explicitly via -Doptimize=Debug, but make normal
+    // Keep Debug available explicitly via -Doptimize=debug, but make normal
     // run/install builds use the performance mode users actually experience.
-    const optimize = optimize_opt orelse .ReleaseFast;
-    const test_optimize = optimize_opt orelse .Debug;
-    const all_targets_optimize = optimize_opt orelse .ReleaseFast;
+    const optimize = optimize_opt orelse .fast;
+    const test_optimize = optimize_opt orelse .debug;
+    const all_targets_optimize = optimize_opt orelse .fast;
     const strip_opt = b.option(bool, "strip", "Strip debug symbols from binaries");
     const strip = strip_opt orelse false;
     const all_targets_strip = strip_opt orelse true;
@@ -150,14 +150,14 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(app_exe);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
 
     const run_tui_step = b.step("run-tui", "Run the app in TUI mode");
     const run_tui_cmd = b.addRunArtifact(app_exe);
     run_tui_step.dependOn(&run_tui_cmd.step);
     run_tui_cmd.step.dependOn(b.getInstallStep());
     run_tui_cmd.addArg("--tui");
-    if (b.args) |args| run_tui_cmd.addArgs(args);
+    run_tui_cmd.addPassthruArgs();
 
     const all_targets_step = b.step("build-all-targets", "Build scrapers for all configured targets into zig-out/bin");
     for (cross_targets) |cross| {
@@ -269,6 +269,13 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_subdl_mod_tests.step);
     test_step.dependOn(&run_scrapers_mod_tests.step);
     test_step.dependOn(&run_app_tests.step);
+    if (test_modules.tui_impl) |tui_mod| {
+        const tui_tests = b.addTest(.{ .root_module = tui_mod, .use_llvm = llvm });
+        const run_tui_tests = b.addRunArtifact(tui_tests);
+        test_step.dependOn(&run_tui_tests.step);
+        const test_tui_step = b.step("test-tui", "Run TUI behavior and state tests");
+        test_tui_step.dependOn(&run_tui_tests.step);
+    }
 
     const test_live_single_step = b.step("test-live-single", "Run live tests for the current provider filter");
     test_live_single_step.dependOn(&run_scrapers_mod_tests_live.step);
@@ -461,12 +468,13 @@ const TargetModuleSet = struct {
     unarr: *std.Build.Module,
     scrapers: *std.Build.Module,
     tui_backend: *std.Build.Module,
+    tui_impl: ?*std.Build.Module,
 };
 
 fn createTargetModuleSet(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     strip: bool,
     single_threaded: ?bool,
     omit_frame_pointer: ?bool,
@@ -536,7 +544,6 @@ fn createTargetModuleSet(
         const unarr_dep = b.lazyDependency("unarr", .{
             .target = target,
             .optimize = optimize,
-            .static_libc = false,
         }) orelse @panic("enable-unarr requested but unarr dependency is unavailable");
         break :blk b.createModule(.{
             .root_source_file = b.path("src/deps/unarr_compat.zig"),
@@ -604,6 +611,7 @@ fn createTargetModuleSet(
             .{ .name = "unarr", .module = unarr_mod },
         },
     });
+    var tui_impl: ?*std.Build.Module = null;
     const tui_backend_mod = if (enable_tui) blk: {
         const libvaxis_dep = b.lazyDependency("libvaxis", .{
             .target = target,
@@ -611,6 +619,7 @@ fn createTargetModuleSet(
         }) orelse @panic("enable-tui requested but libvaxis dependency is unavailable");
         const tui_impl_mod = b.createModule(.{
             .root_source_file = b.path("src/cmd/tui.zig"),
+            .link_libc = true,
             .target = target,
             .optimize = optimize,
             .strip = strip,
@@ -627,6 +636,7 @@ fn createTargetModuleSet(
                 .{ .name = "oneserial", .module = oneserial_dep.module("oneserial") },
             },
         });
+        tui_impl = tui_impl_mod;
         break :blk b.createModule(.{
             .root_source_file = b.path("src/cmd/tui_backend.zig"),
             .target = target,
@@ -664,5 +674,6 @@ fn createTargetModuleSet(
         .unarr = unarr_mod,
         .scrapers = scrapers_mod,
         .tui_backend = tui_backend_mod,
+        .tui_impl = tui_impl,
     };
 }

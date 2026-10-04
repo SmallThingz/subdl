@@ -235,7 +235,7 @@ fn canonicalTitle(raw: []const u8) []const u8 {
 }
 
 fn isTvTitle(raw: []const u8) bool {
-    if (std.ascii.indexOfIgnoreCase(raw, " - Season ") != null) return true;
+    if (std.ascii.findIgnoreCase(raw, " - Season ") != null) return true;
     var i: usize = 0;
     while (i + 5 <= raw.len) : (i += 1) {
         if (std.ascii.isDigit(raw[i]) and std.ascii.isDigit(raw[i + 1]) and raw[i + 2] == 'x' and

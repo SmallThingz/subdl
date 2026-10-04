@@ -180,7 +180,7 @@ fn fetchJson(client: *std.http.Client, allocator: Allocator, url: []const u8) !c
             .retry_on_429 = true,
         });
         if (response.status == .ok) return response;
-        if (@intFromEnum(response.status) == 423 and attempt + 1 < 3) {
+        if (@backingInt(response.status) == 423 and attempt + 1 < 3) {
             allocator.free(response.body);
             common.sleepMilliseconds(500);
             continue;

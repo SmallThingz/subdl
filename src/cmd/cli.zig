@@ -301,7 +301,7 @@ fn parseArgs(init: std.process.Init, stderr: *std.Io.Writer) !Config {
 
 fn addProviderFilter(cfg: *Config, value: []const u8) !void {
     if (!cfg.provider_filter_seen) {
-        cfg.providers_enabled = [_]bool{false} ** app.providerCount();
+        cfg.providers_enabled = @splat(false);
         cfg.provider_filter_seen = true;
     }
 
@@ -311,7 +311,7 @@ fn addProviderFilter(cfg: *Config, value: []const u8) !void {
         const trimmed = std.mem.trim(u8, part, " \t\r\n");
         if (trimmed.len == 0) continue;
         if (isNoneProviderSelector(trimmed)) {
-            cfg.providers_enabled = [_]bool{false} ** app.providerCount();
+            cfg.providers_enabled = @splat(false);
             added = true;
             continue;
         }

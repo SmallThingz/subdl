@@ -208,7 +208,7 @@ fn fetchPostWithStatusRetry(
         allocator.free(response.body);
         if (!retry) return error.UnexpectedHttpStatus;
 
-        const code = @intFromEnum(response.status);
+        const code = @backingInt(response.status);
         const delay_ms: u64 = if (code == 429 or code == 403)
             5500
         else
@@ -219,7 +219,7 @@ fn fetchPostWithStatusRetry(
 }
 
 fn isTransientStatus(status: std.http.Status) bool {
-    const code = @intFromEnum(status);
+    const code = @backingInt(status);
     return code == 403 or
         code == 408 or
         code == 425 or
@@ -385,7 +385,7 @@ test "live indexsubtitle movie and tv search/list/download" {
     try std.testing.expect(tv_subtitles.subtitles.len > 0);
     var found_episode = false;
     for (tv_subtitles.subtitles) |subtitle| {
-        if (std.ascii.indexOfIgnoreCase(subtitle.title, "S01E01") != null) {
+        if (std.ascii.findIgnoreCase(subtitle.title, "S01E01") != null) {
             found_episode = true;
             break;
         }

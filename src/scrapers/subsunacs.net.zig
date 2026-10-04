@@ -150,8 +150,8 @@ fn isSubtitleFilename(filename: []const u8) bool {
     if (std.ascii.endsWithIgnoreCase(filename, ".ssa")) return true;
     if (std.ascii.endsWithIgnoreCase(filename, ".vtt")) return true;
     if (std.ascii.endsWithIgnoreCase(filename, ".txt")) {
-        return std.ascii.indexOfIgnoreCase(filename, "subsunacs") == null and
-            std.ascii.indexOfIgnoreCase(filename, "readme") == null;
+        return std.ascii.findIgnoreCase(filename, "subsunacs") == null and
+            std.ascii.findIgnoreCase(filename, "readme") == null;
     }
     return false;
 }

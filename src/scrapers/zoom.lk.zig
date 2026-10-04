@@ -139,7 +139,7 @@ fn parsePostTitle(raw: []const u8) ParsedTitle {
 
     var core = std.mem.trim(u8, raw, " \t\r\n");
     for (suffixes) |suffix| {
-        if (std.ascii.indexOfIgnoreCase(core, suffix)) |pos| {
+        if (std.ascii.findIgnoreCase(core, suffix)) |pos| {
             core = std.mem.trimEnd(u8, core[0..pos], " \t");
             break;
         }
@@ -149,7 +149,7 @@ fn parsePostTitle(raw: []const u8) ParsedTitle {
     var season: ?i64 = null;
     var media_kind: MediaKind = .movie;
 
-    if (std.ascii.indexOfIgnoreCase(core, "Complete season ")) |pos| {
+    if (std.ascii.findIgnoreCase(core, "Complete season ")) |pos| {
         const tail = core[pos + "Complete season ".len ..];
         var end: usize = 0;
         while (end < tail.len and std.ascii.isDigit(tail[end])) : (end += 1) {}
@@ -159,7 +159,7 @@ fn parsePostTitle(raw: []const u8) ParsedTitle {
     } else if (parseSeasonToken(core)) |parsed_season| {
         season = parsed_season;
         media_kind = .tv;
-        if (std.ascii.indexOfIgnoreCase(core, " S0")) |pos|
+        if (std.ascii.findIgnoreCase(core, " S0")) |pos|
             core = std.mem.trimEnd(u8, core[0..pos], " \t-:");
     }
 
@@ -208,7 +208,7 @@ fn parseSeasonToken(value: []const u8) ?i64 {
 }
 
 fn stripQueryNoise(value: []const u8) []const u8 {
-    if (std.ascii.indexOfIgnoreCase(value, " S0")) |pos|
+    if (std.ascii.findIgnoreCase(value, " S0")) |pos|
         return std.mem.trimEnd(u8, value[0..pos], " \t-:");
     return std.mem.trim(u8, value, " \t\r\n");
 }

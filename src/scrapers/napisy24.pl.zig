@@ -240,7 +240,7 @@ fn extractTag(block: []const u8, tag: []const u8) ?[]const u8 {
     return block[value_start .. value_start + end_relative];
 }
 
-const findIgnoreCase = std.ascii.indexOfIgnoreCase;
+const findIgnoreCase = std.ascii.findIgnoreCase;
 
 fn searchUrl(allocator: Allocator, query: []const u8) ![]u8 {
     const encoded = try common.encodeUriComponent(allocator, query);

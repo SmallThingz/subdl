@@ -25,38 +25,38 @@
     .fingerprint = 0x2a77a132140119e1, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.16.0-dev.2905",
+    .minimum_zig_version = "0.17.0",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        .libvaxis = .{
-            .url = "git+https://github.com/rockorager/libvaxis.git#c060d314930c5552b99a89278a6a695baf0352da",
-            .hash = "vaxis-0.6.0-BWNV_LC4CwBka_bJk8SOXqzCM-nyQH00jzdL0kUhGwRE",
-        },
+        .libvaxis = .{ .path = "vendor/libvaxis" },
         .htmlparser = .{
-            .url = "git+https://github.com/SmallThingz/htmlparser.git#eed9e0504f5c98d52e5f3a4c88a74a882e308f6e",
-            .hash = "html-0.1.0-dtdpOoIzMACXIwSeIJOAx6PPk_5_mctyM6f3dgiYjv4G",
+            .url = "git+https://github.com/SmallThingz/zhtml.git#16e93505d48a40b3af88b2707f45c453f545de9f",
+            .hash = "html-0.1.0-dtdpOrY4MACjLqjVuKONnKlwVcQdPK4BxQ9EhmbaIQ06",
         },
         .alldriver = .{
-            .url = "git+https://github.com/SmallThingz/alldriver.git#ef2abd24e22f912b1c4afee5b268bbe35fe07529",
-            .hash = "alldriver-0.0.0-IXnEoV_pDABwfz2WJjLon1CqMN_ktTgQkDoQkpThvT1n",
+            .url = "git+https://github.com/SmallThingz/alldriver.git#d5a7f2535c8f1516888eb1b7bd155bc77646dd62",
+            .hash = "alldriver-0.0.0-IXnEoa7_EAAq6Yktsoux5YC7OkzRNZArwlKqRnwORct7",
+            .lazy = true,
         },
         .unarr = .{
-            .url = "git+https://github.com/SmallThingz/unarr.git#07311af273079e0f4fd95c8936d559e1a5c72010",
-            .hash = "unarr-0.0.0-9UpXAyjIAAAFFVhPGhpoLcdgKJgyUYhdcdi0Jhjkes3k",
+            .url = "git+https://github.com/SmallThingz/unarr.zig.git#c097ea5477910b4530243be85033f388dcc5c699",
+            .hash = "unarr-0.0.0-9UpXA4spAQAZ4RK9qFppy_jQYjnSY13oqIrdTzKdAQxD",
+            .lazy = true,
         },
         .oneserial = .{
-            .url = "git+https://github.com/SmallThingz/oneserial.git#a4c7df00afd84c9514013980aa11402ed0194171",
-            .hash = "oneserial-0.1.0-vr--ZrLDAQCwCiIL1hgQDU75YqeJHrOKgWETpavJlCe7",
+            .url = "git+https://github.com/SmallThingz/oneserial.git#bebf7ef615a989e9545a2a914c36bd0b61d92378",
+            .hash = "oneserial-0.1.0-vr--ZoDKAQC-JBYRvL59DGDeSxdglsbuTspv70_rHQYk",
         },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "vendor",
         // For example...
         //"LICENSE",
         //"README.md",

@@ -158,9 +158,9 @@ fn archiveHintFromHeaders(headers: []const u8) ArchiveHint {
         const name = std.mem.trim(u8, line[0..colon], " \t");
         if (!std.ascii.eqlIgnoreCase(name, "content-disposition")) continue;
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        if (std.ascii.indexOfIgnoreCase(value, ".zip") != null) return .zip;
-        if (std.ascii.indexOfIgnoreCase(value, ".rar") != null) return .rar;
-        if (std.ascii.indexOfIgnoreCase(value, ".7z") != null) return .seven_z;
+        if (std.ascii.findIgnoreCase(value, ".zip") != null) return .zip;
+        if (std.ascii.findIgnoreCase(value, ".rar") != null) return .rar;
+        if (std.ascii.findIgnoreCase(value, ".7z") != null) return .seven_z;
     }
     return .unknown;
 }
@@ -253,13 +253,13 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
 }
 
 fn hasSeasonSuffix(title: []const u8) bool {
-    return std.ascii.indexOfIgnoreCase(title, " - Sezonul ") != null or
-        std.ascii.indexOfIgnoreCase(title, " - Sezoanele ") != null;
+    return std.ascii.findIgnoreCase(title, " - Sezonul ") != null or
+        std.ascii.findIgnoreCase(title, " - Sezoanele ") != null;
 }
 
 fn stripSeasonSuffix(title: []const u8) []const u8 {
-    if (std.ascii.indexOfIgnoreCase(title, " - Sezonul ")) |idx| return std.mem.trimEnd(u8, title[0..idx], " \t");
-    if (std.ascii.indexOfIgnoreCase(title, " - Sezoanele ")) |idx| return std.mem.trimEnd(u8, title[0..idx], " \t");
+    if (std.ascii.findIgnoreCase(title, " - Sezonul ")) |idx| return std.mem.trimEnd(u8, title[0..idx], " \t");
+    if (std.ascii.findIgnoreCase(title, " - Sezoanele ")) |idx| return std.mem.trimEnd(u8, title[0..idx], " \t");
     return std.mem.trim(u8, title, " \t\r\n");
 }
 

@@ -55,7 +55,7 @@ pub const Scraper = struct {
 
         const page_url = try buildSearchUrl(a, query);
         const response = try fetchSearchPage(self.client, a, page_url);
-        if (common.getenv("SCRAPERS_DEBUG_TVSUB") != null) std.debug.print("[tvsubtitles] search status={d} bytes={d}\n", .{ @intFromEnum(response.status), response.body.len });
+        if (common.getenv("SCRAPERS_DEBUG_TVSUB") != null) std.debug.print("[tvsubtitles] search status={d} bytes={d}\n", .{ @backingInt(response.status), response.body.len });
         if (response.body.len > 0) {
             var doc = try common.parseHtmlStable(a, response.body);
             try collectSearchItems(a, &doc.doc, query, &out, &seen);
@@ -191,7 +191,7 @@ fn collectSearchItemsRaw(allocator: Allocator, body: []const u8, query: []const 
         const title_start = bold_start_marker + 3;
         const title_end = std.mem.indexOfPos(u8, body, title_start, "</b>") orelse continue;
         const title = std.mem.trim(u8, body[title_start..title_end], " \t\r\n");
-        if (title.len == 0 or std.ascii.indexOfIgnoreCase(title, std.mem.trim(u8, query, " \t\r\n")) == null) continue;
+        if (title.len == 0 or std.ascii.findIgnoreCase(title, std.mem.trim(u8, query, " \t\r\n")) == null) continue;
         const show_url = try common.resolveUrl(allocator, site, body[href_start..href_end]);
         if (seen.contains(show_url)) continue;
         try seen.put(allocator, show_url, {});
@@ -235,7 +235,7 @@ fn collectSearchItems(allocator: Allocator, doc: *const HtmlDocument, query: []c
 
         const title = try common.innerTextTrimmedOwned(allocator, anchor);
         if (title.len == 0) continue;
-        if (std.ascii.indexOfIgnoreCase(title, std.mem.trim(u8, query, " \t\r\n")) == null) continue;
+        if (std.ascii.findIgnoreCase(title, std.mem.trim(u8, query, " \t\r\n")) == null) continue;
 
         try out.append(allocator, .{ .title = title, .show_url = show_url });
     }
@@ -253,7 +253,7 @@ fn collectSearchItems(allocator: Allocator, doc: *const HtmlDocument, query: []c
 
             const title = try common.innerTextTrimmedOwned(allocator, anchor);
             if (title.len == 0) continue;
-            if (std.ascii.indexOfIgnoreCase(title, std.mem.trim(u8, query, " \t\r\n")) == null) continue;
+            if (std.ascii.findIgnoreCase(title, std.mem.trim(u8, query, " \t\r\n")) == null) continue;
 
             try out.append(allocator, .{ .title = title, .show_url = show_url });
         }

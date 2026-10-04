@@ -2,7 +2,7 @@
 
 Subtitle scrapers in Zig with a shared provider API and a single `scrapers` binary.
 
-![Zig](https://img.shields.io/badge/Zig-0.16.0--dev-f7a41d)
+![Zig](https://img.shields.io/badge/Zig-0.17.0-f7a41d)
 ![Providers](https://img.shields.io/badge/Active_Providers-43-2ea44f)
 ![Runtime](https://img.shields.io/badge/HTTP-std.http%20(Client)-0366d6)
 
@@ -18,7 +18,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 
 ## Requirements
 
-- Zig `0.16.0-dev.2905+`
+- Zig `0.17.0`
 - Network access for provider queries and downloads
 
 ## Providers
@@ -147,7 +147,7 @@ Build all supported targets into `zig-out/bin`:
 
 ```bash
 zig build build-all-targets
-zig build build-all-targets -Doptimize=ReleaseFast -Dstrip=true
+zig build build-all-targets -Doptimize=fast -Dstrip=true
 ```
 
 Targets produced by `build-all-targets`:
@@ -160,7 +160,7 @@ Targets produced by `build-all-targets`:
 
 ## Optional Features
 
-The default build is intentionally conservative because some upstream integrations are still moving on Zig `0.16-dev`.
+TUI and archive extraction are enabled by default. Browser automation is opt-in.
 
 Run the TUI:
 
@@ -184,7 +184,7 @@ Tracked upstream issues are documented in [ISSUES.md](./ISSUES.md).
 
 ## Build Flags
 
-- `-Doptimize=Debug|ReleaseSafe|ReleaseFast|ReleaseSmall`
+- `-Doptimize=debug|safe|fast|small`
 - `-Dstrip=true|false`
 - `-Dsingle-threaded=true|false`
 - `-Domit-frame-pointer=true|false`
@@ -197,7 +197,7 @@ Tracked upstream issues are documented in [ISSUES.md](./ISSUES.md).
 
 `build-all-targets` defaults:
 
-- `-Doptimize=ReleaseFast`
+- `-Doptimize=fast`
 - `-Dstrip=true`
 
 Use `-Dllvm=true` if the native GNU build hits host CRT `.sframe` relocation errors.

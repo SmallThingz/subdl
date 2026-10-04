@@ -193,7 +193,7 @@ fn filenameMatchesEpisode(filename: []const u8, season: u16, episode: u16) bool 
     return indexOfIgnoreCase(filename, episode_text) != null;
 }
 
-const indexOfIgnoreCase = std.ascii.indexOfIgnoreCase;
+const indexOfIgnoreCase = std.ascii.findIgnoreCase;
 
 fn findResult(items: []const SearchItem, title: []const u8, language_code: []const u8) ?usize {
     for (items, 0..) |item, idx| {

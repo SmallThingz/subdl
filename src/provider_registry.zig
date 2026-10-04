@@ -154,11 +154,11 @@ pub fn info(provider: Provider) Info {
 }
 
 test "registry covers every provider exactly once" {
-    try std.testing.expectEqual(@typeInfo(Provider).@"enum".fields.len, all.len);
+    try std.testing.expectEqual(@typeInfo(Provider).@"enum".field_names.len, all.len);
 
-    var seen = [_]bool{false} ** all.len;
+    var seen: [all.len]bool = @splat(false);
     for (all) |entry| {
-        const index = @intFromEnum(entry.provider);
+        const index = @backingInt(entry.provider);
         try std.testing.expect(index < seen.len);
         try std.testing.expect(!seen[index]);
         seen[index] = true;

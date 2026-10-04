@@ -147,7 +147,7 @@ pub const Scraper = struct {
 
 fn parseTranslatedFrom(raw: []const u8) ?[]const u8 {
     const marker = "(translated from";
-    const start = std.ascii.indexOfIgnoreCase(raw, marker) orelse return null;
+    const start = std.ascii.findIgnoreCase(raw, marker) orelse return null;
     const tail = raw[start + marker.len ..];
     const end = std.mem.indexOfScalar(u8, tail, ')') orelse tail.len;
     return std.mem.trim(u8, tail[0..end], " \t\r\n");

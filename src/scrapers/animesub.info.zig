@@ -320,7 +320,7 @@ fn parseEpisode(value: []const u8) ?i64 {
 }
 
 fn parseSeason(value: []const u8) ?i64 {
-    if (std.ascii.indexOfIgnoreCase(value, "season ")) |pos| {
+    if (std.ascii.findIgnoreCase(value, "season ")) |pos| {
         const tail = value[pos + "season ".len ..];
         var end: usize = 0;
         while (end < tail.len and std.ascii.isDigit(tail[end])) : (end += 1) {}
@@ -330,7 +330,7 @@ fn parseSeason(value: []const u8) ?i64 {
 }
 
 fn stripEpisodeSuffix(value: []const u8) []const u8 {
-    if (std.ascii.indexOfIgnoreCase(value, " ep")) |pos| return std.mem.trimEnd(u8, value[0..pos], " \t-");
+    if (std.ascii.findIgnoreCase(value, " ep")) |pos| return std.mem.trimEnd(u8, value[0..pos], " \t-");
     return std.mem.trim(u8, value, " \t\r\n");
 }
 
@@ -430,7 +430,7 @@ fn extractCookie(allocator: Allocator, headers: []const u8) !?[]u8 {
         const name = std.mem.trim(u8, line[0..colon], " \t");
         if (!std.ascii.eqlIgnoreCase(name, "set-cookie")) continue;
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        if (std.ascii.indexOfIgnoreCase(value, "ansi_sciagnij=") != 0) continue;
+        if (std.ascii.findIgnoreCase(value, "ansi_sciagnij=") != 0) continue;
         const end = std.mem.indexOfScalar(u8, value, ';') orelse value.len;
         return @as(?[]u8, try allocator.dupe(u8, value[0..end]));
     }

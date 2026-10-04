@@ -6,7 +6,7 @@ Thanks for contributing.
 
 Requirements:
 
-- Zig `0.15.2+`
+- Zig `0.17.0`
 - Linux/macOS shell environment
 
 Setup:
@@ -49,6 +49,8 @@ Run baseline tests before opening a PR:
 ```bash
 zig build test
 ```
+
+The default test graph includes TUI behavior tests when TUI support is enabled. Run `zig build test-tui` for that focused suite.
 
 Run provider-targeted live tests when touching provider behavior:
 

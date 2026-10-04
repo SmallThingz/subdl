@@ -331,7 +331,7 @@ fn extractSessionCookie(allocator: Allocator, headers: []const u8) !?[]u8 {
         const name = std.mem.trim(u8, line[0..colon], " \t");
         if (!std.ascii.eqlIgnoreCase(name, "set-cookie")) continue;
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        if (std.ascii.indexOfIgnoreCase(value, "ASPSESSIONID") != 0) continue;
+        if (std.ascii.findIgnoreCase(value, "ASPSESSIONID") != 0) continue;
         const end = std.mem.indexOfScalar(u8, value, ';') orelse value.len;
         return @as(?[]u8, try allocator.dupe(u8, value[0..end]));
     }

@@ -186,13 +186,13 @@ fn languageCount() usize {
 }
 
 fn languageSelectionEnglish() [languageCount()]bool {
-    var out = [_]bool{false} ** languageCount();
+    var out: [languageCount()]bool = @splat(false);
     out[0] = true;
     return out;
 }
 
 fn languageSelectionOnly(index: usize) [languageCount()]bool {
-    var out = [_]bool{false} ** languageCount();
+    var out: [languageCount()]bool = @splat(false);
     if (index < out.len) out[index] = true;
     return out;
 }
@@ -401,7 +401,7 @@ const DownloadTask = struct {
     subtitle: app.SubtitleChoice,
     out_dir: []const u8,
     extract_archive: bool = true,
-    phase: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(app.DownloadPhase.idle)),
+    phase: std.atomic.Value(u8) = std.atomic.Value(u8).init(@backingInt(app.DownloadPhase.idle)),
     phase_done: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     phase_total: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     done: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
@@ -720,7 +720,7 @@ fn downloadTaskMain(task: *DownloadTask) std.Io.Cancelable!void {
 fn onDownloadProgressPhase(user_data: ?*anyopaque, phase: app.DownloadPhase) void {
     const task_ptr = user_data orelse return;
     const task: *DownloadTask = @ptrCast(@alignCast(task_ptr));
-    task.phase.store(@intFromEnum(phase), .release);
+    task.phase.store(@backingInt(phase), .release);
     if (phase != .translating and phase != .translating_fallback) {
         task.phase_done.store(0, .release);
         task.phase_total.store(0, .release);
@@ -857,14 +857,14 @@ fn downloadPhaseLabel(phase: app.DownloadPhase) []const u8 {
 
 fn downloadPhaseFromRaw(raw: u8) app.DownloadPhase {
     return switch (raw) {
-        @intFromEnum(app.DownloadPhase.idle) => .idle,
-        @intFromEnum(app.DownloadPhase.resolving_url) => .resolving_url,
-        @intFromEnum(app.DownloadPhase.fetching_source) => .fetching_source,
-        @intFromEnum(app.DownloadPhase.downloading_file) => .downloading_file,
-        @intFromEnum(app.DownloadPhase.translating) => .translating,
-        @intFromEnum(app.DownloadPhase.translating_fallback) => .translating_fallback,
-        @intFromEnum(app.DownloadPhase.writing_output) => .writing_output,
-        @intFromEnum(app.DownloadPhase.extracting_archive) => .extracting_archive,
+        @backingInt(app.DownloadPhase.idle) => .idle,
+        @backingInt(app.DownloadPhase.resolving_url) => .resolving_url,
+        @backingInt(app.DownloadPhase.fetching_source) => .fetching_source,
+        @backingInt(app.DownloadPhase.downloading_file) => .downloading_file,
+        @backingInt(app.DownloadPhase.translating) => .translating,
+        @backingInt(app.DownloadPhase.translating_fallback) => .translating_fallback,
+        @backingInt(app.DownloadPhase.writing_output) => .writing_output,
+        @backingInt(app.DownloadPhase.extracting_archive) => .extracting_archive,
         else => .idle,
     };
 }
@@ -2893,7 +2893,7 @@ test "search title cleanup strips only known metadata prefixes" {
     try std.testing.expectEqualStrings("[REC]", cleanSearchTitle("[tv] [en] [REC]"));
 }
 
-test "query display order cache reuses stable hit sets and invalidates on changes" {
+test "query display order cache preserves token ranking, filtering, and selection" {
     const allocator = std.testing.allocator;
     var response_arena = std.heap.ArenaAllocator.init(allocator);
     const a = response_arena.allocator();
@@ -2934,10 +2934,16 @@ test "query display order cache reuses stable hit sets and invalidates on change
     try std.testing.expectEqual(@as(usize, 2), selected_row);
     try std.testing.expectEqual(@as(usize, 3), bundle.display_hit_count);
 
-    const narrowed = try ensureQueryHitOrderPreservingSelection(allocator, &bundle, "the matrix", &selected_row);
-    try std.testing.expectEqualSlices(usize, &.{1}, narrowed);
+    // Full-phrase matches rank before hits sharing only a query token.
+    const ranked = try ensureQueryHitOrderPreservingSelection(allocator, &bundle, "the matrix", &selected_row);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 0, 2 }, ranked);
     try std.testing.expectEqual(@as(usize, 0), selected_row);
     try std.testing.expectEqualStrings("the matrix", bundle.display_query_norm.?);
+
+    const narrowed = try ensureQueryHitOrderPreservingSelection(allocator, &bundle, "1999", &selected_row);
+    try std.testing.expectEqualSlices(usize, &.{1}, narrowed);
+    try std.testing.expectEqual(@as(usize, 0), selected_row);
+    try std.testing.expectEqualStrings("1999", bundle.display_query_norm.?);
 
     const no_match = try ensureQueryHitOrder(allocator, &bundle, "blade runner");
     try std.testing.expectEqual(@as(usize, 0), no_match.len);
@@ -6777,7 +6783,7 @@ fn applyActiveSearchQueryCursorKey(
     return false;
 }
 
-test "active search cursor navigation matches query input semantics" {
+test "active search cursor navigation respects focus and UTF-8 boundaries" {
     const query = "AéB";
     var cursor: usize = query.len;
 
@@ -6809,7 +6815,7 @@ test "active search cursor navigation matches query input semantics" {
         query,
         &cursor,
         .{ .codepoint = vaxis.Key.home },
-        false,
+        true,
     ));
     try std.testing.expectEqual(@as(usize, 0), cursor);
 
@@ -6817,7 +6823,7 @@ test "active search cursor navigation matches query input semantics" {
         query,
         &cursor,
         .{ .codepoint = vaxis.Key.end },
-        false,
+        true,
     ));
     try std.testing.expectEqual(query.len, cursor);
 
@@ -8270,7 +8276,7 @@ test "corrupt settings fall back and surface a load warning" {
     {
         var file = try std.Io.Dir.cwd().createFile(runtime_io.get(), settings_path, .{});
         defer file.close(runtime_io.get());
-        try file.writeAll(runtime_io.get(), "not-a-valid-settings-file");
+        try file.writeStreamingAll(runtime_io.get(), "not-a-valid-settings-file");
     }
 
     var env_map = try std.testing.environ.createMap(allocator);
@@ -8338,7 +8344,7 @@ test "corrupt ui preferences report an error instead of silently resetting" {
     {
         var file = try std.Io.Dir.cwd().createFile(runtime_io.get(), path, .{});
         defer file.close(runtime_io.get());
-        try file.writeAll(runtime_io.get(), "corrupt-preferences");
+        try file.writeStreamingAll(runtime_io.get(), "corrupt-preferences");
     }
 
     try std.testing.expectError(

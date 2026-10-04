@@ -167,9 +167,9 @@ fn attributeValue(tag: []const u8, name: []const u8) ?[]const u8 {
 }
 
 fn languageCodeFromTitle(title: []const u8) []const u8 {
-    if (std.ascii.indexOfIgnoreCase(title, "English Subtitle") != null) return "en";
-    if (std.ascii.indexOfIgnoreCase(title, "Español") != null or
-        std.ascii.indexOfIgnoreCase(title, "Spanish Subtitle") != null) return "es";
+    if (std.ascii.findIgnoreCase(title, "English Subtitle") != null) return "en";
+    if (std.ascii.findIgnoreCase(title, "Español") != null or
+        std.ascii.findIgnoreCase(title, "Spanish Subtitle") != null) return "es";
     return "pt";
 }
 
@@ -189,7 +189,7 @@ fn stripReleaseNoise(value: []const u8) []const u8 {
     };
     var end = value.len;
     for (markers) |marker| {
-        if (std.ascii.indexOfIgnoreCase(value[0..end], marker)) |pos|
+        if (std.ascii.findIgnoreCase(value[0..end], marker)) |pos|
             end = @min(end, pos);
     }
     return std.mem.trim(u8, value[0..end], " \t-._");
