@@ -40,7 +40,7 @@ pub const Scraper = struct {
             .cache = false,
             .max_attempts = 2,
         });
-        return parseSearchJson(arena, response.body, trimmed);
+        return parseSearchJson(common.takeArena(&arena), response.body, trimmed);
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
@@ -54,11 +54,15 @@ pub const Scraper = struct {
             .cache = false,
             .max_attempts = 2,
         });
-        var parsed = try parseSubtitlesJson(arena, response.body, item);
+        var parsed = try parseSubtitlesJson(common.takeArena(&arena), response.body, item);
+        errdefer parsed.deinit();
         const parsed_allocator = parsed.arena.allocator();
         var resolved: std.ArrayListUnmanaged(SubtitleItem) = .empty;
         for (parsed.subtitles) |subtitle| {
-            const direct_url = resolveDownloadRedirect(self.client, parsed_allocator, subtitle.download_url) catch continue;
+            const direct_url = resolveDownloadRedirect(self.client, parsed_allocator, subtitle.download_url) catch |err| {
+                if (err == error.Canceled or err == error.OutOfMemory) return err;
+                continue;
+            };
             try resolved.append(parsed_allocator, .{
                 .language_code = subtitle.language_code,
                 .filename = subtitle.filename,
@@ -143,7 +147,7 @@ fn parseSearchJson(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     var items: std.ArrayListUnmanaged(SearchItem) = .empty;
     try items.appendSlice(a, exact.items);
     try items.appendSlice(a, partial.items);
-    return .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) };
+    return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) });
 }
 
 fn parseSubtitlesJson(arena: std.heap.ArenaAllocator, body: []const u8, item: SearchItem) !SubtitlesResponse {
@@ -158,7 +162,7 @@ fn parseSubtitlesJson(arena: std.heap.ArenaAllocator, body: []const u8, item: Se
     };
     const status = if (obj.get("status")) |value| jsonInt(value) else null;
     if (status == null or status.? != 200) {
-        return .{ .arena = owned_arena, .title = try a.dupe(u8, item.title), .subtitles = &.{} };
+        return common.finishResponse(SubtitlesResponse, &owned_arena, .{ .arena = owned_arena, .title = try a.dupe(u8, item.title), .subtitles = &.{} });
     }
     const data_value = obj.get("data") orelse return error.MissingField;
     const data = switch (data_value) {
@@ -199,11 +203,11 @@ fn parseSubtitlesJson(arena: std.heap.ArenaAllocator, body: []const u8, item: Se
         });
     }
 
-    return .{
+    return common.finishResponse(SubtitlesResponse, &owned_arena, .{
         .arena = owned_arena,
         .title = try a.dupe(u8, item.title),
         .subtitles = try subtitles.toOwnedSlice(a),
-    };
+    });
 }
 
 fn normalizeProviderUrl(allocator: Allocator, raw_url: []const u8) ![]const u8 {
@@ -268,7 +272,7 @@ fn jsonInt(value: std.json.Value) ?i64 {
     return switch (value) {
         .integer => |number| number,
         .number_string => |number| std.fmt.parseInt(i64, number, 10) catch null,
-        .float => |number| @intFromFloat(number),
+        .float => |number| common.jsonInt(.{ .float = number }),
         .string => |number| std.fmt.parseInt(i64, number, 10) catch null,
         else => null,
     };

@@ -99,11 +99,11 @@ pub const Scraper = struct {
             });
         }
 
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
             .subtitles = try subtitles.toOwnedSlice(a),
-        };
+        });
     }
 };
 

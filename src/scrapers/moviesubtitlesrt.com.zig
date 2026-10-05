@@ -94,11 +94,11 @@ pub const Scraper = struct {
             if (!has_next_page) break;
         }
 
-        return .{
+        return common.finishResponse(SearchResponse, &arena, .{
             .arena = arena,
             .items = try items.toOwnedSlice(a),
             .has_next_page = has_next_page,
-        };
+        });
     }
 
     pub fn fetchSubtitleByLink(self: *Scraper, page_url: []const u8) !SubtitleResponse {

@@ -440,7 +440,7 @@ Debug flags:
 Smoke suite:
 
 ```bash
-zig build test-live -Dlive=smoke -Dlive-providers=* -Dlive-include-captcha=false
+zig build test-live -Dlive=smoke -Dlive-providers=*
 ```
 
 Extensive suite for one provider:
@@ -464,7 +464,7 @@ zig build test-live-all
 Parallel fan-out mode:
 
 ```bash
-zig build test-live -Dlive=all -Dlive-providers=* -Dlive-include-captcha=true -Dlive-parallel-on-all=true
+zig build test-live -Dlive=all -Dlive-providers=* -Dlive-parallel-on-all=true -Dlive-max-jobs=3
 ```
 
 ## Upstream Dependencies

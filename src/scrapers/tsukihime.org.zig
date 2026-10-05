@@ -156,7 +156,7 @@ pub const Scraper = struct {
             }
         }
 
-        return .{ .arena = arena, .items = try items.toOwnedSlice(a) };
+        return common.finishResponse(SearchResponse, &arena, .{ .arena = arena, .items = try items.toOwnedSlice(a) });
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
@@ -210,11 +210,11 @@ pub const Scraper = struct {
             }
         }
 
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
             .subtitles = try subtitles.toOwnedSlice(a),
-        };
+        });
     }
 
     pub fn fetchDownloadByToken(self: *Scraper, allocator: Allocator, token: []const u8) !common.HttpResponse {
@@ -309,7 +309,7 @@ fn objectInt(obj: std.json.ObjectMap, key: []const u8) ?i64 {
     return switch (value) {
         .integer => |number| number,
         .number_string => |number| std.fmt.parseInt(i64, number, 10) catch null,
-        .float => |number| @intFromFloat(number),
+        .float => |number| common.jsonInt(.{ .float = number }),
         .string => |number| std.fmt.parseInt(i64, number, 10) catch null,
         else => null,
     };

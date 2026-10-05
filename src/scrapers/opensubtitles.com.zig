@@ -92,7 +92,7 @@ pub const Scraper = struct {
             const subtitles_count = if (obj.get("subtitles_count")) |v| switch (v) {
                 .integer => |i| i,
                 .number_string => |s| std.fmt.parseInt(i64, s, 10) catch null,
-                .float => |f| @as(i64, @intFromFloat(f)),
+                .float => |f| common.jsonInt(.{ .float = f }),
                 else => null,
             } else null;
 
@@ -119,7 +119,7 @@ pub const Scraper = struct {
             });
         }
 
-        return .{ .arena = arena, .items = try out.toOwnedSlice(a) };
+        return common.finishResponse(SearchResponse, &arena, .{ .arena = arena, .items = try out.toOwnedSlice(a) });
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
@@ -178,7 +178,7 @@ pub const Scraper = struct {
             });
         }
 
-        return .{ .arena = arena, .subtitles = try subtitles.toOwnedSlice(a) };
+        return common.finishResponse(SubtitlesResponse, &arena, .{ .arena = arena, .subtitles = try subtitles.toOwnedSlice(a) });
     }
 
     const ResolvedDownload = struct {
@@ -420,8 +420,8 @@ fn parseFileDownload(body: []const u8) FileDownload {
     return .{ .filename = filename, .url = url };
 }
 
-fn replaceMoviesWithFeatures(allocator: Allocator, input: []const u8) ![]const u8 {
-    const needle = "/movies/";
+fn replaceMediaWithFeatures(allocator: Allocator, input: []const u8) ![]const u8 {
+    const needle = if (std.mem.indexOf(u8, input, "/movies/") != null) "/movies/" else "/tvshows/";
     const idx = std.mem.indexOf(u8, input, needle) orelse return try allocator.dupe(u8, input);
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -433,7 +433,7 @@ fn replaceMoviesWithFeatures(allocator: Allocator, input: []const u8) ![]const u
 }
 
 fn makeSubtitlesListUrl(allocator: Allocator, locale_path: []const u8) ![]const u8 {
-    const feature_path = try replaceMoviesWithFeatures(allocator, locale_path);
+    const feature_path = try replaceMediaWithFeatures(allocator, locale_path);
     defer allocator.free(feature_path);
     return std.fmt.allocPrint(allocator, "{s}{s}/subtitles_list.json", .{ site, feature_path });
 }
@@ -516,4 +516,10 @@ test "live opensubtitles.com search and resolve" {
     try common.livePrintField(std.testing.allocator, "remote_endpoint", sub.remote_endpoint);
     try common.livePrintOptionalField(std.testing.allocator, "resolved_filename", sub.resolved_filename);
     try common.livePrintOptionalField(std.testing.allocator, "verified_download_url", sub.verified_download_url);
+}
+
+test "opensubtitles TV listings use the public features endpoint" {
+    const url = try makeSubtitlesListUrl(std.testing.allocator, "/en/tvshows/2019-chernobyl");
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings("https://rest.opensubtitles.com/en/features/2019-chernobyl/subtitles_list.json", url);
 }

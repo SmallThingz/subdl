@@ -120,11 +120,11 @@ pub const Scraper = struct {
         });
 
         const subtitles = try parseEpisodeSubtitles(a, response.body, item);
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
             .subtitles = subtitles,
-        };
+        });
     }
 };
 
@@ -331,7 +331,7 @@ fn jsonInt(value: std.json.Value) ?i64 {
         .integer => |number| number,
         .number_string => |number| std.fmt.parseInt(i64, number, 10) catch null,
         .string => |number| std.fmt.parseInt(i64, number, 10) catch null,
-        .float => |number| @intFromFloat(number),
+        .float => |number| common.jsonInt(.{ .float = number }),
         else => null,
     };
 }

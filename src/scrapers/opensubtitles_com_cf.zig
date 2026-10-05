@@ -38,7 +38,7 @@ pub const Session = struct {
     acquired_at_unix: i64,
 
     pub fn isLikelyExpired(self: Session, now_unix: i64) bool {
-        return now_unix - self.acquired_at_unix > session_ttl_seconds;
+        return self.acquired_at_unix > now_unix or @as(i128, now_unix) - self.acquired_at_unix > session_ttl_seconds;
     }
 
     pub fn deinit(self: *Session, allocator: Allocator) void {
@@ -84,13 +84,14 @@ pub fn ensureDomainSession(allocator: Allocator, options: EnsureDomainOptions) !
 
     const now = common.compatUnixTimestamp();
     if (try loadSessionForDomain(allocator, normalized_domain)) |cached| {
-        const is_fresh_retry_session = options.force_refresh and now - cached.acquired_at_unix < 60;
+        const is_fresh_retry_session = options.force_refresh and @as(i128, now) - cached.acquired_at_unix < 60;
         if (!cached.isLikelyExpired(now) and isUsableSession(cached) and (!options.force_refresh or is_fresh_retry_session)) return cached;
         var owned = cached;
         owned.deinit(allocator);
     }
 
-    const acquired = try acquireSessionViaAllDriver(allocator, normalized_domain, challenge_url);
+    var acquired = try acquireSessionViaAllDriver(allocator, normalized_domain, challenge_url);
+    errdefer acquired.deinit(allocator);
     try saveSessionForDomain(allocator, normalized_domain, acquired);
     return acquired;
 }
@@ -111,19 +112,19 @@ fn loadSessionForDomain(allocator: Allocator, domain_input: []const u8) !?Sessio
     for (records.items) |record| {
         if (!std.ascii.eqlIgnoreCase(record.domain, domain)) continue;
 
-        return .{
-            .cookie_header = try allocator.dupe(u8, record.cookie_header),
-            .cf_clearance = try allocator.dupe(u8, record.cf_clearance),
-            .user_agent = try allocator.dupe(u8, record.user_agent),
+        return try cloneSession(allocator, .{
+            .cookie_header = record.cookie_header,
+            .cf_clearance = record.cf_clearance,
+            .user_agent = record.user_agent,
             .csrf_token = if (record.csrf_token) |token|
                 if (token.len > 0 and !std.mem.eql(u8, token, "string"))
-                    try allocator.dupe(u8, token)
+                    token
                 else
                     null
             else
                 null,
             .acquired_at_unix = record.acquired_at_unix,
-        };
+        });
     }
 
     return null;
@@ -138,25 +139,36 @@ fn saveSessionForDomain(allocator: Allocator, domain_input: []const u8, session:
 
     for (records.items) |*record| {
         if (!std.ascii.eqlIgnoreCase(record.domain, domain)) continue;
+        const replacement = try dupRecord(allocator, domain, session);
         freeRecordFields(allocator, record.*);
-        record.* = try dupRecord(allocator, domain, session);
+        record.* = replacement;
         try writeCacheRecords(allocator, records.items);
         return;
     }
 
-    try records.append(allocator, try dupRecord(allocator, domain, session));
+    const additional = try dupRecord(allocator, domain, session);
+    records.append(allocator, additional) catch |err| {
+        freeRecordFields(allocator, additional);
+        return err;
+    };
     try writeCacheRecords(allocator, records.items);
 }
 
+fn cloneSession(allocator: Allocator, source: Session) !Session {
+    const cookie = try allocator.dupe(u8, source.cookie_header);
+    errdefer allocator.free(cookie);
+    const clearance = try allocator.dupe(u8, source.cf_clearance);
+    errdefer allocator.free(clearance);
+    const agent = try allocator.dupe(u8, source.user_agent);
+    errdefer allocator.free(agent);
+    const csrf = if (source.csrf_token) |value| try allocator.dupe(u8, value) else null;
+    return .{ .cookie_header = cookie, .cf_clearance = clearance, .user_agent = agent, .csrf_token = csrf, .acquired_at_unix = source.acquired_at_unix };
+}
 fn dupRecord(allocator: Allocator, domain: []const u8, session: Session) !CacheRecord {
-    return .{
-        .domain = try allocator.dupe(u8, domain),
-        .cookie_header = try allocator.dupe(u8, session.cookie_header),
-        .cf_clearance = try allocator.dupe(u8, session.cf_clearance),
-        .user_agent = try allocator.dupe(u8, session.user_agent),
-        .csrf_token = if (session.csrf_token) |token| try allocator.dupe(u8, token) else null,
-        .acquired_at_unix = session.acquired_at_unix,
-    };
+    const owned_domain = try allocator.dupe(u8, domain);
+    errdefer allocator.free(owned_domain);
+    const owned = try cloneSession(allocator, session);
+    return .{ .domain = owned_domain, .cookie_header = owned.cookie_header, .cf_clearance = owned.cf_clearance, .user_agent = owned.user_agent, .csrf_token = owned.csrf_token, .acquired_at_unix = owned.acquired_at_unix };
 }
 
 fn freeRecordFields(allocator: Allocator, record: CacheRecord) void {
@@ -214,20 +226,23 @@ fn readCacheRecords(allocator: Allocator) !std.ArrayListUnmanaged(CacheRecord) {
         } else null;
         const acquired_at_unix = try getInt(obj, "acquired_at_unix");
 
-        try records.append(allocator, .{
-            .domain = try allocator.dupe(u8, domain),
-            .cookie_header = try allocator.dupe(u8, cookie_header),
-            .cf_clearance = try allocator.dupe(u8, cf_clearance),
-            .user_agent = try allocator.dupe(u8, user_agent),
+        const record = try dupRecord(allocator, domain, .{
+            .cookie_header = cookie_header,
+            .cf_clearance = cf_clearance,
+            .user_agent = user_agent,
             .csrf_token = if (csrf_token) |token|
                 if (token.len > 0 and !std.mem.eql(u8, token, "string"))
-                    try allocator.dupe(u8, token)
+                    token
                 else
                     null
             else
                 null,
             .acquired_at_unix = acquired_at_unix,
         });
+        records.append(allocator, record) catch |err| {
+            freeRecordFields(allocator, record);
+            return err;
+        };
     }
 
     return records;
@@ -306,8 +321,11 @@ fn acquireSessionViaAllDriver(allocator: Allocator, domain: []const u8, challeng
             };
 
             const cookie_header = try buildCookieHeaderForDomain(allocator, cookies, domain);
+            errdefer allocator.free(cookie_header);
             const user_agent = try fetchUserAgent(allocator, &browser);
+            errdefer allocator.free(user_agent);
             const csrf_token = try fetchCsrfToken(allocator, &browser);
+            errdefer if (csrf_token) |value| allocator.free(value);
 
             return .{
                 .cookie_header = cookie_header,
@@ -498,7 +516,7 @@ fn getInt(obj: std.json.ObjectMap, field: []const u8) !i64 {
     return switch (v) {
         .integer => |i| i,
         .number_string => |s| std.fmt.parseInt(i64, s, 10) catch error.InvalidSessionPayload,
-        .float => |f| @intFromFloat(f),
+        .float => |f| common.jsonInt(.{ .float = f }) orelse error.InvalidSessionPayload,
         else => error.InvalidSessionPayload,
     };
 }
@@ -560,4 +578,13 @@ test "extract evaluated string does not return type marker alone" {
 
     const extracted = try extractEvaluatedString(allocator, parsed.value);
     try std.testing.expect(extracted == null);
+}
+
+fn checkRecordClone(allocator: Allocator) !void {
+    const record = try dupRecord(allocator, "fixture.invalid", .{ .cookie_header = "dummy=value", .cf_clearance = "dummy", .user_agent = "fixture", .csrf_token = "dummy-csrf", .acquired_at_unix = 1 });
+    defer freeRecordFields(allocator, record);
+    try std.testing.expectEqualStrings("fixture", record.user_agent);
+}
+test "session record cloning frees every partial allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkRecordClone, .{});
 }

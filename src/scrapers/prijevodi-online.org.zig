@@ -97,7 +97,7 @@ pub const Scraper = struct {
         var out: std.ArrayListUnmanaged(SearchItem) = .empty;
         try out.appendSlice(a, exact.items);
         try out.appendSlice(a, other.items);
-        return .{ .arena = arena, .items = try out.toOwnedSlice(a) };
+        return common.finishResponse(SearchResponse, &arena, .{ .arena = arena, .items = try out.toOwnedSlice(a) });
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
@@ -158,11 +158,11 @@ pub const Scraper = struct {
         const owned = try subtitles.toOwnedSlice(a);
         std.mem.sort(SubtitleItem, owned, {}, subtitleLessThan);
 
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
             .subtitles = owned,
-        };
+        });
     }
 };
 

@@ -65,7 +65,7 @@ pub const Scraper = struct {
             try items.append(a, .{ .title = title, .details_url = details_url, .source_language = source_language });
         }
 
-        return .{ .arena = arena, .items = try items.toOwnedSlice(a) };
+        return common.finishResponse(SearchResponse, &arena, .{ .arena = arena, .items = try items.toOwnedSlice(a) });
     }
 
     pub fn fetchSubtitlesByDetailsLink(self: *Scraper, details_url: []const u8) !SubtitlesResponse {
@@ -141,7 +141,7 @@ pub const Scraper = struct {
             }
         }
 
-        return .{ .arena = arena, .subtitles = try subtitles.toOwnedSlice(a) };
+        return common.finishResponse(SubtitlesResponse, &arena, .{ .arena = arena, .subtitles = try subtitles.toOwnedSlice(a) });
     }
 };
 

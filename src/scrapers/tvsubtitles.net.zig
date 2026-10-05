@@ -62,13 +62,13 @@ pub const Scraper = struct {
             if (out.items.len == 0) try collectSearchItemsRaw(a, response.body, query, &out, &seen);
         }
 
-        return .{
+        return common.finishResponse(SearchResponse, &arena, .{
             .arena = arena,
             .items = try out.toOwnedSlice(a),
             .page = 1,
             .has_prev_page = false,
             .has_next_page = false,
-        };
+        });
     }
 
     pub fn fetchSubtitlesByShowLinkWithOptions(self: *Scraper, show_url: []const u8, options: SubtitlesOptions) !SubtitlesResponse {
@@ -142,13 +142,13 @@ pub const Scraper = struct {
             }
         }
 
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .subtitles = try subtitles.toOwnedSlice(a),
             .page = 1,
             .has_prev_page = false,
             .has_next_page = false,
-        };
+        });
     }
 
     pub fn resolveDownloadPageUrl(self: *Scraper, allocator: Allocator, download_page_url: []const u8) ![]const u8 {

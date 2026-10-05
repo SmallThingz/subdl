@@ -7,6 +7,21 @@ const HtmlDocument = HtmlParseOptions.GetDocument();
 const HtmlNode = HtmlParseOptions.GetNode();
 const build_options = @import("build_options");
 
+/// Transfer an arena to a response parser without leaving a second cleanup owner.
+pub fn takeArena(source: *std.heap.ArenaAllocator) std.heap.ArenaAllocator {
+    const owned = source.*;
+    source.* = std.heap.ArenaAllocator.init(owned.child_allocator);
+    return owned;
+}
+
+/// Field expressions may grow the arena after its first struct-field copy.
+/// Capture its final buffer chain only after every response field is ready.
+pub fn finishResponse(comptime T: type, arena: *std.heap.ArenaAllocator, response: T) T {
+    var result = response;
+    result.arena = arena.*;
+    return result;
+}
+
 pub const Allocator = std.mem.Allocator;
 
 pub const default_user_agent = "subdl-zig-scrapers/0.2 (+https://subdl.com)";
@@ -27,6 +42,7 @@ pub const FetchOptions = struct {
     retry_initial_backoff_ms: u64 = 200,
     retry_on_429: bool = true,
     cache: bool = true,
+    max_response_bytes: usize = 128 * 1024 * 1024,
 };
 
 pub const FetchCacheConfig = struct {
@@ -263,6 +279,10 @@ fn selectorDebugEnabled() bool {
 }
 
 pub fn fetchBytes(client: *std.http.Client, allocator: Allocator, url: []const u8, opts: FetchOptions) !HttpResponse {
+    return fetchBytesWith(fetchBytesViaHttp, sleepBackoff, client, allocator, url, opts);
+}
+
+fn fetchBytesWith(comptime fetch: anytype, comptime backoff: anytype, client: *std.http.Client, allocator: Allocator, url: []const u8, opts: FetchOptions) !HttpResponse {
     if (try loadFetchCache(allocator, url, opts)) |cached| return cached;
 
     var attempts: usize = 0;
@@ -274,28 +294,31 @@ pub fn fetchBytes(client: *std.http.Client, allocator: Allocator, url: []const u
             );
         }
 
-        const response = fetchBytesViaHttp(client, allocator, url, opts) catch |err| {
+        const response = fetch(client, allocator, url, opts) catch |err| {
+            if (err == error.Canceled or err == error.OutOfMemory) return err;
             if (attempts + 1 < opts.max_attempts) {
-                sleepBackoff(opts.retry_initial_backoff_ms, attempts);
+                try backoff(opts.retry_initial_backoff_ms, attempts);
                 continue;
             }
             return err;
         };
         if (response.status == .too_many_requests and opts.retry_on_429 and attempts + 1 < opts.max_attempts) {
             allocator.free(response.body);
-            sleepBackoff(opts.retry_initial_backoff_ms, attempts);
+            try backoff(opts.retry_initial_backoff_ms, attempts);
             continue;
         }
         if (!opts.allow_non_ok and response.status != .ok) {
+            if (livePhaseLoggingEnabled()) std.debug.print("[live][http.status] code={d} url={s}\n", .{ @intFromEnum(response.status), url });
             allocator.free(response.body);
             return error.UnexpectedHttpStatus;
         }
+        errdefer allocator.free(response.body);
         try storeFetchCache(allocator, url, opts, response);
         return response;
     }
 }
 
-const fetch_cache_magic = "subdl-http-cache-v1\n";
+const fetch_cache_magic = "subdl-http-cache-v3\n";
 
 fn loadFetchCache(allocator: Allocator, url: []const u8, opts: FetchOptions) !?HttpResponse {
     if (!opts.cache) return null;
@@ -311,6 +334,7 @@ fn loadFetchCache(allocator: Allocator, url: []const u8, opts: FetchOptions) !?H
 
     const data = std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), path, allocator, .limited(128 * 1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return null,
+        error.OutOfMemory, error.Canceled => return err,
         else => return null,
     };
     defer allocator.free(data);
@@ -325,11 +349,12 @@ fn loadFetchCache(allocator: Allocator, url: []const u8, opts: FetchOptions) !?H
 
     const fetched_at = std.fmt.parseInt(i64, fetched_line, 10) catch return null;
     const now = compatUnixTimestamp();
-    if (fetched_at > now) return null;
-    if (config.ttl_seconds > 0 and now - fetched_at > config.ttl_seconds) return null;
+    if (fetched_at < 0 or fetched_at > now) return null;
+    if (config.ttl_seconds > 0 and @as(i128, now) - fetched_at > config.ttl_seconds) return null;
     const status_int = std.fmt.parseInt(u10, status_line, 10) catch return null;
+    if (status_int != @intFromEnum(std.http.Status.ok)) return null;
     const body_len = std.fmt.parseInt(usize, body_len_line, 10) catch return null;
-    if (body.len != body_len) return null;
+    if (body.len != body_len or body.len > opts.max_response_bytes) return null;
 
     return .{
         .status = @fromBackingInt(@intCast(status_int)),
@@ -347,7 +372,6 @@ fn storeFetchCache(allocator: Allocator, url: []const u8, opts: FetchOptions, re
 
     const path = try fetchCachePath(allocator, root, url, opts);
     defer allocator.free(path);
-    try ensureParentDir(path);
 
     const header = try std.fmt.allocPrint(allocator, "{s}{d}\n{d}\n{d}\n", .{
         fetch_cache_magic,
@@ -363,7 +387,19 @@ fn storeFetchCache(allocator: Allocator, url: []const u8, opts: FetchOptions, re
 
     const guard = FetchCacheGuard.lock();
     defer guard.unlock();
-    std.Io.Dir.cwd().writeFile(runtime_io.get(), .{ .sub_path = path, .data = data.items }) catch {};
+    writeFetchCacheAtomically(path, data.items) catch |err| {
+        if (err == error.Canceled) return err;
+        // A disposable cache must not turn a successful request into an I/O failure.
+    };
+}
+
+fn writeFetchCacheAtomically(path: []const u8, bytes: []const u8) !void {
+    try ensureParentDir(path);
+    const io = runtime_io.get();
+    var atomic = try std.Io.Dir.cwd().createFileAtomic(io, path, .{ .replace = true });
+    defer atomic.deinit(io);
+    try atomic.file.writeStreamingAll(io, bytes);
+    try atomic.replace(io);
 }
 
 fn currentFetchCacheConfig() FetchCacheConfig {
@@ -383,7 +419,6 @@ fn fetchCachePath(allocator: Allocator, root: []const u8, url: []const u8, opts:
     if (opts.content_type) |content_type| hasher.update(content_type);
     hasher.update("\n");
     for (opts.extra_headers) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, "cookie")) continue;
         hasher.update(header.name);
         hasher.update(":");
         hasher.update(header.value);
@@ -453,15 +488,7 @@ fn fetchBytesViaHttp(client: *std.http.Client, allocator: Allocator, url: []cons
     var body_writer = std.Io.Writer.Allocating.init(allocator);
     defer body_writer.deinit();
 
-    const fetched = try client.fetch(.{
-        .location = .{ .url = normalized_url },
-        .method = opts.method,
-        .payload = opts.payload,
-        .headers = request_headers,
-        .extra_headers = headers.items,
-        .response_writer = &body_writer.writer,
-        .redirect_behavior = std.http.Client.Request.RedirectBehavior.init(5),
-    });
+    const fetched = try fetchWithRedirects(client, allocator, normalized_url, opts, request_headers, headers.items, &body_writer.writer);
 
     var body = body_writer.toArrayList();
     errdefer body.deinit(allocator);
@@ -469,6 +496,128 @@ fn fetchBytesViaHttp(client: *std.http.Client, allocator: Allocator, url: []cons
         .status = fetched.status,
         .body = try body.toOwnedSlice(allocator),
     };
+}
+
+// Own redirect policy and validate framing independently of Zig 0.16 helpers.
+// Private headers survive only while the origin stays unchanged.
+fn responseReadError(response: *std.http.Client.Response, request: *std.http.Client.Request) anyerror {
+    if (response.bodyErr()) |err| return err;
+    if (request.connection.?.stream_reader.err) |err| return err;
+    return error.InvalidResponseBody;
+}
+
+fn fetchWithRedirects(client: *std.http.Client, allocator: Allocator, start_url: []const u8, opts: FetchOptions, initial_headers: std.http.Client.Request.Headers, extra_headers: []const std.http.Header, output: *std.Io.Writer) !std.http.Client.FetchResult {
+    var current: []const u8 = try allocator.dupe(u8, start_url);
+    defer allocator.free(current);
+    var method = opts.method;
+    var payload = opts.payload;
+    var private_allowed = true;
+    var redirects: usize = 0;
+    while (true) {
+        var headers = initial_headers;
+        var selected: std.ArrayList(std.http.Header) = .empty;
+        defer selected.deinit(allocator);
+        if (!private_allowed) {
+            headers.authorization = .omit;
+            headers.host = .default;
+        }
+        if (payload == null and opts.payload != null) headers.content_type = .omit;
+        for (extra_headers) |header| {
+            if (!private_allowed and (std.ascii.eqlIgnoreCase(header.name, "cookie") or std.ascii.eqlIgnoreCase(header.name, "authorization") or std.ascii.eqlIgnoreCase(header.name, "proxy-authorization") or std.ascii.eqlIgnoreCase(header.name, "referer"))) continue;
+            try selected.append(allocator, header);
+        }
+        var request = try client.request(method, try std.Uri.parse(current), .{ .redirect_behavior = .unhandled, .handle_continue = false, .headers = headers, .extra_headers = selected.items });
+        defer request.deinit();
+        errdefer request.connection.?.closing = true;
+        if (payload) |body| {
+            request.transfer_encoding = .{ .content_length = body.len };
+            var writer = try request.sendBodyUnflushed(&.{});
+            try writer.writer.writeAll(body);
+            try writer.end();
+            try request.connection.?.flush();
+        } else try request.sendBodiless();
+        var head_buffer: [32 * 1024]u8 = undefined;
+        var response = try request.receiveHead(&head_buffer);
+        var interim_count: usize = 0;
+        while (response.head.status.class() == .informational) {
+            if (response.head.status == .switching_protocols) return error.UnsupportedProtocolUpgrade;
+            interim_count += 1;
+            if (interim_count > 16) return error.TooManyInformationalResponses;
+            response = try request.receiveHead(&head_buffer);
+        }
+        if (isRedirectStatus(response.head.status)) {
+            // Do not drain an untrusted redirect body during request cleanup.
+            request.connection.?.closing = true;
+            if (redirects == 5) return error.TooManyHttpRedirects;
+            const next = try resolveUrl(allocator, current, response.head.location orelse return error.HttpRedirectLocationMissing);
+            errdefer allocator.free(next);
+            if (!try sameOrigin(current, next)) private_allowed = false;
+            if (response.head.status == .see_other or ((response.head.status == .moved_permanently or response.head.status == .found) and method == .POST)) {
+                if (method != .HEAD) method = .GET;
+                payload = null;
+            }
+            allocator.free(current);
+            current = next;
+            redirects += 1;
+            continue;
+        }
+        if (method == .HEAD or response.head.status == .no_content or response.head.status == .not_modified) {
+            _ = request.reader.bodyReader(&.{}, .none, 0);
+            return .{ .status = response.head.status };
+        }
+        const decompression_size: usize = switch (response.head.content_encoding) {
+            .identity => 0,
+            .zstd => std.compress.zstd.default_window_len,
+            .deflate, .gzip => std.compress.flate.max_window_len,
+            .compress => return error.UnsupportedCompressionMethod,
+        };
+        const decompression_buffer = try allocator.alloc(u8, decompression_size);
+        defer allocator.free(decompression_buffer);
+        var transfer: [64]u8 = undefined;
+        var decompress: std.http.Decompress = undefined;
+        const encoding = response.head.content_encoding;
+        const transfer_reader = response.reader(&transfer);
+        var received: usize = 0;
+        var members: usize = 0;
+        while (true) {
+            members += 1;
+            if (members > 1024) return error.TooManyCompressedMembers;
+            const reader = decompress.init(transfer_reader, decompression_buffer, encoding);
+            while (true) {
+                if (received == opts.max_response_bytes) {
+                    _ = reader.takeByte() catch |err| switch (err) {
+                        error.EndOfStream => break,
+                        error.ReadFailed => return responseReadError(&response, &request),
+                    };
+                    return error.ResponseTooLarge;
+                }
+                const count = reader.stream(output, .limited(opts.max_response_bytes - received)) catch |err| switch (err) {
+                    error.EndOfStream => break,
+                    error.ReadFailed => return responseReadError(&response, &request),
+                    else => return err,
+                };
+                received += count;
+            }
+            if (encoding == .identity) break;
+            // Decoder EOF can precede the chunk terminator/trailers. Preserve
+            // any next member's first byte while validating transfer framing.
+            _ = transfer_reader.peekByte() catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.ReadFailed => return responseReadError(&response, &request),
+            };
+            if (encoding != .gzip) return error.UnexpectedEncodedPayload;
+            // RFC 1952 permits concatenated gzip members; the same aggregate
+            // decoded-byte limit applies to every member.
+        }
+        switch (request.reader.state) {
+            .body_remaining_content_length => |left| if (left != 0) {
+                return error.HttpBodyTruncated;
+            },
+            .body_remaining_chunk_len => return error.HttpChunkTruncated,
+            else => {},
+        }
+        return .{ .status = response.head.status };
+    }
 }
 
 pub fn ensureClientTlsReady(client: *std.http.Client) !void {
@@ -627,14 +776,31 @@ pub fn normalizeTitle(allocator: Allocator, input: []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
     var pending_space = false;
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c)) {
+    var i: usize = 0;
+    while (i < input.len) {
+        const c = input[i];
+        var width: usize = 1;
+        var whitespace = false;
+        if (c >= 0x80) {
+            const count = std.unicode.utf8ByteSequenceLength(c) catch 1;
+            if (count <= input.len - i) {
+                if (std.unicode.utf8Decode(input[i..][0..count])) |cp| {
+                    width = count;
+                    whitespace = switch (cp) {
+                        0x85, 0xa0, 0x1680, 0x2000...0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000 => true,
+                        else => false,
+                    };
+                } else |_| {}
+            }
+        }
+        if (!whitespace and (std.ascii.isAlphanumeric(c) or c >= 0x80)) {
             if (pending_space and out.items.len > 0) try out.append(allocator, ' ');
             pending_space = false;
-            try out.append(allocator, std.ascii.toLower(c));
+            if (width == 1) try out.append(allocator, std.ascii.toLower(c)) else try out.appendSlice(allocator, input[i..][0..width]);
         } else {
             pending_space = out.items.len > 0;
         }
+        i += width;
     }
     return out.toOwnedSlice(allocator);
 }
@@ -667,7 +833,7 @@ pub fn jsonInt(value: std.json.Value) ?i64 {
     return switch (value) {
         .integer => |number| number,
         .number_string => |number| std.fmt.parseInt(i64, number, 10) catch null,
-        .float => |number| @intFromFloat(number),
+        .float => |number| if (std.math.isFinite(number) and number >= -0x1p63 and number < 0x1p63) @intFromFloat(number) else null,
         else => null,
     };
 }
@@ -764,13 +930,11 @@ pub fn parseSeasonEpisode(value: []const u8) SeasonEpisode {
     while (i + 4 < value.len) : (i += 1) {
         if (value[i] != 's' and value[i] != 'S') continue;
         var p = i + 1;
-        while (p < value.len and value[p] == '0') : (p += 1) {}
         const season_start = p;
         while (p < value.len and std.ascii.isDigit(value[p])) : (p += 1) {}
         if (p == season_start or p >= value.len or (value[p] != 'e' and value[p] != 'E')) continue;
         const season = std.fmt.parseInt(i64, value[season_start..p], 10) catch continue;
         p += 1;
-        while (p < value.len and value[p] == '0') : (p += 1) {}
         const episode_start = p;
         while (p < value.len and std.ascii.isDigit(value[p])) : (p += 1) {}
         if (p == episode_start) continue;
@@ -896,12 +1060,12 @@ pub fn parseEpisodeQuery(input: []const u8) EpisodeQuery {
         if (std.ascii.toLower(trimmed[i]) != 's') continue;
         var cursor = i + 1;
         const season_start = cursor;
-        while (cursor < trimmed.len and std.ascii.isDigit(trimmed[cursor]) and cursor - season_start < 2) : (cursor += 1) {}
+        while (cursor < trimmed.len and std.ascii.isDigit(trimmed[cursor])) : (cursor += 1) {}
         if (cursor == season_start or cursor >= trimmed.len or std.ascii.toLower(trimmed[cursor]) != 'e') continue;
         const season = std.fmt.parseInt(u16, trimmed[season_start..cursor], 10) catch continue;
         cursor += 1;
         const episode_start = cursor;
-        while (cursor < trimmed.len and std.ascii.isDigit(trimmed[cursor]) and cursor - episode_start < 3) : (cursor += 1) {}
+        while (cursor < trimmed.len and std.ascii.isDigit(trimmed[cursor])) : (cursor += 1) {}
         if (cursor == episode_start) continue;
         const episode = std.fmt.parseInt(u16, trimmed[episode_start..cursor], 10) catch continue;
         const title = std.mem.trim(u8, trimmed[0..i], " \t\r\n-._");
@@ -1005,21 +1169,52 @@ pub fn encodeUriComponent(allocator: Allocator, value: []const u8) ![]u8 {
 }
 
 pub fn resolveUrl(allocator: Allocator, base: []const u8, href: []const u8) ![]const u8 {
-    if (std.mem.startsWith(u8, href, "http://") or std.mem.startsWith(u8, href, "https://")) {
-        return try allocator.dupe(u8, href);
+    const base_uri = try std.Uri.parse(base);
+    // resolveInPlace retains the input reference before allocating merged paths.
+    const size = try std.math.add(usize, try std.math.add(usize, base.len, try std.math.mul(usize, href.len, 2)), 32);
+    const storage = try allocator.alloc(u8, size);
+    defer allocator.free(storage);
+    @memcpy(storage[0..href.len], href);
+    var remaining = storage;
+    const resolved = try base_uri.resolveInPlace(href.len, &remaining);
+    return std.fmt.allocPrint(allocator, "{f}", .{resolved});
+}
+
+pub fn sameOrigin(left: []const u8, right: []const u8) !bool {
+    const l = try std.Uri.parse(left);
+    const r = try std.Uri.parse(right);
+    const lh = switch (l.host orelse return false) {
+        .raw => |v| v,
+        .percent_encoded => |v| v,
+    };
+    const rh = switch (r.host orelse return false) {
+        .raw => |v| v,
+        .percent_encoded => |v| v,
+    };
+    const lp = l.port orelse @as(u16, if (std.ascii.eqlIgnoreCase(l.scheme, "https")) 443 else 80);
+    const rp = r.port orelse @as(u16, if (std.ascii.eqlIgnoreCase(r.scheme, "https")) 443 else 80);
+    return std.ascii.eqlIgnoreCase(l.scheme, r.scheme) and std.ascii.eqlIgnoreCase(lh, rh) and lp == rp;
+}
+
+test "URL resolution follows document relative and origin semantics" {
+    const cases = [_][3][]const u8{
+        .{ "https://example.test/dir/page.html", "/download/x.zip", "https://example.test/download/x.zip" },
+        .{ "https://example.test/dir/page.html", "x.zip", "https://example.test/dir/x.zip" },
+        .{ "https://example.test/dir/page.html", "../x.zip", "https://example.test/x.zip" },
+        .{ "https://example.test/dir/page.html?old=1", "?dl_id=1", "https://example.test/dir/page.html?dl_id=1" },
+        .{ "https://example.test/dir/page.html?old=1", "#part", "https://example.test/dir/page.html?old=1#part" },
+        .{ "http://example.test/dir/", "//cdn.test/x.zip", "http://cdn.test/x.zip" },
+        .{ "https://example.test/films/", "x.zip", "https://example.test/films/x.zip" },
+    };
+    for (cases) |case| {
+        const result = try resolveUrl(std.testing.allocator, case[0], case[1]);
+        defer std.testing.allocator.free(result);
+        try std.testing.expectEqualStrings(case[2], result);
     }
 
-    if (std.mem.startsWith(u8, href, "//")) {
-        return std.fmt.allocPrint(allocator, "https:{s}", .{href});
-    }
-
-    if (href.len == 0) return try allocator.dupe(u8, base);
-
-    if (href[0] == '/') {
-        return std.fmt.allocPrint(allocator, "{s}{s}", .{ base, href });
-    }
-
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, href });
+    try std.testing.expect(try sameOrigin("https://EXAMPLE.test/a", "https://example.test:443/b"));
+    try std.testing.expect(!try sameOrigin("https://example.test/a", "http://example.test/b"));
+    try std.testing.expect(!try sameOrigin("http://localhost:8080/a", "http://localhost:8081/b"));
 }
 
 pub fn shouldRunLiveTests(allocator: Allocator) bool {
@@ -1286,10 +1481,11 @@ pub fn tableCellTextByHeaderAliases(
     return tableCellTextByColumnIndex(allocator, row, col);
 }
 
-fn sleepBackoff(initial_ms: u64, attempt: usize) void {
+fn sleepBackoff(initial_ms: u64, attempt: usize) std.Io.Cancelable!void {
     const shift: u6 = @intCast(@min(attempt, 6));
     const multiplier = (@as(u64, 1) << shift);
-    sleepMilliseconds(initial_ms * multiplier);
+    const delay = std.math.mul(u64, initial_ms, multiplier) catch std.math.maxInt(u64);
+    try runtime_io.get().sleep(.fromMilliseconds(@intCast(@min(delay, std.math.maxInt(i64)))), .awake);
 }
 
 pub fn appendHexEscape(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), value: u8) !void {
@@ -1302,7 +1498,7 @@ fn namedLiveProvider(name: []const u8) ?[]const u8 {
     if (std.ascii.eqlIgnoreCase(name, "MOVIESUBTITLES_ORG")) return "moviesubtitles.org";
     if (std.ascii.eqlIgnoreCase(name, "MOVIESUBTITLESRT_COM")) return "moviesubtitlesrt.com";
     if (std.ascii.eqlIgnoreCase(name, "PODNAPISI")) return "podnapisi.net";
-    if (std.ascii.eqlIgnoreCase(name, "SUBTITLECAT")) return "subtitlecat.com";
+    if (std.ascii.eqlIgnoreCase(name, "SUBTITLECAT") or std.ascii.eqlIgnoreCase(name, "SUBTITLECAT_COM")) return "subtitlecat.com";
     if (std.ascii.eqlIgnoreCase(name, "YIFY")) return "yifysubtitles.ch";
     if (std.ascii.eqlIgnoreCase(name, "OPENSUBTITLES_ORG")) return "opensubtitles.org";
     if (std.ascii.eqlIgnoreCase(name, "OPENSUBTITLES_COM")) return "opensubtitles.com";
@@ -1531,4 +1727,230 @@ test "provider filter matching" {
     try std.testing.expect(providerMatchesLiveFilter("*", "tvsubtitles.net"));
     try std.testing.expect(providerMatchesLiveFilter("all", "tvsubtitles.net"));
     try std.testing.expect(!providerMatchesLiveFilter("podnapisi.net", "tvsubtitles.net"));
+}
+
+test "JSON integer conversion rejects nonfinite and out of range provider numbers" {
+    const t = std.testing;
+    for ([_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64), 1e100, -1e100, 0x1p63 }) |number|
+        try t.expectEqual(@as(?i64, null), jsonInt(.{ .float = number }));
+    try t.expectEqual(@as(?i64, std.math.minInt(i64)), jsonInt(.{ .float = -0x1p63 }));
+    try t.expectEqual(@as(?i64, 9223372036854774784), jsonInt(.{ .float = 0x1p63 - 1024 }));
+    try t.expectEqual(@as(?i64, 42), jsonInt(.{ .float = 42.75 }));
+    try t.expectEqual(@as(?i64, -42), jsonInt(.{ .float = -42.75 }));
+    try t.expectEqual(@as(?i64, null), jsonInt(.{ .number_string = "9223372036854775808" }));
+}
+
+test "HTTP cancellation and allocation failure never retry" {
+    const Mock = struct {
+        var calls: usize = 0;
+        fn canceled(_: *std.http.Client, _: Allocator, _: []const u8, _: FetchOptions) anyerror!HttpResponse {
+            calls += 1;
+            return error.Canceled;
+        }
+        fn oom(_: *std.http.Client, _: Allocator, _: []const u8, _: FetchOptions) anyerror!HttpResponse {
+            calls += 1;
+            return error.OutOfMemory;
+        }
+        fn noBackoff(_: u64, _: usize) anyerror!void {
+            return error.UnexpectedBackoff;
+        }
+    };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    Mock.calls = 0;
+    try std.testing.expectError(error.Canceled, fetchBytesWith(Mock.canceled, Mock.noBackoff, &client, std.testing.allocator, "https://fixture.invalid", .{ .cache = false, .max_attempts = 3 }));
+    try std.testing.expectEqual(@as(usize, 1), Mock.calls);
+    Mock.calls = 0;
+    try std.testing.expectError(error.OutOfMemory, fetchBytesWith(Mock.oom, Mock.noBackoff, &client, std.testing.allocator, "https://fixture.invalid", .{ .cache = false, .max_attempts = 3 }));
+    try std.testing.expectEqual(@as(usize, 1), Mock.calls);
+}
+test "HTTP backoff cancellation prevents the next network attempt" {
+    const Mock = struct {
+        var calls: usize = 0;
+        fn fail(_: *std.http.Client, _: Allocator, _: []const u8, _: FetchOptions) anyerror!HttpResponse {
+            calls += 1;
+            return error.ConnectionResetByPeer;
+        }
+        fn cancel(_: u64, _: usize) anyerror!void {
+            return error.Canceled;
+        }
+    };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    Mock.calls = 0;
+    try std.testing.expectError(error.Canceled, fetchBytesWith(Mock.fail, Mock.cancel, &client, std.testing.allocator, "https://fixture.invalid", .{ .cache = false, .max_attempts = 3 }));
+    try std.testing.expectEqual(@as(usize, 1), Mock.calls);
+}
+
+fn failAfterArenaTransfer(allocator: Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    _ = try arena.allocator().dupe(u8, "allocated response body");
+    return consumeArenaFailure(takeArena(&arena));
+}
+fn consumeArenaFailure(arena: std.heap.ArenaAllocator) !void {
+    var owned = arena;
+    defer owned.deinit();
+    return error.MalformedTestResponse;
+}
+fn checkArenaErrorOwnership(allocator: Allocator) !void {
+    failAfterArenaTransfer(allocator) catch |err| switch (err) {
+        error.MalformedTestResponse => return,
+        else => return err,
+    };
+    return error.ExpectedMalformedTestResponse;
+}
+test "response parser transfer has one cleanup owner on all failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkArenaErrorOwnership, .{});
+}
+test "native script title normalization keeps non ASCII identity" {
+    for ([_][]const u8{ "進撃の巨人", "字幕", "école" }) |title| {
+        const result = try normalizeTitle(std.testing.allocator, title);
+        defer std.testing.allocator.free(result);
+        try std.testing.expectEqualStrings(title, result);
+    }
+}
+test "episode parsing preserves season zero and complete episode numbers" {
+    try std.testing.expectEqual(@as(?i64, 0), parseSeasonEpisode("Show S00E01").season);
+    try std.testing.expectEqual(@as(?i64, 0), parseSeasonEpisode("Show S01E00").episode);
+    try std.testing.expectEqual(@as(?u16, 1000), parseEpisodeQuery("Show S01E1000").episode);
+    try std.testing.expectEqual(@as(?u16, 100), parseEpisodeQuery("Show S100E01").season);
+    try std.testing.expectEqual(@as(?u16, null), parseEpisodeQuery("Show S01E99999999999").episode);
+}
+
+fn checkFinalArenaCapture(allocator: Allocator) !void {
+    const Response = struct { arena: std.heap.ArenaAllocator, title: []const u8 };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    var response = finishResponse(Response, &arena, .{ .arena = arena, .title = try arena.allocator().dupe(u8, "first allocation occurs after the arena field") });
+    defer response.arena.deinit();
+    try std.testing.expectEqualStrings("first allocation occurs after the arena field", response.title);
+}
+test "response finalization captures allocations made by later field expressions" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkFinalArenaCapture, .{});
+}
+
+pub fn isWindowsReservedFilename(name: []const u8) bool {
+    const stem_end = std.mem.indexOfScalar(u8, name, '.') orelse name.len;
+    var trimmed_end = stem_end;
+    while (trimmed_end > 0) {
+        const ch = name[trimmed_end - 1];
+        if (ch != ' ' and ch != '.') break;
+        trimmed_end -= 1;
+    }
+    const stem = name[0..trimmed_end];
+    if (stem.len == 0) return false;
+    if (std.ascii.eqlIgnoreCase(stem, "CON") or
+        std.ascii.eqlIgnoreCase(stem, "PRN") or
+        std.ascii.eqlIgnoreCase(stem, "AUX") or
+        std.ascii.eqlIgnoreCase(stem, "NUL") or
+        std.ascii.eqlIgnoreCase(stem, "CONIN$") or
+        std.ascii.eqlIgnoreCase(stem, "CONOUT$") or
+        std.ascii.eqlIgnoreCase(stem, "CLOCK$"))
+    {
+        return true;
+    }
+    if (stem.len == 4 and
+        (std.ascii.eqlIgnoreCase(stem[0..3], "COM") or
+            std.ascii.eqlIgnoreCase(stem[0..3], "LPT")) and
+        stem[3] >= '1' and stem[3] <= '9')
+    {
+        return true;
+    }
+    // Win32 also recognizes superscript 1/2/3 in device-number aliases.
+    if (stem.len == 5 and (std.ascii.eqlIgnoreCase(stem[0..3], "COM") or std.ascii.eqlIgnoreCase(stem[0..3], "LPT"))) {
+        return std.mem.eql(u8, stem[3..], "¹") or std.mem.eql(u8, stem[3..], "²") or std.mem.eql(u8, stem[3..], "³");
+    }
+    return false;
+}
+
+test "HTTP cache keys isolate cookie identities" {
+    const a = std.testing.allocator;
+    const first = try fetchCachePath(a, "cache", "https://fixture.invalid/data", .{ .extra_headers = &.{.{ .name = "Cookie", .value = "fixture=first" }} });
+    defer a.free(first);
+    const second = try fetchCachePath(a, "cache", "https://fixture.invalid/data", .{ .extra_headers = &.{.{ .name = "Cookie", .value = "fixture=second" }} });
+    defer a.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+}
+
+test "URL resolution reserves both relative input and merged output" {
+    const href = "very-long-relative-subtitle-directory/" ** 8 ++ "episode.srt";
+    const resolved = try resolveUrl(std.testing.allocator, "https://fixture.invalid/base/", href);
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expectEqualStrings("https://fixture.invalid/base/" ++ href, resolved);
+}
+
+test "named live subtitlecat aliases reach translation coverage" {
+    try std.testing.expectEqualStrings("subtitlecat.com", namedLiveProvider("SUBTITLECAT_COM").?);
+    try std.testing.expectEqualStrings("subtitlecat.com", namedLiveProvider("SUBTITLECAT").?);
+}
+
+test "HTTP cache rejects legacy status and impossible timestamps" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    configureFetchCache(.{ .enabled = true, .root_dir = root, .ttl_seconds = 0 });
+    defer configureFetchCache(.{});
+    const url = "https://fixture.invalid/cache";
+    const path = try fetchCachePath(allocator, root, url, .{});
+    defer allocator.free(path);
+    try ensureParentDir(path);
+    var body = [_]u8{'x'};
+    try storeFetchCache(allocator, url, .{}, .{ .status = .ok, .body = &body });
+    const valid = (try loadFetchCache(allocator, url, .{})).?;
+    allocator.free(valid.body);
+    const now = compatUnixTimestamp();
+    for ([_]struct { magic: []const u8, status: u16 = 200, timestamp: i64 }{
+        .{ .magic = "subdl-http-cache-v1\n", .timestamp = now },
+        .{ .magic = "subdl-http-cache-v2\n", .timestamp = now },
+        .{ .magic = fetch_cache_magic, .status = 500, .timestamp = now },
+        .{ .magic = fetch_cache_magic, .timestamp = -1 },
+        .{ .magic = fetch_cache_magic, .timestamp = std.math.maxInt(i64) },
+    }) |case| {
+        const content = try std.fmt.allocPrint(allocator, "{s}{d}\n{d}\n1\nx", .{ case.magic, case.timestamp, case.status });
+        defer allocator.free(content);
+        try std.Io.Dir.cwd().writeFile(runtime_io.get(), .{ .sub_path = path, .data = content });
+        try std.testing.expect((try loadFetchCache(allocator, url, .{})) == null);
+    }
+}
+
+test "unusable cache directory cannot discard a successful HTTP response" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(runtime_io.get(), .{ .sub_path = "http", .data = "ordinary file" });
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    configureFetchCache(.{ .enabled = true, .root_dir = root });
+    defer configureFetchCache(.{});
+    const Mock = struct {
+        fn fetch(_: *std.http.Client, a: Allocator, _: []const u8, _: FetchOptions) anyerror!HttpResponse {
+            return .{ .status = .ok, .body = try a.dupe(u8, "success") };
+        }
+        fn backoff(_: u64, _: usize) anyerror!void {
+            return error.UnexpectedRetry;
+        }
+    };
+    var client: std.http.Client = .{ .allocator = allocator, .io = runtime_io.get() };
+    defer client.deinit();
+    const response = try fetchBytesWith(Mock.fetch, Mock.backoff, &client, allocator, "https://fixture.invalid/cache-failure", .{});
+    defer allocator.free(response.body);
+    try std.testing.expectEqualStrings("success", response.body);
+}
+
+test "title normalization collapses Unicode whitespace without destroying scripts" {
+    const allocator = std.testing.allocator;
+    const title = try normalizeTitle(allocator, "\u{a0}Chernobyl\u{a0}");
+    defer allocator.free(title);
+    try std.testing.expectEqualStrings("chernobyl", title);
+    const japanese = try normalizeTitle(allocator, "字幕\u{3000}作品");
+    defer allocator.free(japanese);
+    try std.testing.expectEqualStrings("字幕 作品", japanese);
+}
+
+test "Windows superscript device names are reserved before extensions" {
+    for ([_][]const u8{ "COM¹.srt", "LPT².ass", "COM³", "lpt³ .srt" }) |name| try std.testing.expect(isWindowsReservedFilename(name));
+    try std.testing.expect(!isWindowsReservedFilename("COM⁴.srt"));
 }

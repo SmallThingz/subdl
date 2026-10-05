@@ -57,7 +57,7 @@ pub const Scraper = struct {
             try items.appendSlice(a, partial.items[0..@min(remaining, partial.items.len)]);
         }
 
-        return .{ .arena = arena, .items = try items.toOwnedSlice(a) };
+        return common.finishResponse(SearchResponse, &arena, .{ .arena = arena, .items = try items.toOwnedSlice(a) });
     }
 
     fn appendCatalogMatches(
@@ -160,11 +160,11 @@ pub const Scraper = struct {
             try subtitles.appendSlice(a, fallback.items[0..@min(max_subtitle_items, fallback.items.len)]);
         }
 
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
             .subtitles = try subtitles.toOwnedSlice(a),
-        };
+        });
     }
 };
 
@@ -179,18 +179,29 @@ fn isSupportedFilename(filename: []const u8) bool {
         std.ascii.endsWithIgnoreCase(filename, ".zip");
 }
 
+fn containsNumericToken(text: []const u8, token: []const u8) bool {
+    var at: usize = 0;
+    while (indexOfIgnoreCase(text[at..], token)) |relative| {
+        const start = at + relative;
+        const end = start + token.len;
+        if ((start == 0 or !std.ascii.isAlphanumeric(text[start - 1])) and (end == text.len or !std.ascii.isDigit(text[end]))) return true;
+        at = start + 1;
+    }
+    return false;
+}
+
 fn filenameMatchesEpisode(filename: []const u8, season: u16, episode: u16) bool {
     var sxe_buf: [16]u8 = undefined;
     const sxe = std.fmt.bufPrint(&sxe_buf, "S{d:0>2}E{d:0>2}", .{ season, episode }) catch return false;
-    if (indexOfIgnoreCase(filename, sxe) != null) return true;
+    if (containsNumericToken(filename, sxe)) return true;
 
     var x_buf: [16]u8 = undefined;
     const x = std.fmt.bufPrint(&x_buf, "{d:0>2}x{d:0>2}", .{ season, episode }) catch return false;
-    if (indexOfIgnoreCase(filename, x) != null) return true;
+    if (containsNumericToken(filename, x)) return true;
 
     var episode_buf: [24]u8 = undefined;
     const episode_text = std.fmt.bufPrint(&episode_buf, "episode {d}", .{episode}) catch return false;
-    return indexOfIgnoreCase(filename, episode_text) != null;
+    return containsNumericToken(filename, episode_text);
 }
 
 const indexOfIgnoreCase = std.ascii.findIgnoreCase;
@@ -278,4 +289,9 @@ test "live kitsunekko english and japanese movie plus tv downloads" {
     defer std.testing.allocator.free(tv_download.body);
     try std.testing.expect(tv_download.body.len > 100);
     try std.testing.expect(std.mem.indexOf(u8, tv_download.body, "[Script Info]") != null);
+}
+
+test "episode tokens do not match longer episode numbers" {
+    for ([_][]const u8{ "Show Episode 10.ass", "Show.S01E010.ass", "Show.01x010.ass" }) |name| try std.testing.expect(!filenameMatchesEpisode(name, 1, 1));
+    for ([_][]const u8{ "Show Episode 1.ass", "Show.S01E01.ass", "Show.01x01.ass" }) |name| try std.testing.expect(filenameMatchesEpisode(name, 1, 1));
 }

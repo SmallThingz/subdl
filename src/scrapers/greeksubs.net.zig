@@ -54,7 +54,7 @@ pub const Scraper = struct {
             .cache = false,
             .max_attempts = 2,
         });
-        return parseSearchHtml(arena, response.body, trimmed);
+        return parseSearchHtml(common.takeArena(&arena), response.body, trimmed);
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
@@ -95,11 +95,11 @@ pub const Scraper = struct {
             }
         }
 
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
             .subtitles = try subtitles.toOwnedSlice(a),
-        };
+        });
     }
 
     pub fn fetchDownloadByToken(self: *Scraper, allocator: Allocator, token: []const u8) !common.HttpResponse {
@@ -188,6 +188,7 @@ fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, ext
     var response = try req.receiveHead(&head_buffer);
     const status = response.head.status;
     const cookie = try common.extractPhpSessionCookie(allocator, response.head.bytes);
+    errdefer if (cookie) |value| allocator.free(value);
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
@@ -239,7 +240,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     var out: std.ArrayListUnmanaged(SearchItem) = .empty;
     try out.appendSlice(a, exact.items);
     try out.appendSlice(a, partial.items);
-    return .{ .arena = owned_arena, .items = try out.toOwnedSlice(a) };
+    return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try out.toOwnedSlice(a) });
 }
 
 fn cardMediaKind(allocator: Allocator, anchor: anytype) !?MediaKind {

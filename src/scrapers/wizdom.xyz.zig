@@ -62,7 +62,7 @@ pub const Scraper = struct {
         if (try self.resolveCandidate(a, title, .tv, parts.season, parts.episode)) |item|
             try items.append(a, item);
 
-        return .{ .arena = arena, .items = try items.toOwnedSlice(a) };
+        return common.finishResponse(SearchResponse, &arena, .{ .arena = arena, .items = try items.toOwnedSlice(a) });
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
@@ -86,11 +86,11 @@ pub const Scraper = struct {
         };
 
         var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
-        const subs = obj.get("subs") orelse return .{
+        const subs = obj.get("subs") orelse return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
             .subtitles = &.{},
-        };
+        });
 
         switch (item.media_kind) {
             .movie => try appendMovieSubtitles(a, subs, &subtitles),
@@ -99,11 +99,11 @@ pub const Scraper = struct {
 
         const owned = try subtitles.toOwnedSlice(a);
         std.mem.sort(SubtitleItem, owned, {}, subtitleLessThan);
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
             .subtitles = owned,
-        };
+        });
     }
 
     fn resolveCandidate(
@@ -314,13 +314,11 @@ fn parseQuery(query: []const u8) QueryParts {
     while (i + 4 < query.len) : (i += 1) {
         if (query[i] != 's' and query[i] != 'S') continue;
         var p = i + 1;
-        while (p < query.len and query[p] == '0') : (p += 1) {}
         const season_start = p;
         while (p < query.len and std.ascii.isDigit(query[p])) : (p += 1) {}
         if (p == season_start or p >= query.len or (query[p] != 'e' and query[p] != 'E')) continue;
         const season = std.fmt.parseInt(i64, query[season_start..p], 10) catch continue;
         p += 1;
-        while (p < query.len and query[p] == '0') : (p += 1) {}
         const episode_start = p;
         while (p < query.len and std.ascii.isDigit(query[p])) : (p += 1) {}
         if (p == episode_start) continue;
@@ -397,4 +395,11 @@ test "live wizdom movie and tv downloads" {
     defer std.testing.allocator.free(tv_download.body);
     try std.testing.expect(tv_download.body.len > 4);
     try std.testing.expect(std.mem.eql(u8, tv_download.body[0..2], "PK"));
+}
+
+test "Wizdom query accepts season zero specials" {
+    const parsed = parseQuery("House S00E01");
+    try std.testing.expectEqualStrings("House", parsed.title);
+    try std.testing.expectEqual(@as(?i64, 0), parsed.season);
+    try std.testing.expectEqual(@as(?i64, 1), parsed.episode);
 }

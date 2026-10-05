@@ -57,6 +57,7 @@
         "build.zig.zon",
         "src",
         "vendor",
+        "tools",
         // For example...
         //"LICENSE",
         //"README.md",

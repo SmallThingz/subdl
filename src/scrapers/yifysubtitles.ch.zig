@@ -69,7 +69,7 @@ pub const Scraper = struct {
             });
         }
 
-        return .{ .arena = arena, .items = try items.toOwnedSlice(a) };
+        return common.finishResponse(SearchResponse, &arena, .{ .arena = arena, .items = try items.toOwnedSlice(a) });
     }
 
     pub fn fetchSubtitlesByMovieLink(self: *Scraper, movie_page_url: []const u8) !SubtitlesResponse {
@@ -154,11 +154,11 @@ pub const Scraper = struct {
             }
         }
 
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = title,
             .subtitles = try subtitles.toOwnedSlice(a),
-        };
+        });
     }
 
     fn subtitleToZipUrl(allocator: Allocator, details_url: []const u8) ![]const u8 {

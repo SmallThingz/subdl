@@ -283,10 +283,10 @@ pub const Scraper = struct {
             });
         }
 
-        return .{
+        return common.finishResponse(SearchResponse, &arena, .{
             .arena = arena,
             .items = try items.toOwnedSlice(a),
-        };
+        });
     }
 
     pub fn fetchMovieByLink(self: *Scraper, link: []const u8) !MovieSubtitlesResponse {
@@ -320,15 +320,16 @@ pub const Scraper = struct {
 
         const resolved_season_slug = season_slug orelse parsed.season_slug orelse return error.MissingSeasonSlug;
 
-        const page = try self.fetchSubtitlePage(link, resolved_season_slug);
+        var page = try self.fetchSubtitlePage(link, resolved_season_slug);
         errdefer page.arena.deinit();
 
         if (page.title.media_type != .tv) return error.UnexpectedTitleType;
+        const owned_slug = try page.arena.allocator().dupe(u8, resolved_season_slug);
 
         return .{
             .arena = page.arena,
             .tv = page.title,
-            .season_slug = resolved_season_slug,
+            .season_slug = owned_slug,
             .languages = page.languages,
         };
     }
@@ -639,7 +640,7 @@ fn asString(value: std.json.Value) ![]const u8 {
 fn asInt(value: std.json.Value) !i64 {
     return switch (value) {
         .integer => |i| i,
-        .float => |f| @as(i64, @intFromFloat(f)),
+        .float => |f| common.jsonInt(.{ .float = f }) orelse error.InvalidFieldType,
         .number_string => |n| std.fmt.parseInt(i64, n, 10) catch error.InvalidFieldType,
         else => error.InvalidFieldType,
     };

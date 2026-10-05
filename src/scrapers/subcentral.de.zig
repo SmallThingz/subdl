@@ -68,11 +68,11 @@ pub const Scraper = struct {
 
         const already_revealed = try parseRevealedAttachments(a, thread.body, item.title, item.season);
         if (already_revealed.len > 0) {
-            return .{
+            return common.finishResponse(SubtitlesResponse, &arena, .{
                 .arena = arena,
                 .title = try a.dupe(u8, item.title),
                 .subtitles = already_revealed,
-            };
+            });
         }
 
         const gate = try parseGate(a, thread.body);
@@ -94,11 +94,11 @@ pub const Scraper = struct {
                 subtitles = try parseRevealedAttachments(a, refreshed.body, item.title, item.season);
             }
         }
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
             .subtitles = subtitles,
-        };
+        });
     }
 };
 
@@ -454,6 +454,7 @@ fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, coo
     var head_buffer: [24 * 1024]u8 = undefined;
     var response = try req.receiveHead(&head_buffer);
     const cookie_value = try extractCookie(allocator, response.head.bytes);
+    errdefer if (cookie_value) |value| allocator.free(value);
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);

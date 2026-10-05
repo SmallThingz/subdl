@@ -87,13 +87,13 @@ pub const Scraper = struct {
             }
         }
 
-        return .{
+        return common.finishResponse(SearchResponse, &arena, .{
             .arena = arena,
             .items = try out.toOwnedSlice(a),
             .page = 1,
             .has_prev_page = false,
             .has_next_page = false,
-        };
+        });
     }
 
     pub fn fetchSubtitlesByDetailsLink(self: *Scraper, details_url: []const u8, media_kind: MediaKind) !SubtitlesResponse {
@@ -183,13 +183,13 @@ pub const Scraper = struct {
             }
         }
 
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .subtitles = try subtitles.toOwnedSlice(a),
             .page = 1,
             .has_prev_page = false,
             .has_next_page = false,
-        };
+        });
     }
 
     pub fn resolveDownloadPageUrl(self: *Scraper, allocator: Allocator, download_page_url: []const u8) ![]const u8 {

@@ -121,6 +121,8 @@ Build and test:
 ```bash
 zig build
 zig build test
+zig build test-http # native Python 3 + isolated loopback integration gate
+zig build test-pty  # native POSIX Python 3 + actual terminal navigation/shutdown
 ```
 
 List providers:
@@ -209,3 +211,27 @@ Use `-Dllvm=true` if the native GNU build hits host CRT `.sframe` relocation err
 - [CONTRIBUTIONS.md](./CONTRIBUTIONS.md)
 - [SECURITY.md](./SECURITY.md)
 - [LICENCE](./LICENCE)
+
+### Navigation and validation
+
+In the TUI, Tab switches panes without rescanning the disk. F5 refreshes cached
+files. With results focused, `[` and `]` navigate search pages; PgUp/PgDn move
+within the current page. Up to 16 previous search pages are retained; refine the
+query or use the CLI page selector for deeper navigation. Query-focused brackets remain ordinary input. The CLI
+accepts positive `--search-page N` and `--subtitle-page N` selectors.
+
+ZIP extraction is bounded to 256 entries, 64 MiB per entry and 128 MiB aggregate.
+Archives are staged and checked before publication, and existing output files
+are never overwritten. 7z archives remain downloadable but require external
+extraction; builds with `-Denable-unarr=false` also save archives without
+extracting them. The CLI/TUI explicitly report this state.
+
+`zig build test` runs deterministic offline tests. `zig build test-http` is a
+separate native-only integration gate requiring Python 3 and loopback sockets.
+Network suites are opt-in; `-Dlive-max-jobs=3` bounds concurrent provider probes
+and `-Dlive-timeout-seconds=45` supplies their default deadline. A live skip or
+upstream failure is not proof of a working provider.
+
+Translation downloads preserve source text for missing or malformed translated
+segments and explicitly warn when the result is incomplete. Unicode filenames
+are preserved while Windows device-name aliases are made safe.

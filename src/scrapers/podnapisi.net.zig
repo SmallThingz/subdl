@@ -82,11 +82,11 @@ pub const Scraper = struct {
         }
 
         dedupeSearchItemsById(&items);
-        return .{
+        return common.finishResponse(SearchResponse, &arena, .{
             .arena = arena,
             .items = try items.toOwnedSlice(a),
             .has_next_page = has_next_page,
-        };
+        });
     }
 
     fn appendJsonSearchItems(
@@ -289,7 +289,7 @@ pub const Scraper = struct {
             });
         }
 
-        return .{ .arena = arena, .subtitles = try out.toOwnedSlice(a) };
+        return common.finishResponse(SubtitlesResponse, &arena, .{ .arena = arena, .subtitles = try out.toOwnedSlice(a) });
     }
 };
 

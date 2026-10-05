@@ -86,7 +86,7 @@ pub const Scraper = struct {
         var items: std.ArrayListUnmanaged(SearchItem) = .empty;
         try items.appendSlice(a, exact.items);
         try items.appendSlice(a, other.items);
-        return .{ .arena = arena, .items = try items.toOwnedSlice(a) };
+        return common.finishResponse(SearchResponse, &arena, .{ .arena = arena, .items = try items.toOwnedSlice(a) });
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
@@ -102,11 +102,11 @@ pub const Scraper = struct {
 
         const flight = try extractNextFlightText(a, response.body);
         const subtitles = try parseInitialSubtitles(a, flight);
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
             .subtitles = subtitles,
-        };
+        });
     }
 };
 

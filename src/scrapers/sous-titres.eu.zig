@@ -44,7 +44,7 @@ pub const Scraper = struct {
             .max_attempts = 2,
         });
 
-        return parseSearchHtml(arena, response.body, trimmed);
+        return parseSearchHtml(common.takeArena(&arena), response.body, trimmed);
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
@@ -63,8 +63,8 @@ pub const Scraper = struct {
         var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
         var anchors = parsed.doc.queryAll("a.subList");
         const section = switch (item.media_kind) {
-            .movie => site ++ "/films",
-            .tv => site ++ "/series",
+            .movie => site ++ "/films/",
+            .tv => site ++ "/series/",
         };
         while (anchors.next()) |anchor| {
             const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
@@ -84,11 +84,11 @@ pub const Scraper = struct {
             });
         }
 
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
             .subtitles = try subtitles.toOwnedSlice(a),
-        };
+        });
     }
 };
 
@@ -135,7 +135,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     var items: std.ArrayListUnmanaged(SearchItem) = .empty;
     try items.appendSlice(a, exact.items);
     try items.appendSlice(a, other.items);
-    return .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) };
+    return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) });
 }
 
 fn hasClassToken(classes: []const u8, token: []const u8) bool {

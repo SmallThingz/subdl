@@ -87,11 +87,11 @@ pub const Scraper = struct {
             .filename = try a.dupe(u8, filename),
             .download_url = try makeDownloadToken(a, item.subtitle_id, item.detail_url, filename),
         };
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
             .subtitles = subtitles,
-        };
+        });
     }
 
     pub fn fetchDownloadByToken(self: *Scraper, allocator: Allocator, token: []const u8) !common.HttpResponse {
@@ -433,6 +433,7 @@ fn fetchRaw(
     var head_buffer: [24 * 1024]u8 = undefined;
     var response = try req.receiveHead(&head_buffer);
     const response_cookie = try extractCookie(allocator, response.head.bytes);
+    errdefer if (response_cookie) |value| allocator.free(value);
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);

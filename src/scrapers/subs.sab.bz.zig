@@ -76,7 +76,7 @@ pub const Scraper = struct {
         var items: std.ArrayListUnmanaged(SearchItem) = .empty;
         try items.appendSlice(a, exact.items);
         try items.appendSlice(a, partial.items);
-        return .{ .arena = arena, .items = try items.toOwnedSlice(a) };
+        return common.finishResponse(SearchResponse, &arena, .{ .arena = arena, .items = try items.toOwnedSlice(a) });
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
@@ -92,11 +92,11 @@ pub const Scraper = struct {
             .filename = filename,
             .download_url = try makeDownloadToken(a, item.attach_id),
         };
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
             .subtitles = subtitles,
-        };
+        });
     }
 
     pub fn fetchDownloadByToken(self: *Scraper, allocator: Allocator, token: []const u8) !common.HttpResponse {

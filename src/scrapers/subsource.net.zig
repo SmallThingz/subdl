@@ -117,14 +117,14 @@ pub const Scraper = struct {
         }
         rankSearchResults(out.items, query_used);
 
-        return .{
+        return common.finishResponse(SearchResponse, &arena, .{
             .arena = arena,
             .query_used = query_used,
             .items = try out.toOwnedSlice(a),
             .page = 1,
             .has_prev_page = false,
             .has_next_page = false,
-        };
+        });
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
@@ -236,14 +236,15 @@ pub const Scraper = struct {
         }
 
         const current_page = if (options.page_start == 0) 1 else options.page_start;
-        return .{
+        const response_title = try a.dupe(u8, item.title);
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
-            .title = item.title,
+            .title = response_title,
             .subtitles = try out.toOwnedSlice(a),
             .page = current_page,
             .has_prev_page = current_page > 1,
             .has_next_page = false,
-        };
+        });
     }
 
     const SubtitleDetails = struct {
@@ -639,7 +640,7 @@ fn objInt(obj: std.json.ObjectMap, key: []const u8) ?i64 {
     const v = obj.get(key) orelse return null;
     return switch (v) {
         .integer => |i| i,
-        .float => |f| @intFromFloat(f),
+        .float => |f| common.jsonInt(.{ .float = f }),
         .number_string => |s| std.fmt.parseInt(i64, s, 10) catch null,
         else => null,
     };

@@ -45,7 +45,7 @@ pub const Scraper = struct {
             .cache = false,
             .max_attempts = 2,
         });
-        return parseSearchHtml(arena, response.body, trimmed);
+        return parseSearchHtml(common.takeArena(&arena), response.body, trimmed);
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
@@ -59,11 +59,11 @@ pub const Scraper = struct {
             .filename = try std.fmt.allocPrint(a, "{s}.zip", .{item.release}),
             .download_url = try makeDownloadToken(a, item.page_url),
         };
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
             .subtitles = subtitles,
-        };
+        });
     }
 
     pub fn fetchDownloadByToken(self: *Scraper, allocator: Allocator, token: []const u8) !common.HttpResponse {
@@ -135,6 +135,7 @@ fn fetchDetailPage(client: *std.http.Client, allocator: Allocator, url: []const 
     var head_buffer: [16 * 1024]u8 = undefined;
     var response = try req.receiveHead(&head_buffer);
     const cookie = try common.extractPhpSessionCookie(allocator, response.head.bytes);
+    errdefer if (cookie) |value| allocator.free(value);
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
@@ -203,7 +204,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     var items: std.ArrayListUnmanaged(SearchItem) = .empty;
     try items.appendSlice(a, exact.items);
     try items.appendSlice(a, partial.items);
-    return .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) };
+    return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) });
 }
 
 const TitleYear = common.RequiredTitleYear;

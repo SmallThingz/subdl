@@ -56,7 +56,7 @@ pub const Scraper = struct {
             .max_attempts = 2,
         });
 
-        return parseSearchBody(arena, response.body, parsed_query);
+        return parseSearchBody(common.takeArena(&arena), response.body, parsed_query);
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
@@ -105,11 +105,11 @@ pub const Scraper = struct {
             try subtitles.appendSlice(a, forced.items[0..@min(remaining, forced.items.len)]);
         }
 
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
             .subtitles = try subtitles.toOwnedSlice(a),
-        };
+        });
     }
 
     pub fn fetchDownloadByToken(self: *Scraper, allocator: Allocator, token: []const u8) !common.HttpResponse {
@@ -191,7 +191,7 @@ fn parseSearchBody(arena: std.heap.ArenaAllocator, body: []const u8, parsed_quer
         });
     }
 
-    return .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) };
+    return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) });
 }
 
 fn appendAttachments(

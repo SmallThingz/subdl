@@ -52,8 +52,9 @@ pub const Scraper = struct {
             .cache = false,
             .max_attempts = 3,
         });
-        var parsed = try parseSearchHtml(arena, response.body, trimmed);
-        try self.preferZipMovieDuplicate(a, &parsed);
+        var parsed = try parseSearchHtml(common.takeArena(&arena), response.body, trimmed);
+        errdefer parsed.deinit();
+        try self.preferZipMovieDuplicate(parsed.arena.allocator(), &parsed);
         return parsed;
     }
 
@@ -69,11 +70,11 @@ pub const Scraper = struct {
             .filename = filename,
             .download_url = try makeDownloadToken(a, item.subtitle_id, item.page_url),
         };
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
             .subtitles = subtitles,
-        };
+        });
     }
 
     pub fn fetchDownloadByToken(self: *Scraper, allocator: Allocator, token: []const u8) !common.HttpResponse {
@@ -249,7 +250,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     var items: std.ArrayListUnmanaged(SearchItem) = .empty;
     try items.appendSlice(a, exact.items);
     try items.appendSlice(a, partial.items);
-    return .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) };
+    return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) });
 }
 
 fn hasSeasonSuffix(title: []const u8) bool {

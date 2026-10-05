@@ -47,7 +47,7 @@ pub const Scraper = struct {
         });
         if (isCloudflareChallenge(response.status, response.body)) return error.CloudflareChallenge;
         if (response.status != .ok) return error.UnexpectedHttpStatus;
-        return parseSuggestJson(arena, response.body);
+        return parseSuggestJson(common.takeArena(&arena), response.body);
     }
 
     pub fn fetchSubtitles(self: *Scraper, page_url: []const u8) !SubtitlesResponse {
@@ -61,7 +61,7 @@ pub const Scraper = struct {
         });
         if (isCloudflareChallenge(response.status, response.body)) return error.CloudflareChallenge;
         if (response.status != .ok) return error.UnexpectedHttpStatus;
-        return parseSubtitlesHtml(arena, response.body);
+        return parseSubtitlesHtml(common.takeArena(&arena), response.body);
     }
 };
 
@@ -120,7 +120,7 @@ fn parseSuggestJson(arena: std.heap.ArenaAllocator, body: []const u8) !SearchRes
         }
     }
 
-    return .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) };
+    return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) });
 }
 
 fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8) !SearchResponse {
@@ -143,7 +143,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8) !SearchResp
             .page_url = try common.resolveUrl(a, site, href),
         });
     }
-    return .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) };
+    return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) });
 }
 
 fn parseSubtitlesHtml(arena: std.heap.ArenaAllocator, body: []const u8) !SubtitlesResponse {
@@ -180,7 +180,7 @@ fn parseSubtitlesHtml(arena: std.heap.ArenaAllocator, body: []const u8) !Subtitl
             .download_url = try std.fmt.allocPrint(a, "{s}/download/{s}", .{ site, id }),
         });
     }
-    return .{ .arena = owned_arena, .title = title, .subtitles = try subtitles.toOwnedSlice(a) };
+    return common.finishResponse(SubtitlesResponse, &owned_arena, .{ .arena = owned_arena, .title = title, .subtitles = try subtitles.toOwnedSlice(a) });
 }
 
 fn optionalText(allocator: Allocator, node: ?HtmlNode) !?[]const u8 {

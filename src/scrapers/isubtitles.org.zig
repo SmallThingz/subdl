@@ -100,13 +100,13 @@ pub const Scraper = struct {
             if (page > 128) break;
         }
 
-        return .{
+        return common.finishResponse(SearchResponse, &arena, .{
             .arena = arena,
             .items = try out.toOwnedSlice(a),
             .page = last_page,
             .has_prev_page = last_page > 1,
             .has_next_page = has_next_page,
-        };
+        });
     }
 
     pub fn fetchSubtitlesByMovieLink(self: *Scraper, details_url: []const u8) !SubtitlesResponse {
@@ -191,14 +191,14 @@ pub const Scraper = struct {
             if (page > 128) break;
         }
 
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = title,
             .subtitles = try out.toOwnedSlice(a),
             .page = last_page,
             .has_prev_page = last_page > 1,
             .has_next_page = has_next_page,
-        };
+        });
     }
 
     fn fetchHtml(self: *Scraper, allocator: Allocator, url: []const u8) !common.HttpResponse {

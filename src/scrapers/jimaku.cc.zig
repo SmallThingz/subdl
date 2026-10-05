@@ -43,7 +43,7 @@ pub const Scraper = struct {
             .accept = "text/html,application/xhtml+xml,*/*",
             .max_attempts = 2,
         });
-        return parseCatalog(arena, response.body, trimmed);
+        return parseCatalog(common.takeArena(&arena), response.body, trimmed);
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
@@ -77,11 +77,11 @@ pub const Scraper = struct {
             });
         }
 
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.english_name orelse item.title),
             .subtitles = try subtitles.toOwnedSlice(a),
-        };
+        });
     }
 };
 
@@ -149,7 +149,7 @@ fn parseCatalog(arena: std.heap.ArenaAllocator, body: []const u8, query: []const
     var items: std.ArrayListUnmanaged(SearchItem) = .empty;
     try items.appendSlice(a, exact.items);
     try items.appendSlice(a, partial.items);
-    return .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) };
+    return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) });
 }
 
 fn parseEntryId(href: []const u8) ?i64 {

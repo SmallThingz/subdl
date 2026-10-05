@@ -39,7 +39,7 @@ pub const Scraper = struct {
             .accept = "text/html,application/xhtml+xml,*/*",
             .max_attempts = 2,
         });
-        return parseIndex(arena, response.body, query);
+        return parseIndex(common.takeArena(&arena), response.body, query);
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
@@ -71,11 +71,11 @@ pub const Scraper = struct {
             });
         }
 
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
             .subtitles = try subtitles.toOwnedSlice(a),
-        };
+        });
     }
 };
 
@@ -116,7 +116,7 @@ fn parseIndex(arena: std.heap.ArenaAllocator, body: []const u8, query: []const u
         });
     }
 
-    return .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) };
+    return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) });
 }
 
 fn parseMediaKind(value: []const u8) ?MediaKind {

@@ -79,8 +79,9 @@ pub const Document = struct {
 
     pub fn parse(self: *Document, input: []u8, opts: anytype) !void {
         _ = opts;
+        const replacement = try upstream_options.parse(self.allocator, input);
         self.inner.deinit();
-        self.inner = try upstream_options.parse(self.allocator, input);
+        self.inner = replacement;
     }
 
     pub fn query(self: *const Document, comptime selector: []const u8) CompatQueryIter {
@@ -244,4 +245,20 @@ pub fn GetQueryIter(comptime _: ParseOptions) type {
 
 fn wrapNode(node: ?UpstreamNode) ?Node {
     return if (node) |inner| .{ .inner = inner } else null;
+}
+
+fn checkDocumentReplacement(allocator: std.mem.Allocator) !void {
+    var first = "<p>original document</p>".*;
+    var second = "<div><span>replacement document</span></div>".*;
+    var document = Document.init(allocator);
+    defer document.deinit();
+    try document.parse(&first, .{});
+    document.parse(&second, .{}) catch |err| {
+        try std.testing.expect(document.queryOne("p") != null);
+        return err;
+    };
+    try std.testing.expect(document.queryOne("span") != null);
+}
+test "HTML replacement preserves old document on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkDocumentReplacement, .{});
 }

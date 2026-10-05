@@ -332,6 +332,7 @@ const QueryFocus = enum {
 };
 
 const SearchBundle = struct {
+    page: u32 = 1,
     query_norm: []u8,
     searches: std.ArrayListUnmanaged(app.SearchResponse) = .empty,
     hits: std.ArrayListUnmanaged(CombinedSearchHit) = .empty,
@@ -366,6 +367,7 @@ const ProviderSearchTask = struct {
     language_code: ?[]const u8 = null,
     page: usize = 1,
     done: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    in_flight_credit: bool = false,
     err: ?anyerror = null,
     result: ?app.SearchResponse = null,
 };
@@ -432,7 +434,7 @@ const Ui = struct {
         // Ctrl+D is an explicit process quit, not a graceful "back" action.
         // Restore all terminal modes first, then let the OS reclaim any
         // outstanding provider work instead of waiting on slow cancellation.
-        self.loop.stop();
+        stopInputLoop(self.loop);
         self.vx.deinit(null, self.writer());
         self.tty.deinit();
         std.process.exit(0);
@@ -577,7 +579,7 @@ pub fn main(init: std.process.Init) !void {
 
     var loop: vaxis.Loop(Event) = .init(runtime_io.get(), &tty, &vx);
     try loop.start();
-    defer loop.stop();
+    defer stopInputLoop(&loop);
 
     try vx.enterAltScreen(tty.writer());
     try vx.queryTerminal(tty.writer(), .fromSeconds(1));
@@ -619,7 +621,7 @@ pub fn main(init: std.process.Init) !void {
             // back/cancel flows.
             defer vx.exitAltScreen(tty.writer()) catch {};
             defer vx.setMouseMode(tty.writer(), false) catch {};
-            defer loop.stop();
+            defer stopInputLoop(&loop);
 
             // Terminals that do not advertise in-band resize rely on SIGWINCH.
             // vaxis does not install that handler as part of Loop.start(), so
@@ -941,6 +943,16 @@ fn runTui(ui: *Ui) !void {
 
     var state = try loadTuiRuntimeState(ui.allocator, ui.environ_map);
     defer state.deinit(ui.allocator);
+    defer {
+        // Restore terminal ownership before waiting, while keeping cache paths
+        // alive until every cancelled provider has released its borrowed state.
+        stopInputLoop(ui.loop);
+        ui.vx.exitAltScreen(ui.writer()) catch {};
+        ui.vx.setMouseMode(ui.writer(), false) catch {};
+        ui.writer().flush() catch {};
+        ui.awaitSearchReapers();
+        common.configureFetchCache(.{});
+    }
     applyRuntimeCacheSettings(&state);
 
     var query: std.ArrayList(u8) = .empty;
@@ -960,6 +972,11 @@ fn runTui(ui: *Ui) !void {
     defer ui.allocator.free(last_searched_norm);
     var results: ?SearchBundle = null;
     defer if (results) |*bundle| bundle.deinit(ui.allocator);
+    var previous_pages: std.ArrayList(SearchBundle) = .empty;
+    defer {
+        clearSearchPages(ui.allocator, &previous_pages);
+        previous_pages.deinit(ui.allocator);
+    }
 
     while (true) {
         ui.collectSearchReapers();
@@ -968,14 +985,14 @@ fn runTui(ui: *Ui) !void {
         if (query_norm_view.len == 0 and results != null) {
             if (results) |*bundle| bundle.deinit(ui.allocator);
             results = null;
-            ui.allocator.free(last_searched_norm);
-            last_searched_norm = try ui.allocator.dupe(u8, "");
+            clearSearchPages(ui.allocator, &previous_pages);
+            try replaceOwnedString(ui.allocator, &last_searched_norm, "");
             selected_result = 0;
             result_scroll = 0;
             focus = .query;
         }
         const query_dirty = !std.mem.eql(u8, query_norm_view, last_searched_norm);
-        const has_current_results = !query_dirty and results != null and results.?.hits.items.len > 0;
+        const has_current_results = !query_dirty and results != null and searchPaneAvailable(&results.?);
         focus = normalizeQueryFocus(
             focus,
             has_current_results,
@@ -1119,7 +1136,7 @@ fn runTui(ui: *Ui) !void {
                         if (canRenderOverlayMenu(ui.vx.window())) info_open = true;
                         continue;
                     }
-                    if (key.matches(vaxis.Key.tab, .{})) {
+                    if (key.matches(vaxis.Key.f5, .{})) {
                         if (state.settings.download_cache_enabled) {
                             refreshCachedDownloads(ui.allocator, &state) catch |err| {
                                 switch (try showFriendlyError(ui, "Could not refresh cached downloads", err)) {
@@ -1130,6 +1147,10 @@ fn runTui(ui: *Ui) !void {
                                 continue;
                             };
                         }
+                        clampSelection(&selected_download, state.download_entries.len);
+                        continue;
+                    }
+                    if (key.matches(vaxis.Key.tab, .{})) {
                         focus = nextQueryFocus(focus, has_current_results, state.settings.download_cache_enabled and state.download_entries.len > 0);
                         continue;
                     }
@@ -1155,12 +1176,80 @@ fn runTui(ui: *Ui) !void {
                         if (search_settings_changed) {
                             if (results) |*bundle| bundle.deinit(ui.allocator);
                             results = null;
+                            clearSearchPages(ui.allocator, &previous_pages);
                             selected_result = 0;
                             result_scroll = 0;
                             focus = .query;
-                            ui.allocator.free(last_searched_norm);
-                            last_searched_norm = try ui.allocator.dupe(u8, "");
+                            try replaceOwnedString(ui.allocator, &last_searched_norm, "");
                         }
+                        continue;
+                    }
+
+                    if (focus == .results and !query_dirty and results != null and
+                        (key.matches('[', .{}) or key.matches(']', .{})))
+                    {
+                        if (key.matches('[', .{})) {
+                            if (previous_pages.pop()) |prior| {
+                                results.?.deinit(ui.allocator);
+                                results = prior;
+                                selected_result = 0;
+                                result_scroll = 0;
+                            }
+                            continue;
+                        }
+                        if (ui.searchReaperBacklogFull()) continue;
+                        if (previous_pages.items.len >= 16) {
+                            switch (try vaxisMessage(ui, "Search page limit", "Sixteen previous pages are already retained.", "Refine the query or use --search-page in the CLI.", ui.styleWarn())) {
+                                .ok => {},
+                                .to_query => focus = .query,
+                                .quit => return,
+                            }
+                            continue;
+                        }
+                        if (results.?.page == std.math.maxInt(u32)) continue;
+                        const mask = nextSearchProviders(&results.?);
+                        if (std.mem.indexOfScalar(bool, &mask, true) == null) continue;
+                        // Reserve before fetching, so ownership transfer cannot fail.
+                        try previous_pages.ensureUnusedCapacity(ui.allocator, 1);
+                        const old_selected = selected_result;
+                        const old_scroll = result_scroll;
+                        selected_result = 0;
+                        result_scroll = 0;
+                        var outcome = executeQuerySearchIncremental(ui, &state, results.?.query_norm, results.?.page + 1, &mask, &query, &cursor_pos, &selected_result, &result_scroll, &info_open) catch |err| switch (err) {
+                            error.TuiQuit => return,
+                            else => return err,
+                        };
+                        if (outcome.discard_results) {
+                            outcome.bundle.deinit(ui.allocator);
+                            results.?.deinit(ui.allocator);
+                            results = null;
+                            clearSearchPages(ui.allocator, &previous_pages);
+                            try replaceOwnedString(ui.allocator, &last_searched_norm, "");
+                            selected_result = 0;
+                            result_scroll = 0;
+                            focus = outcome.focus;
+                            continue;
+                        }
+                        if (outcome.mark_query_dirty or outcome.bundle.canceled or outcome.bundle.failed_count > 0 or outcome.bundle.unavailable_count > 0) {
+                            const failed = outcome.bundle.failed_count + outcome.bundle.unavailable_count;
+                            outcome.bundle.deinit(ui.allocator);
+                            selected_result = old_selected;
+                            result_scroll = old_scroll;
+                            focus = outcome.focus;
+                            if (outcome.mark_query_dirty) try replaceOwnedString(ui.allocator, &last_searched_norm, "");
+                            if (failed > 0) {
+                                switch (try vaxisMessage(ui, "Search page unavailable", "A provider could not load this page.", "Previous results were kept. Press ] to retry.", ui.styleWarn())) {
+                                    .ok => focus = .results,
+                                    .to_query => focus = .query,
+                                    .quit => return,
+                                }
+                            }
+                            continue;
+                        }
+                        previous_pages.appendAssumeCapacity(results.?);
+                        results = outcome.bundle;
+                        focus = .results;
+                        if (results.?.cache_changed) try persistTuiRuntimeState(ui.allocator, &state);
                         continue;
                     }
 
@@ -1270,25 +1359,26 @@ fn runTui(ui: *Ui) !void {
                         resetHistoryBrowse(&history_pick, &history_draft, &history_draft_cursor);
                         if (results) |*bundle| bundle.deinit(ui.allocator);
                         results = null;
+                        clearSearchPages(ui.allocator, &previous_pages);
                         const owned_query = try ui.allocator.dupe(u8, current_query_norm);
                         defer ui.allocator.free(owned_query);
                         const keyword_changed = try rememberKeyword(ui.allocator, &state, owned_query);
-                        const search_outcome = executeQuerySearchIncremental(ui, &state, owned_query, &query, &cursor_pos, &selected_result, &result_scroll, &info_open) catch |err| switch (err) {
+                        const search_outcome = executeQuerySearchIncremental(ui, &state, owned_query, 1, null, &query, &cursor_pos, &selected_result, &result_scroll, &info_open) catch |err| switch (err) {
                             error.TuiQuit => return,
                             else => return err,
                         };
-                        ui.allocator.free(last_searched_norm);
                         if (search_outcome.discard_results) {
                             var stale_bundle = search_outcome.bundle;
                             stale_bundle.deinit(ui.allocator);
                             results = null;
-                            last_searched_norm = try ui.allocator.dupe(u8, "");
+                            try replaceOwnedString(ui.allocator, &last_searched_norm, "");
                             selected_result = 0;
                             result_scroll = 0;
                         } else {
                             results = search_outcome.bundle;
-                            last_searched_norm = try ui.allocator.dupe(
-                                u8,
+                            try replaceOwnedString(
+                                ui.allocator,
+                                &last_searched_norm,
                                 if (search_outcome.mark_query_dirty) "" else owned_query,
                             );
                         }
@@ -1423,17 +1513,18 @@ fn defaultTuiSettings() TuiSettings {
 }
 
 fn loadTuiRuntimeState(allocator: std.mem.Allocator, environ_map: *std.process.Environ.Map) !TuiRuntimeState {
+    var transferred = false;
     var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
+    errdefer if (!transferred) arena.deinit();
 
     const state_path = try tuiCachePath(allocator, environ_map, "state.oneserial");
-    errdefer allocator.free(state_path);
+    errdefer if (!transferred) allocator.free(state_path);
     const settings_path = try tuiCachePath(allocator, environ_map, "settings.oneserial");
-    errdefer allocator.free(settings_path);
+    errdefer if (!transferred) allocator.free(settings_path);
     const keyword_path = try tuiCachePath(allocator, environ_map, "keywords.oneserial");
-    errdefer allocator.free(keyword_path);
+    errdefer if (!transferred) allocator.free(keyword_path);
     const cache_root_path = try tuiCachePath(allocator, environ_map, "cache");
-    errdefer allocator.free(cache_root_path);
+    errdefer if (!transferred) allocator.free(cache_root_path);
 
     var out: TuiRuntimeState = .{
         .arena = arena,
@@ -1443,6 +1534,7 @@ fn loadTuiRuntimeState(allocator: std.mem.Allocator, environ_map: *std.process.E
         .keyword_path = keyword_path,
         .cache_root_path = cache_root_path,
     };
+    transferred = true;
     errdefer out.deinit(allocator);
 
     if (loadPersistentSearchState(out.arena.allocator(), state_path) catch |err| blk: {
@@ -1481,6 +1573,7 @@ fn loadTuiRuntimeState(allocator: std.mem.Allocator, environ_map: *std.process.E
     // entries evicted by the bounds above do not remain pinned for the TUI lifetime.
     try compactRuntimeArena(allocator, &out);
     out.download_entries = cachedDownloadLabels(allocator, cache_root_path) catch |err| blk: {
+        if (err == error.OutOfMemory or err == error.Canceled) return err;
         out.download_scan_error = err;
         break :blk &.{};
     };
@@ -1677,13 +1770,15 @@ fn saveOneSerial(comptime T: type, allocator: std.mem.Allocator, path: []const u
     try common.ensureParentDir(path);
     const encoded = try oneserial.serializeAlloc(T, .{}, value, allocator);
     defer allocator.free(encoded);
-    var file = try std.Io.Dir.cwd().createFile(runtime_io.get(), path, .{});
-    defer file.close(runtime_io.get());
+    var atomic = try std.Io.Dir.cwd().createFileAtomic(runtime_io.get(), path, .{ .replace = true });
+    defer atomic.deinit(runtime_io.get());
     var buffer: [16 * 1024]u8 = undefined;
-    var writer = file.writer(runtime_io.get(), &buffer);
+    var writer = atomic.file.writer(runtime_io.get(), &buffer);
     try writer.interface.writeAll(magic);
     try writer.interface.writeAll(encoded);
     try writer.interface.flush();
+    try atomic.file.sync(runtime_io.get());
+    try atomic.replace(runtime_io.get());
 }
 
 fn tuiCachePath(allocator: std.mem.Allocator, environ_map: *std.process.Environ.Map, basename: []const u8) ![]u8 {
@@ -1701,10 +1796,9 @@ fn normalizeQueryView(query: []const u8) []const u8 {
 }
 
 fn cacheFresh(entry: QueryCacheEntry, now: i64, ttl_seconds: i64) bool {
+    if (entry.fetched_at_unix < 0 or entry.fetched_at_unix > now or ttl_seconds < 0) return false;
     if (ttl_seconds == 0) return true;
-    if (ttl_seconds < 0) return false;
-    if (entry.fetched_at_unix > now) return false;
-    return now - entry.fetched_at_unix <= ttl_seconds;
+    return @as(i128, now) - entry.fetched_at_unix <= ttl_seconds;
 }
 
 fn findCacheEntry(state: *const TuiRuntimeState, provider: app.Provider, query_norm: []const u8, page: u32, now: i64) ?usize {
@@ -2235,6 +2329,8 @@ fn executeQuerySearchIncremental(
     ui: *Ui,
     state: *TuiRuntimeState,
     query_norm: []const u8,
+    requested_page: u32,
+    provider_mask: ?*const [app.providerCount()]bool,
     query: *std.ArrayList(u8),
     cursor_pos: *usize,
     selected_result: *usize,
@@ -2244,6 +2340,7 @@ fn executeQuerySearchIncremental(
     var bundle: SearchBundle = .{
         .query_norm = try ui.allocator.dupe(u8, query_norm),
         .searching = true,
+        .page = requested_page,
     };
     errdefer bundle.deinit(ui.allocator);
     var selected_download: usize = 0;
@@ -2266,10 +2363,14 @@ fn executeQuerySearchIncremental(
     const now = scrapers.common.compatUnixTimestamp();
     for (app.providers()) |provider| {
         if (!state.settings.providers_enabled[app.providerIndex(provider)]) continue;
-        if (findCacheEntry(state, provider, cache_key, 1, now)) |cache_idx| {
+        if (provider_mask) |mask| if (!mask[app.providerIndex(provider)]) continue;
+        if (findCacheEntry(state, provider, cache_key, requested_page, now)) |cache_idx| {
             const response_index = bundle.searches.items.len;
-            const cached = try searchResponseFromCache(ui.allocator, state.cache_entries.items[cache_idx]);
-            try bundle.searches.append(ui.allocator, cached);
+            var cached = try searchResponseFromCache(ui.allocator, state.cache_entries.items[cache_idx]);
+            bundle.searches.append(ui.allocator, cached) catch |err| {
+                cached.deinit();
+                return err;
+            };
             for (bundle.searches.items[response_index].items, 0..) |_, item_index| {
                 try bundle.hits.append(ui.allocator, .{
                     .provider = provider,
@@ -2285,7 +2386,7 @@ fn executeQuerySearchIncremental(
             .provider = provider,
             .query = search_work.query,
             .language_code = language_code,
-            .page = 1,
+            .page = requested_page,
         };
         task_count += 1;
         bundle.pending_count += 1;
@@ -2296,7 +2397,7 @@ fn executeQuerySearchIncremental(
     startQueuedProviderSearches(search_group, tasks, task_count, &started_count, &in_flight);
     bundle.active_count = in_flight;
     bundle.queued_count = task_count - started_count;
-    var active_focus: QueryFocus = if (bundle.hits.items.len > 0) .results else .query;
+    var active_focus: QueryFocus = if (searchPaneAvailable(&bundle)) .results else .query;
     var focus_explicit = false;
 
     try renderQueryHome(
@@ -2323,20 +2424,23 @@ fn executeQuerySearchIncremental(
         while (idx < started_count) : (idx += 1) {
             if (consumed[idx]) continue;
             if (tasks[idx].done.load(.acquire) == 0) continue;
-            consumed[idx] = true;
             bundle.pending_count -= 1;
-            in_flight -|= 1;
+            releaseProviderSearchCredit(&tasks[idx], &in_flight);
             dirty = true;
             if (tasks[idx].err) |err| {
+                consumed[idx] = true;
                 recordSearchFailure(&bundle, err);
                 continue;
             }
             const search_result = tasks[idx].result orelse {
+                consumed[idx] = true;
                 bundle.failed_count += 1;
                 continue;
             };
             const response_index = bundle.searches.items.len;
             try bundle.searches.append(ui.allocator, search_result);
+            tasks[idx].result = null;
+            consumed[idx] = true;
             for (bundle.searches.items[response_index].items, 0..) |_, item_index| {
                 try bundle.hits.append(ui.allocator, .{ .provider = tasks[idx].provider, .response_index = response_index, .item_index = item_index, .source = .live });
             }
@@ -2350,7 +2454,8 @@ fn executeQuerySearchIncremental(
         if (!focus_explicit and bundle.hits.items.len > 0) active_focus = .results;
 
         var wheel_delta: i32 = 0;
-        while (try ui.loop.tryEvent()) |event| {
+        while (try ui.loop.tryEvent()) |queued_event| {
+            const event = try decodeInputEvent(ui, queued_event);
             dirty = true;
             switch (event) {
                 .winsize => |ws| try ui.resize(ws),
@@ -2464,7 +2569,7 @@ fn executeQuerySearchIncremental(
                         continue;
                     }
                     if (key.matches(vaxis.Key.tab, .{})) {
-                        active_focus = nextQueryFocus(active_focus, bundle.display_order.len > 0, false);
+                        active_focus = nextQueryFocus(active_focus, searchPaneAvailable(&bundle), false);
                         focus_explicit = true;
                         continue;
                     }
@@ -2478,6 +2583,7 @@ fn executeQuerySearchIncremental(
                         focus_explicit = true;
                         continue;
                     }
+                    if (active_focus == .results and (key.matches('[', .{}) or key.matches(']', .{}))) continue;
                     if (try applyActiveSearchQueryEditKey(ui.allocator, query, cursor_pos, key)) {
                         bundle.searching = false;
                         bundle.pending_count = 0;
@@ -2580,7 +2686,7 @@ fn executeQuerySearchIncremental(
         }
         if (dirty) {
             clampSelection(selected_result, bundle.display_order.len);
-            active_focus = normalizeQueryFocus(active_focus, bundle.display_order.len > 0, false);
+            active_focus = normalizeQueryFocus(active_focus, searchPaneAvailable(&bundle), false);
             try renderQueryHome(ui, state, query.items, cursor_pos.*, active_focus, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
         }
         for (cache_response_indices[0..cache_response_count]) |response_index| {
@@ -2590,7 +2696,7 @@ fn executeQuerySearchIncremental(
                 state,
                 response.provider,
                 cache_key,
-                1,
+                requested_page,
                 scrapers.common.compatUnixTimestamp(),
                 response,
             )) {
@@ -2604,7 +2710,7 @@ fn executeQuerySearchIncremental(
     bundle.searching = false;
     bundle.active_count = 0;
     bundle.queued_count = 0;
-    active_focus = normalizeQueryFocus(active_focus, bundle.display_order.len > 0, false);
+    active_focus = normalizeQueryFocus(active_focus, searchPaneAvailable(&bundle), false);
     try renderQueryHome(ui, state, query.items, cursor_pos.*, active_focus, false, &bundle, selected_result, result_scroll, &selected_download, &download_scroll, info_open.*, true);
     return .{
         .bundle = bundle,
@@ -2612,7 +2718,28 @@ fn executeQuerySearchIncremental(
     };
 }
 
+fn releaseProviderSearchCredit(task: *ProviderSearchTask, in_flight: *usize) void {
+    if (task.in_flight_credit) {
+        std.debug.assert(in_flight.* > 0);
+        in_flight.* -= 1;
+        task.in_flight_credit = false;
+    }
+}
+fn scheduleProvider(group: *std.Io.Group, task: *ProviderSearchTask) !void {
+    try group.concurrent(runtime_io.get(), providerSearchTaskMain, .{task});
+}
 fn startQueuedProviderSearches(
+    group: *std.Io.Group,
+    tasks: []ProviderSearchTask,
+    task_count: usize,
+    started_count: *usize,
+    in_flight: *usize,
+) void {
+    return startQueuedProviderSearchesWith(scheduleProvider, group, tasks, task_count, started_count, in_flight);
+}
+
+fn startQueuedProviderSearchesWith(
+    comptime schedule: anytype,
     group: *std.Io.Group,
     tasks: []ProviderSearchTask,
     task_count: usize,
@@ -2623,7 +2750,7 @@ fn startQueuedProviderSearches(
     std.debug.assert(started_count.* <= task_count);
     while (started_count.* < task_count and in_flight.* < max_parallel_provider_searches) {
         const idx = started_count.*;
-        group.concurrent(runtime_io.get(), providerSearchTaskMain, .{&tasks[idx]}) catch |err| {
+        schedule(group, &tasks[idx]) catch |err| {
             // Scheduler/resource exhaustion is a per-provider failure, not a
             // reason to abort the whole interactive search.
             tasks[idx].err = err;
@@ -2631,6 +2758,7 @@ fn startQueuedProviderSearches(
             started_count.* += 1;
             continue;
         };
+        tasks[idx].in_flight_credit = true;
         started_count.* += 1;
         in_flight.* += 1;
     }
@@ -2772,6 +2900,7 @@ fn formatHomeTopLine(
     if (help_available) pos += (try std.fmt.bufPrint(buf[pos..], " · F1 Help", .{})).len;
     pos += (try std.fmt.bufPrint(buf[pos..], " · {d}/{d} providers", .{ enabled_provider_count, provider_count })).len;
     if (maybe_bundle) |bundle| {
+        pos += (try std.fmt.bufPrint(buf[pos..], " · page {d} [ / ]", .{bundle.page})).len;
         if (bundle.hits.items.len > 0) {
             const visible_count = visible_result_count orelse bundle.hits.items.len;
             if (visible_count == bundle.hits.items.len) {
@@ -2959,19 +3088,21 @@ fn queryHitScore(bundle: *const SearchBundle, hit_idx: usize, query_norm: []cons
     const hit = bundle.hits.items[hit_idx];
     const item = bundle.searches.items[hit.response_index].items[hit.item_index];
     const title = cleanSearchTitle(item.label);
+    const title_query = common.parseEpisodeQuery(query_norm).title;
     var score: u32 = 0;
-    if (startsWithCaseInsensitive(title, query_norm)) {
+    if (startsWithCaseInsensitive(title, title_query)) {
         score += 1000;
-    } else if (containsCaseInsensitive(title, query_norm)) {
+    } else if (containsCaseInsensitive(title, title_query)) {
         score += 700;
     }
     if (containsCaseInsensitive(app.providerDisplayName(hit.provider), query_norm) or containsCaseInsensitive(app.providerName(hit.provider), query_norm)) {
         score += 100;
     }
-    var terms = std.mem.tokenizeAny(u8, query_norm, " \t\r\n._-");
+    const provider_match = score == 100;
+    var terms = std.mem.tokenizeAny(u8, title_query, " \t\r\n._-");
     while (terms.next()) |term| {
         if (term.len < 2) continue;
-        if (containsCaseInsensitive(title, term)) score += 50;
+        if (containsCaseInsensitive(title, term)) score += 50 else if (!provider_match) return 0;
     }
     return score;
 }
@@ -3321,7 +3452,7 @@ fn settingsPageSize(metrics: SettingsPopupMetrics) usize {
 }
 
 fn settingsPopupInteractive(metrics: SettingsPopupMetrics) bool {
-    return metrics.row_end > metrics.row_start;
+    return metrics.width >= 24 and metrics.row_end > metrics.row_start;
 }
 
 fn settingsMainItemCount(keyword_count: usize) usize {
@@ -3545,6 +3676,7 @@ fn editSettingsPopup(
                     const win_now = ui.vx.window();
                     const metrics_now = settingsPopupMetrics(win_now.width, win_now.height);
                     if (!settingsPopupInteractive(metrics_now)) continue;
+                    if (mouse.button == .left and !settingsPopupContainsColumn(metrics_now, mouse.col)) continue;
                     switch (panel) {
                         .main => {
                             const item_count = settingsMainItemCount(state.keywords.items.len);
@@ -3683,6 +3815,7 @@ fn editSettingsPopup(
                     }
                     if (!settingsPopupInteractive(metrics)) {
                         if (key.matches(vaxis.Key.escape, .{})) {
+                            if (settings_dirty) try persistTuiSettingsState(ui.allocator, state);
                             return searchSettingsChanged(initial_settings, state.settings);
                         }
                         continue;
@@ -4087,7 +4220,7 @@ fn parseCacheTtlSeconds(input: []const u8) ?i64 {
     if (hours == 0) return 0;
     const seconds_f = hours * 3600.0;
     if (!std.math.isFinite(seconds_f) or seconds_f >= @as(f64, @floatFromInt(std.math.maxInt(i64)))) return null;
-    return @intFromFloat(@round(seconds_f));
+    return @max(@as(i64, 1), @as(i64, @intFromFloat(@round(seconds_f))));
 }
 
 fn renderQueryHome(
@@ -4262,7 +4395,7 @@ fn renderQueryHome(
         }
     }
 
-    const has_results = if (visible_order) |order| order.len > 0 else false;
+    const has_results = if (results) |bundle| !query_dirty and searchPaneAvailable(bundle) else false;
     const has_downloads = state.settings.download_cache_enabled and state.download_entries.len > 0;
     const has_history = state.settings.keyword_cache_enabled and state.keywords.items.len > 0;
     const search_active = if (results) |bundle| bundle.searching else false;
@@ -4758,17 +4891,16 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
                 .ref = selected_title.ref,
                 .page = subtitle_page_current,
             };
+            defer if (subtitles_task.result) |*r| r.deinit();
             var subtitles_group: std.Io.Group = .init;
             defer subtitles_group.cancel(runtime_io.get());
             try subtitles_group.concurrent(runtime_io.get(), subtitlesTaskMain, .{&subtitles_task});
             const subtitles_control = try waitForTask(ui, &subtitles_task.done, "Subtitles", detail);
             try finalizeWorkerGroupWithStatus(ui, &subtitles_group, subtitles_control, "Subtitles", detail);
             if (subtitles_control == .quit) {
-                if (subtitles_task.result) |*r| r.deinit();
                 return .quit;
             }
             if (subtitles_control == .canceled) {
-                if (subtitles_task.result) |*r| r.deinit();
                 return .back;
             }
             if (subtitles_task.err) |err| {
@@ -4788,11 +4920,12 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
                 };
             };
             try subtitle_pages.append(ui.allocator, .{ .page = subtitle_page_current, .response = subtitles });
+            subtitles_task.result = null;
             break :blk_fetch subtitle_pages.items.len - 1;
         };
 
         const subtitles = &subtitle_pages.items[subtitles_idx].response;
-        if (subtitles.items.len == 0) {
+        if (subtitles.items.len == 0 and !(supports_subtitles_pagination and (subtitles.has_prev_page or subtitles.has_next_page))) {
             const msg = try vaxisMessage(ui, "No Subtitles", "No subtitle rows were returned.", "Press Enter to continue.", ui.styleWarn());
             return switch (msg) {
                 .ok => .back,
@@ -4886,17 +5019,16 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
             .out_dir = download_out_dir,
             .extract_archive = true,
         };
+        defer if (download_task.result) |*r| r.deinit(std.heap.page_allocator);
         var download_group: std.Io.Group = .init;
         defer download_group.cancel(runtime_io.get());
         try download_group.concurrent(runtime_io.get(), downloadTaskMain, .{&download_task});
         const download_control = try waitForDownloadTask(ui, &download_task, "Download", download_detail);
         try finalizeWorkerGroupWithStatus(ui, &download_group, download_control, "Download", download_detail);
         if (download_control == .quit) {
-            if (download_task.result) |*r| r.deinit(std.heap.page_allocator);
             return .quit;
         }
         if (download_control == .canceled) {
-            if (download_task.result) |*r| r.deinit(std.heap.page_allocator);
             continue :subtitle_page_loop;
         }
         if (download_task.err) |err| {
@@ -4915,7 +5047,22 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
                 .quit => .quit,
             };
         };
+        download_task.result = null;
         defer result.deinit(std.heap.page_allocator);
+        if (result.translation_incomplete) {
+            switch (try vaxisMessage(ui, "Translation incomplete", "Some lines remain in the original language.", "The partially translated file can still be exported.", ui.styleWarn())) {
+                .ok => {},
+                .to_query => return .to_query,
+                .quit => return .quit,
+            }
+        }
+        if (result.extraction_unavailable) {
+            switch (try vaxisMessage(ui, "Archive saved", "This archive needs an external extraction tool.", "The original download is available to export.", ui.styleWarn())) {
+                .ok => {},
+                .to_query => return .to_query,
+                .quit => return .quit,
+            }
+        }
         if (settings.download_cache_enabled) {
             refreshCachedDownloads(ui.allocator, state) catch |err| {
                 if (err == error.OutOfMemory) return err;
@@ -5193,7 +5340,7 @@ fn cachedDownloadLabels(allocator: std.mem.Allocator, cache_root_path: []const u
     if (subtitle_count > 0 and subtitle_count < out.items.len) {
         var write_idx: usize = 0;
         for (out.items) |label| {
-            if (isLikelySubtitlePath(label)) {
+            if (isLikelySubtitlePath(label) or isCachedArchivePath(label)) {
                 out.items[write_idx] = label;
                 write_idx += 1;
             } else {
@@ -5226,6 +5373,7 @@ fn cachedDownloadLabelsRecursive(
 
     var it = dir.iterate();
     while (try it.next(runtime_io.get())) |entry| {
+        if (std.mem.startsWith(u8, entry.name, ".scrapers-extract-staging")) continue;
         const rel = if (rel_prefix.len == 0)
             try allocator.dupe(u8, entry.name)
         else
@@ -5330,35 +5478,7 @@ fn sanitizeExportFilename(allocator: std.mem.Allocator, input: []const u8) ![]u8
     return try out.toOwnedSlice(allocator);
 }
 
-fn isWindowsReservedFilename(name: []const u8) bool {
-    const stem_end = std.mem.indexOfScalar(u8, name, '.') orelse name.len;
-    var trimmed_end = stem_end;
-    while (trimmed_end > 0) {
-        const ch = name[trimmed_end - 1];
-        if (ch != ' ' and ch != '.') break;
-        trimmed_end -= 1;
-    }
-    const stem = name[0..trimmed_end];
-    if (stem.len == 0) return false;
-    if (std.ascii.eqlIgnoreCase(stem, "CON") or
-        std.ascii.eqlIgnoreCase(stem, "PRN") or
-        std.ascii.eqlIgnoreCase(stem, "AUX") or
-        std.ascii.eqlIgnoreCase(stem, "NUL") or
-        std.ascii.eqlIgnoreCase(stem, "CONIN$") or
-        std.ascii.eqlIgnoreCase(stem, "CONOUT$") or
-        std.ascii.eqlIgnoreCase(stem, "CLOCK$"))
-    {
-        return true;
-    }
-    if (stem.len == 4 and
-        (std.ascii.eqlIgnoreCase(stem[0..3], "COM") or
-            std.ascii.eqlIgnoreCase(stem[0..3], "LPT")) and
-        stem[3] >= '1' and stem[3] <= '9')
-    {
-        return true;
-    }
-    return false;
-}
+const isWindowsReservedFilename = common.isWindowsReservedFilename;
 
 test "export filenames remain valid on Windows targets" {
     const cases = [_]struct {
@@ -5384,15 +5504,23 @@ test "export filenames remain valid on Windows targets" {
 }
 
 fn nextAvailableExportPath(allocator: std.mem.Allocator, out_dir: []const u8, filename: []const u8) ![]u8 {
+    return nextAvailableExportPathWith(exportPathAccess, allocator, out_dir, filename);
+}
+fn exportPathAccess(path: []const u8) !void {
+    _ = try std.Io.Dir.cwd().statFile(runtime_io.get(), path, .{ .follow_symlinks = false });
+}
+fn nextAvailableExportPathWith(comptime access: anytype, allocator: std.mem.Allocator, out_dir: []const u8, filename: []const u8) ![]u8 {
     var candidate = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ out_dir, filename });
+    errdefer allocator.free(candidate);
     var suffix: usize = 2;
     while (true) : (suffix += 1) {
-        std.Io.Dir.cwd().access(runtime_io.get(), candidate, .{}) catch |err| switch (err) {
+        access(candidate) catch |err| switch (err) {
             error.FileNotFound => return candidate,
             else => return err,
         };
+        const next = try std.fmt.allocPrint(allocator, "{s}/{d}-{s}", .{ out_dir, suffix, filename });
         allocator.free(candidate);
-        candidate = try std.fmt.allocPrint(allocator, "{s}/{d}-{s}", .{ out_dir, suffix, filename });
+        candidate = next;
     }
 }
 
@@ -5444,6 +5572,9 @@ fn friendlyErrorMessage(err: anyerror) []const u8 {
         error.InvalidSessionPayload => "Provider session data was invalid or incomplete.",
         error.BrowserAutomationFailed => "Browser automation failed while acquiring session cookies.",
         error.ArchiveExtractionUnavailable => "Archive extraction is not available for this archive format in this build.",
+        error.ArchiveFormatNeedsExternalExtraction => "7z needs an external extractor. The original archive was saved.",
+        error.ArchiveEntryLimit, error.ArchiveEntryTooLarge, error.ArchiveTooLarge => "Archive exceeds safe extraction limits. The original archive was saved.",
+        error.InvalidArchivePath, error.ArchiveMetadataUnsupported, error.ArchiveEncrypted => "Archive metadata is unsafe or unsupported. The original archive was saved.",
         error.ArchiveExtractionFailed => "Downloaded archive could not be extracted on this machine.",
         else => "An unexpected error occurred at this step.",
     };
@@ -5520,12 +5651,27 @@ fn compactInputErrorRow(layout: CompactDialogLayout, input_row: ?u16) ?u16 {
     return error_row;
 }
 
+fn lineFitsDisplayWidth(win: anytype, line: []const u8, max_width: usize) bool {
+    if (!std.unicode.utf8ValidateSlice(line)) return false;
+    for (line) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+    var width: usize = 0;
+    var iter = vaxis.unicode.graphemeIterator(line);
+    while (iter.next()) |grapheme| {
+        const bytes = grapheme.bytes(line);
+        if (bytes.len > std.math.maxInt(u16) / 2) return false;
+        const part: usize = win.gwidth(bytes);
+        if (part > max_width - width) return false;
+        width += part;
+    }
+    return true;
+}
+
 fn confirmationLinesFitWidth(win: anytype, lines: []const []const u8) bool {
     if (lines.len == 0) return true;
     if (win.width <= 2) return false;
     const max_width: usize = @intCast(win.width - 2);
     for (lines) |line| {
-        if (win.gwidth(line) > max_width) return false;
+        if (!lineFitsDisplayWidth(win, line, max_width)) return false;
     }
     return true;
 }
@@ -6072,7 +6218,7 @@ fn vaxisSelectSubtitle(
     enabled: []const bool,
     page_nav: ?PageNav,
 ) !SelectResult {
-    if (subtitles.len == 0) return error.NoData;
+    if (subtitles.len == 0 and subtitlePageHasNoSelectableExit(0, page_nav)) return error.NoData;
     if (enabled.len != subtitles.len) return error.InvalidFieldType;
 
     var sort_mode: SubtitleSort = .relevance;
@@ -6099,8 +6245,8 @@ fn vaxisSelectSubtitle(
         win.hideCursor();
 
         const show_pane = subtitleDetailsPaneVisible(win.width, win.height);
-        const left_width: u16 = if (show_pane) @max(@as(u16, 36), (win.width * 56) / 100) else win.width;
-        const pane_col: u16 = left_width + 3;
+        const left_width: u16 = if (show_pane) @max(@as(u16, 36), @as(u16, @intCast((@as(u32, win.width) * 56) / 100))) else win.width;
+        const pane_col = subtitlePaneColumn(win.width, win.height);
         const pane_width: usize = if (show_pane and win.width > pane_col + 1) @intCast(win.width - pane_col - 1) else 0;
 
         try renderCompactTopLine(ui, win, title, ui.styleTitle());
@@ -6308,8 +6454,7 @@ fn vaxisSelectSubtitle(
                     }
 
                     if (key.matches(vaxis.Key.escape, .{})) return .back;
-                    if (can_page and key.matches('[', .{})) return .page_prev;
-                    if (can_page and key.matches(']', .{})) return .page_next;
+                    if (subtitlePageKeyResult(page_nav, key)) |result| return result;
                     if (key.matches('/', .{})) {
                         filter_mode = true;
                         continue;
@@ -6320,8 +6465,9 @@ fn vaxisSelectSubtitle(
                         else
                             null;
                         sort_mode = nextSortMode(sort_mode);
+                        const next_order = try buildSubtitleOrder(ui.allocator, subtitles, sort_mode);
                         ui.allocator.free(order);
-                        order = try buildSubtitleOrder(ui.allocator, subtitles, sort_mode);
+                        order = next_order;
                         try rebuildSubtitleMatches(ui.allocator, subtitles, order, filter.items, &matches);
                         if (selected_subtitle_idx) |subtitle_idx| {
                             selected_row = findIndexInMatches(matches.items, subtitle_idx) orelse 0;
@@ -6413,16 +6559,30 @@ fn vaxisSelectSubtitle(
     }
 }
 
-fn vaxisConfirm(ui: *Ui, title: []const u8, lines: []const []const u8) !ConfirmResult {
-    const owned_title = try ui.allocator.dupe(u8, title);
-    defer ui.allocator.free(owned_title);
-    const owned_lines = try ui.allocator.alloc([]u8, lines.len);
+fn duplicateStrings(allocator: std.mem.Allocator, lines: []const []const u8) ![][]u8 {
+    const result = try allocator.alloc([]u8, lines.len);
+    errdefer allocator.free(result);
     var initialized: usize = 0;
-    errdefer freeInitializedStrings(ui.allocator, owned_lines, initialized);
-    for (lines, 0..) |line, idx| {
-        owned_lines[idx] = try ui.allocator.dupe(u8, line);
+    errdefer freeInitializedStrings(allocator, result, initialized);
+    for (lines, 0..) |line, i| {
+        result[i] = try escapeConfirmationText(allocator, line);
         initialized += 1;
     }
+    return result;
+}
+fn checkStringDuplication(allocator: std.mem.Allocator) !void {
+    const result = try duplicateStrings(allocator, &.{ "first", "second", "third" });
+    defer freeOwnedStrings(allocator, result);
+    try std.testing.expectEqualStrings("second", result[1]);
+}
+test "confirmation text has a single owner through allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkStringDuplication, .{});
+}
+
+fn vaxisConfirm(ui: *Ui, title: []const u8, lines: []const []const u8) !ConfirmResult {
+    const owned_title = try escapeConfirmationText(ui.allocator, title);
+    defer ui.allocator.free(owned_title);
+    const owned_lines = try duplicateStrings(ui.allocator, lines);
     defer freeOwnedStrings(ui.allocator, owned_lines);
 
     while (true) {
@@ -7177,10 +7337,14 @@ const EventBatch = struct {
     }
 };
 
+fn decodeInputEvent(ui: *Ui, event: Event) !Event {
+    if (event != .paste_start) return event;
+    const batch = try readBracketedPaste(ui);
+    return batch.items[0];
+}
 fn readEventBatch(ui: *Ui, first: Event) !EventBatch {
-    if (first == .paste_start) return readBracketedPaste(ui);
     var batch: EventBatch = .{};
-    batch.collect(first);
+    batch.collect(try decodeInputEvent(ui, first));
     // Do not eagerly drain keyboard events. Many TUI handlers intentionally
     // return or change screens on Enter/Esc/Ctrl+C; draining ahead would drop
     // any immediately-following keystrokes from the same terminal burst.
@@ -7890,6 +8054,9 @@ test "query cache helpers trim and expire predictably" {
     try std.testing.expect(cacheFresh(entry, 100 + 60, 120));
     try std.testing.expect(!cacheFresh(entry, 100 + 121, 120));
     try std.testing.expect(cacheFresh(entry, 100 + 365 * 24 * 60 * 60, 0));
+    var ancient = entry;
+    ancient.fetched_at_unix = std.math.minInt(i64);
+    try std.testing.expect(!cacheFresh(ancient, 1, 1));
     try std.testing.expectEqual(@as(?i64, 0), parseCacheTtlSeconds("inf"));
     try std.testing.expectEqual(@as(?i64, 0), parseCacheTtlSeconds("0"));
     try std.testing.expectEqual(@as(?i64, 5400), parseCacheTtlSeconds("1.5"));
@@ -8043,8 +8210,8 @@ test "download cache refresh discovers new files and exports the selected entry"
     defer state.deinit(allocator);
 
     try refreshCachedDownloads(allocator, &state);
-    try std.testing.expectEqual(@as(usize, 1), state.download_entries.len);
-    try std.testing.expectEqualStrings("first.srt", state.download_entries[0]);
+    try std.testing.expectEqual(@as(usize, 2), state.download_entries.len);
+    try std.testing.expectEqualStrings("first.srt", state.download_entries[1]);
 
     const second_path = try std.fmt.allocPrint(allocator, "{s}/second.srt", .{downloads_root});
     defer allocator.free(second_path);
@@ -8057,9 +8224,9 @@ test "download cache refresh discovers new files and exports the selected entry"
         try writer.interface.flush();
     }
     try refreshCachedDownloads(allocator, &state);
-    try std.testing.expectEqual(@as(usize, 2), state.download_entries.len);
-    try std.testing.expectEqualStrings("first.srt", state.download_entries[0]);
-    try std.testing.expectEqualStrings("second.srt", state.download_entries[1]);
+    try std.testing.expectEqual(@as(usize, 3), state.download_entries.len);
+    try std.testing.expectEqualStrings("first.srt", state.download_entries[1]);
+    try std.testing.expectEqualStrings("second.srt", state.download_entries[2]);
 
     var second_index: ?usize = null;
     for (state.download_entries, 0..) |entry, idx| {
@@ -8719,4 +8886,316 @@ fn freeOwnedStrings(allocator: std.mem.Allocator, strings: [][]u8) void {
 
 fn freeInitializedStrings(allocator: std.mem.Allocator, strings: [][]u8, initialized: usize) void {
     for (strings[0..initialized]) |s| allocator.free(s);
+}
+
+test "confirmation width handles huge and composed Unicode text" {
+    const Window = struct {
+        width: u16 = 80,
+        method: vaxis.gwidth.Method = .unicode,
+        pub fn gwidth(self: @This(), bytes: []const u8) u16 {
+            return vaxis.gwidth.gwidth(bytes, self.method);
+        }
+    };
+    const win = Window{};
+    try std.testing.expect(lineFitsDisplayWidth(win, "e\u{301}", 1));
+    try std.testing.expect(!lineFitsDisplayWidth(win, "e\u{301}x", 1));
+    try std.testing.expect(lineFitsDisplayWidth(win, "\u{1f469}\u{200d}\u{1f680}", 2));
+    try std.testing.expect(!lineFitsDisplayWidth(win, "\u{1f469}\u{200d}\u{1f680}", 1));
+    try std.testing.expect(!lineFitsDisplayWidth(win, "\xff", 20));
+    const huge = try std.testing.allocator.alloc(u8, 70_000);
+    defer std.testing.allocator.free(huge);
+    @memset(huge, 'a');
+    try std.testing.expect(!confirmationLinesFitWidth(win, &.{huge}));
+}
+
+test "failed scheduler admission never releases another provider credit" {
+    const Mock = struct {
+        var calls: usize = 0;
+        fn schedule(_: *std.Io.Group, _: *ProviderSearchTask) anyerror!void {
+            calls += 1;
+            if (calls == 1) return error.ConcurrentUnavailable;
+        }
+    };
+    var tasks: [max_parallel_provider_searches + 2]ProviderSearchTask = undefined;
+    for (&tasks) |*task| task.* = .{ .provider = .subdl_com, .query = "fixture" };
+    var group: std.Io.Group = .init;
+    var started: usize = 0;
+    var active: usize = 0;
+    Mock.calls = 0;
+    startQueuedProviderSearchesWith(Mock.schedule, &group, &tasks, tasks.len, &started, &active);
+    try std.testing.expectEqual(max_parallel_provider_searches, active);
+    releaseProviderSearchCredit(&tasks[0], &active);
+    startQueuedProviderSearchesWith(Mock.schedule, &group, &tasks, tasks.len, &started, &active);
+    try std.testing.expectEqual(max_parallel_provider_searches + 1, Mock.calls);
+    releaseProviderSearchCredit(&tasks[1], &active);
+    startQueuedProviderSearchesWith(Mock.schedule, &group, &tasks, tasks.len, &started, &active);
+    try std.testing.expectEqual(max_parallel_provider_searches + 2, Mock.calls);
+    try std.testing.expectEqual(max_parallel_provider_searches, active);
+}
+fn checkRuntimeLoadOwnership(allocator: std.mem.Allocator, env: *std.process.Environ.Map) !void {
+    var state = try loadTuiRuntimeState(allocator, env);
+    defer state.deinit(allocator);
+}
+test "runtime state construction transfers cleanup once under allocation failure" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temp.sub_path});
+    defer std.testing.allocator.free(root);
+    var env = try std.testing.environ.createMap(std.testing.allocator);
+    defer env.deinit();
+    try env.put("XDG_CACHE_HOME", root);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkRuntimeLoadOwnership, .{&env});
+}
+test "active and idle bracketed paste decode controls as text and preserve next event" {
+    var loop: vaxis.Loop(Event) = .init(std.testing.io, undefined, undefined);
+    var ui: Ui = .{ .allocator = std.testing.allocator, .environ_map = undefined, .tty = undefined, .vx = undefined, .loop = &loop, .frame_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer ui.frame_arena.deinit();
+    const events = [_]Event{ .{ .paste = "new" }, .{ .key_press = .{ .codepoint = vaxis.Key.enter } }, .{ .key_press = .{ .codepoint = 'd', .mods = .{ .ctrl = true } } }, .{ .paste = "query" }, .paste_end, .{ .key_press = .{ .codepoint = vaxis.Key.enter } } };
+    for (0..2) |pass| {
+        for (events) |event| try loop.postEvent(event);
+        const event = if (pass == 0) try decodeInputEvent(&ui, .paste_start) else (try readEventBatch(&ui, .paste_start)).items[0];
+        try std.testing.expect(event == .paste);
+        try std.testing.expectEqualStrings("new query", event.paste);
+        try std.testing.expect((try loop.tryEvent()).?.key_press.matches(vaxis.Key.enter, .{}));
+        try std.testing.expect((try loop.tryEvent()) == null);
+    }
+}
+
+fn replaceOwnedString(allocator: std.mem.Allocator, owned: *[]u8, replacement: []const u8) !void {
+    const next = try allocator.dupe(u8, replacement);
+    allocator.free(owned.*);
+    owned.* = next;
+}
+
+test "owned query replacement preserves allocation on failure" {
+    var owned = try std.testing.allocator.dupe(u8, "old");
+    defer std.testing.allocator.free(owned);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, replaceOwnedString(failing.allocator(), &owned, "new"));
+    try std.testing.expectEqualStrings("old", owned);
+    try replaceOwnedString(std.testing.allocator, &owned, "new");
+    try std.testing.expectEqualStrings("new", owned);
+}
+
+fn clearSearchPages(allocator: std.mem.Allocator, pages: *std.ArrayList(SearchBundle)) void {
+    for (pages.items) |*page| page.deinit(allocator);
+    pages.clearRetainingCapacity();
+}
+fn nextSearchProviders(bundle: *const SearchBundle) [app.providerCount()]bool {
+    var mask: [app.providerCount()]bool = @splat(false);
+    for (bundle.searches.items) |response| {
+        if (response.has_next_page) mask[app.providerIndex(response.provider)] = true;
+    }
+    return mask;
+}
+
+test "next search page admits only responses advertising another page" {
+    const allocator = std.testing.allocator;
+    var bundle: SearchBundle = .{ .query_norm = try allocator.dupe(u8, "fixture") };
+    defer bundle.deinit(allocator);
+    try bundle.searches.append(allocator, .{ .arena = std.heap.ArenaAllocator.init(allocator), .provider = .subdl_com, .items = &.{}, .has_next_page = false });
+    try bundle.searches.append(allocator, .{ .arena = std.heap.ArenaAllocator.init(allocator), .provider = .subsource_net, .items = &.{}, .has_next_page = true });
+    const mask = nextSearchProviders(&bundle);
+    try std.testing.expectEqual(@as(usize, 1), common.countTrue(&mask));
+    try std.testing.expect(mask[app.providerIndex(.subsource_net)]);
+}
+
+fn searchPaneAvailable(bundle: *const SearchBundle) bool {
+    if (bundle.hits.items.len > 0 or bundle.page > 1) return true;
+    for (bundle.searches.items) |response| if (response.has_next_page) return true;
+    return false;
+}
+
+test "empty search pages retain navigation when continuation exists" {
+    const allocator = std.testing.allocator;
+    var bundle: SearchBundle = .{ .query_norm = try allocator.dupe(u8, "fixture") };
+    defer bundle.deinit(allocator);
+    try std.testing.expect(!searchPaneAvailable(&bundle));
+    bundle.page = 2;
+    try std.testing.expect(searchPaneAvailable(&bundle));
+    bundle.page = 1;
+    try bundle.searches.append(allocator, .{ .arena = std.heap.ArenaAllocator.init(allocator), .provider = .subsource_net, .items = &.{}, .has_next_page = true });
+    try std.testing.expect(searchPaneAvailable(&bundle));
+}
+
+fn stopInputLoop(loop: *vaxis.Loop(Event)) void {
+    // vaxis.stop waits for a terminal status reply and cannot release a full
+    // event queue. Cancellation wakes both the tty read and queue condition.
+    if (loop.thread) |*future| {
+        future.cancel(loop.io);
+        loop.thread = null;
+        loop.should_quit = false;
+    }
+}
+
+test "input shutdown cancels a producer blocked on the full event queue" {
+    var tty: vaxis.Tty = undefined;
+    var vx: vaxis.Vaxis = undefined;
+    var loop = vaxis.Loop(Event).init(runtime_io.get(), &tty, &vx);
+    for (0..512) |_| try loop.postEvent(.{ .key_press = .{ .codepoint = 'x' } });
+    const Producer = struct {
+        fn run(input: *vaxis.Loop(Event)) void {
+            input.postEvent(.{ .key_press = .{ .codepoint = 'y' } }) catch {};
+        }
+    };
+    loop.thread = try runtime_io.get().concurrent(Producer.run, .{&loop});
+    stopInputLoop(&loop);
+    try std.testing.expect(loop.thread == null);
+    stopInputLoop(&loop);
+}
+
+test "serializer compatibility preserves pointer alignment and golden wire bytes" {
+    const allocator = std.testing.allocator;
+    const Tag = enum(u8) { first = 1, last = 7 };
+    const Wire = struct { number: u16, tag: Tag };
+    const value: Wire = .{ .number = 0x1234, .tag = .last };
+    const bytes = try oneserial.serializeAlloc(Wire, .{ .endian = .little }, &value, allocator);
+    defer allocator.free(bytes);
+    // The pinned wire format advances an aligned u16 by two padding bytes.
+    // Preserve it to keep existing persisted data readable.
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0x34, 0x12, 7 }, bytes);
+    try std.testing.expectError(error.InvalidEnumTag, oneserial.Untrusted(Tag, .{}).init(&.{255}).toOwned(allocator));
+    var natural: u32 = 42;
+    var aligned: [2]u32 align(64) = .{ 7, 9 };
+    const Pointers = struct { natural: *const u32, aligned: []align(64) const u32 };
+    const pointers: Pointers = .{ .natural = &natural, .aligned = &aligned };
+    const encoded = try oneserial.serializeAlloc(Pointers, .{}, &pointers, allocator);
+    defer allocator.free(encoded);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const decoded = try oneserial.Untrusted(Pointers, .{}).init(encoded).toOwned(arena.allocator());
+    try std.testing.expectEqual(@as(u32, 42), decoded.natural.*);
+    try std.testing.expectEqualSlices(u32, &aligned, decoded.aligned);
+    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(decoded.aligned.ptr) % 64);
+}
+
+fn isCachedArchivePath(path: []const u8) bool {
+    return std.ascii.endsWithIgnoreCase(path, ".zip") or std.ascii.endsWithIgnoreCase(path, ".rar") or std.ascii.endsWithIgnoreCase(path, ".7z");
+}
+fn escapeConfirmationText(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const hex = "0123456789abcdef";
+    for (input) |byte| {
+        if (byte < 0x20 or byte == 0x7f) {
+            try out.appendSlice(allocator, &.{ '\\', 'x', hex[byte >> 4], hex[byte & 15] });
+        } else try out.append(allocator, byte);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "confirmation escapes control bytes into visible single-line text" {
+    const text = try escapeConfirmationText(std.testing.allocator, "safe\nhidden\t\x1b");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("safe\\x0ahidden\\x09\\x1b", text);
+}
+
+test "cached archive downloads remain visible beside subtitles" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(runtime_io.get(), "downloads", .default_dir);
+    for ([_][]const u8{ "downloads/movie.srt", "downloads/unpacked.7z", "downloads/readme.txt" }) |path| {
+        try tmp.dir.writeFile(runtime_io.get(), .{ .sub_path = path, .data = "fixture" });
+    }
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    const labels = try cachedDownloadLabels(allocator, root);
+    defer freeOwnedStrings(allocator, labels);
+    try std.testing.expectEqual(@as(usize, 2), labels.len);
+    try std.testing.expectEqualStrings("movie.srt", labels[0]);
+    try std.testing.expectEqualStrings("unpacked.7z", labels[1]);
+}
+
+test "episode syntax does not hide matching title-only result labels" {
+    const allocator = std.testing.allocator;
+    var bundle: SearchBundle = .{ .query_norm = try allocator.dupe(u8, "Breaking Bad S01E01") };
+    defer bundle.deinit(allocator);
+    const choices = [_]app.SearchChoice{.{ .label = "[tv] Breaking Bad (2008)", .ref = undefined }};
+    try bundle.searches.append(allocator, .{ .arena = std.heap.ArenaAllocator.init(allocator), .provider = .wizdom_xyz, .items = &choices });
+    try bundle.hits.append(allocator, .{ .provider = .wizdom_xyz, .response_index = 0, .item_index = 0, .source = .live });
+    try std.testing.expect(queryHitScore(&bundle, 0, "Breaking Bad S01E01") > 0);
+    try std.testing.expectEqual(@as(u32, 0), queryHitScore(&bundle, 0, "Breaking News S01E01"));
+}
+
+fn subtitlePageKeyResult(nav: ?PageNav, key: vaxis.Key) ?SelectResult {
+    const page = nav orelse return null;
+    if (!page.enabled) return null;
+    if (page.has_prev and key.matches('[', .{})) return .page_prev;
+    if (page.has_next and key.matches(']', .{})) return .page_next;
+    return null;
+}
+fn settingsPopupContainsColumn(metrics: SettingsPopupMetrics, col: i32) bool {
+    return col > metrics.x and col < @as(i32, metrics.x) + metrics.width - 1;
+}
+
+test "subtitle paging boundaries are no-ops preserving selector state" {
+    const first: PageNav = .{ .enabled = true, .page = 1, .has_prev = false, .has_next = true };
+    try std.testing.expect(subtitlePageKeyResult(first, .{ .codepoint = '[' }) == null);
+    try std.testing.expect(subtitlePageKeyResult(first, .{ .codepoint = ']' }).? == .page_next);
+    const last: PageNav = .{ .enabled = true, .page = 2, .has_prev = true, .has_next = false };
+    try std.testing.expect(subtitlePageKeyResult(last, .{ .codepoint = ']' }) == null);
+    try std.testing.expect(subtitlePageKeyResult(last, .{ .codepoint = '[' }).? == .page_prev);
+}
+test "settings clicks outside popup columns cannot activate rows" {
+    const metrics = settingsPopupMetrics(120, 32);
+    try std.testing.expect(metrics.x > 0);
+    try std.testing.expect(!settingsPopupContainsColumn(metrics, 0));
+    try std.testing.expect(!settingsPopupContainsColumn(metrics, metrics.x));
+    try std.testing.expect(settingsPopupContainsColumn(metrics, metrics.x + 1));
+    try std.testing.expect(!settingsPopupContainsColumn(metrics, @as(i32, metrics.x) + metrics.width));
+}
+
+test "positive fractional cache TTL never becomes infinite" {
+    try std.testing.expectEqual(@as(?i64, 1), parseCacheTtlSeconds("0.0001"));
+    try std.testing.expectEqual(@as(?i64, 1), parseCacheTtlSeconds("0.00000001"));
+}
+
+test "narrow settings popups cannot activate invisible controls" {
+    for (0..32) |width| try std.testing.expect(!settingsPopupInteractive(settingsPopupMetrics(@intCast(width), 24)));
+    try std.testing.expect(settingsPopupInteractive(settingsPopupMetrics(80, 24)));
+}
+
+fn checkExportCollisionAllocation(allocator: std.mem.Allocator, root: []const u8) !void {
+    const path = try nextAvailableExportPath(allocator, root, "existing.srt");
+    defer allocator.free(path);
+    try std.testing.expect(std.mem.endsWith(u8, path, "2-existing.srt"));
+}
+test "export path owns its candidate through filesystem and allocation failures" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(runtime_io.get(), .{ .sub_path = "existing.srt", .data = "fixture" });
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    try std.testing.checkAllAllocationFailures(allocator, checkExportCollisionAllocation, .{root});
+    const Denied = struct {
+        fn access(_: []const u8) anyerror!void {
+            return error.AccessDenied;
+        }
+    };
+    try std.testing.expectError(error.AccessDenied, nextAvailableExportPathWith(Denied.access, allocator, root, "child"));
+}
+
+test "dangling export symlinks reserve their filename without being overwritten" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.symLink(runtime_io.get(), "missing-target", "movie.srt", .{});
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    const path = try nextAvailableExportPath(allocator, root, "movie.srt");
+    defer allocator.free(path);
+    try std.testing.expect(std.mem.endsWith(u8, path, "/2-movie.srt"));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(runtime_io.get(), "missing-target", .{}));
+}
+
+fn subtitlePaneColumn(width: u16, height: u16) u16 {
+    if (!subtitleDetailsPaneVisible(width, height)) return 0;
+    return @max(@as(u16, 36), @as(u16, @intCast((@as(u32, width) * 56) / 100))) + 3;
+}
+test "hidden subtitle pane cannot overflow at maximum terminal width" {
+    try std.testing.expectEqual(@as(u16, 0), subtitlePaneColumn(65535, 9));
+    try std.testing.expect(subtitlePaneColumn(65535, 10) < 65535);
 }

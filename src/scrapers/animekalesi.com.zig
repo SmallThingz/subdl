@@ -37,7 +37,7 @@ pub const Scraper = struct {
             .cache = false,
             .max_attempts = 2,
         });
-        return parseSeriesIndex(arena, response.body, trimmed);
+        return parseSeriesIndex(common.takeArena(&arena), response.body, trimmed);
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
@@ -78,11 +78,11 @@ pub const Scraper = struct {
 
         const owned = try subtitles.toOwnedSlice(a);
         std.mem.sort(SubtitleItem, owned, {}, common.seasonEpisodeLessThan(SubtitleItem));
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
             .subtitles = owned,
-        };
+        });
     }
 
     pub fn fetchDownloadByToken(self: *Scraper, allocator: Allocator, token: []const u8) !common.HttpResponse {
@@ -153,7 +153,7 @@ fn parseSeriesIndex(arena: std.heap.ArenaAllocator, body: []const u8, query: []c
     var out: std.ArrayListUnmanaged(SearchItem) = .empty;
     try out.appendSlice(a, exact.items);
     try out.appendSlice(a, partial.items);
-    return .{ .arena = owned_arena, .items = try out.toOwnedSlice(a) };
+    return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try out.toOwnedSlice(a) });
 }
 
 fn subtitleListingUrl(allocator: Allocator, series_url: []const u8) ![]u8 {
@@ -308,7 +308,9 @@ fn fetchRaw(
     var head_buffer: [24 * 1024]u8 = undefined;
     var response = try req.receiveHead(&head_buffer);
     const cookie_value = try extractSessionCookie(allocator, response.head.bytes);
+    errdefer if (cookie_value) |value| allocator.free(value);
     const location = try extractHeader(allocator, response.head.bytes, "location");
+    errdefer if (location) |value| allocator.free(value);
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
@@ -351,8 +353,9 @@ fn extractHeader(allocator: Allocator, headers: []const u8, wanted: []const u8) 
 
 fn updateSessionCookie(allocator: Allocator, current: *?[]u8, candidate: ?[]u8) !void {
     const value = candidate orelse return;
+    const replacement = try allocator.dupe(u8, value);
     if (current.*) |old| allocator.free(old);
-    current.* = try allocator.dupe(u8, value);
+    current.* = replacement;
 }
 
 fn fetchRedirectChain(
@@ -373,29 +376,30 @@ fn fetchRedirectChain(
     var redirects: usize = 0;
     while (true) {
         var response = try fetchRaw(client, allocator, current_url, cookie, referer);
+        defer response.deinit(allocator);
         try updateSessionCookie(allocator, &cookie, response.cookie);
 
         if (!common.isRedirectStatus(response.status)) {
             if (response.status != .ok) {
-                response.deinit(allocator);
                 return error.UnexpectedHttpStatus;
             }
             const body = response.body;
             response.body = &.{};
-            response.deinit(allocator);
             return .{ .status = .ok, .body = body };
         }
 
         if (redirects >= max_redirects) {
-            response.deinit(allocator);
             return error.TooManyRedirects;
         }
         const location = response.location orelse {
-            response.deinit(allocator);
             return error.MissingField;
         };
         const next_url = try common.resolveUrl(allocator, current_url, location);
-        response.deinit(allocator);
+        errdefer allocator.free(next_url);
+        if (!try common.sameOrigin(current_url, next_url)) {
+            if (cookie) |value| allocator.free(value);
+            cookie = null;
+        }
 
         allocator.free(referer);
         referer = current_url;

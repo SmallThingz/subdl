@@ -43,7 +43,7 @@ pub const Scraper = struct {
             .max_attempts = 2,
         });
 
-        return parseSearchHtml(arena, response.body, trimmed);
+        return parseSearchHtml(common.takeArena(&arena), response.body, trimmed);
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
@@ -57,11 +57,11 @@ pub const Scraper = struct {
             .filename = try a.dupe(u8, item.filename),
             .download_url = try a.dupe(u8, item.download_url),
         };
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
             .subtitles = subtitles,
-        };
+        });
     }
 };
 
@@ -131,7 +131,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     var items: std.ArrayListUnmanaged(SearchItem) = .empty;
     try items.appendSlice(a, exact.items);
     try items.appendSlice(a, partial.items);
-    return .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) };
+    return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) });
 }
 
 const TitleYear = common.TitleYear;

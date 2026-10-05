@@ -26,23 +26,15 @@ pub fn main(init: std.process.Init) !void {
 
 fn printUsage(io: std.Io) !void {
     var stdout_buf: [1024]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buf);
     const stdout = &stdout_writer.interface;
 
-    try stdout.print(
-        \\Usage:
-        \\  scrapers [tui|--tui]
-        \\  scrapers [cli args...]
-        \\
-        \\Examples:
-        \\  scrapers --query "The Matrix"
-        \\  scrapers --providers subdl_com,podnapisi_net --query "The Matrix"
-        \\  scrapers --providers=none --query "The Matrix"
-        \\  scrapers -p subsource --query "The Matrix" --extract
-        \\  scrapers --tui
-        \\
-    ,
-        .{},
-    );
+    try stdout.writeAll("Interactive mode: scrapers --tui\n\n");
+    try cli.printUsage(stdout);
     try stdout.flush();
+}
+
+test {
+    std.testing.refAllDecls(cli);
+    std.testing.refAllDecls(tui);
 }

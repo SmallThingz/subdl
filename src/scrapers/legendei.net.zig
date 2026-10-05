@@ -91,7 +91,7 @@ pub const Scraper = struct {
         var items: std.ArrayListUnmanaged(SearchItem) = .empty;
         try items.appendSlice(a, exact.items);
         try items.appendSlice(a, partial.items);
-        return .{ .arena = arena, .items = try items.toOwnedSlice(a) };
+        return common.finishResponse(SearchResponse, &arena, .{ .arena = arena, .items = try items.toOwnedSlice(a) });
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
@@ -112,11 +112,11 @@ pub const Scraper = struct {
             .filename = try std.fmt.allocPrint(a, "legendei-{d}-{s}.zip", .{ item.post_id, item.language_code }),
             .download_url = download_url,
         };
-        return .{
+        return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
             .subtitles = subtitles,
-        };
+        });
     }
 };
 
@@ -174,14 +174,8 @@ fn languageCodeFromTitle(title: []const u8) []const u8 {
 }
 
 fn stripReleaseNoise(value: []const u8) []const u8 {
-    const se = common.parseSeasonEpisode(value);
-    if (se.episode != null) {
-        var i: usize = 0;
-        while (i + 4 < value.len) : (i += 1) {
-            if ((value[i] == 's' or value[i] == 'S') and i > 0)
-                return std.mem.trimEnd(u8, value[0..i], " \t-._");
-        }
-    }
+    const parsed = common.parseEpisodeQuery(value);
+    if (parsed.episode != null) return parsed.title;
 
     const markers = [_][]const u8{
         " BluRay", " WEB DL", " WEB-DL", " 1080p", " 2160p", " 720p", " BRRip",
@@ -255,4 +249,10 @@ test "live legendei movie and tv downloads" {
     defer std.testing.allocator.free(tv_dl.body);
     try std.testing.expect(tv_dl.body.len > 4);
     try std.testing.expect(std.mem.eql(u8, tv_dl.body[0..2], "PK"));
+}
+
+test "release noise truncation uses the season marker not title letters" {
+    try std.testing.expectEqualStrings("The Last of Us", stripReleaseNoise("The Last of Us S01E01"));
+    try std.testing.expectEqualStrings("House", stripReleaseNoise("House S01E01"));
+    try std.testing.expectEqualStrings("Specials", stripReleaseNoise("Specials S00E01"));
 }

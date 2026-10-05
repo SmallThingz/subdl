@@ -26,6 +26,8 @@ pub fn build(b: *std.Build) void {
     const live_mode = b.option([]const u8, "live", "Live test mode: off | smoke | named | extensive | all") orelse "off";
     const live_providers = b.option([]const u8, "live-providers", "Comma-separated provider filter for live tests, or '*' for all") orelse "*";
     const live_parallel_on_all = b.option(bool, "live-parallel-on-all", "Run one live subprocess per provider when -Dlive-providers=all/*") orelse true;
+    const live_max_jobs = b.option(u32, "live-max-jobs", "Maximum concurrent live provider subprocesses") orelse 4;
+    if (live_max_jobs == 0) @panic("live-max-jobs must be positive");
     const live_timeout_seconds = b.option(u32, "live-timeout-seconds", "Hard deadline for each parallel live provider") orelse 60;
 
     const valid_mode = std.mem.eql(u8, live_mode, "off") or
@@ -269,13 +271,47 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_subdl_mod_tests.step);
     test_step.dependOn(&run_scrapers_mod_tests.step);
     test_step.dependOn(&run_app_tests.step);
+    const html_tests = b.addRunArtifact(b.addTest(.{ .root_module = test_modules.htmlparser_compat, .use_llvm = llvm }));
+    test_step.dependOn(&html_tests.step);
+    b.step("test-html", "Check parser replacement ownership").dependOn(&html_tests.step);
+    const backend_tests = b.addRunArtifact(b.addTest(.{ .root_module = test_modules.tui_backend, .use_llvm = llvm }));
+    test_step.dependOn(&backend_tests.step);
     if (test_modules.tui_impl) |tui_mod| {
         const tui_tests = b.addTest(.{ .root_module = tui_mod, .use_llvm = llvm });
         const run_tui_tests = b.addRunArtifact(tui_tests);
         test_step.dependOn(&run_tui_tests.step);
-        const test_tui_step = b.step("test-tui", "Run TUI behavior and state tests");
+        const test_tui_step = b.step("test-tui", "Check terminal navigation, persistence and cancellation");
         test_tui_step.dependOn(&run_tui_tests.step);
     }
+
+    const http_fixture = b.addExecutable(.{
+        .name = "http-transport-test",
+        .use_llvm = llvm,
+        .root_module = b.createModule(.{ .root_source_file = b.path("tools/http_transport_test.zig"), .target = target, .optimize = test_optimize, .imports = &.{ .{ .name = "scrapers", .module = test_modules.scrapers }, .{ .name = "runtime_io", .module = test_modules.runtime_io } } }),
+    });
+    const http_test = b.addSystemCommand(&.{ "python3", "-B" });
+    http_test.addFileArg(b.path("tools/test_http_transport.py"));
+    http_test.addFileArg(http_fixture.getEmittedBin());
+    const http_step = b.step("test-http", "Native Python 3 loopback transport integration tests");
+    if (target.query.isNative()) {
+        http_step.dependOn(&http_test.step);
+    } else {
+        http_step.dependOn(&b.addFail("test-http is a native integration gate; omit -Dtarget").step);
+    }
+    const pty_step = b.step("test-pty", "Native POSIX Python terminal navigation and shutdown integration");
+    if (enable_tui and target.query.isNative() and target.result.os.tag != .windows) {
+        for ([_][]const u8{ "normal", "burst" }) |mode| {
+            const pty_test = b.addSystemCommand(&.{ "python3", "-B" });
+            pty_test.addFileArg(b.path("tools/test_tui_pty.py"));
+            pty_test.addFileArg(app_exe.getEmittedBin());
+            pty_test.addArg(mode);
+            pty_step.dependOn(&pty_test.step);
+        }
+    } else {
+        pty_step.dependOn(&b.addFail("test-pty requires a native POSIX target and enabled TUI").step);
+    }
+    // Explicit native integration gate: Python directly runs the fixture.
+    // Keep ordinary/cross-target unit tests independent of host Python/runners.
 
     const test_live_single_step = b.step("test-live-single", "Run live tests for the current provider filter");
     test_live_single_step.dependOn(&run_scrapers_mod_tests_live.step);
@@ -287,6 +323,7 @@ pub fn build(b: *std.Build) void {
         const script = makeParallelLiveRunScript(
             b,
             live_timeout_seconds,
+            live_max_jobs,
             isActiveLiveProviderSelection(live_providers),
         );
         const fanout_cmd = b.addSystemCommand(&.{ "bash", "-lc", script, "_test_bin_" });
@@ -335,6 +372,7 @@ fn isActiveLiveProviderSelection(raw_filter: []const u8) bool {
 fn makeParallelLiveRunScript(
     b: *std.Build,
     timeout_seconds: u32,
+    max_jobs: u32,
     active_only: bool,
 ) []const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -351,9 +389,16 @@ fn makeParallelLiveRunScript(
         \\
     ) catch @panic("oom");
 
+    out.print(b.allocator, "max_jobs={d}\n", .{max_jobs}) catch @panic("oom");
     for (provider_registry.all) |target_info| {
         if (active_only and !target_info.active) continue;
         if (target_info.live_serial) continue;
+        out.appendSlice(b.allocator,
+            \\while (( $(jobs -rp | wc -l) >= max_jobs )); do
+            \\  wait -n || true
+            \\done
+            \\
+        ) catch @panic("oom");
         const provider_timeout_seconds = target_info.live_timeout_seconds orelse timeout_seconds;
         out.print(b.allocator,
             \\echo "[live][runner] START {s}"
@@ -495,6 +540,7 @@ fn createTargetModuleSet(
         .target = target,
         .optimize = optimize,
     });
+    const oneserial_mod = compatibleOneserial(b, oneserial_dep);
     const htmlparser_compat_mod = b.createModule(.{
         .root_source_file = b.path("src/deps/htmlparser_compat.zig"),
         .target = target,
@@ -633,7 +679,7 @@ fn createTargetModuleSet(
                 .{ .name = "runtime_alloc", .module = runtime_alloc_mod },
                 .{ .name = "runtime_io", .module = runtime_io_mod },
                 .{ .name = "build_options", .module = build_options_mod },
-                .{ .name = "oneserial", .module = oneserial_dep.module("oneserial") },
+                .{ .name = "oneserial", .module = oneserial_mod },
             },
         });
         tui_impl = tui_impl_mod;
@@ -668,7 +714,7 @@ fn createTargetModuleSet(
     return .{
         .htmlparser_compat = htmlparser_compat_mod,
         .alldriver = alldriver_mod,
-        .oneserial = oneserial_dep.module("oneserial"),
+        .oneserial = oneserial_mod,
         .runtime_alloc = runtime_alloc_mod,
         .runtime_io = runtime_io_mod,
         .unarr = unarr_mod,
@@ -676,4 +722,42 @@ fn createTargetModuleSet(
         .tui_backend = tui_backend_mod,
         .tui_impl = tui_impl,
     };
+}
+
+fn compatibleOneserial(b: *std.Build, dependency: *std.Build.Dependency) *std.Build.Module {
+    const module = dependency.module("oneserial");
+    if (@typeInfo(@TypeOf(@as(std.builtin.Type.Pointer, undefined).alignment)) != .optional) return module;
+    // The pinned serializer predates nullable pointer alignment. Keep its
+    // wire format and immutable package intact; patch reflection in build output.
+    const generated = b.addWriteFiles();
+    _ = generated.addCopyDirectory(dependency.path("src"), "src", .{ .exclude_extensions = &.{ "serialization_functions.zig", "shim_allocation.zig" } });
+    const files = [_]struct { name: []const u8, sha: []const u8, count: usize }{
+        .{ .name = "serialization_functions.zig", .sha = "4fbe8f15c114f4b6b8168a5656b85af733b9e2db2baab169b1d885e1b749496b", .count = 2 },
+        .{ .name = "shim_allocation.zig", .sha = "8688c61f7365884dd2cef85676b5709fc99ff1b65320ea65e4a9ec8fff089891", .count = 1 },
+    };
+    for (files) |file| {
+        const path = b.fmt("src/{s}", .{file.name});
+        const source = std.Io.Dir.cwd().readFileAlloc(b.graph.io, dependency.path(path).getPath(b), b.allocator, .limited(1024 * 1024)) catch @panic("cannot read pinned oneserial source");
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
+        if (!std.mem.eql(u8, &std.fmt.bytesToHex(digest, .lower), file.sha)) @panic("oneserial compatibility source identity changed");
+        const old = "std.mem.Alignment.fromByteUnits(pi.alignment)";
+        if (std.mem.count(u8, source, old) != file.count) @panic("oneserial alignment patch mismatch");
+        var patched = std.mem.replaceOwned(u8, b.allocator, source, old, "std.mem.Alignment.fromByteUnits(pi.alignment orelse @alignOf(pi.child))") catch @panic("oom");
+        if (std.mem.eql(u8, file.name, "serialization_functions.zig")) {
+            const sentinel = "if (ti.pointer.alignment == 0) @alignOf(ti.pointer.child) else ti.pointer.alignment";
+            if (std.mem.count(u8, patched, sentinel) != 1) @panic("oneserial sentinel patch mismatch");
+            patched = std.mem.replaceOwned(u8, b.allocator, patched, sentinel, "ti.pointer.alignment orelse @alignOf(ti.pointer.child)") catch @panic("oom");
+        }
+        if (std.mem.eql(u8, file.name, "serialization_functions.zig")) {
+            const replacements = [_][2][]const u8{
+                .{ "std.meta.intToEnum(Tag, raw) catch error.InvalidUnionTag", "std.enums.fromInt(Tag, raw) orelse error.InvalidUnionTag" },
+                .{ "std.meta.intToEnum(T, raw) catch return error.InvalidEnumTag", "std.enums.fromInt(T, raw) orelse return error.InvalidEnumTag" },
+            };
+            for (replacements) |pair| patched = std.mem.replaceOwned(u8, b.allocator, patched, pair[0], pair[1]) catch @panic("oom");
+        }
+        _ = generated.add(path, patched);
+    }
+    module.root_source_file = generated.getDirectory().path(b, "src/root.zig");
+    return module;
 }

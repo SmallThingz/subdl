@@ -564,11 +564,14 @@ pub const DownloadResult = struct {
     file_path: []const u8,
     archive_path: ?[]const u8 = null,
     extracted_files: []const []const u8 = &.{},
+    extraction_unavailable: bool = false,
+    translation_incomplete: bool = false,
     bytes_written: usize,
     source_url: []const u8,
 
     pub fn deinit(self: *DownloadResult, allocator: Allocator) void {
         allocator.free(self.file_path);
+        allocator.free(self.source_url);
         if (self.archive_path) |p| allocator.free(p);
         if (self.extracted_files.len > 0) {
             for (self.extracted_files) |p| allocator.free(p);
@@ -1730,11 +1733,11 @@ pub fn searchWithOptions(allocator: Allocator, client: *std.http.Client, provide
         },
     }
 
-    return .{
+    return common.finishResponse(SearchResponse, &arena, .{
         .arena = arena,
         .provider = provider,
         .items = try out.toOwnedSlice(a),
-    };
+    });
 }
 
 /// Page-aware search wrapper. Providers without real pagination expose page 1
@@ -1865,14 +1868,14 @@ pub fn searchPageWithOptions(allocator: Allocator, client: *std.http.Client, pro
         else => return error.UnsupportedProvider,
     }
 
-    return .{
+    return common.finishResponse(SearchResponse, &arena, .{
         .arena = arena,
         .provider = provider,
         .items = try out.toOwnedSlice(a),
         .page = requested_page,
         .has_prev_page = requested_page > 1,
         .has_next_page = has_next_page,
-    };
+    });
 }
 
 pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: SearchRef) !SubtitlesResponse {
@@ -1913,7 +1916,10 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                     title = try a.dupe(u8, seasons.tv.name);
 
                     for (seasons.seasons) |season| {
-                        var season_data = scraper.fetchTvSeasonByLink(item.link, season.number) catch continue;
+                        var season_data = scraper.fetchTvSeasonByLink(item.link, season.number) catch |err| {
+                            if (err == error.Canceled or err == error.OutOfMemory) return err;
+                            continue;
+                        };
                         defer season_data.deinit();
 
                         for (season_data.languages) |group| {
@@ -2836,12 +2842,12 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
         },
     }
 
-    return .{
+    return common.finishResponse(SubtitlesResponse, &arena, .{
         .arena = arena,
         .provider = std.meta.activeTag(ref),
         .title = title,
         .items = try out.toOwnedSlice(a),
-    };
+    });
 }
 
 /// Same pagination contract as searchPage: unsupported providers return an
@@ -2866,7 +2872,7 @@ pub fn fetchSubtitlesPage(allocator: Allocator, client: *std.http.Client, ref: S
     const a = arena.allocator();
 
     var out: std.ArrayListUnmanaged(SubtitleChoice) = .empty;
-    var title = titleFromRef(ref);
+    var title: []const u8 = try a.dupe(u8, titleFromRef(ref));
     var has_next_page = false;
 
     switch (ref) {
@@ -2915,7 +2921,7 @@ pub fn fetchSubtitlesPage(allocator: Allocator, client: *std.http.Client, ref: S
         else => return error.UnsupportedProvider,
     }
 
-    return .{
+    return common.finishResponse(SubtitlesResponse, &arena, .{
         .arena = arena,
         .provider = provider,
         .title = title,
@@ -2923,7 +2929,7 @@ pub fn fetchSubtitlesPage(allocator: Allocator, client: *std.http.Client, ref: S
         .page = requested_page,
         .has_prev_page = requested_page > 1,
         .has_next_page = has_next_page,
-    };
+    });
 }
 
 fn emptySearchPage(allocator: Allocator, provider: Provider, page: usize) !SearchResponse {
@@ -2943,10 +2949,11 @@ fn emptySubtitlesPage(allocator: Allocator, ref: SearchRef, page: usize) !Subtit
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const p = if (page == 0) 1 else page;
+    const title = try arena.allocator().dupe(u8, titleFromRef(ref));
     return .{
         .arena = arena,
         .provider = std.meta.activeTag(ref),
-        .title = titleFromRef(ref),
+        .title = title,
         .items = &.{},
         .page = p,
         .has_prev_page = p > 1,
@@ -3037,6 +3044,8 @@ pub fn downloadSubtitleWithProgressAndOptions(
         return downloadSubtitlecatTranslated(allocator, client, subtitle, out_dir, source_url, token, progress);
     }
 
+    const owned_source = try allocator.dupe(u8, source_url);
+    errdefer allocator.free(owned_source);
     emitDownloadPhase(progress, .resolving_url);
     const greeksubs_download = subdl.greeksubs_net.parseDownloadToken(source_url) != null;
     const indexsubtitle_download = subdl.indexsubtitle_cc.parseDownloadToken(source_url) != null;
@@ -3110,36 +3119,32 @@ pub fn downloadSubtitleWithProgressAndOptions(
     const safe_name = try sanitizeFilename(allocator, raw_name);
     defer allocator.free(safe_name);
 
-    const output_path = try nextAvailableOutputPath(allocator, out_dir, safe_name);
+    const output_path = try publishUniqueFile(allocator, out_dir, safe_name, body);
     errdefer allocator.free(output_path);
-    try std.Io.Dir.cwd().writeFile(runtime_io.get(), .{ .sub_path = output_path, .data = body });
 
     if (archive_kind == .none) {
         return .{
             .file_path = output_path,
             .bytes_written = bytes_written,
-            .source_url = source_url,
+            .source_url = owned_source,
         };
     }
 
     const archive_copy = try allocator.dupe(u8, output_path);
     errdefer allocator.free(archive_copy);
 
-    if (!options.extract_archive) {
+    if (!options.extract_archive or archive_kind == .seven_z or !unarr.enabled) {
         return .{
             .file_path = output_path,
             .archive_path = archive_copy,
+            .extraction_unavailable = options.extract_archive,
             .bytes_written = bytes_written,
-            .source_url = source_url,
+            .source_url = owned_source,
         };
     }
 
     emitDownloadPhase(progress, .extracting_archive);
-    const extracted_files = if (archive_kind == .zip)
-        extractZipArchiveFiles(allocator, out_dir, output_path) catch
-            try extractArchiveFiles(allocator, body, archive_kind, out_dir, output_path)
-    else
-        try extractArchiveFiles(allocator, body, archive_kind, out_dir, output_path);
+    const extracted_files = try extractArchiveFiles(allocator, body, archive_kind, out_dir, output_path);
     errdefer {
         for (extracted_files) |path| allocator.free(path);
         allocator.free(extracted_files);
@@ -3150,7 +3155,7 @@ pub fn downloadSubtitleWithProgressAndOptions(
         .archive_path = archive_copy,
         .extracted_files = extracted_files,
         .bytes_written = bytes_written,
-        .source_url = source_url,
+        .source_url = owned_source,
     };
 }
 
@@ -3296,6 +3301,8 @@ fn downloadSubtitlecatTranslated(
     token: SubtitlecatTranslateToken,
     progress: ?*const DownloadProgress,
 ) !DownloadResult {
+    const owned_source = try allocator.dupe(u8, source_token);
+    errdefer allocator.free(owned_source);
     emitDownloadPhase(progress, .fetching_source);
     const source_response = try common.fetchBytes(client, allocator, token.source_url, .{
         .accept = "text/plain,*/*",
@@ -3307,10 +3314,14 @@ fn downloadSubtitlecatTranslated(
 
     const target_lang = languageToGoogleCode(token.target_lang) orelse "";
 
+    var translation_incomplete = target_lang.len == 0;
     emitDownloadPhase(progress, .translating);
     const translated_text = if (target_lang.len > 0)
-        translateSubtitlecatSrt(allocator, client, source_response.body, target_lang, progress) catch
-            try allocator.dupe(u8, source_response.body)
+        translateSubtitlecatSrt(allocator, client, source_response.body, target_lang, progress, &translation_incomplete) catch |err| blk: {
+            if (err == error.Canceled or err == error.OutOfMemory) return err;
+            translation_incomplete = true;
+            break :blk try allocator.dupe(u8, source_response.body);
+        }
     else
         try allocator.dupe(u8, source_response.body);
     defer allocator.free(translated_text);
@@ -3324,14 +3335,14 @@ fn downloadSubtitlecatTranslated(
     const safe_name = try sanitizeFilename(allocator, raw_name);
     defer allocator.free(safe_name);
 
-    const output_path = try nextAvailableOutputPath(allocator, out_dir, safe_name);
+    const output_path = try publishUniqueFile(allocator, out_dir, safe_name, translated_text);
     errdefer allocator.free(output_path);
-    try std.Io.Dir.cwd().writeFile(runtime_io.get(), .{ .sub_path = output_path, .data = translated_text });
 
     return .{
         .file_path = output_path,
         .bytes_written = translated_text.len,
-        .source_url = source_token,
+        .translation_incomplete = translation_incomplete,
+        .source_url = owned_source,
     };
 }
 
@@ -3366,6 +3377,7 @@ fn translateSubtitlecatSrt(
     source: []const u8,
     target_lang: []const u8,
     progress: ?*const DownloadProgress,
+    incomplete: *bool,
 ) ![]u8 {
     var lines: std.ArrayListUnmanaged([]const u8) = .empty;
     defer lines.deinit(allocator);
@@ -3408,15 +3420,14 @@ fn translateSubtitlecatSrt(
 
         const extra_len = sanitized.len + @as(usize, if (batch_indices.items.len > 0) subtitlecat_batch_separator.len else 0);
         if (batch_indices.items.len > 0 and batch_text.items.len + extra_len > batch_limit) {
-            const batch = SubtitlecatBatch{
-                .text = try batch_text.toOwnedSlice(allocator),
-                .indices = try batch_indices.toOwnedSlice(allocator),
-            };
-            defer allocator.free(batch.text);
-            defer allocator.free(batch.indices);
+            const owned_text = try batch_text.toOwnedSlice(allocator);
+            defer allocator.free(owned_text);
+            const owned_indices = try batch_indices.toOwnedSlice(allocator);
+            defer allocator.free(owned_indices);
+            const batch = SubtitlecatBatch{ .text = owned_text, .indices = owned_indices };
             batch_text.clearRetainingCapacity();
             batch_indices.clearRetainingCapacity();
-            try applySubtitlecatBatch(allocator, client, lines.items, translated.items, batch, target_lang, progress, &done_units, total_units);
+            try applySubtitlecatBatch(allocator, client, lines.items, translated.items, batch, target_lang, progress, &done_units, total_units, incomplete);
         }
 
         if (batch_indices.items.len > 0) try batch_text.appendSlice(allocator, subtitlecat_batch_separator);
@@ -3425,13 +3436,12 @@ fn translateSubtitlecatSrt(
     }
 
     if (batch_indices.items.len > 0) {
-        const batch = SubtitlecatBatch{
-            .text = try batch_text.toOwnedSlice(allocator),
-            .indices = try batch_indices.toOwnedSlice(allocator),
-        };
-        defer allocator.free(batch.text);
-        defer allocator.free(batch.indices);
-        try applySubtitlecatBatch(allocator, client, lines.items, translated.items, batch, target_lang, progress, &done_units, total_units);
+        const owned_text = try batch_text.toOwnedSlice(allocator);
+        defer allocator.free(owned_text);
+        const owned_indices = try batch_indices.toOwnedSlice(allocator);
+        defer allocator.free(owned_indices);
+        const batch = SubtitlecatBatch{ .text = owned_text, .indices = owned_indices };
+        try applySubtitlecatBatch(allocator, client, lines.items, translated.items, batch, target_lang, progress, &done_units, total_units, incomplete);
     }
 
     emitDownloadUnits(progress, total_units, total_units);
@@ -3457,8 +3467,12 @@ fn applySubtitlecatBatch(
     progress: ?*const DownloadProgress,
     done_units: *usize,
     total_units: usize,
+    incomplete: *bool,
 ) !void {
-    const translated_batch = translateViaGoogle(allocator, client, batch.text, target_lang) catch null;
+    const translated_batch = translateViaGoogle(allocator, client, batch.text, target_lang) catch |err| blk: {
+        if (err == error.Canceled or err == error.OutOfMemory) return err;
+        break :blk null;
+    };
     if (translated_batch) |batch_text| {
         defer allocator.free(batch_text);
         var out_lines: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -3468,9 +3482,7 @@ fn applySubtitlecatBatch(
         while (line_it.next()) |line| try out_lines.append(allocator, line);
 
         if (out_lines.items.len == batch.indices.len) {
-            for (batch.indices, 0..) |line_idx, i| {
-                translated_lines[line_idx] = try allocator.dupe(u8, out_lines.items[i]);
-            }
+            try applyTranslatedLines(allocator, source_lines, translated_lines, batch.indices, out_lines.items, incomplete);
             done_units.* += batch.indices.len;
             emitDownloadUnits(progress, done_units.*, total_units);
             return;
@@ -3479,6 +3491,7 @@ fn applySubtitlecatBatch(
 
     // A provider response can normalize separators. Do not turn that into one
     // network request per subtitle line; preserve the source batch instead.
+    incomplete.* = true;
     emitDownloadPhase(progress, .translating_fallback);
     for (batch.indices) |line_idx| {
         const source_line = source_lines[line_idx];
@@ -3586,12 +3599,17 @@ fn googleTranslateResultToString(allocator: Allocator, value: std.json.Value) ![
     errdefer out.deinit(allocator);
 
     for (root_items[0].array.items) |part| {
-        if (part != .array) continue;
-        if (part.array.items.len == 0) continue;
-        if (part.array.items[0] != .string) continue;
+        if (part != .array) return error.InvalidFieldType;
+        if (part.array.items.len == 0) return error.InvalidField;
+        if (part.array.items[0] != .string) return error.InvalidFieldType;
+        if (std.mem.trim(u8, part.array.items[0].string, " \t\r\n").len == 0) {
+            if (part.array.items.len < 2 or part.array.items[1] != .string or
+                std.mem.trim(u8, part.array.items[1].string, " \t\r\n").len != 0) return error.InvalidField;
+        }
         try out.appendSlice(allocator, part.array.items[0].string);
     }
 
+    if (std.mem.trim(u8, out.items, " \t\r\n").len == 0) return error.InvalidField;
     return try out.toOwnedSlice(allocator);
 }
 
@@ -3746,110 +3764,224 @@ const ArchiveKind = enum {
     seven_z,
 };
 
-/// Prefer filename/URL extensions but fall back to magic bytes because many
-/// subtitle providers serve archives from extensionless download endpoints.
+/// Prefer bytes over provider labels; many download endpoints have no extension.
 fn detectArchiveKind(file_name: []const u8, url: []const u8, body: []const u8) ArchiveKind {
-    if (std.ascii.endsWithIgnoreCase(file_name, ".zip") or std.ascii.endsWithIgnoreCase(url, ".zip")) return .zip;
-    if (std.ascii.endsWithIgnoreCase(file_name, ".rar") or std.ascii.endsWithIgnoreCase(url, ".rar")) return .rar;
-    if (std.ascii.endsWithIgnoreCase(file_name, ".7z") or std.ascii.endsWithIgnoreCase(url, ".7z")) return .seven_z;
     if (body.len >= 4 and std.mem.eql(u8, body[0..4], "PK\x03\x04")) return .zip;
     if (body.len >= 4 and std.mem.eql(u8, body[0..4], "PK\x05\x06")) return .zip;
     if (body.len >= 4 and std.mem.eql(u8, body[0..4], "PK\x07\x08")) return .zip;
     if (body.len >= 7 and std.mem.eql(u8, body[0..7], "Rar!\x1A\x07\x00")) return .rar;
     if (body.len >= 8 and std.mem.eql(u8, body[0..8], "Rar!\x1A\x07\x01\x00")) return .rar;
     if (body.len >= 6 and std.mem.eql(u8, body[0..6], "\x37\x7A\xBC\xAF\x27\x1C")) return .seven_z;
+    if (std.ascii.endsWithIgnoreCase(file_name, ".zip") or std.ascii.endsWithIgnoreCase(url, ".zip")) return .zip;
+    if (std.ascii.endsWithIgnoreCase(file_name, ".rar") or std.ascii.endsWithIgnoreCase(url, ".rar")) return .rar;
+    if (std.ascii.endsWithIgnoreCase(file_name, ".7z") or std.ascii.endsWithIgnoreCase(url, ".7z")) return .seven_z;
     return .none;
 }
 
 const max_archive_entry_size_bytes: usize = 64 * 1024 * 1024;
 const max_archive_entries: usize = 256;
 
-fn extractArchiveFiles(
-    allocator: Allocator,
-    archive_body: []const u8,
-    archive_kind: ArchiveKind,
-    out_dir: []const u8,
-    archive_path: []const u8,
-) ![]const []const u8 {
-    _ = archive_path;
-    if (comptime !unarr.enabled) {
-        return error.ArchiveExtractionUnavailable;
+const max_archive_total_size_bytes: usize = 128 * 1024 * 1024;
+fn safeArchiveName(name: []const u8) bool {
+    if (name.len == 0 or name[0] == '/' or name[0] == '\\' or (name.len >= 2 and name[1] == ':')) return false;
+    var parts = std.mem.splitAny(u8, name, "/\\");
+    while (parts.next()) |part| if (std.mem.eql(u8, part, "..")) return false;
+    return true;
+}
+fn createUniqueDirectory(allocator: Allocator, out_dir: []const u8, base_name: []const u8) ![]u8 {
+    for (0..10000) |attempt| {
+        const name = if (attempt == 0) try allocator.dupe(u8, base_name) else try appendNumericSuffix(allocator, base_name, attempt);
+        defer allocator.free(name);
+        const path = try std.fs.path.join(allocator, &.{ out_dir, name });
+        std.Io.Dir.cwd().createDir(runtime_io.get(), path, .default_dir) catch |err| {
+            allocator.free(path);
+            if (err == error.PathAlreadyExists) continue;
+            return err;
+        };
+        return path;
     }
+    return error.TooManyOutputCollisions;
+}
+fn validateZipExtras(bytes: []const u8) !void {
+    var at: usize = 0;
+    while (at < bytes.len) {
+        if (bytes.len - at < 4) return error.ArchiveExtractionFailed;
+        const tag = std.mem.readInt(u16, bytes[at..][0..2], .little);
+        const size = std.mem.readInt(u16, bytes[at + 2 ..][0..2], .little);
+        if (size > bytes.len - at - 4) return error.ArchiveExtractionFailed;
+        if (tag == 1) return error.ArchiveMetadataUnsupported;
+        at += 4 + @as(usize, size);
+    }
+}
+fn canonicalZipBody(body: []const u8) ![]const u8 {
+    // Some download endpoints append harmless template whitespace after EOCD.
+    // Pass the same exact validated archive boundary to the native decoder.
+    if (body.len < 22) return error.ArchiveExtractionFailed;
+    var footer = body.len - 22;
+    while (true) {
+        if (std.mem.eql(u8, body[footer..][0..4], "PK\x05\x06")) {
+            const end = footer + 22 + @as(usize, std.mem.readInt(u16, body[footer + 20 ..][0..2], .little));
+            if (end <= body.len and body.len - end <= 4096 and std.mem.trim(u8, body[end..], " \t\r\n").len == 0) return body[0..end];
+        }
+        if (footer == 0 or body.len - footer > 65557 + 4096) return error.ArchiveExtractionFailed;
+        footer -= 1;
+    }
+}
+fn preflightZip(body: []const u8) !void {
+    if (body.len < 22) return error.ArchiveExtractionFailed;
+    var footer: usize = body.len - 22;
+    while (true) {
+        if (std.mem.eql(u8, body[footer..][0..4], "PK\x05\x06") and std.mem.readInt(u16, body[footer + 20 ..][0..2], .little) == body.len - footer - 22) break;
+        if (footer == 0 or body.len - footer > 65557) return error.ArchiveExtractionFailed;
+        footer -= 1;
+    }
+    if (std.mem.indexOf(u8, body[footer + 4 .. body.len - 18], "PK\x05\x06") != null) return error.ArchiveMetadataUnsupported;
+    const end = body[footer..];
+    if (std.mem.readInt(u16, end[4..6], .little) != 0 or std.mem.readInt(u16, end[6..8], .little) != 0) return error.ArchiveMetadataUnsupported;
+    const count = std.mem.readInt(u16, end[10..12], .little);
+    if (count > max_archive_entries) return error.ArchiveEntryLimit;
+    if (std.mem.readInt(u16, end[8..10], .little) != count) return error.ArchiveExtractionFailed;
+    const size = std.mem.readInt(u32, end[12..16], .little);
+    var offset: usize = std.mem.readInt(u32, end[16..20], .little);
+    if (offset > footer or size != footer - offset) return error.ArchiveExtractionFailed;
+    const central_start = offset;
+    var total: u64 = 0;
+    for (0..count) |_| {
+        if (offset > footer or footer - offset < 46 or !std.mem.eql(u8, body[offset..][0..4], "PK\x01\x02")) return error.ArchiveExtractionFailed;
+        const record = body[offset..];
+        const unpacked = std.mem.readInt(u32, record[24..28], .little);
+        const compressed_size = std.mem.readInt(u32, record[20..24], .little);
+        const flags = std.mem.readInt(u16, record[8..10], .little);
+        const method = std.mem.readInt(u16, record[10..12], .little);
+        if (compressed_size == std.math.maxInt(u32) or unpacked == std.math.maxInt(u32) or std.mem.readInt(u16, record[34..36], .little) != 0) return error.ArchiveMetadataUnsupported;
+        if (flags & 1 != 0) return error.ArchiveEncrypted;
+        if (method != 0 and method != 8) return error.ArchiveMetadataUnsupported;
+        if (method == 0 and compressed_size != unpacked) return error.ArchiveExtractionFailed;
 
-    const archive_format: unarr.Format = switch (archive_kind) {
+        if (unpacked > max_archive_entry_size_bytes) return error.ArchiveEntryTooLarge;
+        total += unpacked;
+        if (total > max_archive_total_size_bytes) return error.ArchiveTooLarge;
+        const name_len = std.mem.readInt(u16, record[28..30], .little);
+        const record_len: usize = 46 + @as(usize, name_len) + std.mem.readInt(u16, record[30..32], .little) + std.mem.readInt(u16, record[32..34], .little);
+        if (record_len > footer - offset) return error.ArchiveExtractionFailed;
+        const name = record[46..][0..name_len];
+        try validateZipExtras(record[46 + @as(usize, name_len) ..][0..std.mem.readInt(u16, record[30..32], .little)]);
+        if (!safeArchiveName(name) or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidArchivePath;
+        const local_offset: usize = std.mem.readInt(u32, record[42..46], .little);
+        if (local_offset > offset or offset - local_offset < 30 or !std.mem.eql(u8, body[local_offset..][0..4], "PK\x03\x04")) return error.ArchiveExtractionFailed;
+        const local = body[local_offset..];
+        const local_name_len = std.mem.readInt(u16, local[26..28], .little);
+        const local_extra_len = std.mem.readInt(u16, local[28..30], .little);
+        const local_len: usize = 30 + @as(usize, local_name_len) + local_extra_len;
+        if (local_offset > central_start or local_len > central_start - local_offset or compressed_size > central_start - local_offset - local_len) return error.ArchiveExtractionFailed;
+        if (!std.mem.eql(u8, name, local[30..][0..local_name_len]) or std.mem.readInt(u16, local[8..10], .little) != method or std.mem.readInt(u16, local[6..8], .little) != flags) return error.ArchiveExtractionFailed;
+        try validateZipExtras(local[30 + @as(usize, local_name_len) ..][0..local_extra_len]);
+        if (flags & 8 == 0 and (std.mem.readInt(u32, local[14..18], .little) != std.mem.readInt(u32, record[16..20], .little) or std.mem.readInt(u32, local[18..22], .little) != compressed_size or std.mem.readInt(u32, local[22..26], .little) != unpacked)) return error.ArchiveExtractionFailed;
+        offset += record_len;
+    }
+    if (offset != footer) return error.ArchiveExtractionFailed;
+}
+fn publishExtractedDirectory(allocator: Allocator, out_dir: []const u8, base_name: []const u8, staging: []const u8, paths: []const []const u8) ![]const []const u8 {
+    for (0..10000) |attempt| {
+        const name = if (attempt == 0) try allocator.dupe(u8, base_name) else try appendNumericSuffix(allocator, base_name, attempt);
+        defer allocator.free(name);
+        const target = try std.fs.path.join(allocator, &.{ out_dir, name });
+        defer allocator.free(target);
+        const mapped = try allocator.alloc([]const u8, paths.len);
+        var initialized: usize = 0;
+        var transferred = false;
+        defer if (!transferred) {
+            for (mapped[0..initialized]) |path| allocator.free(path);
+            allocator.free(mapped);
+        };
+        for (paths, 0..) |path, i| {
+            mapped[i] = try std.fs.path.join(allocator, &.{ target, common.pathBaseName(path) });
+            initialized += 1;
+        }
+        try runtime_io.get().checkCancel();
+        std.Io.Dir.cwd().renamePreserve(staging, .cwd(), target, runtime_io.get()) catch |err| {
+            if (err == error.PathAlreadyExists) continue;
+            return err;
+        };
+        transferred = true;
+        return mapped;
+    }
+    return error.TooManyOutputCollisions;
+}
+
+fn extractArchiveFiles(allocator: Allocator, archive_body: []const u8, archive_kind: ArchiveKind, out_dir: []const u8, archive_path: []const u8) ![]const []const u8 {
+    if (comptime !unarr.enabled) return error.ArchiveExtractionUnavailable;
+    const bounded_body = if (archive_kind == .zip) try canonicalZipBody(archive_body) else archive_body;
+    if (archive_kind == .zip) try preflightZip(bounded_body);
+    // The native 7z decoder allocates encoded headers before exposing entries.
+    // Keep the downloaded archive, but do not run that unbounded decoder here.
+    if (archive_kind == .seven_z) return error.ArchiveFormatNeedsExternalExtraction;
+    const format: unarr.Format = switch (archive_kind) {
         .zip => .zip,
         .rar => .rar,
         .seven_z => .@"7z",
         .none => return error.ArchiveExtractionFailed,
     };
-
-    var archive = unarr.Archive.openMemory(archive_format, archive_body, .{}) catch return error.ArchiveExtractionFailed;
+    // Preflight the entire declared inventory before native decompression, disk
+    // publication or allocation of any entry buffer.
+    var inventory = unarr.Archive.openMemory(format, bounded_body, .{}) catch return error.ArchiveExtractionFailed;
+    var inventory_open = true;
+    defer if (inventory_open) inventory.deinit();
+    var entry_count: usize = 0;
+    var total: usize = 0;
+    while (inventory.nextEntry() catch return error.ArchiveExtractionFailed) |entry| {
+        try runtime_io.get().checkCancel();
+        entry_count += 1;
+        if (entry_count > max_archive_entries) return error.ArchiveEntryLimit;
+        const name = entry.name() orelse entry.rawName() orelse return error.InvalidArchivePath;
+        if (!safeArchiveName(name)) return error.InvalidArchivePath;
+        if (entry.size() > max_archive_entry_size_bytes) return error.ArchiveEntryTooLarge;
+        total = std.math.add(usize, total, entry.size()) catch return error.ArchiveTooLarge;
+        if (total > max_archive_total_size_bytes) return error.ArchiveTooLarge;
+    }
+    if (total == 0) return error.ArchiveExtractionFailed;
+    inventory.deinit();
+    inventory_open = false;
+    var archive = unarr.Archive.openMemory(format, bounded_body, .{}) catch return error.ArchiveExtractionFailed;
     defer archive.deinit();
-
+    const directory_name = try extractionDirBaseName(allocator, archive_path);
+    defer allocator.free(directory_name);
+    const directory = try createUniqueDirectory(allocator, out_dir, ".scrapers-extract-staging");
+    defer allocator.free(directory);
+    var staging_owned = true;
+    defer if (staging_owned) {
+        const protection = runtime_io.get().swapCancelProtection(.blocked);
+        defer _ = runtime_io.get().swapCancelProtection(protection);
+        std.Io.Dir.cwd().deleteTree(runtime_io.get(), directory) catch {};
+    };
     var extracted: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer {
+    defer {
         for (extracted.items) |path| allocator.free(path);
         extracted.deinit(allocator);
     }
-
-    var entry_index: usize = 0;
-    while (entry_index < max_archive_entries) : (entry_index += 1) {
-        const maybe_entry = archive.nextEntry() catch return error.ArchiveExtractionFailed;
-        const entry = maybe_entry orelse break;
-        if (entry.size() == 0) continue;
-
-        const entry_name = entry.name() orelse entry.rawName() orelse "";
-        if (std.mem.endsWith(u8, entry_name, "/") or std.mem.endsWith(u8, entry_name, "\\")) continue;
-
-        const entry_base_name = try archiveEntryOutputName(allocator, entry_name, entry_index + 1);
-        defer allocator.free(entry_base_name);
-
-        const entry_data = entry.readAlloc(allocator, max_archive_entry_size_bytes) catch |err| switch (err) {
-            error.EntryTooLarge => continue,
+    var index: usize = 0;
+    while (archive.nextEntry() catch return error.ArchiveExtractionFailed) |entry| {
+        try runtime_io.get().checkCancel();
+        index += 1;
+        if (index > entry_count) return error.ArchiveExtractionFailed;
+        const name = entry.name() orelse entry.rawName() orelse return error.InvalidArchivePath;
+        if (entry.size() == 0 or std.mem.endsWith(u8, name, "/") or std.mem.endsWith(u8, name, "\\")) continue;
+        const filename = try archiveEntryOutputName(allocator, name, index);
+        defer allocator.free(filename);
+        const bytes = entry.readAlloc(allocator, max_archive_entry_size_bytes) catch |err| switch (err) {
+            error.OutOfMemory => return err,
             else => return error.ArchiveExtractionFailed,
         };
-        defer allocator.free(entry_data);
-        if (entry_data.len == 0) continue;
-
-        const output_path = try nextAvailableOutputPath(allocator, out_dir, entry_base_name);
-        errdefer allocator.free(output_path);
-
-        std.Io.Dir.cwd().writeFile(runtime_io.get(), .{ .sub_path = output_path, .data = entry_data }) catch return error.ArchiveExtractionFailed;
-
-        try extracted.append(allocator, output_path);
+        defer allocator.free(bytes);
+        try runtime_io.get().checkCancel();
+        const path = try publishUniqueFile(allocator, directory, filename, bytes);
+        errdefer allocator.free(path);
+        try extracted.append(allocator, path);
     }
-
-    if (extracted.items.len == 0) return error.ArchiveExtractionFailed;
-    return try extracted.toOwnedSlice(allocator);
-}
-
-fn extractZipArchiveFiles(
-    allocator: Allocator,
-    out_dir: []const u8,
-    archive_path: []const u8,
-) ![]const []const u8 {
-    const extract_dir_name = try extractionDirBaseName(allocator, archive_path);
-    defer allocator.free(extract_dir_name);
-    const extract_dir_path = try nextAvailableOutputPath(allocator, out_dir, extract_dir_name);
-    errdefer allocator.free(extract_dir_path);
-
-    try std.Io.Dir.cwd().createDirPath(runtime_io.get(), extract_dir_path);
-    var dest_dir = try std.Io.Dir.cwd().openDir(runtime_io.get(), extract_dir_path, .{ .iterate = true });
-    defer dest_dir.close(runtime_io.get());
-
-    var archive_file = try std.Io.Dir.cwd().openFile(runtime_io.get(), archive_path, .{});
-    defer archive_file.close(runtime_io.get());
-    var file_buf: [64 * 1024]u8 = undefined;
-    var file_reader = archive_file.reader(runtime_io.get(), &file_buf);
-
-    std.zip.extract(dest_dir, &file_reader, .{ .allow_backslashes = true }) catch return error.ArchiveExtractionFailed;
-    const files = try collectExtractedFilesRecursive(allocator, extract_dir_path);
-    allocator.free(extract_dir_path);
-    if (files.len == 0) {
-        allocator.free(files);
-        return error.ArchiveExtractionFailed;
-    }
-    return files;
+    if (index != entry_count or extracted.items.len == 0) return error.ArchiveExtractionFailed;
+    const published = try publishExtractedDirectory(allocator, out_dir, directory_name, directory, extracted.items);
+    staging_owned = false;
+    return published;
 }
 
 fn extractionDirBaseName(allocator: Allocator, archive_path: []const u8) ![]u8 {
@@ -3860,54 +3992,6 @@ fn extractionDirBaseName(allocator: Allocator, archive_path: []const u8) ![]u8 {
     const stem = std.mem.trim(u8, raw_stem, " .");
     const chosen = if (stem.len == 0) "archive" else stem;
     return try std.fmt.allocPrint(allocator, "{s}.extracted", .{chosen});
-}
-
-fn collectExtractedFilesRecursive(allocator: Allocator, root_path: []const u8) ![]const []const u8 {
-    var out: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer {
-        for (out.items) |path| allocator.free(path);
-        out.deinit(allocator);
-    }
-    try collectExtractedFilesRecursiveInner(allocator, root_path, &out);
-    return try out.toOwnedSlice(allocator);
-}
-
-fn collectExtractedFilesRecursiveInner(
-    allocator: Allocator,
-    dir_path: []const u8,
-    out: *std.ArrayListUnmanaged([]const u8),
-) !void {
-    var dir = try std.Io.Dir.cwd().openDir(runtime_io.get(), dir_path, .{ .iterate = true });
-    defer dir.close(runtime_io.get());
-    var it = dir.iterate();
-    while (try it.next(runtime_io.get())) |entry| {
-        var renamed_name: ?[]u8 = null;
-        defer if (renamed_name) |name| allocator.free(name);
-
-        const entry_name = if (archiveExtractedNameNeedsSanitizing(entry.name)) blk: {
-            const sanitized = try sanitizeFilename(allocator, entry.name);
-            defer allocator.free(sanitized);
-            const candidate_path = try nextAvailableOutputPath(allocator, dir_path, sanitized);
-            defer allocator.free(candidate_path);
-            const candidate_name = common.pathBaseName(candidate_path);
-            const owned_name = try allocator.dupe(u8, candidate_name);
-            errdefer allocator.free(owned_name);
-            try dir.rename(entry.name, dir, owned_name, runtime_io.get());
-            renamed_name = owned_name;
-            break :blk owned_name;
-        } else entry.name;
-
-        const path = try std.fs.path.join(allocator, &.{ dir_path, entry_name });
-        errdefer allocator.free(path);
-        switch (entry.kind) {
-            .file => try out.append(allocator, path),
-            .directory => {
-                try collectExtractedFilesRecursiveInner(allocator, path, out);
-                allocator.free(path);
-            },
-            else => allocator.free(path),
-        }
-    }
 }
 
 fn archiveExtractedNameNeedsSanitizing(name: []const u8) bool {
@@ -4096,11 +4180,12 @@ fn sanitizeFilename(allocator: Allocator, input: []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
+    const valid_utf8 = std.unicode.utf8ValidateSlice(input);
     for (input) |c| {
         const ok = (c >= 'a' and c <= 'z') or
             (c >= 'A' and c <= 'Z') or
             (c >= '0' and c <= '9') or
-            c == '.' or c == '-' or c == '_' or c == ' ' or c == '(' or c == ')';
+            (valid_utf8 and c >= 0x80) or c == '.' or c == '-' or c == '_' or c == ' ' or c == '(' or c == ')';
         if (ok) {
             try out.append(allocator, c);
         } else {
@@ -4113,8 +4198,14 @@ fn sanitizeFilename(allocator: Allocator, input: []const u8) ![]u8 {
 
     const trimmed = std.mem.trim(u8, owned, " .");
     if (trimmed.len == 0) {
+        const fallback = try allocator.dupe(u8, "subtitle.bin");
         allocator.free(owned);
-        return try allocator.dupe(u8, "subtitle.bin");
+        return fallback;
+    }
+    if (common.isWindowsReservedFilename(trimmed)) {
+        const safe = try std.fmt.allocPrint(allocator, "_{s}", .{trimmed});
+        allocator.free(owned);
+        return safe;
     }
     if (trimmed.len == owned.len) return owned;
 
@@ -4123,23 +4214,34 @@ fn sanitizeFilename(allocator: Allocator, input: []const u8) ![]u8 {
     return duped;
 }
 
-fn nextAvailableOutputPath(allocator: Allocator, out_dir: []const u8, base_name: []const u8) ![]u8 {
-    var attempt: usize = 0;
-    while (true) : (attempt += 1) {
-        const file_name = if (attempt == 0)
-            try allocator.dupe(u8, base_name)
-        else
-            try appendNumericSuffix(allocator, base_name, attempt);
-        defer allocator.free(file_name);
-
-        const full_path = try std.fs.path.join(allocator, &.{ out_dir, file_name });
-        errdefer allocator.free(full_path);
-        std.Io.Dir.cwd().access(runtime_io.get(), full_path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return full_path,
+fn publishUniqueFile(allocator: Allocator, out_dir: []const u8, base_name: []const u8, bytes: []const u8) ![]u8 {
+    for (0..10000) |attempt| {
+        const name = if (attempt == 0) try allocator.dupe(u8, base_name) else try appendNumericSuffix(allocator, base_name, attempt);
+        defer allocator.free(name);
+        const path = try std.fs.path.join(allocator, &.{ out_dir, name });
+        errdefer allocator.free(path);
+        if (std.Io.Dir.cwd().statFile(runtime_io.get(), path, .{ .follow_symlinks = false })) |_| {
+            allocator.free(path);
+            continue;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
             else => return err,
+        }
+
+        var atomic = try std.Io.Dir.cwd().createFileAtomic(runtime_io.get(), path, .{});
+        defer atomic.deinit(runtime_io.get());
+        try atomic.file.writeStreamingAll(runtime_io.get(), bytes);
+        try atomic.file.sync(runtime_io.get());
+        atomic.link(runtime_io.get()) catch |err| {
+            if (err == error.PathAlreadyExists) {
+                allocator.free(path);
+                continue;
+            }
+            return err;
         };
-        allocator.free(full_path);
+        return path;
     }
+    return error.TooManyOutputCollisions;
 }
 
 fn appendNumericSuffix(allocator: Allocator, base_name: []const u8, suffix: usize) ![]u8 {
@@ -4710,10 +4812,10 @@ fn runProviderSmokeTest(provider: Provider) !void {
 
 fn runProviderTuiSmoke(allocator: std.mem.Allocator, client: *std.http.Client, provider: Provider) !void {
     const query = liveQueryForProvider(provider);
-    return runProviderTuiSmokeQuery(allocator, client, provider, query);
+    return runProviderTuiSmokeQuery(allocator, client, provider, query, false);
 }
 
-fn runProviderTuiSmokeQuery(allocator: std.mem.Allocator, client: *std.http.Client, provider: Provider, query: []const u8) !void {
+fn runProviderTuiSmokeQuery(allocator: std.mem.Allocator, client: *std.http.Client, provider: Provider, query: []const u8, require_series: bool) !void {
     std.debug.print("[live][providers_app][{s}] query={s}\n", .{ providerName(provider), query });
 
     std.debug.print("[live][providers_app][{s}] phase=search_start\n", .{providerName(provider)});
@@ -4731,9 +4833,13 @@ fn runProviderTuiSmokeQuery(allocator: std.mem.Allocator, client: *std.http.Clie
     var subtitles_opt: ?SubtitlesResponse = null;
     defer if (subtitles_opt) |*subtitles| subtitles.deinit();
     for (search_response.items, 0..) |candidate, idx| {
-        var candidate_subtitles = fetchSubtitles(allocator, client, candidate.ref) catch |err| {
-            std.debug.print("[live][providers_app][{s}] skip_search={d} err={s}\n", .{ providerName(provider), idx, @errorName(err) });
+        if (require_series and !try liveSeriesCandidateMatches(allocator, candidate.ref, query)) {
+            std.debug.print("[live][providers_app][{s}] skip_search={d} reason=not_requested_series\n", .{ providerName(provider), idx });
             continue;
+        }
+        var candidate_subtitles = fetchSubtitles(allocator, client, candidate.ref) catch |err| {
+            std.debug.print("[live][providers_app][{s}] listing_failed={d} err={s}\n", .{ providerName(provider), idx, @errorName(err) });
+            return err;
         };
         if (candidate_subtitles.items.len == 0 or firstDownloadCandidate(candidate_subtitles.items) == null) {
             std.debug.print("[live][providers_app][{s}] skip_search={d} reason=no_downloadable_subtitles\n", .{ providerName(provider), idx });
@@ -4798,8 +4904,10 @@ fn runProviderTuiSmokeQuery(allocator: std.mem.Allocator, client: *std.http.Clie
     }
 
     if (download.bytes_written == 0) return error.TestUnexpectedResult;
-    if (download.archive_path != null and download.extracted_files.len == 0) return error.TestUnexpectedResult;
-    if (download.extracted_files.len > 0) {
+    if (download.archive_path != null and download.extracted_files.len == 0 and !download.extraction_unavailable) return error.TestUnexpectedResult;
+    if (download.extraction_unavailable) {
+        std.debug.print("[live][providers_app][{s}] archive_download_ok external_extraction_required\n", .{providerName(provider)});
+    } else if (download.extracted_files.len > 0) {
         std.debug.print("[live][providers_app][{s}] extraction_ok idx={d} files={d}\n", .{
             providerName(provider),
             download_idx,
@@ -4856,7 +4964,7 @@ fn runProviderSeriesTest(provider: Provider) !void {
     defer client.deinit();
     std.debug.print("[live][providers_app][{s}][series] test_start\n", .{providerName(provider)});
     defer std.debug.print("[live][providers_app][{s}][series] test_end\n", .{providerName(provider)});
-    try runProviderTuiSmokeQuery(std.testing.allocator, &client, provider, seriesQueryForProvider(provider));
+    try runProviderTuiSmokeQuery(std.testing.allocator, &client, provider, seriesQueryForProvider(provider), true);
 }
 
 fn runSubtitlecatTranslateDownloadLive(allocator: std.mem.Allocator, client: *std.http.Client) !void {
@@ -4960,4 +5068,192 @@ test "live providers_app series download path" {
         try runProviderSeriesTest(info.provider);
     }
     if (!ran) return error.SkipZigTest;
+}
+
+fn freeExtractedPaths(allocator: Allocator, paths: []const []const u8) void {
+    for (paths) |path| allocator.free(path);
+    allocator.free(paths);
+}
+test "ZIP extraction verifies CRC and publishes complete bounded output" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    if (!unarr.enabled) {
+        try std.testing.expectError(error.ArchiveExtractionUnavailable, extractArchiveFiles(allocator, @embedFile("fixtures/safe.zip"), .zip, root, "bundle.zip"));
+        return;
+    }
+    const paths = try extractArchiveFiles(allocator, @embedFile("fixtures/safe.zip"), .zip, root, "bundle.zip");
+    defer freeExtractedPaths(allocator, paths);
+    try std.testing.expectEqual(@as(usize, 2), paths.len);
+    try std.testing.expect(!std.mem.eql(u8, paths[0], paths[1]));
+    for (paths, [_][]const u8{ "first subtitle", "second subtitle" }) |path, expected| {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), path, allocator, .limited(100));
+        defer allocator.free(bytes);
+        try std.testing.expectEqualStrings(expected, bytes);
+    }
+}
+test "invalid ZIPs fail before publishing extracted files" {
+    if (!unarr.enabled) return error.SkipZigTest;
+    const fixtures = [_][]const u8{
+        @embedFile("fixtures/empty.zip"),            @embedFile("fixtures/directories.zip"), @embedFile("fixtures/many-directories.zip"),
+        @embedFile("fixtures/parent.zip"),           @embedFile("fixtures/drive.zip"),       @embedFile("fixtures/drive-relative.zip"),
+        @embedFile("fixtures/unc.zip"),              @embedFile("fixtures/bad-crc.zip"),     @embedFile("fixtures/bad-extra.zip"),
+        @embedFile("fixtures/ambiguous-footer.zip"),
+    };
+    for (fixtures) |body| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer std.testing.allocator.free(root);
+        if (extractArchiveFiles(std.testing.allocator, body, .zip, root, "bundle.zip")) |paths| {
+            freeExtractedPaths(std.testing.allocator, paths);
+            return error.ExpectedArchiveRejection;
+        } else |_| {}
+        var entries = tmp.dir.iterate();
+        try std.testing.expectEqual(@as(?std.Io.Dir.Entry, null), try entries.next(runtime_io.get()));
+    }
+}
+test "download publication never replaces existing files or dangling symlinks" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(root);
+    const first = try publishUniqueFile(allocator, root, "movie.srt", "old");
+    defer allocator.free(first);
+    const second = try publishUniqueFile(allocator, root, "movie.srt", "new");
+    defer allocator.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    const original = try std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), first, allocator, .limited(100));
+    defer allocator.free(original);
+    try std.testing.expectEqualStrings("old", original);
+    if (@import("builtin").os.tag != .windows) {
+        try tmp.dir.symLink(runtime_io.get(), "missing-target.srt", "link.srt", .{});
+        const result = try publishUniqueFile(allocator, root, "link.srt", "safe");
+        defer allocator.free(result);
+        try std.testing.expect(std.mem.endsWith(u8, result, "link-1.srt"));
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access(runtime_io.get(), "missing-target.srt", .{}));
+    }
+}
+test "download filenames avoid Windows device names and archive bytes override suffix" {
+    for ([_][]const u8{ "CON.srt", "CON .srt", "LPT9.ass", "NUL" }) |name| {
+        const safe = try sanitizeFilename(std.testing.allocator, name);
+        defer std.testing.allocator.free(safe);
+        try std.testing.expect(safe[0] == '_');
+    }
+    try std.testing.expectEqual(ArchiveKind.rar, detectArchiveKind("wrong.zip", "https://fixture.invalid/x", "Rar!\x1a\x07\x00"));
+}
+
+fn checkFilenameAllocationFailures(allocator: Allocator) !void {
+    for ([_][]const u8{ "...", "CON.srt", " ordinary.srt ", "file.srt" }) |name| {
+        const result = try sanitizeFilename(allocator, name);
+        allocator.free(result);
+    }
+}
+test "download filename normalization has no partial ownership on failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkFilenameAllocationFailures, .{});
+}
+
+fn liveSeriesCandidateMatches(allocator: Allocator, ref: SearchRef, query: []const u8) !bool {
+    const movie = switch (ref) {
+        inline else => |item| blk: {
+            if (@hasField(@TypeOf(item), "media_kind")) {
+                const tag = @tagName(item.media_kind);
+                if (std.ascii.eqlIgnoreCase(tag, "movie") or std.ascii.eqlIgnoreCase(tag, "film")) break :blk true;
+            }
+            break :blk false;
+        },
+    };
+    if (movie) return false;
+    switch (ref) {
+        .opensubtitles_com => |item| if (item.item_type) |kind| {
+            if (std.ascii.eqlIgnoreCase(kind, "movie")) return false;
+        },
+        .subdl_com => |item| if (std.ascii.eqlIgnoreCase(@tagName(item.media_type), "movie")) return false,
+        .subsource_net => |item| if (std.ascii.eqlIgnoreCase(item.media_type, "movie")) return false,
+        else => {},
+    }
+    const title = try common.normalizeTitle(allocator, common.splitTrailingYear(common.parseEpisodeQuery(titleFromRef(ref)).title).title);
+    defer allocator.free(title);
+    const expected_title = if (ref == .subsunacs_net and std.mem.eql(u8, query, "Game of Thrones 01 01")) "Game of Thrones" else common.parseEpisodeQuery(query).title;
+    const expected = try common.normalizeTitle(allocator, expected_title);
+    defer allocator.free(expected);
+    if (std.mem.indexOf(u8, title, expected) == null) return false;
+    // Ambiguous plain-title endpoints otherwise mistake the 2012 movie for
+    // the requested miniseries, giving false positive TV coverage.
+    if (std.mem.eql(u8, expected, "chernobyl") and !std.mem.eql(u8, title, expected)) return false;
+    return true;
+}
+
+test "series live selection rejects unrelated and movie-only search hits" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(!try liveSeriesCandidateMatches(allocator, .{ .isubtitles_org = .{ .title = "Chernobyl Diaries", .details_url = "" } }, "Chernobyl"));
+    try std.testing.expect(!try liveSeriesCandidateMatches(allocator, .{ .isubtitles_org = .{ .title = "Crumb", .details_url = "" } }, "Chernobyl"));
+    try std.testing.expect(!try liveSeriesCandidateMatches(allocator, .{ .isubtitles_org = .{ .title = "The Battle of Chernobyl", .details_url = "" } }, "Chernobyl"));
+    try std.testing.expect(try liveSeriesCandidateMatches(allocator, .{ .isubtitles_org = .{ .title = "Chernobyl (2019)", .details_url = "" } }, "Chernobyl"));
+    try std.testing.expect(try liveSeriesCandidateMatches(allocator, .{ .isubtitles_org = .{ .title = "Chernobyl\u{a0}", .details_url = "" } }, "Chernobyl"));
+}
+
+test "ZIP download template whitespace preserves exact decoder boundary" {
+    const valid = @embedFile("fixtures/safe.zip");
+    const padded = valid ++ "\n  \t \r\n";
+    const canonical = try canonicalZipBody(padded);
+    try std.testing.expectEqualSlices(u8, valid, canonical);
+    try preflightZip(canonical);
+    try std.testing.expectError(error.ArchiveExtractionFailed, canonicalZipBody(valid ++ "unexpected trailer"));
+    try std.testing.expectError(error.ArchiveExtractionFailed, canonicalZipBody(valid ++ (" " ** 4097)));
+}
+
+fn applyTranslatedLines(allocator: Allocator, source: []const []const u8, translated: []?[]u8, indices: []const usize, lines: []const []const u8, incomplete: *bool) !void {
+    for (indices, 0..) |line_idx, i| {
+        const missing = std.mem.trim(u8, lines[i], " \t\r\n").len == 0;
+        if (missing) incomplete.* = true;
+        translated[line_idx] = try allocator.dupe(u8, if (missing) source[line_idx] else lines[i]);
+    }
+}
+test "empty translated lines preserve source and report incomplete output" {
+    const allocator = std.testing.allocator;
+    var translated: [2]?[]u8 = @splat(null);
+    defer for (translated) |line| if (line) |bytes| allocator.free(bytes);
+    var incomplete = false;
+    try applyTranslatedLines(allocator, &.{ "Hello", "world" }, &translated, &.{ 0, 1 }, &.{ "Bonjour", "" }, &incomplete);
+    try std.testing.expect(incomplete);
+    try std.testing.expectEqualStrings("Bonjour", translated[0].?);
+    try std.testing.expectEqualStrings("world", translated[1].?);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, "[[]]", .{});
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidField, googleTranslateResultToString(allocator, parsed.value));
+}
+
+test "malformed translation fragments cannot silently drop source text" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{
+        "[[[\"Bonjour\",\"Hello\"],[null,\" world\"]]]",
+        "[[[\"Bonjour\",\"Hello\"],[\"\",\" world\"]]]",
+        "[[[\"Bonjour\",\"Hello\"],[]]]",
+    }) |payload| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+        if (googleTranslateResultToString(allocator, parsed.value)) |result| {
+            allocator.free(result);
+            return error.ExpectedInvalidTranslation;
+        } else |err| {
+            try std.testing.expect(err == error.InvalidField or err == error.InvalidFieldType);
+        }
+    }
+}
+
+test "download filenames preserve valid Unicode and guard device aliases" {
+    for ([_][2][]const u8{
+        .{ "字幕.srt", "字幕.srt" },
+        .{ "école.ass", "école.ass" },
+        .{ "COM¹.srt", "_COM¹.srt" },
+        .{ "LPT².ass", "_LPT².ass" },
+    }) |case| {
+        const name = try sanitizeFilename(std.testing.allocator, case[0]);
+        defer std.testing.allocator.free(name);
+        try std.testing.expectEqualStrings(case[1], name);
+    }
 }
