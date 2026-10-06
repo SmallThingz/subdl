@@ -215,6 +215,7 @@ fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, ext
 
     var req = public_client.request(.GET, uri, .{
         .redirect_behavior = .unhandled,
+        .handle_continue = false,
         .keep_alive = false,
         .connection = pinned_connection,
         .headers = .{
@@ -228,10 +229,17 @@ fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, ext
     };
     defer req.deinit();
     errdefer req.connection.?.closing = true;
-    try req.sendBodiless();
+    req.sendBodiless() catch |err| return common.normalizeRequestWriteError(&req, err);
 
     var head_buffer: [16 * 1024]u8 = undefined;
-    var response = try req.receiveHead(&head_buffer);
+    var response = req.receiveHead(&head_buffer) catch |err| return common.normalizeRequestReadError(&req, err);
+    var interim_count: usize = 0;
+    while (response.head.status.class() == .informational) {
+        if (response.head.status == .switching_protocols) return error.UnsupportedProtocolUpgrade;
+        interim_count += 1;
+        if (interim_count > 16) return error.TooManyInformationalResponses;
+        response = req.receiveHead(&head_buffer) catch |err| return common.normalizeRequestReadError(&req, err);
+    }
     const status = response.head.status;
     const cookie = try common.extractPhpSessionCookie(allocator, response.head.bytes);
     errdefer if (cookie) |value| allocator.free(value);
@@ -241,7 +249,7 @@ fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, ext
     const body = readBoundedBody(allocator, reader, max_raw_response_bytes) catch |err| {
         if (err == error.ReadFailed) {
             if (response.bodyErr()) |body_err| return body_err;
-            if (req.connection.?.stream_reader.err) |stream_err| return stream_err;
+            return common.normalizeRequestReadError(&req, err);
         }
         return err;
     };
@@ -402,7 +410,7 @@ fn readBoundedBody(allocator: Allocator, reader: *std.Io.Reader, max_bytes: usiz
         }
         const count = reader.stream(&writer.writer, .limited(max_bytes - received)) catch |err| switch (err) {
             error.EndOfStream => break,
-            else => return err,
+            else => return common.normalizeAllocatingWriterError(err),
         };
         received += count;
     }

@@ -3826,6 +3826,7 @@ fn fetchBytesUsingSessionWith(
         .retry_on_429 = false,
         .cache = false,
         .require_public_origin = true,
+        .require_https = true,
     });
 }
 
@@ -3835,7 +3836,7 @@ fn cookieHeaderValue(header: []const u8, wanted_name: []const u8) ?[]const u8 {
         const pair = std.mem.trim(u8, raw_pair, " \t");
         const equals = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
         const name = std.mem.trim(u8, pair[0..equals], " \t");
-        if (!std.ascii.eqlIgnoreCase(name, wanted_name)) continue;
+        if (!std.mem.eql(u8, name, wanted_name)) continue;
         return std.mem.trim(u8, pair[equals + 1 ..], " \t");
     }
     return null;
@@ -5018,6 +5019,7 @@ test "OpenSubtitles session static cookie header excludes path-scoped cookies" {
             try std.testing.expect(options.allow_non_ok);
             try std.testing.expect(!options.cache);
             try std.testing.expect(!options.retry_on_429);
+            try std.testing.expect(options.require_https);
 
             var cookie: ?[]const u8 = null;
             for (options.extra_headers) |header| {
@@ -5052,6 +5054,14 @@ test "OpenSubtitles session static cookie header excludes path-scoped cookies" {
     );
     defer std.testing.allocator.free(response.body);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+}
+
+test "OpenSubtitles session cookie names are case-sensitive" {
+    try std.testing.expect(cookieHeaderValue("CF_CLEARANCE=wrong", "cf_clearance") == null);
+    try std.testing.expectEqualStrings(
+        "right",
+        cookieHeaderValue("CF_CLEARANCE=wrong; cf_clearance=right", "cf_clearance").?,
+    );
 }
 
 test "OpenSubtitles session requires root-scoped cf_clearance before fetching" {

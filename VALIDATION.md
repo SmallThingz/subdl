@@ -1,93 +1,142 @@
 # Scrapers repair and validation
 
-Date: 2026-10-06 (Australia/Brisbane). Host: dc-box. Compiler: Zig 0.16.0.
+Date: 2026-10-07 (Australia/Brisbane). Host: dc-box. Compiler: Zig 0.16.0.
 
 ## Current scraper qualification
 
-The current registry retains 53 implementations: 46 active providers exposed by
-the CLI/TUI and seven inactive recovery probes (`opensubtitles_org`,
+The current registry retains 53 implementations: 46 registry-exposed providers
+and seven inactive recovery probes (`opensubtitles_org`,
 `moviesubtitlesrt_com`, `podnapisi_net`, `my_subs_co`, `tvsubtitles_net`,
-`greek_subtitles_com`, and `animesubtitle_ir`). The source/build snapshot used
-for the final deterministic gates was captured at
-`f86497cb5bb75d7d72360eb4c31b93a01505c1ee` plus the documented working-tree
-changes, with content digest
-`2d488c9deb6d5392f3fceee08a993ca80b99daea761d9cc3ecb4a99e0d64cf98`.
+`greek_subtitles_com`, and `animesubtitle_ir`). “Active” below means exposed by
+the CLI/TUI registry; it does not mean every changing upstream was reachable in
+the latest network environment. The final gates use commit
+`dd795aa20b0962c6f16976024c8091aa12f667ee` plus the post-critique implementation
+changes whose tracked implementation/test/build content digest is
+`cedf9ba68bebf93e38709e89314c89c0d6e63df57a68e8f22335170607ce552c`.
+The digest covers tracked `src/**`, `tools/**`,
+`build.zig`, and `build.zig.zon`, using NUL-sorted paths and SHA-256 file
+checksums.
 
 ### Deterministic and build gates
 
-- `zig build test test-http -j1`: 26/26 steps; 771 passed, 127 skipped
-  (898 total). The isolated transport fixtures reported
-  `HTTP_TRANSPORT_PASS cases=18` and
-  `HTTP_LOOPBACK_PASS requests=28 cross_origin_credentials=0`.
+- `zig build test test-http -j1`: 26/26 steps; 818 passed, 133 skipped
+  (951 total). The isolated transport fixtures reported
+  `HTTP_TRANSPORT_PASS cases=21` and
+  `HTTP_LOOPBACK_PASS requests=31 cross_origin_credentials=0`.
 - `zig build test test-http -Doptimize=ReleaseSafe -j1`: the same 26/26 steps
-  and 771 passed / 127 skipped result under safety-enabled optimization, with
+  and 818 passed / 133 skipped result under safety-enabled optimization, with
   the same transport counts.
-- `zig build test -Denable-alldriver=true -j1`: 24/24 steps; 771 passed and
-  127 skipped. This is the provider/browser-enabled unit-test boundary.
+- `zig build test -Denable-alldriver=true -j1`: 24/24 steps; 818 passed and
+  133 skipped. This is the provider/browser-enabled deterministic boundary.
 - `SUBDL_CHROMIUM_SMOKE=1 SUBDL_CHROMIUM_PATH=/opt/brave-bin/brave zig build
-  test -Denable-alldriver=true -j1`: 24/24 steps; 773 passed and 125 skipped.
-  Both opt-in Chromium pipe/egress smoke tests therefore ran. This validates
-  the browser process and network policy, not CAPTCHA completion.
+  test -Denable-alldriver=true -j1`: 24/24 steps; 824 passed and 127 skipped.
+  Three opt-in smoke tests ran in each of two compiled test binaries. They cover
+  browser launch, download-denial acknowledgement, browser APIs commonly needed
+  by challenge pages, named-frame compatibility, popup target containment,
+  allowed navigation, user-agent/cookie retrieval, and one user-gesture
+  `mailto:` attempt; they also invoke profile teardown. CDP event rejection is
+  reactive defense in depth. The inaccessible session bus and verified private
+  failing `xdg-email`/`xdg-open` stubs are the preventive boundary. This probe
+  does not prove every protocol/desktop configuration, packet-level WebRTC
+  suppression, every proxy-bypass interpretation, off-origin
+  worker/OOPIF/service-worker denial, or end-to-end CAPTCHA completion.
+- The separately gated headed `mailto:` probe was attempted with
+  `SUBDL_CHROMIUM_HEADED_SMOKE=1` but is not counted as a pass. This host had no
+  `DISPLAY`; its advertised `WAYLAND_DISPLAY=wayland-1` socket was not listening,
+  so both compiled test binaries ended with `BrowserPipeClosed` before CDP
+  initialization. A working compositor is required to qualify the visible path.
 - `zig build -Denable-alldriver=true -j1`: 14/14 production build steps.
 - `zig build build-all-targets -Denable-alldriver=true -j1`: 62/62 compile
-  steps. The default-feature cross build separately passed 57/57 steps. Targets
-  were x86-64 and ARM64 Linux GNU, x86-64 Windows GNU, and x86-64 and ARM64
-  macOS; these are compile checks, not foreign-platform runtime tests.
+  steps. Targets were x86-64 and ARM64 Linux GNU, x86-64 Windows GNU, and
+  x86-64 and ARM64 macOS; these are compile checks, not foreign-platform runtime
+  tests.
 - `zig build test-pty -j1`: 14/14 steps and both PTY probes passed with terminal
   restoration, resize handling, and bracketed paste verified.
 - `zig build test -Denable-tui=false -Denable-unarr=false -j1`: 13/13 steps;
-  677 passed and 128 skipped (805 total).
+  724 passed and 134 skipped (858 total).
+- `zig fmt --check` on every changed Zig file and `git diff --check` passed.
 
 ### Live-provider evidence and current network limitation
 
-The final registry-driven command
-`env -u SUBDL_CHROMIUM_SMOKE SUBDL_CHROMIUM_PATH=/opt/brave-bin/brave zig build
-test-live-active -Denable-alldriver=true -Dlive-max-jobs=4 -j1 --summary all`
-started and ended all 46 active-provider subprocesses. It did **not** produce a
-clean qualification: nine exited zero, 29 exited one, and eight reached their
-bounded subprocess deadline. The nine zero-exit providers were
-`subtitri.nekur.net`, `subtitri.do.am`, `feliratok.eu`, `animekalesi.com`,
-`animetosho.xyz`, `nyasub.cz`, `subhd.tv`, `fansubs.ru`, and `zoom.lk`.
+The registry-driven run on the exact implementation digest above used a
+30-minute outer bound and the command `env -u SUBDL_CHROMIUM_SMOKE -u
+SUBDL_CHROMIUM_HEADED_SMOKE SUBDL_CHROMIUM_PATH=/opt/brave-bin/brave zig build
+test-live-active -Denable-alldriver=true -Dlive-max-jobs=4 -j1 --summary all`.
+It started and ended all 46 active-provider subprocesses: 40 exited zero and six
+exited one; none reached a subprocess deadline. This is substantial live
+coverage, but the six nonzero providers prevent a clean all-provider claim.
 
-The sweep recorded 61 `NameServerFailure` events. The only reported live-test
-failures of another class were two `UnexpectedHttpStatus` events from
-Prijevodi Online and one `ArchiveExtractionFailed` from Titrari. Several
-nonzero subprocesses completed real provider operations before a later lookup
-failed, but they are not counted as passes. A focused 11-provider final-source
-run likewise ended 359 passed / 52 skipped / 7 failed, with DNS failures
-dominating, so it is retained as diagnostic evidence rather than claimed as a
-qualification pass.
+All nine providers whose raw transport paths changed in the post-critique work
+exited zero: `animekalesi.com`, `animesub.info`, `fansubs.ru`, `greeksubs.net`,
+`subcentral.de`, `subhd.tv`, `subs4free.info`, `subsynchro.com`, and
+`titrari.ro`. The exact-snapshot run observed real search/list/download or
+extraction paths for many providers, including AnimeKalesi ZIP download and
+extraction. `opensubtitles.com` and `subsource.net` also exited zero.
+
+Four nonzero providers ended only in resolver failures: `subtis.io`,
+`kitsunekko.net`, `cc.edatribe.com`, and `subclub.eu`. Prijevodi Online reached
+its content and download paths but returned two explicit access-block results
+and one HTTP 403. Nyasub completed search/listing but its selected download
+eventually returned `UnexpectedHttpStatus`. These changing upstream conditions
+are reported as failures, not converted into passes.
+
+A focused current-digest Nyasub rerun subsequently completed all nine build
+steps and both real direct-download paths (152,179-byte movie and 48,252-byte
+series payloads), with 380 tests passed and 65 skipped. This supports treating
+the broad-run status as a transient upstream response, but it does not rewrite
+the exact-sweep count. A focused retry of the four resolver-failure providers
+completed the direct live tests for `cc.edatribe.com`, `subclub.eu`, and
+`kitsunekko.net`, as well as CC Edatribe's provider-app series path. Its three
+remaining failures (380 passed / 62 skipped / 3 failed) were all
+`NameServerFailure`: the Subtis provider-app and direct-live paths, and the
+Subclub provider-app series search. This is evidence of intermittent resolution,
+not a clean combined-provider qualification.
+
+For comparison, the earlier `dd795aa`-snapshot sweep on the same host had only
+nine zero-exit providers, 29 exit-one providers, eight subprocess deadlines,
+and 61 `NameServerFailure` events. That historical run and its focused retries
+remain diagnostic evidence rather than current qualification.
 
 An independent `getent ahostsv4` diagnostic reproduced the host resolver
 failure without scraper code. Repeated lookups of the same public names
 alternated between success taking 0.6–6.9 seconds and an 8-second timeout;
-`animekalesi.com` timed out on all three attempts. A final isolated
+`animekalesi.com` timed out on all three attempts. The isolated
 OpenSubtitles.org recovery probe reached three live paths, but all three ended
 in `NameServerFailure` (353 passed / 62 skipped / 3 failed overall) before an
 access challenge could be reached. These observations prevent an honest claim
-that every upstream passed on this final network run. Earlier qualification
-below records successful real downloads observed during the repair, but is not
-substituted for a clean identical-snapshot sweep.
+that every upstream is reachable consistently from this host. The current
+40-of-46 result, deterministic gates, and real-browser smoke are complementary;
+none is represented as a clean all-provider sweep.
 
 ### CAPTCHA and browser-session boundary
 
 No CAPTCHA solver, CAPTCHA bypass, access-block bypass, TLS downgrade, or
 credentialed cross-origin redirect was added. Manual CAPTCHA completion was not
-performed because the final isolated challenge-provider probe failed during DNS
-resolution before presenting one. Challenge recovery is covered by deterministic
-tests and the real Chromium smoke above. Earlier in the audit, AnimeKalesi's
-browser-enabled retry completed its normal public path without presenting a
-challenge; that is not evidence of CAPTCHA completion.
+performed: no successful current-snapshot path presented a CAPTCHA, and the
+earlier isolated challenge-provider probe failed during DNS resolution before
+presenting one. Deterministic tests cover challenge detection,
+session/cache ownership, cookie handoff, rejection and refresh behavior; the
+real Chromium smoke covers the lower-level browser handoff only. Neither is an
+end-to-end completed challenge. Earlier in the audit, AnimeKalesi's browser-
+enabled retry completed its normal public path without presenting a challenge;
+that is not evidence of CAPTCHA completion. An authorized user may complete a
+displayed challenge manually within the deadline; unresolved challenges fail.
 
 On Linux, the handoff uses a private nonblocking Chromium 154+ CDP pipe and
 private profile with one absolute deadline. Public DNS answers are validated and
-pinned, proxies are disabled, and interception is attached before navigation;
-only the challenged HTTPS origin and required Cloudflare challenge origins are
-allowed, while local/private destinations fail closed. macOS and FreeBSD browser
-handoff fails closed until resolver cancellation can be guaranteed. Windows
-fails closed pending secure native handle/DACL support. Stale session credentials
-are pruned, cache files and locks are private, and transport diagnostics redact
-paths and query values.
+pinned. A process-wide unroutable proxy denies traffic by default, with direct
+bypasses limited to the exact challenged HTTPS host and Cloudflare challenge host
+on port 443; ambient/corporate proxies, other origins, subdomains/CDNs, and
+WebSockets fail closed. Chromium policy denies downloads and new page targets,
+and local/private destinations are blocked. External-protocol events are
+rejected reactively; an inaccessible session bus and private, execution-verified
+failing desktop-helper stubs form the preventive boundary. The headless
+`mailto:` smoke partially exercises these controls but is not a packet-level
+proof of the process-wide egress boundary or every protocol/desktop combination.
+macOS and FreeBSD browser handoff fails closed until resolver cancellation can be
+guaranteed. Windows fails closed pending secure native handle/DACL support. Stale
+session credentials are pruned, cache files and locks are private, and transport
+diagnostics redact paths and query values.
 
 Ordinary public-origin-pinned HTTP fetches retain one platform limitation:
 macOS/FreeBSD Zig 0.16 uses blocking libc `getaddrinfo`, so cancellation waits
@@ -97,18 +146,24 @@ pathological remote/FUSE cache storage likewise cannot be preempted.
 
 ### Current evidence files
 
-Current logs are under `.tmp/audit-20261006/` and are not committed. The frozen
-identity is `final-tree-identity-before.log`. Deterministic evidence is in
-`final-debug-test-http.log`, `final-releasesafe-test-http.log`,
-`test-enabled-provider-final.log`, `final-browser-egress-smoke.log`,
-`final-production-alldriver.log`, `final-cross-targets-alldriver.log`,
-`final-cross-targets-default.log`, `final-test-pty.log`, and
-`final-minimal-features-test.log`. Live evidence is in
+Current logs are under `.tmp/audit-20261007/` and are not committed.
+Post-critique deterministic evidence is in `final-debug-http.log`,
+`final-releasesafe-http.log`, `final-alldriver.log`,
+`final-browser-smoke.log`, `final-build-alldriver.log`,
+`final-cross-alldriver.log`, `final-test-pty.log`, and
+`final-minimal.log`. The exact-snapshot active-provider sweep is in
+`final-live-active-exact.log`; focused current-snapshot evidence is in
+`final-live-nyasub-focused.log` and `final-live-dns-retries.log`. The latter is
+a diagnostic partial failure and does not replace the exact sweep. The failed,
+non-qualifying visible-window diagnostic is in `headed-browser-diagnostic.log`;
+its display-variable, socket-metadata, and listener inspection is in
+`headed-host-environment.log`. Historical live evidence remains under
+`.tmp/audit-20261006/` in
 `final-live-active.log`, `final-live-active-status.log`,
 `final-live-active-failures.log`, `final-live-focused-changed.log`,
-`final-live-opensubtitles-org.log`, and `final-dns-diagnostic.log`. The final
-log set was scanned for unredacted credential/query material. Downloaded
-provider payloads are not committed.
+`final-live-opensubtitles-org.log`, and `final-dns-diagnostic.log`. The qualifying
+current logs and focused diagnostics were scanned for unredacted
+credential/header material; downloaded provider payloads are not committed.
 
 ## Earlier qualification
 
@@ -191,7 +246,7 @@ extraction and Subtitlecat's translation/download path. In total, application
 search/list/download paths were observed working for 45 providers across these
 runs. This is not a claim that all 45 passed one identical final sweep.
 
-Eight external failures remain in this environment:
+Eight external failures were observed in that environment:
 
 | Provider | Observed failure |
 | --- | --- |
@@ -215,8 +270,7 @@ was not available on this Linux host; their binaries were cross-compiled.
 Detailed local logs are under `.tmp/audit-20261005/`, including complete sweeps,
 focused live retries, fresh-cache validation, deterministic gates and terminal
 probes. Synthetic archive/transport fixtures are committed in `src/app/fixtures`
-and `tools`; downloaded provider payloads are not committed. Existing untracked
-`ISSUES.md` was preserved.
+and `tools`; downloaded provider payloads are not committed.
 
 Windows device-alias behavior follows the
 [Microsoft filename documentation](https://learn.microsoft.com/en-us/windows/desktop/fileio/naming-a-file),

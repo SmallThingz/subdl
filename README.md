@@ -8,8 +8,8 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 
 ## Overview
 
-- 46 currently active providers behind one app layer: `providers_app`
-- 53 provider implementations retained and covered by targeted live tests
+- 46 registry-exposed providers behind one app layer: `providers_app`
+- 53 retained provider implementations have targeted live-test probes
 - One binary: `scrapers`
 - CLI mode by default
 - TUI mode available with `--tui` in the default build
@@ -80,6 +80,8 @@ and `my_subs_co`, `podnapisi_net`, and `animesubtitle_ir` because their required
 upstream hosts currently have no usable address.
 They remain covered by focused live tests so upstream recovery can be detected
 without advertising a provider whose complete user path is known to be unreliable.
+Here, “active” means exposed by the current CLI/TUI registry; it is not a claim
+that every upstream was freshly reachable during the latest local run.
 
 `gestdown_info` is TV-only. `yifysubtitles_ch` is movie-only.
 `subtis_io` is movie-only.
@@ -186,20 +188,29 @@ Enable browser automation support:
 zig build -Denable-alldriver=true
 ```
 
-On Linux, Cloudflare session handoff launches a locally installed
-Chromium-family browser through a private, deadline-bounded CDP pipe.
+On Linux, when a fresh Cloudflare session is needed, session handoff launches a
+locally installed Chromium-family browser through a private, deadline-bounded
+CDP pipe.
 Auto-discovery covers Chrome, Chromium, Edge, Brave, and Vivaldi; the root CDP
 product must report Chrome or Chromium 154 or newer. DNS is restricted to pinned
-public addresses for the challenged host and Cloudflare's challenge host, and
-proxies are disabled. Page-session requests are intercepted before navigation
-and limited to those HTTPS origins; other document redirects and local/private
-targets fail closed through interception and Chromium's local-network controls.
+public addresses for the challenged host and Cloudflare's challenge host. A
+process-wide unroutable proxy denies traffic by default, with direct bypasses
+limited to those exact HTTPS hosts on port 443; ambient and corporate proxy
+settings are intentionally ignored. Required subdomains, CDNs, WebSockets, and
+other origins therefore fail closed. New browsing targets, downloads, and
+local/private targets are denied by browser policy and Chromium controls.
+External-protocol navigation is monitored. The private browser's session bus
+points to an inaccessible socket, and private failing `xdg-email`/`xdg-open`
+stubs shadow ambient helpers while the inherited `PATH` remains available to
+browser launch wrappers and graphical-session utilities.
 Graphical environments use a visible window by default; set
 `SUBDL_CF_HEADLESS=1` only where manual challenge completion is not needed. Set
 `SUBDL_CHROMIUM_PATH` to an absolute browser path when auto-discovery does not
 cover the installation. macOS and FreeBSD fail closed until browser DNS can be
 cancelled at the deadline; Windows fails closed pending secure native handle and
-DACL support. This feature neither solves CAPTCHAs nor bypasses access controls.
+DACL support. An authorized user may complete a displayed challenge manually;
+unresolved challenges fail explicitly. The feature contains no CAPTCHA solver
+and does not bypass access controls.
 
 ## Build Flags
 
@@ -237,8 +248,9 @@ query or use the CLI page selector for deeper navigation. Query-focused brackets
 accepts positive `--search-page N` and `--subtitle-page N` selectors.
 
 ZIP extraction is bounded to 256 entries, 64 MiB per entry and 128 MiB aggregate.
-Archives are staged and checked before publication, and existing output files
-are never overwritten. 7z archives remain downloadable but require external
+Downloaded archives are saved atomically before extraction. Their contents are
+preflighted and staged before the extracted directory is published; existing
+output paths are never overwritten. 7z archives remain downloadable but require external
 extraction; builds with `-Denable-unarr=false` also save archives without
 extracting them. The CLI/TUI explicitly report this state.
 

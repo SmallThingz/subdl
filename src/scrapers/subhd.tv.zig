@@ -397,6 +397,7 @@ fn fetchRaw(
 
     var req = public_client.request(method, uri, .{
         .redirect_behavior = .unhandled,
+        .handle_continue = false,
         .keep_alive = false,
         .connection = pinned_connection,
         .headers = .{
@@ -416,11 +417,18 @@ fn fetchRaw(
     if (payload) |body_const| {
         const body = try allocator.dupe(u8, body_const);
         defer allocator.free(body);
-        try req.sendBodyComplete(body);
-    } else try req.sendBodiless();
+        req.sendBodyComplete(body) catch |err| return common.normalizeRequestWriteError(&req, err);
+    } else req.sendBodiless() catch |err| return common.normalizeRequestWriteError(&req, err);
 
     var head_buffer: [24 * 1024]u8 = undefined;
-    var response = try req.receiveHead(&head_buffer);
+    var response = req.receiveHead(&head_buffer) catch |err| return common.normalizeRequestReadError(&req, err);
+    var interim_count: usize = 0;
+    while (response.head.status.class() == .informational) {
+        if (response.head.status == .switching_protocols) return error.UnsupportedProtocolUpgrade;
+        interim_count += 1;
+        if (interim_count > 16) return error.TooManyInformationalResponses;
+        response = req.receiveHead(&head_buffer) catch |err| return common.normalizeRequestReadError(&req, err);
+    }
     const response_cookie = try extractCookie(allocator, response.head.bytes);
     errdefer if (response_cookie) |value| allocator.free(value);
 
@@ -429,7 +437,7 @@ fn fetchRaw(
     const body = readRawBody(allocator, reader, max_raw_response_bytes) catch |err| {
         if (err == error.ReadFailed) {
             if (response.bodyErr()) |body_err| return body_err;
-            if (req.connection.?.stream_reader.err) |stream_err| return stream_err;
+            return common.normalizeRequestReadError(&req, err);
         }
         return err;
     };
@@ -461,7 +469,7 @@ fn readRawBody(allocator: Allocator, reader: *std.Io.Reader, max_bytes: usize) !
         }
         const count = reader.stream(&writer.writer, .limited(max_bytes - received)) catch |err| switch (err) {
             error.EndOfStream => break,
-            else => return err,
+            else => return common.normalizeAllocatingWriterError(err),
         };
         received += count;
     }

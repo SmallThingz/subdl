@@ -118,26 +118,81 @@ pub fn ensureDomainSession(allocator: Allocator, options: EnsureDomainOptions) !
     };
     if (!urlHasExactHttpsHost(challenge_url, normalized_domain)) return error.InvalidSessionPayload;
 
-    const now = common.compatUnixTimestamp();
     if (try loadSessionForDomain(allocator, normalized_domain, deadline)) |cached| {
-        try browserDeadlineCheckpoint(deadline);
-        if (canReuseCachedSession(cached, options, challenge_url, now)) return cached;
-        var owned = cached;
-        defer owned.deinit(allocator);
-        removeCachedSessionForDomain(allocator, normalized_domain, cached, deadline) catch |err| {
-            if (mustPropagateOperationError(err)) return err;
-        };
+        if (try reuseLoadedSessionUsing(
+            allocator,
+            normalized_domain,
+            cached,
+            options,
+            challenge_url,
+            common.compatUnixTimestamp(),
+            deadline,
+            browserDeadlineCheckpoint,
+            removeCachedSessionForDomain,
+        )) |reusable| return reusable;
     }
 
     try browserDeadlineCheckpoint(deadline);
-    var acquired = try acquireSessionViaBrowser(allocator, normalized_domain, challenge_url, deadline);
-    errdefer acquired.deinit(allocator);
-    try browserDeadlineCheckpoint(deadline);
-    saveSessionForDomain(allocator, normalized_domain, acquired, deadline) catch |err| {
+    const acquired = try acquireSessionViaBrowser(allocator, normalized_domain, challenge_url, deadline);
+    return finishAcquiredSessionUsing(
+        allocator,
+        normalized_domain,
+        acquired,
+        deadline,
+        browserDeadlineCheckpoint,
+        saveSessionForDomain,
+    );
+}
+
+fn reuseLoadedSessionUsing(
+    allocator: Allocator,
+    normalized_domain: []const u8,
+    loaded: Session,
+    options: EnsureDomainOptions,
+    challenge_url: []const u8,
+    now: i64,
+    deadline: i64,
+    comptime checkpoint: anytype,
+    comptime remove_cached: anytype,
+) !?Session {
+    var cached = loaded;
+    var owns_cached = true;
+    defer if (owns_cached) cached.deinit(allocator);
+
+    try checkpoint(deadline);
+    if (canReuseCachedSession(cached, options, challenge_url, now)) {
+        // Validation can consume the final part of the shared deadline. Keep
+        // ownership until a second checkpoint confirms the caller can use it.
+        try checkpoint(deadline);
+        owns_cached = false;
+        return cached;
+    }
+    remove_cached(allocator, normalized_domain, cached, deadline) catch |err| {
+        if (mustPropagateOperationError(err)) return err;
+    };
+    return null;
+}
+
+fn finishAcquiredSessionUsing(
+    allocator: Allocator,
+    normalized_domain: []const u8,
+    acquired_value: Session,
+    deadline: i64,
+    comptime checkpoint: anytype,
+    comptime save_session: anytype,
+) !Session {
+    var acquired = acquired_value;
+    var owns_acquired = true;
+    defer if (owns_acquired) acquired.deinit(allocator);
+
+    try checkpoint(deadline);
+    save_session(allocator, normalized_domain, acquired, deadline) catch |err| {
         if (mustPropagateOperationError(err)) return err;
         // Persistence is an optimization. A valid browser session remains
         // useful when HOME, permissions, or the cache lock are unavailable.
     };
+    try checkpoint(deadline);
+    owns_acquired = false;
     return acquired;
 }
 
@@ -253,7 +308,7 @@ fn cacheRecordStale(record: CacheRecord, now: i64) bool {
     };
     if (session.isLikelyExpired(now) or record.cf_clearance.len == 0 or !validBrowserUserAgent(record.user_agent)) return true;
     for (record.cookies) |cookie| {
-        if (!std.ascii.eqlIgnoreCase(cookie.name, "cf_clearance") or
+        if (!std.mem.eql(u8, cookie.name, "cf_clearance") or
             !std.mem.eql(u8, cookie.value, record.cf_clearance)) continue;
         if (cookie.expires_unix_seconds) |expires| if (expires >= 0 and expires <= now) continue;
         if (cookie.host_only) {
@@ -1238,7 +1293,12 @@ fn acquireSessionViaBrowser(allocator: Allocator, domain: []const u8, challenge_
             const cf_value = findCookieValueForUrl(cookies, challenge_url, "cf_clearance", common.compatUnixTimestamp()) orelse {
                 const pause = remainingTimeoutMs(common.compatMilliTimestamp(), deadline, challenge_poll_interval_ms) orelse
                     break :browser_attempt;
-                try common.sleepMillisecondsCancelable(pause);
+                browser.waitForPolicyEvents(pause, deadline) catch |err| {
+                    const classified = normalizeBrowserOperationError(err);
+                    if (mustPropagateOperationError(classified)) return classified;
+                    try browserDeadlineCheckpoint(deadline);
+                    continue :browser_attempt;
+                };
                 continue;
             };
 
@@ -1429,7 +1489,7 @@ fn findCookieValueForUrl(cookies: []const Cookie, url: []const u8, wanted_name: 
     var best: ?[]const u8 = null;
     var best_path_len: usize = 0;
     for (cookies) |cookie| {
-        if (!std.ascii.eqlIgnoreCase(cookie.name, wanted_name)) continue;
+        if (!std.mem.eql(u8, cookie.name, wanted_name)) continue;
         if (!cookieAppliesToTarget(cookie, target, now)) continue;
         // RFC cookie order gives a more specific path precedence. Keep the
         // earliest input cookie for equal-length paths, matching header order.
@@ -1443,7 +1503,7 @@ fn findCookieValueForUrl(cookies: []const Cookie, url: []const u8, wanted_name: 
 
 fn findCookieValueByName(cookies: []const Cookie, wanted_name: []const u8) ?[]const u8 {
     for (cookies) |cookie| {
-        if (std.ascii.eqlIgnoreCase(cookie.name, wanted_name)) return cookie.value;
+        if (std.mem.eql(u8, cookie.name, wanted_name)) return cookie.value;
     }
     return null;
 }
@@ -1601,6 +1661,108 @@ test "cache and browser operations preserve cancellation and allocation failure"
     try std.testing.expectError(error.OutOfMemory, ignoreOrdinaryOperationFailure(out_of_memory));
 }
 
+test "deadline failure after successful cache validation releases the owned session" {
+    const Fixture = struct {
+        var checkpoints: usize = 0;
+        var remove_called = false;
+
+        fn checkpoint(_: i64) !void {
+            checkpoints += 1;
+            if (checkpoints == 2) return error.CloudflareSessionUnavailable;
+        }
+
+        fn remove(_: Allocator, _: []const u8, _: Session, _: i64) !void {
+            remove_called = true;
+        }
+    };
+
+    const cookies = [_]Cookie{.{
+        .name = "cf_clearance",
+        .value = "cached-token",
+        .domain = "example.com",
+        .path = "/",
+        .secure = true,
+        .host_only = true,
+        .expires_unix_seconds = null,
+    }};
+    const loaded = try cloneSession(std.testing.allocator, .{
+        .cookies = &cookies,
+        .cf_clearance = "cached-token",
+        .user_agent = "fixture-agent",
+        .acquired_at_unix = 100,
+        .generation = 1,
+    });
+    Fixture.checkpoints = 0;
+    Fixture.remove_called = false;
+
+    try std.testing.expectError(
+        error.CloudflareSessionUnavailable,
+        reuseLoadedSessionUsing(
+            std.testing.allocator,
+            "example.com",
+            loaded,
+            .{ .domain = "example.com" },
+            "https://example.com/",
+            101,
+            200,
+            Fixture.checkpoint,
+            Fixture.remove,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 2), Fixture.checkpoints);
+    try std.testing.expect(!Fixture.remove_called);
+}
+
+test "acquired session checks deadline after best effort persistence" {
+    const Fixture = struct {
+        var checkpoints: usize = 0;
+        var saves: usize = 0;
+
+        fn checkpoint(_: i64) !void {
+            checkpoints += 1;
+            if (checkpoints == 2) return error.CloudflareSessionUnavailable;
+        }
+
+        fn save(_: Allocator, _: []const u8, _: Session, _: i64) !void {
+            saves += 1;
+            return error.BrowserAutomationFailed;
+        }
+    };
+
+    const cookies = [_]Cookie{.{
+        .name = "cf_clearance",
+        .value = "fresh-token",
+        .domain = "example.com",
+        .path = "/",
+        .secure = true,
+        .host_only = true,
+        .expires_unix_seconds = null,
+    }};
+    const acquired = try cloneSession(std.testing.allocator, .{
+        .cookies = &cookies,
+        .cf_clearance = "fresh-token",
+        .user_agent = "fixture-agent",
+        .acquired_at_unix = 100,
+        .generation = 2,
+    });
+    Fixture.checkpoints = 0;
+    Fixture.saves = 0;
+
+    try std.testing.expectError(
+        error.CloudflareSessionUnavailable,
+        finishAcquiredSessionUsing(
+            std.testing.allocator,
+            "example.com",
+            acquired,
+            200,
+            Fixture.checkpoint,
+            Fixture.save,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 2), Fixture.checkpoints);
+    try std.testing.expectEqual(@as(usize, 1), Fixture.saves);
+}
+
 test "browser resolver deadline is a classified session failure" {
     try std.testing.expectEqual(error.CloudflareSessionUnavailable, normalizeBrowserAcquisitionError(error.Timeout));
     try std.testing.expectEqual(error.CloudflareSessionUnavailable, normalizeBrowserAcquisitionError(error.BrowserOperationTimeout));
@@ -1720,6 +1882,30 @@ test "cookie selection preserves host domain path secure and expiry semantics" {
     try std.testing.expectEqualStrings("cf_clearance=download-token; cf_clearance=root-token", download_header);
     try std.testing.expectEqualStrings("download-token", findCookieValueForUrl(&duplicate_clearance, "https://www.example.com/download/file", "cf_clearance", 10).?);
     try std.testing.expectEqualStrings("root-token", findCookieValueForUrl(&duplicate_clearance, "https://www.example.com/", "cf_clearance", 10).?);
+}
+
+test "cookie names are case-sensitive in clearance lookup and cache validation" {
+    const cookies = [_]Cookie{
+        .{ .name = "CF_CLEARANCE", .value = "wrong", .domain = "www.example.com", .path = "/download", .secure = true, .host_only = true, .expires_unix_seconds = null },
+        .{ .name = "cf_clearance", .value = "right", .domain = "www.example.com", .path = "/", .secure = true, .host_only = true, .expires_unix_seconds = null },
+    };
+    try std.testing.expectEqualStrings("right", findCookieValueForUrl(&cookies, "https://www.example.com/download/1", "cf_clearance", 10).?);
+    try std.testing.expectEqualStrings("right", findCookieValueByName(&cookies, "cf_clearance").?);
+    try std.testing.expect(findCookieValueByName(cookies[0..1], "cf_clearance") == null);
+
+    const valid: CacheRecord = .{
+        .domain = "www.example.com",
+        .cookies = cookies[1..2],
+        .cf_clearance = "right",
+        .user_agent = "fixture-agent",
+        .acquired_at_unix = 9,
+        .generation = 1,
+    };
+    try std.testing.expect(!cacheRecordStale(valid, 10));
+    var wrong_case = valid;
+    wrong_case.cookies = cookies[0..1];
+    wrong_case.cf_clearance = "wrong";
+    try std.testing.expect(cacheRecordStale(wrong_case, 10));
 }
 
 test "forced refresh only coalesces to a different cached generation" {

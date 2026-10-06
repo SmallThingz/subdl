@@ -14,6 +14,11 @@ pub fn main(init: std.process.Init) !void {
     const headers = [_]std.http.Header{
         .{ .name = "cookie", .value = "fixture=session" },
         .{ .name = "authorization", .value = "Bearer fixture-only" },
+        .{ .name = "x-api-key", .value = "fixture-api-key" },
+        .{ .name = "user-agent", .value = "fixture-secret-agent" },
+        .{ .name = "connection", .value = "close" },
+        .{ .name = "accept-encoding", .value = "identity" },
+        .{ .name = "content-type", .value = "application/x-fixture-secret" },
     };
     const cases = [_]struct { path: []const u8, expected: []const u8, post: bool = false, head: bool = false }{
         .{ .path = "/echo", .expected = "GET private" },
@@ -45,6 +50,17 @@ pub fn main(init: std.process.Init) !void {
             return error.UnexpectedRedirectHeaders;
         }
     }
+    const zstd_url = try std.fmt.allocPrint(allocator, "{s}/zstd", .{args[1]});
+    defer allocator.free(zstd_url);
+    const zstd_response = try common.fetchBytes(&client, allocator, zstd_url, .{ .cache = false });
+    defer allocator.free(zstd_response.body);
+    if (!std.mem.eql(u8, zstd_response.body, "GET public")) return error.UnexpectedZstdBody;
+    const hints_url = try std.fmt.allocPrint(allocator, "{s}/too-many-hints", .{args[1]});
+    defer allocator.free(hints_url);
+    if (common.fetchBytes(&client, allocator, hints_url, .{ .cache = false })) |response| {
+        allocator.free(response.body);
+        return error.ExpectedInformationalResponseLimit;
+    } else |err| if (err != error.TooManyInformationalResponses) return err;
     for ([_][]const u8{ "/gzip-truncated", "/gzip-garbage" }) |path| {
         const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ args[1], path });
         defer allocator.free(url);
@@ -53,6 +69,16 @@ pub fn main(init: std.process.Init) !void {
             return error.ExpectedInvalidCompressedBodyFailure;
         } else |_| {}
     }
+    const encoded_size_url = try std.fmt.allocPrint(allocator, "{s}/gzip-wire-chunked", .{args[1]});
+    defer allocator.free(encoded_size_url);
+    if (common.fetchBytes(&client, allocator, encoded_size_url, .{
+        .cache = false,
+        .max_response_bytes = 1024,
+        .max_encoded_response_bytes = 8,
+    })) |response| {
+        allocator.free(response.body);
+        return error.ExpectedEncodedResponseSizeLimit;
+    } else |err| if (err != error.ResponseTooLarge) return err;
     const loop_url = try std.fmt.allocPrint(allocator, "{s}/loop", .{args[1]});
     defer allocator.free(loop_url);
     if (common.fetchBytes(&client, allocator, loop_url, .{ .cache = false, .extra_headers = &headers })) |response| {
@@ -75,5 +101,5 @@ pub fn main(init: std.process.Init) !void {
         allocator.free(response.body);
         return error.ExpectedResponseSizeLimit;
     } else |err| if (err != error.ResponseTooLarge) return err;
-    std.debug.print("HTTP_TRANSPORT_PASS cases=18\n", .{});
+    std.debug.print("HTTP_TRANSPORT_PASS cases=21\n", .{});
 }

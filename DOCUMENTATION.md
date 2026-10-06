@@ -189,7 +189,7 @@ The parser also accepts dotted or hyphenated site forms such as `subsource.net`.
 Usage:
 
 ```text
-scrapers --query <text> [--providers a,b] [-p provider] [--title-index N] [--subtitle-index N] [--out-dir DIR] [--extract]
+scrapers --query <text> [--providers a,b] [-p provider] [--search-page N] [--subtitle-page N] [--title-index N] [--subtitle-index N] [--out-dir DIR] [--extract]
 scrapers --list-providers
 scrapers --tui
 ```
@@ -201,6 +201,8 @@ Options:
 - `-p <provider>`: repeatable provider selector; values may also be comma-separated
 - `--provider <name>`: compatibility alias for selecting one provider
 - `--query <text>`: search query
+- `--search-page <N>`: one-based provider search page, default `1`
+- `--subtitle-page <N>`: one-based subtitle-list page, default `1`
 - `--title-index <N>`: selected search result, default `0`
 - `--subtitle-index <N>`: selected subtitle row, default first downloadable row
 - `--out-dir <DIR>`: download destination, default `downloads`
@@ -249,7 +251,6 @@ Key behaviors:
 - `Enter` with zero selected providers opens the highlighted provider.
 - `Enter` with one selected provider opens that provider, even if a different provider is highlighted.
 - `Enter` with multiple selected providers opens a combined search tab across the selected providers.
-- `my_subs_co` does not expose pagination in the TUI
 - `[` and `]` only navigate pages for providers that actually support pagination
 
 ## Pagination Behavior
@@ -432,8 +433,10 @@ pub fn main(init: std.process.Init) !void {
 
 Runtime and provider controls:
 
-- `SUBSOURCE_CF_CLEARANCE`
-- `SUBSOURCE_USER_AGENT`
+- `SUBSOURCE_CF_CLEARANCE`: an authorized, manually obtained Cloudflare session
+  cookie for SubSource. Treat it as a credential; do not share or commit it.
+- `SUBSOURCE_USER_AGENT`: the browser user agent paired with that authorized
+  cookie. It is also sensitive when it identifies a live session.
 - `SUBDL_CHROMIUM_PATH`: absolute path to a local Chrome, Chromium, Edge,
   Brave, or Vivaldi executable. Its root CDP product must report Chrome or
   Chromium 154 or newer. Browser session handoff is supported on Linux. macOS
@@ -442,6 +445,17 @@ Runtime and provider controls:
 - `SUBDL_CF_HEADLESS`: accepts `1`/`true`/`yes` or `0`/`false`/`no`.
   Browser handoff defaults to a visible window in graphical Linux environments
   and to headless when neither `DISPLAY` nor `WAYLAND_DISPLAY` is available.
+
+Successful browser sessions are cached on a best-effort basis in the
+credential-bearing `cloudflare_shared_sessions.json` file when a valid absolute
+cache root and writable private storage are available. On Unix it is located at
+`$XDG_CACHE_HOME/subdl/` when `XDG_CACHE_HOME` is absolute, otherwise at
+`$HOME/.cache/subdl/` when `HOME` is absolute; without either usable root,
+persistent caching is unavailable. Remove the file, if present, to invalidate
+saved sessions. Use only sessions you are authorized to use. One four-minute
+absolute acquisition deadline is shared by queueing, normal cache work, DNS,
+browser launch and I/O, and any visible manual completion; a challenge that
+appears late receives only the time remaining.
 
 Live test controls:
 
@@ -453,6 +467,17 @@ Debug flags:
 - `SCRAPERS_DEBUG_TIMING`
 - `SCRAPERS_SELECTOR_DEBUG`
 - `SCRAPERS_DEBUG_ISUB`
+- `SCRAPERS_DEBUG_TVSUB`
+
+Test-only browser control:
+
+- Both test flags below require `SUBDL_CHROMIUM_PATH` to name the browser
+  executable; without it, the corresponding smoke tests skip.
+- `SUBDL_CHROMIUM_SMOKE=1`: opt in to the local Chromium integration smoke; it
+  runs headlessly and is not needed for normal use.
+- `SUBDL_CHROMIUM_HEADED_SMOKE=1`: separately opt in to the visible-window
+  external-protocol probe. It requires a working graphical display/compositor
+  and is not needed for normal use.
 
 ## Live Testing
 
@@ -507,23 +532,30 @@ sockets. These host restrictions do not apply to deterministic tests or
 `build-all-targets` cross-compilation.
 
 The extensive suite primarily checks metadata. Smoke/all modes exercise application
-search, listing and downloads, including TV selection where advertised. CAPTCHA
-and access-block responses must remain explicit failures; qualification does not
-solve challenges or bypass access controls. Browser support supplies an ordinary
+search, listing and downloads, including TV selection where advertised. Unresolved
+challenge and access-block responses remain explicit failures. An authorized user
+may manually complete a challenge in the visible browser; qualification does not
+solve CAPTCHAs or bypass access controls. Browser support supplies an ordinary
 session handoff when explicitly enabled, not a CAPTCHA solver. On Linux it uses
 a private, deadline-bounded pipe to a local Chromium-family browser.
 Auto-discovery covers Chrome, Chromium, Edge, Brave, and Vivaldi, while
 the root CDP product must report Chrome or Chromium 154 or newer. DNS permits
 only pinned public answers for the challenged host and Cloudflare's challenge
-host, proxies are disabled, and page-session requests are intercepted before
-navigation and restricted to those HTTPS origins. Chromium local-network
-controls fail closed for literal/private targets outside that interception.
+host. A process-wide unroutable proxy denies traffic by default, and direct
+bypasses are limited to those exact HTTPS hosts on port 443. Ambient/corporate
+proxy settings, other origins, required subdomains/CDNs, and WebSockets are not
+used and therefore fail closed. Browser policy denies downloads and unexpected
+browsing targets; Chromium local-network controls reject literal/private targets.
+External-protocol attempts are monitored. The private browser's session bus
+points to an inaccessible socket, and private failing `xdg-email`/`xdg-open`
+stubs shadow ambient helpers while preserving the inherited `PATH` for browser
+launch wrappers and graphical-session utilities.
 Firefox is not supported. macOS and FreeBSD handoff fails closed until their
 blocking resolver path can be cancelled reliably; Windows fails closed pending
-secure native handle/DACL support. Deadline checks cover queueing, DNS, browser
-I/O, and normal cache work; a single kernel filesystem operation stuck on
-pathological remote or FUSE storage cannot be preempted, so the session cache
-should reside on local storage.
+secure native handle/DACL support. The single acquisition deadline covers
+queueing, normal cache work, DNS, browser launch and I/O, and manual completion;
+a kernel filesystem operation stuck on pathological remote or FUSE storage
+cannot be preempted, so the session cache should reside on local storage.
 
 Outside browser handoff, public-origin-pinned HTTP requests still use the host
 resolver. On macOS and FreeBSD, Zig 0.16 delegates that lookup to blocking libc

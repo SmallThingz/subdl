@@ -18,8 +18,17 @@ const pipe_shell = "/bin/sh";
 const pipe_shell_script = "exec 3<&0 4>&1 0</dev/null 1>/dev/null; exec \"$@\"";
 const cloudflare_challenge_url = "https://challenges.cloudflare.com/";
 const cloudflare_challenge_host = "challenges.cloudflare.com";
+const deny_download_behavior = "deny";
+const block_new_web_contents_arg = "--block-new-web-contents";
+const force_webrtc_ip_policy_arg = "--force-webrtc-ip-handling-policy=disable_non_proxied_udp";
+const dead_proxy_server_arg = "--proxy-server=http://subdl-proxy.invalid:9";
+const proxy_bypass_prefix = "--proxy-bypass-list=<-loopback>;";
+const blocked_session_bus_socket = "blocked-session-bus";
+const blocked_executable_path = "blocked-external-handlers";
+const blocked_external_handler_script = "#!/bin/sh\nexit 1\n";
+const EmptyCdpParams = struct {};
 const secure_profile_preferences =
-    \\{"profile":{"default_content_setting_values":{"local_network_access":2}}}
+    \\{"profile":{"default_content_setting_values":{"local_network_access":2,"popups":2}},"webrtc":{"ip_handling_policy":"disable_non_proxied_udp"}}
 ;
 
 pub const Cookie = struct {
@@ -125,15 +134,14 @@ fn validExecutablePath(path: []const u8) bool {
     return true;
 }
 
-const RequestDecision = enum {
-    allow,
-    block,
-    abort,
+const TargetFilterEntry = struct {
+    type: []const u8 = "",
+    exclude: bool = false,
 };
 
-const FetchPattern = struct {
-    urlPattern: []const u8 = "*",
-    requestStage: []const u8 = "Request",
+const unexpected_target_filter = [_]TargetFilterEntry{
+    .{ .type = "page" },
+    .{ .exclude = true },
 };
 
 pub const NavigationPolicy = struct {
@@ -198,25 +206,33 @@ pub const NavigationPolicy = struct {
         self.* = undefined;
     }
 
-    fn requestDecision(self: NavigationPolicy, url: []const u8, resource_type: []const u8) RequestDecision {
+    fn allowsNavigation(self: NavigationPolicy, url: []const u8) bool {
         if (std.mem.eql(u8, url, "about:blank") or
             std.mem.startsWith(u8, url, "data:") or
-            std.mem.startsWith(u8, url, "blob:")) return .allow;
+            std.mem.startsWith(u8, url, "blob:")) return true;
 
-        const uri = std.Uri.parse(url) catch return .abort;
+        const uri = std.Uri.parse(url) catch return false;
         if (std.ascii.eqlIgnoreCase(uri.scheme, "https") and
             (uri.port == null or uri.port.? == 443) and
             uri.user == null and uri.password == null)
         {
             var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-            const host_name = uri.getHost(&host_buffer) catch return .abort;
+            const host_name = uri.getHost(&host_buffer) catch return false;
             const host = host_name.bytes;
             if (std.ascii.eqlIgnoreCase(host, self.origin_host) or
-                std.ascii.eqlIgnoreCase(host, cloudflare_challenge_host)) return .allow;
+                std.ascii.eqlIgnoreCase(host, cloudflare_challenge_host)) return true;
         }
+        return false;
+    }
 
-        common.validatePublicHttpUrl(url) catch return .abort;
-        return if (std.mem.eql(u8, resource_type, "Document")) .abort else .block;
+    fn allowsPageNavigation(self: NavigationPolicy, url: []const u8) bool {
+        // Script URLs execute in the already-confined renderer and do not invoke
+        // an OS protocol handler. Other non-network schemes must stay blocked.
+        if (std.ascii.startsWithIgnoreCase(url, "javascript:") or
+            std.ascii.eqlIgnoreCase(url, "about:srcdoc") or
+            std.ascii.startsWithIgnoreCase(url, "about:blank#") or
+            std.ascii.eqlIgnoreCase(url, "chrome-error://chromewebdata/")) return true;
+        return self.allowsNavigation(url);
     }
 };
 
@@ -226,6 +242,15 @@ fn validResolverHost(host: []const u8) bool {
         if (!(std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '.')) return false;
     }
     return std.mem.indexOfScalar(u8, host, '.') != null;
+}
+
+fn makeProxyBypassArg(allocator: Allocator, origin_host: []const u8) ![]u8 {
+    if (!validResolverHost(origin_host)) return error.InvalidBrowserNavigation;
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}https://{s}:443;https://{s}:443",
+        .{ proxy_bypass_prefix, origin_host, cloudflare_challenge_host },
+    );
 }
 
 const SecureProfile = struct {
@@ -260,11 +285,33 @@ const SecureProfile = struct {
                 },
                 else => return err,
             };
-            errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
+            errdefer {
+                const protection = io.swapCancelProtection(.blocked);
+                defer _ = io.swapCancelProtection(protection);
+                std.Io.Dir.cwd().deleteTree(io, path) catch {};
+            }
 
             const stat = try std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
             if (stat.kind != .directory or stat.permissions.toMode() & 0o077 != 0)
                 return error.BrowserAutomationFailed;
+
+            const blocker_path = try std.fs.path.join(allocator, &.{ path, blocked_executable_path });
+            defer allocator.free(blocker_path);
+            try std.Io.Dir.cwd().createDir(io, blocker_path, permissions);
+            inline for (.{ "xdg-email", "xdg-open" }) |helper| {
+                const helper_path = try std.fs.path.join(allocator, &.{ blocker_path, helper });
+                defer allocator.free(helper_path);
+                try std.Io.Dir.cwd().writeFile(io, .{
+                    .sub_path = helper_path,
+                    .data = blocked_external_handler_script,
+                    .flags = .{ .permissions = permissions },
+                });
+                // execvp may continue searching PATH after EACCES (for
+                // example, when /tmp is mounted noexec). Prove this exact
+                // blocker can execute before putting inherited PATH entries
+                // behind it; otherwise browser launch must fail closed.
+                try verifyExternalHandlerBlocker(helper_path);
+            }
 
             const default_path = try std.fs.path.join(allocator, &.{ path, "Default" });
             defer allocator.free(default_path);
@@ -283,6 +330,8 @@ const SecureProfile = struct {
 
     fn deinit(self: *SecureProfile, allocator: Allocator, deadline_ms: i64) void {
         const io = runtime_io.get();
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
         var last_error: ?anyerror = null;
         var attempt: usize = 0;
         while (attempt < profile_cleanup_attempts) : (attempt += 1) {
@@ -307,6 +356,30 @@ const SecureProfile = struct {
     }
 };
 
+fn verifyExternalHandlerBlocker(path: []const u8) !void {
+    const io = runtime_io.get();
+    var child = std.process.spawn(io, .{
+        .argv = &.{path},
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch |err| switch (err) {
+        error.OutOfMemory, error.Canceled => return err,
+        else => return error.BrowserAutomationFailed,
+    };
+    const term = child.wait(io) catch |err| {
+        child.kill(io);
+        return switch (err) {
+            error.Canceled => err,
+            else => error.BrowserAutomationFailed,
+        };
+    };
+    switch (term) {
+        .exited => |code| if (code != 1) return error.BrowserAutomationFailed,
+        else => return error.BrowserAutomationFailed,
+    }
+}
+
 pub const Browser = struct {
     allocator: Allocator,
     child: std.process.Child,
@@ -315,7 +388,9 @@ pub const Browser = struct {
     read_buffer: []u8,
     read_len: usize = 0,
     next_command_id: u64 = 1,
+    primary_target_id: ?[]u8 = null,
     session_id: ?[]u8 = null,
+    downloads_denied: bool = false,
     deadline_ms: i64,
 
     pub fn launch(
@@ -338,6 +413,7 @@ pub const Browser = struct {
     pub fn deinit(self: *Browser) void {
         killProcessTree(&self.child);
         self.profile.deinit(self.allocator, self.deadline_ms);
+        if (self.primary_target_id) |target_id| self.allocator.free(target_id);
         if (self.session_id) |session_id| self.allocator.free(session_id);
         self.allocator.free(self.read_buffer);
         self.* = undefined;
@@ -351,16 +427,23 @@ pub const Browser = struct {
         if (!supportedChromiumProduct(product)) return error.BrowserSecurityFeaturesUnavailable;
         const user_agent = try extractResultString(self.allocator, response, "userAgent");
         self.allocator.free(user_agent);
+
+        const download_response = try self.sendCommand("Browser.setDownloadBehavior", .{
+            .behavior = deny_download_behavior,
+            .eventsEnabled = false,
+        }, deadline_ms);
+        self.allocator.free(download_response);
+        self.downloads_denied = true;
     }
 
     pub fn navigate(self: *Browser, url: []const u8, deadline_ms: i64) !void {
-        if (self.navigation_policy.requestDecision(url, "Document") != .allow)
+        if (!self.downloads_denied) return error.BrowserSecurityFeaturesUnavailable;
+        if (self.primary_target_id != null or self.session_id != null) return error.BrowserTargetUnavailable;
+        if (!self.navigation_policy.allowsNavigation(url))
             return error.UnsafeBrowserNavigation;
 
-        const create_response = try self.sendCommand("Target.createTarget", .{ .url = "about:blank" }, deadline_ms);
-        defer self.allocator.free(create_response);
-        const target_id = try extractResultString(self.allocator, create_response, "targetId");
-        defer self.allocator.free(target_id);
+        const target_id = try self.waitForInitialPageTarget(deadline_ms);
+        self.primary_target_id = target_id;
 
         const activate_response = try self.sendCommand("Target.activateTarget", .{ .targetId = target_id }, deadline_ms);
         self.allocator.free(activate_response);
@@ -374,16 +457,50 @@ pub const Browser = struct {
         if (self.session_id) |old_session_id| self.allocator.free(old_session_id);
         self.session_id = session_id;
 
-        const patterns = [_]FetchPattern{.{}};
-        const enable_response = try self.sendSessionCommand(session_id, "Fetch.enable", .{
-            .patterns = &patterns,
-        }, deadline_ms);
-        self.allocator.free(enable_response);
+        const page_response = try self.sendSessionCommand(session_id, "Page.enable", EmptyCdpParams{}, deadline_ms);
+        self.allocator.free(page_response);
 
+        const browser_auto_attach_response = try self.sendCommand("Target.setAutoAttach", .{
+            .autoAttach = true,
+            .waitForDebuggerOnStart = true,
+            .flatten = true,
+            .filter = &unexpected_target_filter,
+        }, deadline_ms);
+        self.allocator.free(browser_auto_attach_response);
+
+        const auto_attach_response = try self.sendSessionCommand(session_id, "Target.setAutoAttach", .{
+            .autoAttach = true,
+            .waitForDebuggerOnStart = true,
+            .flatten = true,
+            .filter = &unexpected_target_filter,
+        }, deadline_ms);
+        self.allocator.free(auto_attach_response);
+
+        // Keep challenge APIs and request scheduling native. The process-wide proxy,
+        // resolver, WebRTC policy, and target rejection are the security boundary.
         const navigate_response = try self.sendSessionCommand(session_id, "Page.navigate", .{ .url = url }, deadline_ms);
         defer self.allocator.free(navigate_response);
         if (try resultHasNonEmptyString(self.allocator, navigate_response, "errorText"))
             return error.BrowserNavigationFailed;
+    }
+
+    fn waitForInitialPageTarget(self: *Browser, deadline_ms: i64) ![]u8 {
+        while (true) {
+            try deadlineCheckpoint(deadline_ms);
+            const targets_response = try self.sendCommand("Target.getTargets", EmptyCdpParams{}, deadline_ms);
+            defer self.allocator.free(targets_response);
+            const target_id = extractInitialPageTargetId(self.allocator, targets_response) catch |err| switch (err) {
+                error.BrowserTargetNotReady => {
+                    try deadlineCheckpoint(deadline_ms);
+                    const remaining_ms = deadline_ms - common.compatMilliTimestamp();
+                    if (remaining_ms <= 0) return error.BrowserOperationTimeout;
+                    try common.sleepMillisecondsCancelable(@intCast(@min(remaining_ms, 10)));
+                    continue;
+                },
+                else => return err,
+            };
+            return target_id;
+        }
     }
 
     pub fn getCookiesForUrl(self: *Browser, allocator: Allocator, url: []const u8, deadline_ms: i64) ![]Cookie {
@@ -445,7 +562,7 @@ pub const Browser = struct {
                 .object => |object| object,
                 else => return error.InvalidBrowserResponse,
             };
-            if (try self.handleFetchRequest(root, timeout)) continue;
+            try self.validateBrowserEvent(root);
             const response_id = responseId(root.get("id") orelse continue) orelse
                 return error.InvalidBrowserResponse;
             if (response_id != command_id) continue;
@@ -455,6 +572,89 @@ pub const Browser = struct {
             return self.allocator.dupe(u8, frame);
         }
         return error.TooManyBrowserEvents;
+    }
+
+    /// Wait while continuing to inspect browser events. The Cloudflare caller
+    /// uses this instead of sleeping so an external-protocol navigation is
+    /// detected and the private browser is torn down immediately.
+    pub fn waitForPolicyEvents(self: *Browser, delay_ms: u64, deadline_ms: i64) !void {
+        try deadlineCheckpoint(deadline_ms);
+        if (delay_ms == 0) return;
+        const now = common.compatMilliTimestamp();
+        const requested_deadline = std.math.add(i64, now, @intCast(@min(
+            delay_ms,
+            @as(u64, std.math.maxInt(i64)),
+        ))) catch std.math.maxInt(i64);
+        const wait_deadline = @min(deadline_ms, requested_deadline);
+
+        var unsolicited: usize = 0;
+        while (unsolicited < max_unsolicited_frames) : (unsolicited += 1) {
+            if (common.compatMilliTimestamp() >= wait_deadline) return;
+            const timeout = try operationTimeout(wait_deadline);
+            const frame = self.readFrameWithTimeout(timeout) catch |err| switch (err) {
+                error.BrowserOperationTimeout => return,
+                else => return err,
+            };
+            defer self.allocator.free(frame);
+            if (frame.len == 0) continue;
+            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, frame, .{}) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return error.InvalidBrowserResponse;
+            };
+            defer parsed.deinit();
+            const root = switch (parsed.value) {
+                .object => |object| object,
+                else => return error.InvalidBrowserResponse,
+            };
+            if (root.get("id") != null) return error.InvalidBrowserResponse;
+            try self.validateBrowserEvent(root);
+        }
+        return error.TooManyBrowserEvents;
+    }
+
+    fn validateBrowserEvent(self: *Browser, root: std.json.ObjectMap) !void {
+        try self.rejectUnexpectedTarget(root);
+        if (try pageNavigationEventUrl(root)) |url| {
+            if (!self.navigation_policy.allowsPageNavigation(url))
+                return error.UnsafeBrowserNavigation;
+        }
+    }
+
+    fn rejectUnexpectedTarget(self: *Browser, root: std.json.ObjectMap) !void {
+        const method_value = root.get("method") orelse return;
+        const method = switch (method_value) {
+            .string => |value| value,
+            else => return error.InvalidBrowserResponse,
+        };
+        if (!std.mem.eql(u8, method, "Target.attachedToTarget")) return;
+
+        const params = switch (root.get("params") orelse return error.InvalidBrowserResponse) {
+            .object => |object| object,
+            else => return error.InvalidBrowserResponse,
+        };
+        const attached_session_id = try requiredString(params, "sessionId");
+        const target_info = switch (params.get("targetInfo") orelse return error.InvalidBrowserResponse) {
+            .object => |object| object,
+            else => return error.InvalidBrowserResponse,
+        };
+        const target_type = try requiredString(target_info, "type");
+        const target_id = try requiredString(target_info, "targetId");
+        if (self.primary_target_id) |primary_target_id| {
+            if (std.mem.eql(u8, target_type, "page") and std.mem.eql(u8, target_id, primary_target_id)) {
+                _ = attached_session_id;
+                if (root.get("sessionId") != null)
+                    return error.InvalidBrowserResponse;
+                return;
+            }
+        }
+        if (!std.mem.eql(u8, target_type, "page") and
+            !std.mem.eql(u8, target_type, "worker") and
+            !std.mem.eql(u8, target_type, "shared_worker") and
+            !std.mem.eql(u8, target_type, "service_worker"))
+        {
+            return error.InvalidBrowserResponse;
+        }
+        return error.UnexpectedBrowserTarget;
     }
 
     fn writeCommand(
@@ -485,48 +685,6 @@ pub const Browser = struct {
         if (command.len > max_cdp_command_bytes) return error.BrowserCommandTooLarge;
         try writeWithTimeout(self.child.stdin.?, command, timeout);
         return command_id;
-    }
-
-    fn handleFetchRequest(self: *Browser, root: std.json.ObjectMap, timeout: std.Io.Timeout) !bool {
-        const method_value = root.get("method") orelse return false;
-        const method = switch (method_value) {
-            .string => |value| value,
-            else => return error.InvalidBrowserResponse,
-        };
-        if (!std.mem.eql(u8, method, "Fetch.requestPaused")) return false;
-
-        const session_id = self.session_id orelse return error.InvalidBrowserResponse;
-        if (!responseSessionMatches(root, session_id)) return error.InvalidBrowserResponse;
-        const params = switch (root.get("params") orelse return error.InvalidBrowserResponse) {
-            .object => |object| object,
-            else => return error.InvalidBrowserResponse,
-        };
-        const request_id = try requiredString(params, "requestId");
-        const request = switch (params.get("request") orelse return error.InvalidBrowserResponse) {
-            .object => |object| object,
-            else => return error.InvalidBrowserResponse,
-        };
-        const url = try requiredString(request, "url");
-        const resource_type = if (params.get("resourceType")) |value| switch (value) {
-            .string => |text| text,
-            else => return error.InvalidBrowserResponse,
-        } else "Document";
-
-        switch (self.navigation_policy.requestDecision(url, resource_type)) {
-            .allow => {
-                _ = try self.writeCommand(session_id, "Fetch.continueRequest", .{
-                    .requestId = request_id,
-                }, timeout);
-            },
-            .block, .abort => |decision| {
-                _ = try self.writeCommand(session_id, "Fetch.failRequest", .{
-                    .requestId = request_id,
-                    .errorReason = "BlockedByClient",
-                }, timeout);
-                if (decision == .abort) return error.UnsafeBrowserNavigation;
-            },
-        }
-        return true;
     }
 
     fn readFrameWithTimeout(self: *Browser, timeout: std.Io.Timeout) ![]u8 {
@@ -572,6 +730,64 @@ fn takeBufferedFrame(allocator: Allocator, buffer: []u8, read_len: *usize) !?[]u
     return null;
 }
 
+fn pageNavigationEventUrl(root: std.json.ObjectMap) !?[]const u8 {
+    const method_value = root.get("method") orelse return null;
+    const method = switch (method_value) {
+        .string => |value| value,
+        else => return error.InvalidBrowserResponse,
+    };
+    const nested_frame = std.mem.eql(u8, method, "Page.frameNavigated");
+    if (!std.mem.eql(u8, method, "Page.frameScheduledNavigation") and
+        !std.mem.eql(u8, method, "Page.frameRequestedNavigation") and
+        !std.mem.eql(u8, method, "Page.frameStartedNavigating") and
+        !std.mem.eql(u8, method, "Page.navigatedWithinDocument") and
+        !nested_frame and
+        !std.mem.eql(u8, method, "Page.windowOpen")) return null;
+    const params = switch (root.get("params") orelse return error.InvalidBrowserResponse) {
+        .object => |object| object,
+        else => return error.InvalidBrowserResponse,
+    };
+    if (!nested_frame) return try requiredString(params, "url");
+    const frame = switch (params.get("frame") orelse return error.InvalidBrowserResponse) {
+        .object => |object| object,
+        else => return error.InvalidBrowserResponse,
+    };
+    return try requiredString(frame, "url");
+}
+
+fn makeBrowserEnvironment(allocator: Allocator, profile_path: []const u8) !std.process.Environ.Map {
+    var environment = std.process.Environ.Map.init(allocator);
+    errdefer environment.deinit();
+    for (std.mem.span(std.c.environ)) |entry_optional| {
+        const entry_z = entry_optional orelse return error.InvalidBrowserEnvironment;
+        const entry = std.mem.span(entry_z);
+        const separator = std.mem.indexOfScalar(u8, entry, '=') orelse
+            return error.InvalidBrowserEnvironment;
+        if (separator == 0) return error.InvalidBrowserEnvironment;
+        try environment.put(entry[0..separator], entry[separator + 1 ..]);
+    }
+    const blocked_path = try std.fs.path.join(allocator, &.{ profile_path, blocked_executable_path });
+    defer allocator.free(blocked_path);
+    const blocked_bus_path = try std.fs.path.join(allocator, &.{ profile_path, blocked_session_bus_socket });
+    defer allocator.free(blocked_bus_path);
+    const blocked_bus_address = try std.fmt.allocPrint(allocator, "unix:path={s}", .{blocked_bus_path});
+    defer allocator.free(blocked_bus_address);
+    const inherited_path = environment.get("PATH") orelse "";
+    const confined_path = if (inherited_path.len == 0)
+        try allocator.dupe(u8, blocked_path)
+    else
+        try std.fmt.allocPrint(allocator, "{s}:{s}", .{ blocked_path, inherited_path });
+    defer allocator.free(confined_path);
+    // Chromium's Linux external-protocol path first tries the desktop portal,
+    // then xdg-email/xdg-open. Shadow both helpers while retaining the inherited
+    // PATH for distro browser wrappers and display utilities.
+    try environment.put("DBUS_SESSION_BUS_ADDRESS", blocked_bus_address);
+    try environment.put("DBUS_STARTER_ADDRESS", blocked_bus_address);
+    try environment.put("DBUS_STARTER_BUS_TYPE", "session");
+    try environment.put("PATH", confined_path);
+    return environment;
+}
+
 fn spawnBrowser(
     allocator: Allocator,
     executable: []const u8,
@@ -585,6 +801,10 @@ fn spawnBrowser(
     defer allocator.free(profile_arg);
     const resolver_arg = try std.fmt.allocPrint(allocator, "--host-resolver-rules={s}", .{navigation_policy.resolver_rules});
     defer allocator.free(resolver_arg);
+    const proxy_bypass_arg = try makeProxyBypassArg(allocator, navigation_policy.origin_host);
+    defer allocator.free(proxy_bypass_arg);
+    var environment = try makeBrowserEnvironment(allocator, profile.path);
+    defer environment.deinit();
 
     var argv_storage: [24][]const u8 = undefined;
     var count: usize = 0;
@@ -612,7 +832,13 @@ fn spawnBrowser(
     count += 1;
     argv_storage[count] = "--disable-component-update";
     count += 1;
-    argv_storage[count] = "--no-proxy-server";
+    argv_storage[count] = dead_proxy_server_arg;
+    count += 1;
+    argv_storage[count] = proxy_bypass_arg;
+    count += 1;
+    argv_storage[count] = block_new_web_contents_arg;
+    count += 1;
+    argv_storage[count] = force_webrtc_ip_policy_arg;
     count += 1;
     argv_storage[count] = "--enable-features=LocalNetworkAccessChecks,LocalNetworkAccessForNavigations,LocalNetworkAccessForSubframeNavigations,LocalNetworkAccessForWorkers,LocalNetworkAccessChecksWebSockets,LocalNetworkAccessChecksWebTransport,LocalNetworkAccessChecksWebRTC";
     count += 1;
@@ -631,6 +857,7 @@ fn spawnBrowser(
         .stdout = .pipe,
         .stderr = .ignore,
         .pgid = 0,
+        .environ_map = &environment,
     });
     errdefer killProcessTree(&child);
     if (child.stdin) |*file| try setPipeNonblocking(file) else return error.BrowserPipeClosed;
@@ -749,6 +976,90 @@ fn extractResultString(allocator: Allocator, payload: []const u8, field: []const
     return allocator.dupe(u8, text);
 }
 
+fn extractInitialPageTargetId(allocator: Allocator, payload: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidBrowserResponse;
+    };
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidBrowserResponse,
+    };
+    const result = switch (root.get("result") orelse return error.InvalidBrowserResponse) {
+        .object => |object| object,
+        else => return error.InvalidBrowserResponse,
+    };
+    const target_infos = switch (result.get("targetInfos") orelse return error.InvalidBrowserResponse) {
+        .array => |array| array,
+        else => return error.InvalidBrowserResponse,
+    };
+
+    var selected: ?[]const u8 = null;
+    for (target_infos.items) |target_value| {
+        const target = switch (target_value) {
+            .object => |object| object,
+            else => return error.InvalidBrowserResponse,
+        };
+        const target_type = try requiredString(target, "type");
+        const target_url = try requiredString(target, "url");
+        if (!std.mem.eql(u8, target_type, "page")) continue;
+        if (!std.mem.eql(u8, target_url, "about:blank"))
+            return error.BrowserTargetUnavailable;
+        if (try requiredBool(target, "attached") or target.get("openerId") != null)
+            return error.BrowserTargetUnavailable;
+        if (selected != null) return error.BrowserTargetUnavailable;
+        const target_id = try requiredString(target, "targetId");
+        if (target_id.len == 0 or std.mem.indexOfScalar(u8, target_id, 0) != null)
+            return error.InvalidBrowserResponse;
+        selected = target_id;
+    }
+    return allocator.dupe(u8, selected orelse return error.BrowserTargetNotReady);
+}
+
+const PageTargetSummary = struct {
+    count: usize = 0,
+    has_opener: bool = false,
+};
+
+fn pageTargetSummary(allocator: Allocator, payload: []const u8) !PageTargetSummary {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidBrowserResponse;
+    };
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidBrowserResponse,
+    };
+    const result = switch (root.get("result") orelse return error.InvalidBrowserResponse) {
+        .object => |object| object,
+        else => return error.InvalidBrowserResponse,
+    };
+    const target_infos = switch (result.get("targetInfos") orelse return error.InvalidBrowserResponse) {
+        .array => |array| array,
+        else => return error.InvalidBrowserResponse,
+    };
+    var summary: PageTargetSummary = .{};
+    for (target_infos.items) |target_value| {
+        const target = switch (target_value) {
+            .object => |object| object,
+            else => return error.InvalidBrowserResponse,
+        };
+        if (!std.mem.eql(u8, try requiredString(target, "type"), "page")) continue;
+        summary.count += 1;
+        if (target.get("openerId")) |opener_value| {
+            const opener_id = switch (opener_value) {
+                .string => |value| value,
+                else => return error.InvalidBrowserResponse,
+            };
+            if (opener_id.len == 0) return error.InvalidBrowserResponse;
+            summary.has_opener = true;
+        }
+    }
+    return summary;
+}
+
 fn resultHasNonEmptyString(allocator: Allocator, payload: []const u8, field: []const u8) !bool {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch |err| {
         if (err == error.OutOfMemory) return err;
@@ -768,6 +1079,30 @@ fn resultHasNonEmptyString(allocator: Allocator, payload: []const u8, field: []c
         .string => |text| text.len != 0,
         else => error.InvalidBrowserResponse,
     };
+}
+
+fn extractRuntimeBoolean(allocator: Allocator, payload: []const u8) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidBrowserResponse;
+    };
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidBrowserResponse,
+    };
+    const result = switch (root.get("result") orelse return error.InvalidBrowserResponse) {
+        .object => |object| object,
+        else => return error.InvalidBrowserResponse,
+    };
+    if (result.get("exceptionDetails") != null) return error.InvalidBrowserResponse;
+    const remote_object = switch (result.get("result") orelse return error.InvalidBrowserResponse) {
+        .object => |object| object,
+        else => return error.InvalidBrowserResponse,
+    };
+    const value_type = try requiredString(remote_object, "type");
+    if (!std.mem.eql(u8, value_type, "boolean")) return error.InvalidBrowserResponse;
+    return requiredBool(remote_object, "value");
 }
 
 pub fn parseCookies(allocator: Allocator, payload: []const u8) ![]Cookie {
@@ -943,19 +1278,188 @@ test "Chromium version gate fails closed without verified LNA support" {
     try std.testing.expect(!supportedChromiumProduct("Chrome/not-a-version"));
 }
 
-test "browser navigation policy allows only pinned challenge origins" {
+test "browser hardening denies downloads and rejects alternate page targets" {
+    try std.testing.expectEqualStrings("deny", deny_download_behavior);
+    try std.testing.expectEqualStrings("--block-new-web-contents", block_new_web_contents_arg);
+    try std.testing.expectEqualStrings(
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+        force_webrtc_ip_policy_arg,
+    );
+    try std.testing.expectEqualStrings("--proxy-server=http://subdl-proxy.invalid:9", dead_proxy_server_arg);
+    try std.testing.expectEqualStrings("--proxy-bypass-list=<-loopback>;", proxy_bypass_prefix);
+    try std.testing.expect(std.mem.indexOf(u8, secure_profile_preferences, "disable_non_proxied_udp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, secure_profile_preferences, "\"popups\":2") != null);
+
+    try std.testing.expectEqual(@as(usize, 2), unexpected_target_filter.len);
+    try std.testing.expectEqualStrings("page", unexpected_target_filter[0].type);
+    try std.testing.expect(!unexpected_target_filter[0].exclude);
+    try std.testing.expect(unexpected_target_filter[1].exclude);
+}
+
+test "startup page selection cannot attach to popup or ambiguous targets" {
+    const allocator = std.testing.allocator;
+    const target_id = try extractInitialPageTargetId(
+        allocator,
+        "{\"result\":{\"targetInfos\":[{\"targetId\":\"worker\",\"type\":\"service_worker\",\"url\":\"https://example.org/sw.js\",\"attached\":false},{\"targetId\":\"startup-page\",\"type\":\"page\",\"url\":\"about:blank\",\"attached\":false}]}}",
+    );
+    defer allocator.free(target_id);
+    try std.testing.expectEqualStrings("startup-page", target_id);
+
+    try std.testing.expectError(
+        error.BrowserTargetNotReady,
+        extractInitialPageTargetId(
+            allocator,
+            "{\"result\":{\"targetInfos\":[{\"targetId\":\"worker\",\"type\":\"service_worker\",\"url\":\"https://example.org/sw.js\",\"attached\":false}]}}",
+        ),
+    );
+
+    try std.testing.expectError(
+        error.BrowserTargetUnavailable,
+        extractInitialPageTargetId(
+            allocator,
+            "{\"result\":{\"targetInfos\":[{\"targetId\":\"popup\",\"type\":\"page\",\"url\":\"about:blank\",\"attached\":false,\"openerId\":\"parent\"}]}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.BrowserTargetUnavailable,
+        extractInitialPageTargetId(
+            allocator,
+            "{\"result\":{\"targetInfos\":[{\"targetId\":\"one\",\"type\":\"page\",\"url\":\"about:blank\",\"attached\":false},{\"targetId\":\"two\",\"type\":\"page\",\"url\":\"about:blank\",\"attached\":false}]}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.BrowserTargetUnavailable,
+        extractInitialPageTargetId(
+            allocator,
+            "{\"result\":{\"targetInfos\":[{\"targetId\":\"unexpected\",\"type\":\"page\",\"url\":\"chrome://new-tab-page/\",\"attached\":false},{\"targetId\":\"startup-page\",\"type\":\"page\",\"url\":\"about:blank\",\"attached\":false}]}}",
+        ),
+    );
+    const popup_summary = try pageTargetSummary(
+        allocator,
+        "{\"result\":{\"targetInfos\":[{\"targetId\":\"popup\",\"type\":\"page\",\"url\":\"about:blank\",\"attached\":false,\"openerId\":\"parent\"}]}}",
+    );
+    try std.testing.expectEqual(@as(usize, 1), popup_summary.count);
+    try std.testing.expect(popup_summary.has_opener);
+    const startup_summary = try pageTargetSummary(
+        allocator,
+        "{\"result\":{\"targetInfos\":[{\"targetId\":\"startup-page\",\"type\":\"page\",\"url\":\"about:blank\",\"attached\":true}]}}",
+    );
+    try std.testing.expectEqual(@as(usize, 1), startup_summary.count);
+    try std.testing.expect(!startup_summary.has_opener);
+}
+
+test "runtime boolean responses fail closed" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(try extractRuntimeBoolean(
+        allocator,
+        "{\"result\":{\"result\":{\"type\":\"boolean\",\"value\":true}}}",
+    ));
+    try std.testing.expect(!try extractRuntimeBoolean(
+        allocator,
+        "{\"result\":{\"result\":{\"type\":\"boolean\",\"value\":false}}}",
+    ));
+    try std.testing.expectError(
+        error.InvalidBrowserResponse,
+        extractRuntimeBoolean(allocator, "{\"result\":{\"result\":{\"type\":\"string\",\"value\":\"true\"}}}"),
+    );
+    try std.testing.expectError(
+        error.InvalidBrowserResponse,
+        extractRuntimeBoolean(allocator, "{\"result\":{\"result\":{\"type\":\"boolean\",\"value\":true},\"exceptionDetails\":{}}}"),
+    );
+}
+
+test "initial browser navigation allows only pinned challenge origins" {
     const policy = NavigationPolicy{
         .origin_host = "provider.example.org",
         .resolver_rules = "",
     };
-    try std.testing.expectEqual(RequestDecision.allow, policy.requestDecision("https://provider.example.org/challenge", "Document"));
-    try std.testing.expectEqual(RequestDecision.allow, policy.requestDecision("https://challenges.cloudflare.com/turnstile/v0/api.js", "Script"));
-    try std.testing.expectEqual(RequestDecision.allow, policy.requestDecision("data:text/plain,fixture", "Other"));
-    try std.testing.expectEqual(RequestDecision.block, policy.requestDecision("https://www.google.com/image.png", "Image"));
-    try std.testing.expectEqual(RequestDecision.abort, policy.requestDecision("https://www.google.com/redirect", "Document"));
-    try std.testing.expectEqual(RequestDecision.abort, policy.requestDecision("http://provider.example.org/downgrade", "Document"));
-    try std.testing.expectEqual(RequestDecision.abort, policy.requestDecision("http://127.0.0.1/private", "Image"));
-    try std.testing.expectEqual(RequestDecision.abort, policy.requestDecision("https://user:pass@provider.example.org/private", "Image"));
+    try std.testing.expect(policy.allowsNavigation("https://provider.example.org/challenge"));
+    try std.testing.expect(policy.allowsNavigation("https://challenges.cloudflare.com/turnstile/v0/api.js"));
+    try std.testing.expect(policy.allowsNavigation("data:text/plain,fixture"));
+    try std.testing.expect(!policy.allowsNavigation("https://www.google.com/image.png"));
+    try std.testing.expect(!policy.allowsNavigation("http://provider.example.org/downgrade"));
+    try std.testing.expect(!policy.allowsNavigation("http://127.0.0.1/private"));
+    try std.testing.expect(!policy.allowsNavigation("https://user:pass@provider.example.org/private"));
+    try std.testing.expect(policy.allowsPageNavigation("javascript:void(0)"));
+    try std.testing.expect(policy.allowsPageNavigation("about:srcdoc"));
+    try std.testing.expect(!policy.allowsPageNavigation("mailto:fixture@example.invalid"));
+    try std.testing.expect(!policy.allowsPageNavigation("tel:+10000000000"));
+    try std.testing.expect(!policy.allowsPageNavigation("subdl-fixture:external"));
+}
+
+test "browser navigation events expose every policy-relevant URL" {
+    const fixtures = [_]struct { payload: []const u8, expected: []const u8 }{
+        .{ .payload = "{\"method\":\"Page.frameScheduledNavigation\",\"params\":{\"url\":\"mailto:fixture@example.invalid\"}}", .expected = "mailto:fixture@example.invalid" },
+        .{ .payload = "{\"method\":\"Page.frameRequestedNavigation\",\"params\":{\"url\":\"tel:+10000000000\"}}", .expected = "tel:+10000000000" },
+        .{ .payload = "{\"method\":\"Page.frameStartedNavigating\",\"params\":{\"url\":\"subdl-fixture:external\"}}", .expected = "subdl-fixture:external" },
+        .{ .payload = "{\"method\":\"Page.navigatedWithinDocument\",\"params\":{\"url\":\"https://provider.example.org/#done\"}}", .expected = "https://provider.example.org/#done" },
+        .{ .payload = "{\"method\":\"Page.frameNavigated\",\"params\":{\"frame\":{\"url\":\"https://challenges.cloudflare.com/turnstile/\"}}}", .expected = "https://challenges.cloudflare.com/turnstile/" },
+        .{ .payload = "{\"method\":\"Page.windowOpen\",\"params\":{\"url\":\"https://off-origin.invalid/\"}}", .expected = "https://off-origin.invalid/" },
+    };
+    for (fixtures) |fixture| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, fixture.payload, .{});
+        defer parsed.deinit();
+        const url = try pageNavigationEventUrl(parsed.value.object);
+        try std.testing.expectEqualStrings(fixture.expected, url.?);
+    }
+
+    var malformed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"method\":\"Page.frameNavigated\",\"params\":{\"frame\":{}}}",
+        .{},
+    );
+    defer malformed.deinit();
+    try std.testing.expectError(error.InvalidBrowserResponse, pageNavigationEventUrl(malformed.value.object));
+}
+
+test "browser environment blocks desktop protocol launchers and preserves display" {
+    const allocator = std.testing.allocator;
+    var environment = try makeBrowserEnvironment(allocator, "/tmp/subdl-profile-fixture");
+    defer environment.deinit();
+    const expected_path = if (common.getenv("PATH")) |inherited_path|
+        try std.fmt.allocPrint(
+            allocator,
+            "/tmp/subdl-profile-fixture/blocked-external-handlers:{s}",
+            .{inherited_path},
+        )
+    else
+        try allocator.dupe(u8, "/tmp/subdl-profile-fixture/blocked-external-handlers");
+    defer allocator.free(expected_path);
+    try std.testing.expectEqualStrings(expected_path, environment.get("PATH").?);
+    try std.testing.expectEqualStrings(
+        "unix:path=/tmp/subdl-profile-fixture/blocked-session-bus",
+        environment.get("DBUS_SESSION_BUS_ADDRESS").?,
+    );
+    for ([_][]const u8{ "DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR" }) |name| {
+        if (common.getenv(name)) |value|
+            try std.testing.expectEqualStrings(value, environment.get(name).?);
+    }
+}
+
+test "secure browser profile shadows external protocol helpers" {
+    var profile = try SecureProfile.create(std.testing.allocator);
+    defer profile.deinit(std.testing.allocator, common.compatMilliTimestamp() + 5_000);
+    const io = runtime_io.get();
+    inline for (.{ "xdg-email", "xdg-open" }) |helper| {
+        const helper_path = try std.fs.path.join(
+            std.testing.allocator,
+            &.{ profile.path, blocked_executable_path, helper },
+        );
+        defer std.testing.allocator.free(helper_path);
+        const stat = try std.Io.Dir.cwd().statFile(io, helper_path, .{ .follow_symlinks = false });
+        try std.testing.expectEqual(std.Io.File.Kind.file, stat.kind);
+        try std.testing.expectEqual(@as(u32, 0), stat.permissions.toMode() & 0o077);
+        try std.testing.expect(stat.permissions.toMode() & 0o100 != 0);
+        const contents = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            helper_path,
+            std.testing.allocator,
+            .limited(64),
+        );
+        defer std.testing.allocator.free(contents);
+        try std.testing.expectEqualStrings(blocked_external_handler_script, contents);
+    }
 }
 
 test "resolver-rule hosts reject argument injection" {
@@ -963,6 +1467,19 @@ test "resolver-rule hosts reject argument injection" {
     try std.testing.expect(!validResolverHost("localhost"));
     try std.testing.expect(!validResolverHost("provider.example.org, MAP * 127.0.0.1"));
     try std.testing.expect(!validResolverHost("provider.example.org\n--no-sandbox"));
+}
+
+test "proxy bypass is limited to pinned HTTPS origins on port 443" {
+    const argument = try makeProxyBypassArg(std.testing.allocator, "provider.example.org");
+    defer std.testing.allocator.free(argument);
+    try std.testing.expectEqualStrings(
+        "--proxy-bypass-list=<-loopback>;https://provider.example.org:443;https://challenges.cloudflare.com:443",
+        argument,
+    );
+    try std.testing.expectError(
+        error.InvalidBrowserNavigation,
+        makeProxyBypassArg(std.testing.allocator, "provider.example.org;*.invalid"),
+    );
 }
 
 test "CDP responses stay on their requested session" {
@@ -1060,6 +1577,110 @@ test "CDP payload extractors reject malformed envelopes" {
         extractResultString(allocator, "{\"id\":2,\"error\":{}}", "sessionId"),
     );
     try std.testing.expectError(error.InvalidBrowserResponse, parseCookies(allocator, "{\"result\":{\"cookies\":{}}}"));
+}
+
+test "opt-in local Chromium hardening smoke test" {
+    const enabled = common.getenv("SUBDL_CHROMIUM_SMOKE") orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, enabled, "1")) return error.SkipZigTest;
+    const executable = common.getenv("SUBDL_CHROMIUM_PATH") orelse return error.SkipZigTest;
+    const deadline = common.compatMilliTimestamp() + 30_000;
+    const data_url = "data:text/html,<title>subdl-browser-hardening</title>";
+    const policy = NavigationPolicy{
+        .origin_host = "example.invalid",
+        .resolver_rules = "MAP * ~NOTFOUND",
+    };
+    var browser = try Browser.launch(std.testing.allocator, executable, &policy, true, deadline);
+    defer browser.deinit();
+    try std.testing.expect(browser.downloads_denied);
+    try browser.navigate(data_url, deadline);
+
+    const session_id = browser.session_id orelse return error.BrowserTargetUnavailable;
+    const challenge_capabilities = try browser.sendSessionCommand(session_id, "Runtime.evaluate", .{
+        .expression = "typeof globalThis.open === 'function' && typeof Window === 'function' && typeof RTCPeerConnection === 'function' && typeof Worker === 'function' && typeof SharedWorker === 'function' && (typeof ServiceWorkerContainer !== 'function' || typeof ServiceWorkerContainer.prototype.register === 'function')",
+        .returnByValue = true,
+    }, deadline);
+    defer std.testing.allocator.free(challenge_capabilities);
+    try std.testing.expect(try extractRuntimeBoolean(std.testing.allocator, challenge_capabilities));
+
+    const named_frame_compatibility = try browser.sendSessionCommand(session_id, "Runtime.evaluate", .{
+        .expression = "(() => { const frame = document.createElement('iframe'); frame.name = 'challenge-frame'; frame.src = 'about:blank'; document.body.append(frame); const named = document.createElement('a'); named.href = 'about:blank'; named.target = 'challenge-frame'; document.body.append(named); named.click(); const compatible = named.target === 'challenge-frame'; named.remove(); frame.remove(); return compatible; })()",
+        .returnByValue = true,
+    }, deadline);
+    defer std.testing.allocator.free(named_frame_compatibility);
+    try std.testing.expect(try extractRuntimeBoolean(std.testing.allocator, named_frame_compatibility));
+
+    const targets_response = browser.sendCommand("Target.getTargets", EmptyCdpParams{}, deadline) catch |err| {
+        try std.testing.expectEqual(error.UnexpectedBrowserTarget, err);
+        return;
+    };
+    defer std.testing.allocator.free(targets_response);
+    const target_summary = try pageTargetSummary(std.testing.allocator, targets_response);
+    try std.testing.expectEqual(@as(usize, 1), target_summary.count);
+    try std.testing.expect(!target_summary.has_opener);
+
+    const popup_attempt = browser.sendSessionCommand(session_id, "Runtime.evaluate", .{
+        .expression = "(() => { const link = document.createElement('a'); link.href = 'data:text/html,popup'; link.target = '_blank'; document.body.append(link); link.click(); link.remove(); const opened = globalThis.open('data:text/html,programmatic-popup', '_blank'); if (opened) opened.close(); return true; })()",
+        .returnByValue = true,
+        .userGesture = true,
+    }, deadline) catch |err| {
+        try std.testing.expectEqual(error.UnexpectedBrowserTarget, err);
+        return;
+    };
+    defer std.testing.allocator.free(popup_attempt);
+    try std.testing.expect(try extractRuntimeBoolean(std.testing.allocator, popup_attempt));
+
+    const final_targets_response = browser.sendCommand("Target.getTargets", EmptyCdpParams{}, deadline) catch |err| {
+        try std.testing.expectEqual(error.UnexpectedBrowserTarget, err);
+        return;
+    };
+    defer std.testing.allocator.free(final_targets_response);
+    const final_target_summary = try pageTargetSummary(std.testing.allocator, final_targets_response);
+    try std.testing.expectEqual(@as(usize, 1), final_target_summary.count);
+    try std.testing.expect(!final_target_summary.has_opener);
+}
+
+fn runExternalProtocolSmoke(executable: []const u8, headless: bool) !void {
+    const deadline = common.compatMilliTimestamp() + 30_000;
+    const policy = NavigationPolicy{
+        .origin_host = "example.invalid",
+        .resolver_rules = "MAP * ~NOTFOUND",
+    };
+    var browser = try Browser.launch(std.testing.allocator, executable, &policy, headless, deadline);
+    defer browser.deinit();
+    try browser.navigate("data:text/html,<title>subdl-external-protocol</title>", deadline);
+    const session_id = browser.session_id orelse return error.BrowserTargetUnavailable;
+
+    // Keep this as the final action. Event rejection makes the production
+    // caller tear down the browser; PATH/DBus isolation is what prevents an OS
+    // handler from starting before that teardown completes.
+    const response = browser.sendSessionCommand(session_id, "Runtime.evaluate", .{
+        .expression = "location.href = 'mailto:subdl-fixture@example.invalid'; true",
+        .returnByValue = true,
+        .userGesture = true,
+    }, deadline) catch |err| {
+        try std.testing.expectEqual(error.UnsafeBrowserNavigation, err);
+        return;
+    };
+    defer std.testing.allocator.free(response);
+    browser.waitForPolicyEvents(1_000, deadline) catch |err| {
+        try std.testing.expectEqual(error.UnsafeBrowserNavigation, err);
+        return;
+    };
+    return error.TestExpectedError;
+}
+
+test "opt-in local Chromium blocks external protocol navigation" {
+    const enabled = common.getenv("SUBDL_CHROMIUM_SMOKE") orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, enabled, "1")) return error.SkipZigTest;
+    const executable = common.getenv("SUBDL_CHROMIUM_PATH") orelse return error.SkipZigTest;
+    try runExternalProtocolSmoke(executable, true);
+}
+
+test "opt-in headed Chromium blocks external protocol navigation" {
+    const enabled = common.getenv("SUBDL_CHROMIUM_HEADED_SMOKE") orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, enabled, "1")) return error.SkipZigTest;
+    const executable = common.getenv("SUBDL_CHROMIUM_PATH") orelse return error.SkipZigTest;
+    try runExternalProtocolSmoke(executable, false);
 }
 
 test "opt-in local Chromium pipe smoke test" {

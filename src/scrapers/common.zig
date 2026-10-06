@@ -43,9 +43,15 @@ pub const FetchOptions = struct {
     retry_on_429: bool = true,
     cache: bool = true,
     max_response_bytes: usize = 128 * 1024 * 1024,
+    /// Maximum encoded entity bytes consumed before decompression. This is
+    /// independent of max_response_bytes so empty/skippable compressed frames
+    /// cannot consume unbounded input while producing little or no output.
+    max_encoded_response_bytes: usize = 128 * 1024 * 1024,
     /// Reject credentials, local/private hosts, and unsafe redirect targets.
     /// Enable this for URLs originating in provider-controlled response data.
     require_public_origin: bool = false,
+    /// Require HTTPS for the initial request and every redirect hop.
+    require_https: bool = false,
 };
 
 pub const FetchCacheConfig = struct {
@@ -110,6 +116,7 @@ pub fn mustNotRetryFetchError(err: anyerror) bool {
         err == error.HttpRedirectLocationMissing or
         err == error.UnsupportedCompressionMethod or
         err == error.TooManyCompressedMembers or
+        err == error.InvalidResponseLimit or
         err == error.ResponseTooLarge or
         err == error.UnexpectedEncodedPayload;
 }
@@ -334,7 +341,7 @@ pub fn fetchBytes(client: *std.http.Client, allocator: Allocator, url: []const u
 
 fn fetchBytesWith(comptime fetch: anytype, comptime backoff: anytype, client: *std.http.Client, allocator: Allocator, url: []const u8, opts: FetchOptions) !HttpResponse {
     try validateFetchHeaders(opts);
-    if (opts.require_public_origin) try validatePublicHttpUrl(url);
+    try validateFetchTarget(url, opts);
     if (try loadFetchCache(allocator, url, opts)) |cached| return cached;
 
     const logging_enabled = livePhaseLoggingEnabled();
@@ -500,6 +507,7 @@ fn fetchCachePath(allocator: Allocator, root: []const u8, url: []const u8, opts:
     hasher.update(@tagName(opts.method));
     hasher.update("\n");
     hasher.update(if (opts.require_public_origin) "public-origin\n" else "unrestricted-origin\n");
+    hasher.update(if (opts.require_https) "https-only\n" else "http-or-https\n");
     hasher.update(url);
     hasher.update("\n");
     if (opts.accept) |accept| hasher.update(accept);
@@ -618,7 +626,9 @@ fn fetchBytesViaReadyClient(client: *std.http.Client, allocator: Allocator, url:
             .{ .override = value }
         else
             .{ .override = default_user_agent },
-        .connection = typedHeaderOverride(opts.extra_headers, "connection"),
+        // Connection is hop-by-hop transport state. A caller override can
+        // disagree with keep_alive and leave a closed socket in the pool.
+        .connection = .default,
         .accept_encoding = typedHeaderOverride(opts.extra_headers, "accept-encoding"),
         .content_type = if (findHeaderValue(opts.extra_headers, "content-type")) |value|
             .{ .override = value }
@@ -648,10 +658,101 @@ fn fetchBytesViaReadyClient(client: *std.http.Client, allocator: Allocator, url:
 
 // Own redirect policy and validate framing independently of Zig 0.16 helpers.
 // Private headers survive only while the origin stays unchanged.
-fn responseReadError(response: *std.http.Client.Response, request: *std.http.Client.Request) anyerror {
+fn decompressionReadError(decompress: *const std.http.Decompress) ?anyerror {
+    return switch (decompress.*) {
+        .flate => |value| value.err,
+        .zstd => |value| value.err,
+        .none => null,
+    };
+}
+
+fn responseReadError(response: *std.http.Client.Response, request: *std.http.Client.Request, decompress: ?*const std.http.Decompress) anyerror {
+    // Decoder format failures are also surfaced as ReadFailed, but they do not
+    // set a socket error. Preserve the decoder's concrete error before looking
+    // at transfer framing or transport state.
+    if (decompress) |value| {
+        if (decompressionReadError(value)) |err| {
+            if (err != error.ReadFailed) return err;
+        }
+    }
     if (response.bodyErr()) |err| return err;
-    if (request.connection.?.stream_reader.err) |err| return err;
-    return error.InvalidResponseBody;
+    return normalizeRequestReadError(request, error.ReadFailed);
+}
+
+fn normalizeWrappedTransportError(wrapper: anyerror, underlying: ?anyerror) anyerror {
+    return underlying orelse wrapper;
+}
+
+/// Recover the concrete connection error hidden by std.http's WriteFailed.
+/// In particular, cancellation must remain terminal instead of becoming a
+/// retryable generic transport failure.
+pub fn normalizeRequestWriteError(request: *std.http.Client.Request, err: anyerror) anyerror {
+    if (err != error.WriteFailed) return err;
+    const connection = request.connection orelse return err;
+    return normalizeWrappedTransportError(err, connection.stream_writer.err);
+}
+
+/// `std.Io.Writer.Allocating` reports allocation failure through its generic
+/// writer interface. Its only WriteFailed cause is allocator exhaustion.
+pub fn normalizeAllocatingWriterError(err: anyerror) anyerror {
+    return if (err == error.WriteFailed) error.OutOfMemory else err;
+}
+
+/// Recover the concrete connection error hidden by std.http's ReadFailed.
+/// This is suitable for receiveHead and for response readers after bodyErr has
+/// already been checked.
+pub fn normalizeRequestReadError(request: *std.http.Client.Request, err: anyerror) anyerror {
+    if (err != error.ReadFailed) return err;
+    const connection = request.connection orelse return err;
+    const underlying: ?anyerror = switch (connection.protocol) {
+        .plain => connection.stream_reader.err,
+        .tls => tls: {
+            if (std.http.Client.disable_tls) break :tls null;
+            // Request.reader.in is initialized from Connection.reader(). Avoid
+            // Connection.getReadError(), whose implementation force-unwraps
+            // when ReadFailed came from a decoder rather than the transport.
+            if (request.reader.in != connection.reader()) break :tls null;
+            const tls_client: *const std.crypto.tls.Client = @alignCast(@fieldParentPtr("reader", request.reader.in));
+            if (tls_client.read_err) |read_err| break :tls @as(anyerror, read_err);
+            if (connection.stream_reader.err) |stream_err| break :tls @as(anyerror, stream_err);
+            break :tls null;
+        },
+    };
+    return normalizeWrappedTransportError(err, underlying);
+}
+
+const RedirectDisposition = struct {
+    method: std.http.Method,
+    preserve_payload: bool,
+};
+
+fn redirectDisposition(status: std.http.Status, method: std.http.Method, has_payload: bool, cross_origin: bool) !RedirectDisposition {
+    std.debug.assert(isRedirectStatus(status));
+    var result: RedirectDisposition = .{
+        .method = method,
+        .preserve_payload = has_payload,
+    };
+    if (status == .see_other or ((status == .moved_permanently or status == .found) and method == .POST)) {
+        if (method != .HEAD) result.method = .GET;
+        result.preserve_payload = false;
+    }
+
+    // A provider-controlled redirect must not forward an opaque request body
+    // or a state-changing method to another origin. GET/HEAD without a body
+    // remain useful for ordinary CDN redirects.
+    if (cross_origin and (result.preserve_payload or (result.method != .GET and result.method != .HEAD))) {
+        return error.UnsafeHttpTarget;
+    }
+    return result;
+}
+
+fn isCrossOriginSafeRequestHeader(name: []const u8) bool {
+    // Treat caller-supplied headers as origin-bound unless they are ordinary
+    // response-content negotiation. Unknown extensions frequently carry API
+    // keys, CSRF tokens, signed request metadata, or other bearer material.
+    return std.ascii.eqlIgnoreCase(name, "accept") or
+        std.ascii.eqlIgnoreCase(name, "accept-language") or
+        std.ascii.eqlIgnoreCase(name, "accept-charset");
 }
 
 fn fetchWithRedirects(client: *std.http.Client, allocator: Allocator, start_url: []const u8, opts: FetchOptions, initial_headers: std.http.Client.Request.Headers, extra_headers: []const std.http.Header, output: *std.Io.Writer) !std.http.Client.FetchResult {
@@ -662,7 +763,7 @@ fn fetchWithRedirects(client: *std.http.Client, allocator: Allocator, start_url:
     var private_allowed = true;
     var redirects: usize = 0;
     while (true) {
-        if (opts.require_public_origin) try validatePublicHttpUrl(current);
+        try validateFetchTarget(current, opts);
         var headers = initial_headers;
         var selected: std.ArrayList(std.http.Header) = .empty;
         defer selected.deinit(allocator);
@@ -670,10 +771,17 @@ fn fetchWithRedirects(client: *std.http.Client, allocator: Allocator, start_url:
         if (!private_allowed) {
             headers.authorization = .omit;
             headers.host = .default;
+            // These typed fields may also have originated in caller-supplied
+            // extra_headers. Reset them rather than letting an arbitrary value
+            // bypass the cross-origin safe-header allowlist below.
+            headers.user_agent = .{ .override = default_user_agent };
+            headers.connection = .default;
+            headers.accept_encoding = .default;
+            headers.content_type = .omit;
         }
         if (payload == null and opts.payload != null) headers.content_type = .omit;
         for (extra_headers) |header| {
-            if (!private_allowed and (std.ascii.eqlIgnoreCase(header.name, "cookie") or std.ascii.eqlIgnoreCase(header.name, "authorization") or std.ascii.eqlIgnoreCase(header.name, "proxy-authorization") or std.ascii.eqlIgnoreCase(header.name, "referer"))) continue;
+            if (!private_allowed and !isCrossOriginSafeRequestHeader(header.name)) continue;
             try selected.append(allocator, header);
         }
         const pinned_connection = if (opts.require_public_origin)
@@ -695,21 +803,24 @@ fn fetchWithRedirects(client: *std.http.Client, allocator: Allocator, start_url:
         };
         defer request.deinit();
         errdefer request.connection.?.closing = true;
+        // std.http's default acceptance mask omits zstd even though its request
+        // writer and bounded decoder both support it here.
+        request.accept_encoding[@intFromEnum(std.http.ContentEncoding.zstd)] = true;
         if (payload) |body| {
             request.transfer_encoding = .{ .content_length = body.len };
-            var writer = try request.sendBodyUnflushed(&.{});
-            try writer.writer.writeAll(body);
-            try writer.end();
-            try request.connection.?.flush();
-        } else try request.sendBodiless();
+            var writer = request.sendBodyUnflushed(&.{}) catch |err| return normalizeRequestWriteError(&request, err);
+            writer.writer.writeAll(body) catch |err| return normalizeRequestWriteError(&request, err);
+            writer.end() catch |err| return normalizeRequestWriteError(&request, err);
+            request.connection.?.flush() catch |err| return normalizeRequestWriteError(&request, err);
+        } else request.sendBodiless() catch |err| return normalizeRequestWriteError(&request, err);
         var head_buffer: [32 * 1024]u8 = undefined;
-        var response = try request.receiveHead(&head_buffer);
+        var response = request.receiveHead(&head_buffer) catch |err| return normalizeRequestReadError(&request, err);
         var interim_count: usize = 0;
         while (response.head.status.class() == .informational) {
             if (response.head.status == .switching_protocols) return error.UnsupportedProtocolUpgrade;
             interim_count += 1;
             if (interim_count > 16) return error.TooManyInformationalResponses;
-            response = try request.receiveHead(&head_buffer);
+            response = request.receiveHead(&head_buffer) catch |err| return normalizeRequestReadError(&request, err);
         }
         if (isRedirectStatus(response.head.status)) {
             // Do not drain an untrusted redirect body during request cleanup.
@@ -717,12 +828,12 @@ fn fetchWithRedirects(client: *std.http.Client, allocator: Allocator, start_url:
             if (redirects == 5) return error.TooManyHttpRedirects;
             const next = try resolveUrl(allocator, current, response.head.location orelse return error.HttpRedirectLocationMissing);
             errdefer allocator.free(next);
-            if (opts.require_public_origin) try validatePublicHttpUrl(next);
-            if (!try sameOrigin(current, next)) private_allowed = false;
-            if (response.head.status == .see_other or ((response.head.status == .moved_permanently or response.head.status == .found) and method == .POST)) {
-                if (method != .HEAD) method = .GET;
-                payload = null;
-            }
+            try validateFetchTarget(next, opts);
+            const cross_origin = !try sameOrigin(current, next);
+            const disposition = try redirectDisposition(response.head.status, method, payload != null, cross_origin);
+            method = disposition.method;
+            if (!disposition.preserve_payload) payload = null;
+            if (cross_origin) private_allowed = false;
             allocator.free(current);
             current = next;
             redirects += 1;
@@ -732,9 +843,14 @@ fn fetchWithRedirects(client: *std.http.Client, allocator: Allocator, start_url:
             _ = request.reader.bodyReader(&.{}, .none, 0);
             return .{ .status = response.head.status };
         }
+        if (response.head.content_length) |content_length| {
+            if (content_length > @as(u64, @intCast(opts.max_encoded_response_bytes))) {
+                return error.ResponseTooLarge;
+            }
+        }
         const decompression_size: usize = switch (response.head.content_encoding) {
             .identity => 0,
-            .zstd => std.compress.zstd.default_window_len,
+            .zstd => std.compress.zstd.default_window_len + std.compress.zstd.block_size_max,
             .deflate, .gzip => std.compress.flate.max_window_len,
             .compress => return error.UnsupportedCompressionMethod,
         };
@@ -744,34 +860,59 @@ fn fetchWithRedirects(client: *std.http.Client, allocator: Allocator, start_url:
         var decompress: std.http.Decompress = undefined;
         const encoding = response.head.content_encoding;
         const transfer_reader = response.reader(&transfer);
+        // Keep one sentinel byte beyond the configured limit. Exhausting it
+        // proves that the encoded body is too large without confusing an
+        // artificial boundary with a legitimate end of stream.
+        var encoded_buffer: [2048]u8 = undefined;
+        var bounded_transfer = transfer_reader.limited(
+            .limited(opts.max_encoded_response_bytes + 1),
+            &encoded_buffer,
+        );
+        const encoded_reader = &bounded_transfer.interface;
         var received: usize = 0;
         var members: usize = 0;
         while (true) {
             members += 1;
             if (members > 1024) return error.TooManyCompressedMembers;
-            const reader = decompress.init(transfer_reader, decompression_buffer, encoding);
+            const reader = decompress.init(encoded_reader, decompression_buffer, encoding);
             while (true) {
                 if (received == opts.max_response_bytes) {
                     _ = reader.takeByte() catch |err| switch (err) {
                         error.EndOfStream => break,
-                        error.ReadFailed => return responseReadError(&response, &request),
+                        error.ReadFailed => {
+                            if (bounded_transfer.remaining == .nothing) return error.ResponseTooLarge;
+                            return responseReadError(&response, &request, &decompress);
+                        },
                     };
+                    if (bounded_transfer.remaining == .nothing) return error.ResponseTooLarge;
                     return error.ResponseTooLarge;
                 }
                 const count = reader.stream(output, .limited(opts.max_response_bytes - received)) catch |err| switch (err) {
                     error.EndOfStream => break,
-                    error.ReadFailed => return responseReadError(&response, &request),
-                    else => return err,
+                    error.ReadFailed => {
+                        if (bounded_transfer.remaining == .nothing) return error.ResponseTooLarge;
+                        return responseReadError(&response, &request, &decompress);
+                    },
+                    error.WriteFailed => return normalizeAllocatingWriterError(err),
                 };
+                if (bounded_transfer.remaining == .nothing) return error.ResponseTooLarge;
                 received += count;
             }
+            if (bounded_transfer.remaining == .nothing) return error.ResponseTooLarge;
             if (encoding == .identity) break;
             // Decoder EOF can precede the chunk terminator/trailers. Preserve
             // any next member's first byte while validating transfer framing.
-            _ = transfer_reader.peekByte() catch |err| switch (err) {
-                error.EndOfStream => break,
-                error.ReadFailed => return responseReadError(&response, &request),
+            _ = encoded_reader.peekByte() catch |err| switch (err) {
+                error.EndOfStream => {
+                    if (bounded_transfer.remaining == .nothing) return error.ResponseTooLarge;
+                    break;
+                },
+                error.ReadFailed => {
+                    if (bounded_transfer.remaining == .nothing) return error.ResponseTooLarge;
+                    return responseReadError(&response, &request, null);
+                },
             };
+            if (bounded_transfer.remaining == .nothing) return error.ResponseTooLarge;
             if (encoding != .gzip) return error.UnexpectedEncodedPayload;
             // RFC 1952 permits concatenated gzip members; the same aggregate
             // decoded-byte limit applies to every member.
@@ -855,6 +996,14 @@ pub fn normalizeUrlForFetch(allocator: Allocator, url: []const u8) ![]u8 {
     }
 
     return try out.toOwnedSlice(allocator);
+}
+
+pub fn validateFetchTarget(url: []const u8, opts: FetchOptions) !void {
+    if (opts.require_public_origin) try validatePublicHttpUrl(url);
+    if (!opts.require_https) return;
+
+    const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.UnsafeHttpTarget;
 }
 
 /// Validate an untrusted network target before a request is sent. Provider
@@ -1166,6 +1315,8 @@ pub fn validateHttpHeaders(headers: []const std.http.Header) !void {
 }
 
 fn validateFetchHeaders(opts: FetchOptions) !void {
+    // Io.Limit reserves maxInt for `.unlimited`; leave room for the sentinel.
+    if (opts.max_encoded_response_bytes > std.math.maxInt(usize) - 2) return error.InvalidResponseLimit;
     if (opts.accept) |value| if (!validHttpHeaderValue(value)) return error.InvalidHttpHeader;
     if (opts.content_type) |value| if (!validHttpHeaderValue(value)) return error.InvalidHttpHeader;
     try validateHttpHeaders(opts.extra_headers);
@@ -1684,6 +1835,37 @@ test "URL resolution follows document relative and origin semantics" {
     try std.testing.expect(!try sameOrigin("https://example.test/a", "https://example.test/path\r\nx-injected: yes"));
 }
 
+test "cross-origin redirects cannot preserve payloads or unsafe methods" {
+    const rewritten_post = try redirectDisposition(.found, .POST, true, true);
+    try std.testing.expectEqual(std.http.Method.GET, rewritten_post.method);
+    try std.testing.expect(!rewritten_post.preserve_payload);
+
+    const rewritten_other = try redirectDisposition(.see_other, .PATCH, true, true);
+    try std.testing.expectEqual(std.http.Method.GET, rewritten_other.method);
+    try std.testing.expect(!rewritten_other.preserve_payload);
+
+    const safe_get = try redirectDisposition(.temporary_redirect, .GET, false, true);
+    try std.testing.expectEqual(std.http.Method.GET, safe_get.method);
+    try std.testing.expect(!safe_get.preserve_payload);
+    const safe_head = try redirectDisposition(.permanent_redirect, .HEAD, false, true);
+    try std.testing.expectEqual(std.http.Method.HEAD, safe_head.method);
+
+    try std.testing.expectError(error.UnsafeHttpTarget, redirectDisposition(.temporary_redirect, .POST, true, true));
+    try std.testing.expectError(error.UnsafeHttpTarget, redirectDisposition(.permanent_redirect, .GET, true, true));
+    try std.testing.expectError(error.UnsafeHttpTarget, redirectDisposition(.moved_permanently, .PUT, false, true));
+
+    const same_origin = try redirectDisposition(.temporary_redirect, .POST, true, false);
+    try std.testing.expectEqual(std.http.Method.POST, same_origin.method);
+    try std.testing.expect(same_origin.preserve_payload);
+
+    for ([_][]const u8{ "accept", "Accept-Language", "ACCEPT-CHARSET" }) |name| {
+        try std.testing.expect(isCrossOriginSafeRequestHeader(name));
+    }
+    for ([_][]const u8{ "cookie", "Authorization", "Referer", "Origin", "X-API-Key", "X-CSRF-Token" }) |name| {
+        try std.testing.expect(!isCrossOriginSafeRequestHeader(name));
+    }
+}
+
 test "untrusted HTTP targets reject credentials and local address spellings" {
     for ([_][]const u8{
         "https://subdl.com/download/1",
@@ -1716,6 +1898,26 @@ test "untrusted HTTP targets reject credentials and local address spellings" {
         "https://%6cocalhost/subtitle.srt",
         "https://metadata/subtitle.srt",
     }) |url| try std.testing.expectError(error.UnsafeHttpTarget, validatePublicHttpUrl(url));
+}
+
+test "HTTPS fetch policy rejects an initial or redirected downgrade" {
+    const opts: FetchOptions = .{
+        .require_public_origin = true,
+        .require_https = true,
+    };
+    try validateFetchTarget("https://cdn.example.com/archive.zip", opts);
+    try std.testing.expectError(
+        error.UnsafeHttpTarget,
+        validateFetchTarget("http://cdn.example.com/archive.zip", opts),
+    );
+
+    const redirected = try resolveUrl(
+        std.testing.allocator,
+        "https://cdn.example.com/archive.zip",
+        "http://downloads.example.com/archive.zip",
+    );
+    defer std.testing.allocator.free(redirected);
+    try std.testing.expectError(error.UnsafeHttpTarget, validateFetchTarget(redirected, opts));
 }
 
 test "resolved public address classification rejects private and special networks" {
@@ -2404,6 +2606,68 @@ test "HTTP cancellation and allocation failure never retry" {
     try std.testing.expectEqual(@as(usize, 1), Mock.calls);
 }
 
+test "HTTP wrapper errors preserve their underlying cancellation" {
+    try std.testing.expectEqual(error.Canceled, normalizeWrappedTransportError(error.WriteFailed, error.Canceled));
+    try std.testing.expectEqual(error.Canceled, normalizeWrappedTransportError(error.ReadFailed, error.Canceled));
+    try std.testing.expectEqual(error.WriteFailed, normalizeWrappedTransportError(error.WriteFailed, null));
+    try std.testing.expectEqual(error.ReadFailed, normalizeWrappedTransportError(error.ReadFailed, null));
+    try std.testing.expectEqual(error.OutOfMemory, normalizeAllocatingWriterError(error.WriteFailed));
+    try std.testing.expectEqual(error.Canceled, normalizeAllocatingWriterError(error.Canceled));
+}
+
+test "malformed gzip and zstd retain decoder errors" {
+    {
+        var input: std.Io.Reader = .fixed("not a gzip payload");
+        var decoder: std.http.Decompress = undefined;
+        const reader = decoder.init(&input, &.{}, .gzip);
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+
+        try std.testing.expectError(error.ReadFailed, reader.streamRemaining(&output.writer));
+        const decoder_error = decompressionReadError(&decoder) orelse return error.ExpectedDecoderError;
+        try std.testing.expect(decoder_error != error.ReadFailed);
+    }
+    {
+        var input: std.Io.Reader = .fixed("\x28\xb5\x2f");
+        var decoder: std.http.Decompress = undefined;
+        const reader = decoder.init(&input, &.{}, .zstd);
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+
+        try std.testing.expectError(error.ReadFailed, reader.streamRemaining(&output.writer));
+        const decoder_error = decompressionReadError(&decoder) orelse return error.ExpectedDecoderError;
+        try std.testing.expect(decoder_error != error.ReadFailed);
+    }
+}
+
+test "encoded response cap bounds zstd skippable input" {
+    const encoded = "\x50\x2a\x4d\x18\x40\x00\x00\x00" ++ ("x" ** 64);
+    var input: std.Io.Reader = .fixed(encoded);
+    var bounded_buffer: [2048]u8 = undefined;
+    var bounded = input.limited(.limited(17), &bounded_buffer);
+    var decoder: std.http.Decompress = undefined;
+    const reader = decoder.init(&bounded.interface, &.{}, .zstd);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    _ = reader.streamRemaining(&output.writer) catch {};
+    try std.testing.expectEqual(std.Io.Limit.nothing, bounded.remaining);
+    try std.testing.expectEqual(@as(usize, 17), input.seek);
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+}
+
+test "encoded response limit leaves room for the sentinel" {
+    try validateFetchHeaders(.{ .max_encoded_response_bytes = std.math.maxInt(usize) - 2 });
+    try std.testing.expectError(
+        error.InvalidResponseLimit,
+        validateFetchHeaders(.{ .max_encoded_response_bytes = std.math.maxInt(usize) - 1 }),
+    );
+    try std.testing.expectError(
+        error.InvalidResponseLimit,
+        validateFetchHeaders(.{ .max_encoded_response_bytes = std.math.maxInt(usize) }),
+    );
+}
+
 test "HTTP deterministic response and policy failures never retry" {
     const Fixture = struct {
         client: std.http.Client,
@@ -2431,6 +2695,7 @@ test "HTTP deterministic response and policy failures never retry" {
         error.HttpRedirectLocationMissing,
         error.UnsupportedCompressionMethod,
         error.TooManyCompressedMembers,
+        error.InvalidResponseLimit,
         error.ResponseTooLarge,
         error.UnexpectedEncodedPayload,
     }) |failure| {
@@ -2621,6 +2886,12 @@ test "HTTP cache keys isolate cookie identities" {
     const second = try fetchCachePath(a, "cache", "https://fixture.invalid/data", .{ .extra_headers = &.{.{ .name = "Cookie", .value = "fixture=second" }} });
     defer a.free(second);
     try std.testing.expect(!std.mem.eql(u8, first, second));
+
+    const downgrade_allowed = try fetchCachePath(a, "cache", "https://fixture.invalid/data", .{});
+    defer a.free(downgrade_allowed);
+    const https_only = try fetchCachePath(a, "cache", "https://fixture.invalid/data", .{ .require_https = true });
+    defer a.free(https_only);
+    try std.testing.expect(!std.mem.eql(u8, downgrade_allowed, https_only));
 }
 
 test "URL resolution reserves both relative input and merged output" {

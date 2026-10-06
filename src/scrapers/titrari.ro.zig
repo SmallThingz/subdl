@@ -122,6 +122,7 @@ pub const Scraper = struct {
 
         var req = public_client.request(.HEAD, uri, .{
             .redirect_behavior = .unhandled,
+            .handle_continue = false,
             .keep_alive = false,
             .connection = pinned_connection,
             .headers = .{
@@ -135,10 +136,17 @@ pub const Scraper = struct {
         };
         defer req.deinit();
         errdefer req.connection.?.closing = true;
-        try req.sendBodiless();
+        req.sendBodiless() catch |err| return common.normalizeRequestWriteError(&req, err);
 
         var head_buffer: [16 * 1024]u8 = undefined;
-        const response = try req.receiveHead(&head_buffer);
+        var response = req.receiveHead(&head_buffer) catch |err| return common.normalizeRequestReadError(&req, err);
+        var interim_count: usize = 0;
+        while (response.head.status.class() == .informational) {
+            if (response.head.status == .switching_protocols) return error.UnsupportedProtocolUpgrade;
+            interim_count += 1;
+            if (interim_count > 16) return error.TooManyInformationalResponses;
+            response = req.receiveHead(&head_buffer) catch |err| return common.normalizeRequestReadError(&req, err);
+        }
         if (!try archiveProbeStatusIsUsable(response.head.status)) return .unknown;
         return archiveHintFromHeaders(response.head.bytes);
     }

@@ -346,7 +346,10 @@ fn fetchDownloadByDetailsPathWith(
     const download_url = details.download_url orelse return error.InvalidDownloadUrl;
     try validateSubsourceApiUrl(download_url);
 
-    return fetchAuthenticatedWithAllocators(fetch_download, acquire, client, allocator, a, download_url, null, &auth, options);
+    const response = try fetchAuthenticatedWithAllocators(fetch_download, acquire, client, allocator, a, download_url, null, &auth, options);
+    errdefer allocator.free(response.body);
+    try validateDownloadBody(response.body);
+    return response;
 }
 
 const RankedQuery = common.TitleYear;
@@ -573,6 +576,17 @@ fn requireApiResponse(response: common.HttpResponse) !void {
     if (response.status != .ok) return error.UnexpectedHttpStatus;
 }
 
+fn validateDownloadBody(body: []const u8) !void {
+    if (body.len < 4) return error.UnexpectedResponseType;
+    const signature = body[0..4];
+    if (!std.mem.eql(u8, signature, "PK\x03\x04") and
+        !std.mem.eql(u8, signature, "PK\x05\x06") and
+        !std.mem.eql(u8, signature, "PK\x07\x08"))
+    {
+        return error.UnexpectedResponseType;
+    }
+}
+
 fn validateSubsourceApiUrl(url: []const u8) !void {
     try common.validatePublicHttpUrl(url);
     if (!(try common.sameOrigin(api_base, url))) return error.InvalidDownloadUrl;
@@ -723,6 +737,7 @@ fn getWithAuth(comptime fetch: anytype, client: *std.http.Client, allocator: All
         .retry_on_429 = false,
         .cache = false,
         .require_public_origin = true,
+        .require_https = true,
     });
 }
 
@@ -759,6 +774,7 @@ fn postJson(client: *std.http.Client, allocator: Allocator, url: []const u8, pay
         .retry_on_429 = false,
         .cache = false,
         .require_public_origin = true,
+        .require_https = true,
     });
 }
 
@@ -1183,7 +1199,7 @@ test "subsource authenticated download keeps recovered auth for the archive" {
             try std.testing.expect(payload == null);
             try std.testing.expectEqual(@as(u64, 41), auth.browser_session.?.generation);
             try std.testing.expectEqualStrings("fixture-browser-agent", auth.user_agent);
-            return .{ .status = .ok, .body = try allocator.dupe(u8, "PK fixture archive") };
+            return .{ .status = .ok, .body = try allocator.dupe(u8, "PK\x03\x04fixture archive") };
         }
 
         fn acquire(allocator: Allocator, request_url: []const u8, rejected_generation: ?u64, force_refresh: bool) !Auth {
@@ -1214,10 +1230,27 @@ test "subsource authenticated download keeps recovered auth for the archive" {
         },
     );
     defer std.testing.allocator.free(response.body);
-    try std.testing.expectEqualStrings("PK fixture archive", response.body);
+    try std.testing.expectEqualStrings("PK\x03\x04fixture archive", response.body);
     try std.testing.expectEqual(@as(usize, 2), Mock.detail_calls);
     try std.testing.expectEqual(@as(usize, 1), Mock.download_calls);
     try std.testing.expectEqual(@as(usize, 1), Mock.acquire_calls);
+}
+
+test "subsource accepts ZIP signatures and rejects non-archives" {
+    for ([_][]const u8{
+        "PK\x03\x04local file",
+        "PK\x05\x06empty archive",
+        "PK\x07\x08spanning archive",
+    }) |body| try validateDownloadBody(body);
+
+    for ([_][]const u8{
+        "<html><body>provider error</body></html>",
+        "  <!DOCTYPE html><title>provider error</title>",
+        "\xef\xbb\xbf<script>window._cf_chl_opt = {};</script>",
+        "{\"error\":\"archive unavailable\"}",
+        "archive temporarily unavailable",
+        "PK fixture is not a ZIP signature",
+    }) |body| try std.testing.expectError(error.UnexpectedResponseType, validateDownloadBody(body));
 }
 
 test "subsource API URL validation rejects alternate and unsafe origins" {
