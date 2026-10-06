@@ -67,7 +67,7 @@ pub const Scraper = struct {
 
         var thread = try fetchRaw(self.client, a, item.thread_url, null, item.board_url);
         defer thread.deinit(a);
-        if (thread.status != .ok) return error.UnexpectedHttpStatus;
+        try requireOkResponseStatus(thread.status);
 
         const already_revealed = try parseRevealedAttachments(a, thread.body, item.title, item.season);
         if (already_revealed.len > 0) {
@@ -87,15 +87,14 @@ pub const Scraper = struct {
 
         var revealed = try fetchRaw(self.client, a, thank_url, thread.cookie, item.thread_url);
         defer revealed.deinit(a);
-        if (revealed.status != .ok) return error.UnexpectedHttpStatus;
+        try requireOkResponseStatus(revealed.status);
 
         var subtitles = try parseRevealedAttachments(a, revealed.body, item.title, item.season);
         if (subtitles.len == 0) {
             var refreshed = try fetchRaw(self.client, a, item.thread_url, thread.cookie, item.board_url);
             defer refreshed.deinit(a);
-            if (refreshed.status == .ok) {
-                subtitles = try parseRevealedAttachments(a, refreshed.body, item.title, item.season);
-            }
+            try requireOkResponseStatus(refreshed.status);
+            subtitles = try parseRevealedAttachments(a, refreshed.body, item.title, item.season);
         }
         return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
@@ -109,6 +108,12 @@ const Board = struct {
     title: []const u8,
     url: []const u8,
 };
+
+fn requireOkResponseStatus(status: std.http.Status) !void {
+    if (status == .too_many_requests) return error.RateLimited;
+    if (status == .unauthorized or status == .forbidden) return error.ProviderAccessBlocked;
+    if (status != .ok) return error.UnexpectedHttpStatus;
+}
 
 fn findBoard(allocator: Allocator, body: []const u8, query: []const u8) !?Board {
     const wanted = try common.normalizeTitle(allocator, query);
@@ -428,7 +433,6 @@ const RawResponse = common.RawResponse;
 fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, cookie: ?[]const u8, referer: ?[]const u8) !RawResponse {
     try validateProviderEndpoint(url);
     if (referer) |value| try validateProviderEndpoint(value);
-    try common.ensureClientTlsReady(client);
     const normalized = try common.normalizeUrlForFetch(allocator, url);
     defer allocator.free(normalized);
     const uri = try std.Uri.parse(normalized);
@@ -445,15 +449,27 @@ fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, coo
     }
     headers[count] = .{ .name = "accept", .value = "text/html,application/xhtml+xml,application/xml,*/*" };
     count += 1;
+    try common.validateHttpHeaders(headers[0..count]);
 
-    var req = try client.request(.GET, uri, .{
+    var public_client: std.http.Client = undefined;
+    try common.initPublicOriginClient(client, &public_client);
+    defer public_client.deinit();
+    const pinned_connection = try common.connectPinnedPublicHttpUrl(&public_client, allocator, normalized);
+    pinned_connection.closing = true;
+
+    var req = public_client.request(.GET, uri, .{
         .redirect_behavior = .unhandled,
+        .keep_alive = false,
+        .connection = pinned_connection,
         .headers = .{
             .user_agent = .{ .override = common.default_user_agent },
             .accept_encoding = .{ .override = "identity" },
         },
         .extra_headers = headers[0..count],
-    });
+    }) catch |err| {
+        public_client.connection_pool.release(pinned_connection, public_client.io);
+        return err;
+    };
     defer req.deinit();
     errdefer req.connection.?.closing = true;
     try req.sendBodiless();
@@ -561,6 +577,14 @@ fn extractCookie(allocator: Allocator, headers: []const u8) !?[]u8 {
 test "subcentral parses season and episode" {
     try std.testing.expectEqual(@as(?i64, 1), parseSeason("Breaking Bad - Staffel 1 - [DE-Subs]"));
     try std.testing.expectEqual(@as(?i64, 1), parseEpisode("E01 - Pilot"));
+}
+
+test "subcentral classifies raw response failures" {
+    try requireOkResponseStatus(.ok);
+    try std.testing.expectError(error.RateLimited, requireOkResponseStatus(.too_many_requests));
+    try std.testing.expectError(error.ProviderAccessBlocked, requireOkResponseStatus(.unauthorized));
+    try std.testing.expectError(error.ProviderAccessBlocked, requireOkResponseStatus(.forbidden));
+    try std.testing.expectError(error.UnexpectedHttpStatus, requireOkResponseStatus(.internal_server_error));
 }
 
 test "subcentral rejects unsafe raw request targets before fetch" {

@@ -103,53 +103,73 @@ pub const Scraper = struct {
     }
 
     fn preferZipMovieDuplicate(self: *Scraper, allocator: Allocator, response: *SearchResponse) !void {
-        if (response.items.len < 2) return;
-        const first = response.items[0];
-        if (first.media_kind != .movie) return;
-        if (try optionalArchiveProbe(self.probeArchiveKind(allocator, first)) != .rar) return;
-
-        const max_probe = @min(response.items.len, @as(usize, 6));
-        var idx: usize = 1;
-        while (idx < max_probe) : (idx += 1) {
-            const candidate = response.items[idx];
-            if (candidate.media_kind != .movie) continue;
-            if (!std.ascii.eqlIgnoreCase(candidate.title, first.title)) continue;
-            if (candidate.year != first.year) continue;
-            if (try optionalArchiveProbe(self.probeArchiveKind(allocator, candidate)) != .zip) continue;
-
-            const reordered = try allocator.alloc(SearchItem, response.items.len);
-            @memcpy(reordered, response.items);
-            std.mem.swap(SearchItem, &reordered[0], &reordered[idx]);
-            response.items = reordered;
-            return;
-        }
+        return preferZipMovieDuplicateWith(probeArchiveKindForPreference, self, allocator, response);
     }
 
     fn probeArchiveKind(self: *Scraper, allocator: Allocator, item: SearchItem) !ArchiveHint {
         try validateProviderEndpoint(item.download_url);
         try validateProviderEndpoint(item.page_url);
-        try common.ensureClientTlsReady(self.client);
         const normalized = try common.normalizeUrlForFetch(allocator, item.download_url);
         defer allocator.free(normalized);
         const uri = try std.Uri.parse(normalized);
         const headers = [_]std.http.Header{.{ .name = "referer", .value = item.page_url }};
-        var req = try self.client.request(.HEAD, uri, .{
+        try common.validateHttpHeaders(&headers);
+        var public_client: std.http.Client = undefined;
+        try common.initPublicOriginClient(self.client, &public_client);
+        defer public_client.deinit();
+        const pinned_connection = try common.connectPinnedPublicHttpUrl(&public_client, allocator, normalized);
+        pinned_connection.closing = true;
+
+        var req = public_client.request(.HEAD, uri, .{
             .redirect_behavior = .unhandled,
+            .keep_alive = false,
+            .connection = pinned_connection,
             .headers = .{
                 .user_agent = .{ .override = common.default_user_agent },
                 .accept_encoding = .{ .override = "identity" },
             },
             .extra_headers = &headers,
-        });
+        }) catch |err| {
+            public_client.connection_pool.release(pinned_connection, public_client.io);
+            return err;
+        };
         defer req.deinit();
+        errdefer req.connection.?.closing = true;
         try req.sendBodiless();
 
         var head_buffer: [16 * 1024]u8 = undefined;
         const response = try req.receiveHead(&head_buffer);
-        if (response.head.status != .ok) return .unknown;
+        if (!try archiveProbeStatusIsUsable(response.head.status)) return .unknown;
         return archiveHintFromHeaders(response.head.bytes);
     }
 };
+
+fn probeArchiveKindForPreference(scraper: *Scraper, allocator: Allocator, item: SearchItem) !ArchiveHint {
+    return scraper.probeArchiveKind(allocator, item);
+}
+
+fn preferZipMovieDuplicateWith(comptime probe: anytype, context: anytype, allocator: Allocator, response: *SearchResponse) !void {
+    if (response.items.len < 2) return;
+    const first = response.items[0];
+    if (first.media_kind != .movie) return;
+    if (try optionalArchiveProbe(probe(context, allocator, first)) != .rar) return;
+
+    const max_probe = @min(response.items.len, @as(usize, 6));
+    var idx: usize = 1;
+    while (idx < max_probe) : (idx += 1) {
+        const candidate = response.items[idx];
+        if (candidate.media_kind != .movie) continue;
+        if (!std.ascii.eqlIgnoreCase(candidate.title, first.title)) continue;
+        if (candidate.year != first.year) continue;
+        if (try optionalArchiveProbe(probe(context, allocator, candidate)) != .zip) continue;
+
+        const reordered = try allocator.alloc(SearchItem, response.items.len);
+        @memcpy(reordered, response.items);
+        std.mem.swap(SearchItem, &reordered[0], &reordered[idx]);
+        response.items = reordered;
+        return;
+    }
+}
 
 fn validateProviderEndpoint(url: []const u8) !void {
     try common.validatePublicHttpUrl(url);
@@ -164,10 +184,16 @@ const ArchiveHint = enum {
 };
 
 fn optionalArchiveProbe(result: anyerror!ArchiveHint) !ArchiveHint {
-    return result catch |err| switch (err) {
-        error.Canceled, error.OutOfMemory => return err,
-        else => .unknown,
+    return result catch |err| {
+        if (common.mustPropagateOptionalFailure(err)) return err;
+        return .unknown;
     };
+}
+
+fn archiveProbeStatusIsUsable(status: std.http.Status) !bool {
+    if (status == .too_many_requests) return error.RateLimited;
+    if (status == .unauthorized or status == .forbidden) return error.ProviderAccessBlocked;
+    return status == .ok;
 }
 
 test "titrari archive preference preserves search on probe failure" {
@@ -175,6 +201,35 @@ test "titrari archive preference preserves search on probe failure" {
     try std.testing.expectEqual(ArchiveHint.zip, try optionalArchiveProbe(.zip));
     try std.testing.expectError(error.Canceled, optionalArchiveProbe(error.Canceled));
     try std.testing.expectError(error.OutOfMemory, optionalArchiveProbe(error.OutOfMemory));
+    try std.testing.expectError(error.RateLimited, optionalArchiveProbe(error.RateLimited));
+    try std.testing.expectError(error.UnsafeHttpTarget, optionalArchiveProbe(error.UnsafeHttpTarget));
+
+    try std.testing.expect(try archiveProbeStatusIsUsable(.ok));
+    try std.testing.expect(!(try archiveProbeStatusIsUsable(.service_unavailable)));
+    try std.testing.expectError(error.RateLimited, archiveProbeStatusIsUsable(.too_many_requests));
+    try std.testing.expectError(error.ProviderAccessBlocked, archiveProbeStatusIsUsable(.unauthorized));
+    try std.testing.expectError(error.ProviderAccessBlocked, archiveProbeStatusIsUsable(.forbidden));
+}
+
+test "titrari archive preference stops probing on a rate limit" {
+    const Mock = struct {
+        fn probe(calls: *usize, _: Allocator, _: SearchItem) !ArchiveHint {
+            calls.* += 1;
+            return error.RateLimited;
+        }
+    };
+    const items = [_]SearchItem{
+        .{ .title = "Movie", .year = 2024, .media_kind = .movie, .language_code = "ro", .subtitle_id = "1", .page_url = site ++ "/one", .download_url = site ++ "/get.php?id=1" },
+        .{ .title = "Movie", .year = 2024, .media_kind = .movie, .language_code = "ro", .subtitle_id = "2", .page_url = site ++ "/two", .download_url = site ++ "/get.php?id=2" },
+    };
+    var response: SearchResponse = .{
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+        .items = &items,
+    };
+    defer response.deinit();
+    var calls: usize = 0;
+    try std.testing.expectError(error.RateLimited, preferZipMovieDuplicateWith(Mock.probe, &calls, response.arena.allocator(), &response));
+    try std.testing.expectEqual(@as(usize, 1), calls);
 }
 
 fn archiveHintFromHeaders(headers: []const u8) ArchiveHint {

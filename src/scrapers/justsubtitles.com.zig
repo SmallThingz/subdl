@@ -122,6 +122,7 @@ fn validateProviderUrl(url: []const u8) !void {
 
 fn extractNextFlightText(allocator: Allocator, body: []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
     const marker = "self.__next_f.push(";
     var cursor: usize = 0;
 
@@ -131,7 +132,7 @@ fn extractNextFlightText(allocator: Allocator, body: []const u8) ![]u8 {
         cursor = close + ")</script>".len;
         const payload = body[payload_start..close];
 
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch continue;
+        var parsed = (try parseNextFlightPayload(allocator, payload)) orelse continue;
         defer parsed.deinit();
         const array = switch (parsed.value) {
             .array => |value| value,
@@ -146,6 +147,13 @@ fn extractNextFlightText(allocator: Allocator, body: []const u8) ![]u8 {
     }
 
     return out.toOwnedSlice(allocator);
+}
+
+fn parseNextFlightPayload(allocator: Allocator, payload: []const u8) Allocator.Error!?std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
 }
 
 fn parseInitialSubtitles(allocator: Allocator, flight: []const u8) ![]const SubtitleItem {
@@ -295,6 +303,21 @@ test "justsubtitles extracts next flight strings" {
     const text = try extractNextFlightText(allocator, body);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("hello\nworld", text);
+}
+
+test "justsubtitles flight JSON skips malformed input and preserves allocation errors" {
+    const body =
+        "<script>self.__next_f.push(not-json)</script>" ++
+        "<script>self.__next_f.push([1,\"valid\"])</script>";
+    const text = try extractNextFlightText(std.testing.allocator, body);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("valid", text);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        parseNextFlightPayload(failing.allocator(), "[1,\"text\"]"),
+    );
 }
 
 test "live justsubtitles movie search listing and download" {

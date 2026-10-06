@@ -5,7 +5,9 @@ const impl = if (enabled)
     @import("alldriver_upstream")
 else
     struct {
-        const StubInstall = struct {};
+        const StubInstall = struct {
+            path: []const u8 = "",
+        };
 
         const StubCookie = struct {
             domain: []const u8 = "",
@@ -19,6 +21,15 @@ else
             pub fn deinit(_: *StubInstallList) void {}
         };
 
+        pub const TimeoutPolicy = struct {
+            launch_ms: u32 = 15_000,
+            attach_ms: u32 = 10_000,
+            navigate_ms: u32 = 30_000,
+            wait_ms: u32 = 30_000,
+            network_ms: u32 = 15_000,
+            overall_ms: ?u32 = null,
+        };
+
         pub fn discover(_: anytype, _: anytype, _: anytype) !StubInstallList {
             return .{};
         }
@@ -28,6 +39,8 @@ else
                 base: Base = .{},
 
                 pub fn deinit(_: *ModernSession) void {}
+
+                pub fn setTimeoutPolicy(_: *ModernSession, _: anytype) void {}
 
                 pub fn page(_: *ModernSession) Page {
                     return .{};
@@ -43,6 +56,10 @@ else
             };
 
             pub fn launch(_: anytype, _: anytype) !ModernSession {
+                return error.AllDriverUnavailable;
+            }
+
+            pub fn attach(_: anytype, _: []const u8) !ModernSession {
                 return error.AllDriverUnavailable;
             }
 
@@ -85,6 +102,7 @@ pub const BrowserPreference = impl.BrowserPreference;
 pub const DiscoveryOptions = impl.DiscoveryOptions;
 pub const Cookie = impl.Cookie;
 pub const InstallList = impl.BrowserInstallList;
+pub const TimeoutPolicy = impl.TimeoutPolicy;
 pub const modern = impl.modern;
 
 pub fn discover(allocator: anytype, options: anytype, overrides: anytype) !InstallList {

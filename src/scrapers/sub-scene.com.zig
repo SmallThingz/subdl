@@ -40,15 +40,8 @@ pub const Scraper = struct {
         const a = arena.allocator();
         const encoded = try common.encodeUriComponent(a, std.mem.trim(u8, query, " \t\r\n"));
         const url = try std.fmt.allocPrint(a, "{s}/suggest?query={s}", .{ site, encoded });
-        const response = try common.fetchBytes(self.client, a, url, .{
-            .accept = "application/json",
-            .allow_non_ok = true,
-            .max_attempts = 2,
-            .cache = false,
-            .require_public_origin = true,
-        });
-        if (isCloudflareChallenge(response.status, response.body)) return error.CloudflareChallenge;
-        if (response.status != .ok) return error.UnexpectedHttpStatus;
+        const response = try common.fetchBytes(self.client, a, url, providerFetchOptions("application/json"));
+        try requireSuccessfulResponse(response.status, response.body);
         return parseSuggestJson(common.takeArena(&arena), response.body);
     }
 
@@ -57,18 +50,29 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
         try validateProviderEndpoint(page_url);
-        const response = try common.fetchBytes(self.client, a, page_url, .{
-            .accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            .allow_non_ok = true,
-            .max_attempts = 2,
-            .cache = false,
-            .require_public_origin = true,
-        });
-        if (isCloudflareChallenge(response.status, response.body)) return error.CloudflareChallenge;
-        if (response.status != .ok) return error.UnexpectedHttpStatus;
+        const response = try common.fetchBytes(
+            self.client,
+            a,
+            page_url,
+            providerFetchOptions("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+        );
+        try requireSuccessfulResponse(response.status, response.body);
         return parseSubtitlesHtml(common.takeArena(&arena), response.body);
     }
 };
+
+fn providerFetchOptions(accept: []const u8) common.FetchOptions {
+    return .{
+        .accept = accept,
+        .allow_non_ok = true,
+        .max_attempts = 2,
+        // The provider owns 429 classification. Do not send another request
+        // before it can return the terminal RateLimited result.
+        .retry_on_429 = false,
+        .cache = false,
+        .require_public_origin = true,
+    };
+}
 
 fn parseSuggestJson(arena: std.heap.ArenaAllocator, body: []const u8) !SearchResponse {
     var owned_arena = arena;
@@ -202,6 +206,12 @@ fn isCloudflareChallenge(_: std.http.Status, body: []const u8) bool {
     return cf.isChallengeBody(body);
 }
 
+fn requireSuccessfulResponse(status: std.http.Status, body: []const u8) !void {
+    if (status == .too_many_requests) return error.RateLimited;
+    if (isCloudflareChallenge(status, body)) return error.CloudflareChallenge;
+    if (status != .ok) return error.UnexpectedHttpStatus;
+}
+
 fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
     const resolved = try common.resolveUrl(allocator, site, href);
     errdefer allocator.free(resolved);
@@ -228,6 +238,22 @@ test "sub-scene detects positive challenge pages independently of status" {
         try std.testing.expect(!isCloudflareChallenge(status, "<html><body>Just a moment: a movie title</body></html>"));
         try std.testing.expect(!isCloudflareChallenge(status, "<html><body>Subtitle details<script src='/cdn-cgi/challenge-platform/scripts/jsd/main.js'></script></body></html>"));
     }
+}
+
+test "sub-scene prioritizes rate limiting over challenge detection" {
+    const challenge = "<!DOCTYPE html><html><title>Just a moment...</title><script src='/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1'></script></html>";
+    try requireSuccessfulResponse(.ok, "{\"film\":[]}");
+    try std.testing.expectError(error.RateLimited, requireSuccessfulResponse(.too_many_requests, challenge));
+    try std.testing.expectError(error.CloudflareChallenge, requireSuccessfulResponse(.forbidden, challenge));
+    try std.testing.expectError(error.UnexpectedHttpStatus, requireSuccessfulResponse(.service_unavailable, "temporarily unavailable"));
+}
+
+test "sub-scene leaves rate-limit retry to its status classifier" {
+    const options = providerFetchOptions("application/json");
+    try std.testing.expect(options.allow_non_ok);
+    try std.testing.expectEqual(@as(usize, 2), options.max_attempts);
+    try std.testing.expect(!options.retry_on_429);
+    try std.testing.expect(!options.cache);
 }
 
 test "sub-scene parses search and subtitle pages" {

@@ -52,16 +52,13 @@ pub const Scraper = struct {
             .allow_non_ok = true,
             .cache = false,
             .max_attempts = 3,
+            .retry_on_429 = false,
             .require_public_origin = true,
         });
 
         // Nekur currently emits a complete search table with HTTP 500. Keep
         // this exception provider-local and reject every other non-OK shape.
-        if (response.status != .ok and
-            !(response.status == .internal_server_error and hasSearchTable(response.body)))
-        {
-            return error.UnexpectedHttpStatus;
-        }
+        try requireSearchResponse(response.status, response.body);
 
         return parseSearchHtml(common.takeArena(&arena), response.body, trimmed);
     }
@@ -166,6 +163,13 @@ fn hasSearchTable(body: []const u8) bool {
         std.mem.indexOf(u8, body, "<tbody") != null;
 }
 
+fn requireSearchResponse(status: std.http.Status, body: []const u8) !void {
+    if (status == .too_many_requests) return error.RateLimited;
+    if (status == .ok) return;
+    if (status == .internal_server_error and hasSearchTable(body)) return;
+    return error.UnexpectedHttpStatus;
+}
+
 fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
     const resolved = try common.resolveUrl(allocator, site, href);
     errdefer allocator.free(resolved);
@@ -206,6 +210,9 @@ test "nekur recognizes valid search table on upstream error response" {
         \\<table id="subt_tabula" class="sTable"><tbody><tr></tr></tbody></table>
     ));
     try std.testing.expect(!hasSearchTable("<html><h1>Internal Server Error</h1></html>"));
+    try requireSearchResponse(.internal_server_error, "<table id=\"subt_tabula\"><tbody></tbody></table>");
+    try std.testing.expectError(error.RateLimited, requireSearchResponse(.too_many_requests, "busy"));
+    try std.testing.expectError(error.UnexpectedHttpStatus, requireSearchResponse(.internal_server_error, "<h1>Internal Server Error</h1>"));
 }
 
 test "nekur rejects unsafe provider urls before fetch" {

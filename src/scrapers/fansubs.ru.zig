@@ -52,7 +52,7 @@ pub const Scraper = struct {
         });
 
         if (isRateLimited(response.body)) {
-            common.sleepMilliseconds(5200);
+            try common.sleepMillisecondsCancelable(5200);
             response = try common.fetchBytes(self.client, a, search_url, .{
                 .method = .POST,
                 .payload = payload,
@@ -66,6 +66,7 @@ pub const Scraper = struct {
                 .require_public_origin = true,
             });
         }
+        try requireSearchNotRateLimited(response.body);
 
         return parseSearchHtml(common.takeArena(&arena), response.body, trimmed);
     }
@@ -105,17 +106,17 @@ pub const Scraper = struct {
         var attempt: usize = 0;
         while (attempt < 3) : (attempt += 1) {
             const response = fetchDownloadOnce(self.client, allocator, payload) catch |err| {
-                if (err == error.Canceled or err == error.OutOfMemory or err == error.ResponseTooLarge) return err;
+                if (!shouldRetryDownloadError(err)) return err;
                 if (attempt + 1 < 3) {
-                    common.sleepMilliseconds(250 * (attempt + 1));
+                    try common.sleepMillisecondsCancelable(250 * (attempt + 1));
                     continue;
                 }
                 return err;
             };
-            if (response.status != .ok) {
+            requireDownloadStatus(response.status) catch |err| {
                 allocator.free(response.body);
-                return error.UnexpectedHttpStatus;
-            }
+                return err;
+            };
             if (common.looksLikeHtml(response.body)) {
                 allocator.free(response.body);
                 return error.UnexpectedResponseType;
@@ -126,15 +127,31 @@ pub const Scraper = struct {
     }
 };
 
+fn shouldRetryDownloadError(err: anyerror) bool {
+    return !common.mustNotRetryFetchError(err);
+}
+
+fn requireDownloadStatus(status: std.http.Status) !void {
+    if (status == .too_many_requests) return error.RateLimited;
+    if (status != .ok) return error.UnexpectedHttpStatus;
+}
+
 fn fetchDownloadOnce(client: *std.http.Client, allocator: Allocator, payload: []const u8) !common.HttpResponse {
     try validateProviderUrl(download_url);
-    try common.ensureClientTlsReady(client);
     const normalized = try common.normalizeUrlForFetch(allocator, download_url);
     defer allocator.free(normalized);
     const uri = try std.Uri.parse(normalized);
 
-    var req = try client.request(.POST, uri, .{
+    var public_client: std.http.Client = undefined;
+    try common.initPublicOriginClient(client, &public_client);
+    defer public_client.deinit();
+    const pinned_connection = try common.connectPinnedPublicHttpUrl(&public_client, allocator, normalized);
+    pinned_connection.closing = true;
+
+    var req = public_client.request(.POST, uri, .{
         .redirect_behavior = .unhandled,
+        .keep_alive = false,
+        .connection = pinned_connection,
         .headers = .{
             .user_agent = .{ .override = common.default_user_agent },
             .accept_encoding = .{ .override = "identity" },
@@ -144,7 +161,10 @@ fn fetchDownloadOnce(client: *std.http.Client, allocator: Allocator, payload: []
             .{ .name = "accept", .value = "application/octet-stream,application/zip,application/x-rar-compressed,text/plain,*/*" },
             .{ .name = "accept-language", .value = "ru,en;q=0.8" },
         },
-    });
+    }) catch |err| {
+        public_client.connection_pool.release(pinned_connection, public_client.io);
+        return err;
+    };
     defer req.deinit();
     errdefer req.connection.?.closing = true;
 
@@ -322,6 +342,10 @@ fn isRateLimited(body: []const u8) bool {
     return std.mem.indexOf(u8, body, "\xCF\xEE\xE2\xF2\xEE\xF0\xE8\xF2\xE5 \xE7\xE0\xEF\xF0\xEE\xF1 \xF7\xE5\xF0\xE5\xE7 5 \xF1\xE5\xEA\xF3\xED\xE4") != null;
 }
 
+fn requireSearchNotRateLimited(body: []const u8) !void {
+    if (isRateLimited(body)) return error.RateLimited;
+}
+
 fn readBoundedBody(allocator: Allocator, reader: *std.Io.Reader, max_bytes: usize) ![]u8 {
     var writer = std.Io.Writer.Allocating.init(allocator);
     defer writer.deinit();
@@ -373,6 +397,33 @@ test "fansubs rejects non-provider page targets" {
     }
 }
 
+test "fansubs download retry policy stops on deterministic transport errors" {
+    try std.testing.expect(!shouldRetryDownloadError(error.PublicOriginProxyUnsupported));
+    try std.testing.expect(!shouldRetryDownloadError(error.InvalidDownloadUrl));
+    try std.testing.expect(!shouldRetryDownloadError(error.ResponseTooLarge));
+    try std.testing.expect(!shouldRetryDownloadError(error.Canceled));
+    try std.testing.expect(!shouldRetryDownloadError(error.OutOfMemory));
+    try std.testing.expect(shouldRetryDownloadError(error.ConnectionResetByPeer));
+}
+
+test "fansubs raw download classifies rate limits" {
+    try requireDownloadStatus(.ok);
+    try std.testing.expectError(error.RateLimited, requireDownloadStatus(.too_many_requests));
+    try std.testing.expectError(error.UnexpectedHttpStatus, requireDownloadStatus(.service_unavailable));
+}
+
+test "fansubs rejects a rate-limit body after retry" {
+    try std.testing.expectError(
+        error.RateLimited,
+        requireSearchNotRateLimited("Please repeat the search in 5 seconds"),
+    );
+    try std.testing.expectError(
+        error.RateLimited,
+        requireSearchNotRateLimited("\xCF\xEE\xE2\xF2\xEE\xF0\xE8\xF2\xE5 \xE7\xE0\xEF\xF0\xEE\xF1 \xF7\xE5\xF0\xE5\xE7 5 \xF1\xE5\xEA\xF3\xED\xE4"),
+    );
+    try requireSearchNotRateLimited("<html><body>search results</body></html>");
+}
+
 test "fansubs parses search and subtitle rows" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -414,7 +465,7 @@ test "live fansubs movie and tv downloads" {
     try std.testing.expect(movie_dl.body.len > 8);
     try std.testing.expect(std.mem.startsWith(u8, movie_dl.body, "Rar!") or std.mem.startsWith(u8, movie_dl.body, "PK"));
 
-    common.sleepMilliseconds(5200);
+    try common.sleepMillisecondsCancelable(5200);
     var tv = try scraper.search("Death Note");
     defer tv.deinit();
     try std.testing.expect(tv.items.len > 0);

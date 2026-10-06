@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
     const pic = b.option(bool, "pic", "Force PIC mode");
     const llvm = b.option(bool, "llvm", "Use LLVM codegen backend") orelse true;
     const enable_tui = b.option(bool, "enable-tui", "Enable TUI support via libvaxis") orelse true;
-    const enable_alldriver = b.option(bool, "enable-alldriver", "Enable browser automation support via alldriver") orelse false;
+    const enable_alldriver = b.option(bool, "enable-alldriver", "Enable local Chromium session handoff") orelse false;
     const enable_unarr = b.option(bool, "enable-unarr", "Enable archive extraction support via unarr") orelse true;
     const live_mode = b.option([]const u8, "live", "Live test mode: off | smoke | named | extensive | all") orelse "off";
     const live_providers = b.option([]const u8, "live-providers", "Comma-separated provider filter for live tests, or '*' for all") orelse "*";

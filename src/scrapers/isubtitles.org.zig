@@ -1,5 +1,6 @@
 const std = @import("std");
 const common = @import("common.zig");
+const cloudflare = @import("opensubtitles_com_cf.zig");
 const html = @import("htmlparser");
 const HtmlParseOptions: html.ParseOptions = .{};
 const HtmlDocument = HtmlParseOptions.GetDocument();
@@ -114,10 +115,15 @@ pub const Scraper = struct {
     }
 
     pub fn fetchSubtitlesByMovieLinkWithOptions(self: *Scraper, details_url: []const u8, options: SubtitlesOptions) !SubtitlesResponse {
+        return self.fetchSubtitlesByMovieLinkWithOptionsUsing(common.fetchBytes, details_url, options);
+    }
+
+    fn fetchSubtitlesByMovieLinkWithOptionsUsing(self: *Scraper, comptime fetch: anytype, details_url: []const u8, options: SubtitlesOptions) !SubtitlesResponse {
         try validateProviderUrl(details_url);
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+        const owned_details_url = try a.dupe(u8, details_url);
 
         var out: std.ArrayListUnmanaged(SubtitleItem) = .empty;
         var seen = std.StringHashMapUnmanaged(void).empty;
@@ -135,12 +141,12 @@ pub const Scraper = struct {
         while (traversed < max_pages) : (traversed += 1) {
             last_page = page;
             const page_url = if (traversed == 0)
-                (if (page == 1) details_url else try addOrReplacePageQuery(a, details_url, page))
+                (if (page == 1) owned_details_url else try addOrReplacePageQuery(a, owned_details_url, page))
             else if (next_url) |u|
                 u
             else
                 break;
-            const response = try self.fetchHtml(a, page_url);
+            const response = try fetchHtmlWith(fetch, self.client, a, page_url);
             if (response.body.len == 0) break;
 
             var parsed = try common.parseHtmlStable(a, response.body);
@@ -162,25 +168,20 @@ pub const Scraper = struct {
                 if (seen.contains(download_page_url)) continue;
                 try seen.put(a, download_page_url, {});
 
-                const language_raw = textAt(row, a, "td[data-title='Language'] a") catch null;
-                const release = textAt(row, a, "td[data-title='Release / Movie'] a") catch null;
-                const created_at = textAt(row, a, "td[data-title='Created']") catch null;
-                const file_count = textAt(row, a, "td[data-title='File']") catch null;
-                const size = textAt(row, a, "td[data-title='Size']") catch null;
-                const comment = textAt(row, a, "td[data-title='Comment']") catch null;
+                const fields = try extractSubtitleRowText(row, a);
 
-                const filename = if (release) |r| r else if (title.len > 0) title else "subtitle.srt";
+                const filename = if (fields.release) |r| r else if (title.len > 0) title else "subtitle.srt";
 
                 try out.append(a, .{
-                    .language_raw = language_raw,
-                    .language_code = if (language_raw) |lang| common.normalizeLanguageCode(lang) else null,
-                    .release = release,
-                    .created_at = created_at,
-                    .file_count = file_count,
-                    .size = size,
-                    .comment = comment,
+                    .language_raw = fields.language_raw,
+                    .language_code = if (fields.language_raw) |lang| common.normalizeLanguageCode(lang) else null,
+                    .release = fields.release,
+                    .created_at = fields.created_at,
+                    .file_count = fields.file_count,
+                    .size = fields.size,
+                    .comment = fields.comment,
                     .filename = filename,
-                    .details_url = details_url,
+                    .details_url = owned_details_url,
                     .download_page_url = download_page_url,
                 });
             }
@@ -204,20 +205,38 @@ pub const Scraper = struct {
     }
 
     fn fetchHtml(self: *Scraper, allocator: Allocator, url: []const u8) !common.HttpResponse {
-        try validateProviderUrl(url);
-        const headers = [_]std.http.Header{
-            .{ .name = "accept-encoding", .value = "identity" },
-            .{ .name = "accept-language", .value = "en-US,en;q=0.8" },
-        };
-        return common.fetchBytes(self.client, allocator, url, .{
-            .accept = "text/html",
-            .extra_headers = &headers,
-            .max_attempts = 2,
-            .allow_non_ok = true,
-            .require_public_origin = true,
-        });
+        return fetchHtmlWith(common.fetchBytes, self.client, allocator, url);
     }
 };
+
+fn fetchHtmlWith(comptime fetch: anytype, client: *std.http.Client, allocator: Allocator, url: []const u8) !common.HttpResponse {
+    try validateProviderUrl(url);
+    const headers = [_]std.http.Header{
+        .{ .name = "accept-encoding", .value = "identity" },
+        .{ .name = "accept-language", .value = "en-US,en;q=0.8" },
+    };
+    const response = try fetch(client, allocator, url, .{
+        .accept = "text/html",
+        .extra_headers = &headers,
+        .cache = false,
+        .max_attempts = 2,
+        // The provider-level classification below owns 429 handling. A rate
+        // limit must be terminal instead of becoming a delayed second request.
+        .retry_on_429 = false,
+        .allow_non_ok = true,
+        .require_public_origin = true,
+    });
+    return acceptHtmlResponse(allocator, response);
+}
+
+fn acceptHtmlResponse(allocator: Allocator, response: common.HttpResponse) !common.HttpResponse {
+    errdefer allocator.free(response.body);
+    if (response.status == .too_many_requests) return error.RateLimited;
+    if (common.isAustralianWebsiteBlockPage(response.body)) return error.ProviderAccessBlocked;
+    if (cloudflare.isChallengeBody(response.body)) return error.CloudflareChallenge;
+    if (response.status != .ok) return error.UnexpectedHttpStatus;
+    return response;
+}
 
 fn validateProviderUrl(url: []const u8) !void {
     const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
@@ -298,6 +317,26 @@ fn textAt(node: HtmlNode, allocator: Allocator, comptime selector: []const u8) !
     const text = try common.innerTextTrimmedOwned(allocator, found);
     if (text.len == 0) return null;
     return text;
+}
+
+const SubtitleRowText = struct {
+    language_raw: ?[]const u8,
+    release: ?[]const u8,
+    created_at: ?[]const u8,
+    file_count: ?[]const u8,
+    size: ?[]const u8,
+    comment: ?[]const u8,
+};
+
+fn extractSubtitleRowText(row: HtmlNode, allocator: Allocator) !SubtitleRowText {
+    return .{
+        .language_raw = try textAt(row, allocator, "td[data-title='Language'] a"),
+        .release = try textAt(row, allocator, "td[data-title='Release / Movie'] a"),
+        .created_at = try textAt(row, allocator, "td[data-title='Created']"),
+        .file_count = try textAt(row, allocator, "td[data-title='File']"),
+        .size = try textAt(row, allocator, "td[data-title='Size']"),
+        .comment = try textAt(row, allocator, "td[data-title='Comment']"),
+    };
 }
 
 fn buildSearchUrl(allocator: Allocator, query: []const u8, page: usize) ![]const u8 {
@@ -495,6 +534,150 @@ test "isubtitles rejects non-provider navigation targets" {
     }) |url| {
         try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl(url));
     }
+}
+
+test "isubtitles subtitle response owns the caller details URL" {
+    const Fixture = struct {
+        fn fetch(_: *std.http.Client, allocator: Allocator, url: []const u8, options: common.FetchOptions) !common.HttpResponse {
+            try std.testing.expectEqualStrings(site ++ "/the-matrix-subtitles", url);
+            try std.testing.expect(!options.cache);
+            return .{
+                .status = .ok,
+                .body = try allocator.dupe(
+                    u8,
+                    "<section><table class='table'><tr>" ++
+                        "<td data-title='Language'><a>English</a></td>" ++
+                        "<td data-title='Release / Movie'><a>The.Matrix.1999</a></td>" ++
+                        "<td data-title='Download'><a href='/download/123'>Download</a></td>" ++
+                        "</tr></table></section>",
+                ),
+            };
+        }
+    };
+
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &client);
+    var details_url = (site ++ "/the-matrix-subtitles").*;
+    var response = try scraper.fetchSubtitlesByMovieLinkWithOptionsUsing(Fixture.fetch, &details_url, .{});
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), response.subtitles.len);
+    @memset(&details_url, 'x');
+    try std.testing.expectEqualStrings(site ++ "/the-matrix-subtitles", response.subtitles[0].details_url);
+}
+
+fn HtmlResponseFixture(comptime status: std.http.Status, comptime body: []const u8) type {
+    return struct {
+        fn fetch(_: *std.http.Client, allocator: Allocator, _: []const u8, options: common.FetchOptions) !common.HttpResponse {
+            try std.testing.expect(!options.cache);
+            return .{ .status = status, .body = try allocator.dupe(u8, body) };
+        }
+    };
+}
+
+fn HtmlErrorFixture(comptime fetch_error: anyerror) type {
+    return struct {
+        fn fetch(_: *std.http.Client, _: Allocator, _: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+            return fetch_error;
+        }
+    };
+}
+
+test "isubtitles classifies failed and deceptive HTML responses" {
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+
+    const challenge = "<!doctype html><html><title>Just a moment...</title><script>window._cf_chl_opt = {};</script></html>";
+    inline for (.{ std.http.Status.ok, std.http.Status.forbidden, std.http.Status.service_unavailable }) |status| {
+        try std.testing.expectError(error.CloudflareChallenge, fetchHtmlWith(
+            HtmlResponseFixture(status, challenge).fetch,
+            &client,
+            std.testing.allocator,
+            site ++ "/search?kwd=matrix",
+        ));
+    }
+
+    const access_block = "<h2>Access to Website Disabled</h2><p>The Federal Court of Australia has determined that this website infringes copyright.</p>";
+    inline for (.{ std.http.Status.ok, std.http.Status.forbidden }) |status| {
+        try std.testing.expectError(error.ProviderAccessBlocked, fetchHtmlWith(
+            HtmlResponseFixture(status, access_block).fetch,
+            &client,
+            std.testing.allocator,
+            site ++ "/search?kwd=matrix",
+        ));
+    }
+
+    inline for (.{ std.http.Status.forbidden, std.http.Status.not_found, std.http.Status.internal_server_error }) |status| {
+        try std.testing.expectError(error.UnexpectedHttpStatus, fetchHtmlWith(
+            HtmlResponseFixture(status, "<html><body>ordinary error page</body></html>").fetch,
+            &client,
+            std.testing.allocator,
+            site ++ "/search?kwd=matrix",
+        ));
+    }
+
+    const accepted = try fetchHtmlWith(
+        HtmlResponseFixture(.ok, "<html><body>ordinary provider page</body></html>").fetch,
+        &client,
+        std.testing.allocator,
+        site ++ "/search?kwd=matrix",
+    );
+    defer std.testing.allocator.free(accepted.body);
+    try std.testing.expectEqualStrings("<html><body>ordinary provider page</body></html>", accepted.body);
+}
+
+test "isubtitles rate limits are terminal after one request" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, _: []const u8, options: common.FetchOptions) !common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            try std.testing.expect(!options.retry_on_429);
+            return .{ .status = .too_many_requests, .body = try allocator.dupe(u8, "rate limited") };
+        }
+    };
+
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    try std.testing.expectError(error.RateLimited, fetchHtmlWith(
+        Fixture.fetch,
+        &fixture.client,
+        std.testing.allocator,
+        site ++ "/search?kwd=matrix",
+    ));
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+}
+
+test "isubtitles preserves cancellation and allocation failures" {
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    inline for (.{ error.Canceled, error.OutOfMemory }) |fetch_error| {
+        try std.testing.expectError(fetch_error, fetchHtmlWith(
+            HtmlErrorFixture(fetch_error).fetch,
+            &client,
+            std.testing.allocator,
+            site ++ "/search?kwd=matrix",
+        ));
+    }
+}
+
+test "isubtitles propagates subtitle row text allocation failure" {
+    const source =
+        \\<table><tr>
+        \\  <td data-title="Language"><a>English</a></td>
+        \\  <td data-title="Release / Movie"><a>The.Matrix.1999</a></td>
+        \\</tr></table>
+    ;
+    var parsed = try common.parseHtmlStable(std.testing.allocator, source);
+    defer parsed.deinit();
+    const row = parsed.doc.queryOne("tr") orelse return error.TestUnexpectedResult;
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, extractSubtitleRowText(row, failing.allocator()));
+    try std.testing.expect(failing.has_induced_failure);
 }
 
 test "isubtitles next-link text" {

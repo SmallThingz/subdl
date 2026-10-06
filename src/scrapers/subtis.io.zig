@@ -162,7 +162,7 @@ test "subtis parses movie search payload" {
     try std.testing.expectEqualStrings("https://subtis.io/subtitles/movie/the-matrix-1999", response.items[0].page_url);
 }
 
-test "live subtis movie search and subtitle listing" {
+test "live subtis movie search subtitle listing and download" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
     if (!common.providerMatchesLiveFilter(common.liveProviderFilter(), "subtis.io")) return error.SkipZigTest;
 
@@ -178,4 +178,13 @@ test "live subtis movie search and subtitle listing" {
     defer subtitles.deinit();
     try std.testing.expect(subtitles.subtitles.len > 0);
     try std.testing.expect(std.mem.startsWith(u8, subtitles.subtitles[0].download_url, "https://api.subt.is/v1/subtitle/link/"));
+
+    const download = try common.fetchBytes(&client, std.testing.allocator, subtitles.subtitles[0].download_url, .{
+        .accept = "text/plain,application/x-subrip,*/*",
+        .max_attempts = 2,
+        .require_public_origin = true,
+    });
+    defer std.testing.allocator.free(download.body);
+    try std.testing.expect(download.body.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, download.body, "-->") != null);
 }

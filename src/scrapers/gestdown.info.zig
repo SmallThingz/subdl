@@ -157,7 +157,7 @@ pub const Scraper = struct {
                         .hearing_impaired = hearing_impaired,
                         .source = if (source) |value| try a.dupe(u8, value) else null,
                         .filename = filename,
-                        .download_url = resolvePublicDownloadUrl(a, download_uri) catch continue,
+                        .download_url = (try resolveOptionalPublicDownloadUrl(a, download_uri)) orelse continue,
                     });
                 }
             }
@@ -178,20 +178,40 @@ fn resolvePublicDownloadUrl(allocator: Allocator, download_uri: []const u8) ![]c
     return resolved;
 }
 
+fn resolveOptionalPublicDownloadUrl(allocator: Allocator, download_uri: []const u8) !?[]const u8 {
+    return resolvePublicDownloadUrl(allocator, download_uri) catch |err| {
+        if (err == error.OutOfMemory or err == error.Canceled) return err;
+        return null;
+    };
+}
+
 fn fetchJson(client: *std.http.Client, allocator: Allocator, url: []const u8) !common.HttpResponse {
+    return fetchJsonWith(common.fetchBytes, common.sleepMillisecondsCancelable, client, allocator, url);
+}
+
+fn fetchJsonWith(
+    comptime fetch: anytype,
+    comptime sleep: anytype,
+    client: *std.http.Client,
+    allocator: Allocator,
+    url: []const u8,
+) !common.HttpResponse {
     var attempt: usize = 0;
     while (attempt < 3) : (attempt += 1) {
-        const response = try common.fetchBytes(client, allocator, url, .{
+        const response = try fetch(client, allocator, url, .{
             .accept = "application/json",
             .allow_non_ok = true,
             .max_attempts = 2,
-            .retry_on_429 = true,
+            // This helper classifies rate limiting itself, so it must see the
+            // first 429 instead of letting the transport retry or cache it.
+            .retry_on_429 = false,
+            .cache = false,
             .require_public_origin = true,
         });
         if (response.status == .ok) return response;
         if (@backingInt(response.status) == 423 and attempt + 1 < 3) {
             allocator.free(response.body);
-            common.sleepMilliseconds(500);
+            try sleep(500);
             continue;
         }
         if (response.status == .too_many_requests) {
@@ -219,6 +239,39 @@ test "gestdown parses show and episode payloads" {
     try std.testing.expectEqualStrings("Chernobyl", shows.items[0].object.get("name").?.string);
 }
 
+test "gestdown treats rate limits as uncached terminal responses" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, _: []const u8, options: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            try std.testing.expect(options.allow_non_ok);
+            try std.testing.expectEqual(@as(usize, 2), options.max_attempts);
+            try std.testing.expect(!options.retry_on_429);
+            try std.testing.expect(!options.cache);
+            try std.testing.expect(options.require_public_origin);
+            return .{ .status = .too_many_requests, .body = try allocator.dupe(u8, "limited") };
+        }
+
+        fn noSleep(_: u64) !void {
+            return error.UnexpectedSleep;
+        }
+    };
+
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    try std.testing.expectError(error.RateLimited, fetchJsonWith(
+        Fixture.fetch,
+        Fixture.noSleep,
+        &fixture.client,
+        std.testing.allocator,
+        site ++ "/shows/search/matrix",
+    ));
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+}
+
 test "gestdown rejects unsafe provider download targets" {
     const allocator = std.testing.allocator;
     const valid = try resolvePublicDownloadUrl(allocator, "/subtitles/episode.srt");
@@ -231,6 +284,14 @@ test "gestdown rejects unsafe provider download targets" {
     }) |url| {
         try std.testing.expectError(error.UnsafeHttpTarget, resolvePublicDownloadUrl(allocator, url));
     }
+}
+
+test "gestdown optional download URL preserves allocation failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, resolveOptionalPublicDownloadUrl(failing.allocator(), "/subtitles/episode.srt"));
+    try std.testing.expect(failing.has_induced_failure);
+
+    try std.testing.expect((try resolveOptionalPublicDownloadUrl(std.testing.allocator, "http://127.0.0.1/subtitles/episode.srt")) == null);
 }
 
 test "live gestdown search, subtitles and download" {

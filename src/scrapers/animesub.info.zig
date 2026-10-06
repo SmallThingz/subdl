@@ -414,10 +414,10 @@ fn fetchRawGet(client: *std.http.Client, allocator: Allocator, url: []const u8) 
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         return fetchRawGetOnce(client, allocator, url) catch |err| {
-            if (err == error.Canceled or err == error.OutOfMemory or err == error.ResponseTooLarge) return err;
+            if (common.mustNotRetryFetchError(err)) return err;
             if (attempt + 1 >= 4) return err;
             const shift: u6 = @intCast(@min(attempt, 4));
-            common.sleepMilliseconds(@as(u64, 250) << shift);
+            try common.sleepMillisecondsCancelable(@as(u64, 250) << shift);
             continue;
         };
     }
@@ -425,13 +425,21 @@ fn fetchRawGet(client: *std.http.Client, allocator: Allocator, url: []const u8) 
 
 fn fetchRawGetOnce(client: *std.http.Client, allocator: Allocator, url: []const u8) !RawResponse {
     try validateProviderUrl(url);
-    try common.ensureClientTlsReady(client);
+    try common.validateHttpHeaders(&.{.{ .name = "accept", .value = "text/html,application/xhtml+xml,*/*" }});
     const normalized = try common.normalizeUrlForFetch(allocator, url);
     defer allocator.free(normalized);
     const uri = try std.Uri.parse(normalized);
 
-    var req = try client.request(.GET, uri, .{
+    var public_client: std.http.Client = undefined;
+    try common.initPublicOriginClient(client, &public_client);
+    defer public_client.deinit();
+    const pinned_connection = try common.connectPinnedPublicHttpUrl(&public_client, allocator, normalized);
+    pinned_connection.closing = true;
+
+    var req = public_client.request(.GET, uri, .{
         .redirect_behavior = .unhandled,
+        .keep_alive = false,
+        .connection = pinned_connection,
         .headers = .{
             .user_agent = .{ .override = "Sub-Zero/2" },
             .accept_encoding = .{ .override = "identity" },
@@ -439,7 +447,10 @@ fn fetchRawGetOnce(client: *std.http.Client, allocator: Allocator, url: []const 
         .extra_headers = &[_]std.http.Header{
             .{ .name = "accept", .value = "text/html,application/xhtml+xml,*/*" },
         },
-    });
+    }) catch |err| {
+        public_client.connection_pool.release(pinned_connection, public_client.io);
+        return err;
+    };
     defer req.deinit();
     errdefer req.connection.?.closing = true;
     try req.sendBodiless();
@@ -541,6 +552,12 @@ test "animesubinfo rejects non-provider session targets before fetching" {
     }) |url| {
         try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl(url));
     }
+}
+
+test "animesubinfo raw request policy does not retry invalid provider URLs" {
+    try std.testing.expect(common.mustNotRetryFetchError(error.InvalidDownloadUrl));
+    try std.testing.expect(common.mustNotRetryFetchError(error.ResponseTooLarge));
+    try std.testing.expect(!common.mustNotRetryFetchError(error.ConnectionResetByPeer));
 }
 
 test "animesubinfo distinguishes failed variants from a successful fallback" {

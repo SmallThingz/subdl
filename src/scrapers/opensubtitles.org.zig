@@ -1,5 +1,6 @@
 const std = @import("std");
 const common = @import("common.zig");
+const cf_shared = @import("opensubtitles_com_cf.zig");
 const html = @import("htmlparser");
 const HtmlParseOptions: html.ParseOptions = .{};
 const HtmlDocument = HtmlParseOptions.GetDocument();
@@ -182,33 +183,18 @@ pub const Scraper = struct {
 };
 
 fn fetchHtmlWith(comptime fetch: anytype, client: *std.http.Client, allocator: Allocator, url: []const u8) !common.HttpResponse {
-    const response = fetch(client, allocator, url, .{
+    const response = try fetch(client, allocator, url, .{
         .accept = "text/html",
+        .cache = false,
         .allow_non_ok = true,
         .max_attempts = 2,
+        .retry_on_429 = false,
         .require_public_origin = true,
-    }) catch |err| {
-        if (err != error.ConnectionRefused or !std.mem.startsWith(u8, url, "https://www.opensubtitles.org/")) return err;
-
-        const diagnostic_url = try std.fmt.allocPrint(allocator, "http://www.opensubtitles.org/{s}", .{url["https://www.opensubtitles.org/".len..]});
-        defer allocator.free(diagnostic_url);
-        const diagnostic = fetch(client, allocator, diagnostic_url, .{
-            .accept = "text/html",
-            .allow_non_ok = true,
-            .max_attempts = 1,
-            .cache = false,
-            .require_public_origin = true,
-        }) catch |diagnostic_err| switch (diagnostic_err) {
-            error.OutOfMemory, error.Canceled => return diagnostic_err,
-            else => return err,
-        };
-        defer allocator.free(diagnostic.body);
-        if (common.isAustralianWebsiteBlockPage(diagnostic.body)) return error.ProviderAccessBlocked;
-        return err;
-    };
+    });
     errdefer allocator.free(response.body);
     if (common.isAustralianWebsiteBlockPage(response.body)) return error.ProviderAccessBlocked;
     if (response.status == .too_many_requests) return error.RateLimited;
+    if (cf_shared.isChallengeBody(response.body)) return error.CloudflareChallenge;
     if (response.status != .ok) return error.UnexpectedHttpStatus;
     return response;
 }
@@ -350,14 +336,14 @@ fn appendSubtitleFromRow(
     else
         "";
 
-    const language_code = extractFlagLanguage(row, allocator) catch null;
-    const filename = extractFilename(row, allocator) catch null;
-    const release = extractSubCellText(row, allocator, 1) catch null;
-    const fps = extractSubCellText(row, allocator, 5) catch null;
-    const cds = extractSubCellText(row, allocator, 4) catch null;
-    const rating = extractSubCellText(row, allocator, 8) catch null;
-    const downloads = extractSubCellText(row, allocator, 7) catch null;
-    const uploaded_at = extractSubCellText(row, allocator, 6) catch null;
+    const language_code = try extractFlagLanguage(row, allocator);
+    const filename = try extractFilename(row, allocator);
+    const release = try extractSubCellText(row, allocator, 1);
+    const fps = try extractSubCellText(row, allocator, 5);
+    const cds = try extractSubCellText(row, allocator, 4);
+    const rating = try extractSubCellText(row, allocator, 8);
+    const downloads = try extractSubCellText(row, allocator, 7);
+    const uploaded_at = try extractSubCellText(row, allocator, 6);
 
     const row_text = try common.innerTextTrimmedOwned(allocator, row);
     const lower_row = try lowerDup(allocator, row_text);
@@ -410,6 +396,30 @@ test "opensubtitles language mapping" {
     try std.testing.expect(languageToOpenSubtitles3("xx") == null);
 }
 
+test "opensubtitles optional row metadata preserves allocation failures" {
+    const source =
+        \\<table><tr>
+        \\  <td id="main1"><span title="Movie.srt">Release</span></td>
+        \\  <td><div class="flag en"></div></td>
+        \\</tr></table>
+    ;
+    var parsed = try common.parseHtmlStable(std.testing.allocator, source);
+    defer parsed.deinit();
+    const row = parsed.doc.queryOne("tr") orelse return error.TestUnexpectedResult;
+
+    var failing_language = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, extractFlagLanguage(row, failing_language.allocator()));
+    try std.testing.expect(failing_language.has_induced_failure);
+
+    var failing_filename = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, extractFilename(row, failing_filename.allocator()));
+    try std.testing.expect(failing_filename.has_induced_failure);
+
+    var failing_cell = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, extractSubCellText(row, failing_cell.allocator(), 1));
+    try std.testing.expect(failing_cell.has_induced_failure);
+}
+
 test "opensubtitles.org rejects unsafe provider links before fetch" {
     try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "http://127.0.0.1/search/idmovie-1"));
     try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://user:pass@www.opensubtitles.org/search/idmovie-1"));
@@ -417,9 +427,9 @@ test "opensubtitles.org rejects unsafe provider links before fetch" {
 }
 
 const OwnedHtmlFixture = struct {
-    fn fetch(_: *std.http.Client, allocator: Allocator, url: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
-        if (std.mem.eql(u8, url, "https://www.opensubtitles.org/diagnostic")) return error.ConnectionRefused;
-        const body = if (std.mem.endsWith(u8, url, "/blocked") or std.mem.eql(u8, url, "http://www.opensubtitles.org/diagnostic"))
+    fn fetch(_: *std.http.Client, allocator: Allocator, url: []const u8, options: common.FetchOptions) anyerror!common.HttpResponse {
+        try std.testing.expect(!options.cache);
+        const body = if (std.mem.endsWith(u8, url, "/blocked"))
             "Access to Website Disabled Federal Court of Australia"
         else
             "<html><body>ordinary provider page</body></html>";
@@ -437,7 +447,6 @@ fn checkHtmlOwnership(allocator: Allocator) !void {
         try std.testing.expectEqualStrings("<html><body>ordinary provider page</body></html>", response.body);
     }
     try checkBlockedHtml(&client, allocator, "https://fixture.invalid/blocked");
-    try checkBlockedHtml(&client, allocator, "https://www.opensubtitles.org/diagnostic");
 }
 
 fn checkBlockedHtml(client: *std.http.Client, allocator: Allocator, url: []const u8) !void {
@@ -454,9 +463,35 @@ test "opensubtitles html bodies belong to caller and free on rejection" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkHtmlOwnership, .{});
 }
 
+test "opensubtitles.org never downgrades failed HTTPS diagnostics" {
+    const Mock = struct {
+        var calls: usize = 0;
+
+        fn fetch(_: *std.http.Client, _: Allocator, url: []const u8, options: common.FetchOptions) !common.HttpResponse {
+            calls += 1;
+            try std.testing.expect(std.mem.startsWith(u8, url, "https://"));
+            try std.testing.expect(options.require_public_origin);
+            return error.ConnectionRefused;
+        }
+    };
+
+    Mock.calls = 0;
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    try std.testing.expectError(error.ConnectionRefused, fetchHtmlWith(
+        Mock.fetch,
+        &client,
+        std.testing.allocator,
+        "https://www.opensubtitles.org/search/sublanguageid-all/idmovie-1?q=private",
+    ));
+    try std.testing.expectEqual(@as(usize, 1), Mock.calls);
+}
+
 fn HtmlStatusFixture(comptime status: std.http.Status, comptime body: []const u8) type {
     return struct {
-        fn fetch(_: *std.http.Client, allocator: Allocator, _: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+        fn fetch(_: *std.http.Client, allocator: Allocator, _: []const u8, options: common.FetchOptions) anyerror!common.HttpResponse {
+            try std.testing.expect(!options.cache);
+            try std.testing.expect(!options.retry_on_429);
             return .{ .status = status, .body = try allocator.dupe(u8, body) };
         }
     };
@@ -485,6 +520,15 @@ test "opensubtitles rejects non-ok HTML and frees rejected bodies" {
         std.testing.allocator,
         "https://fixture.invalid/page",
     ));
+    const challenge = "<html><script>window._cf_chl_opt = {};</script></html>";
+    inline for (.{ std.http.Status.ok, std.http.Status.forbidden }) |status| {
+        try std.testing.expectError(error.CloudflareChallenge, fetchHtmlWith(
+            HtmlStatusFixture(status, challenge).fetch,
+            &client,
+            std.testing.allocator,
+            "https://fixture.invalid/page",
+        ));
+    }
 }
 
 test "live opensubtitles.org search and subtitles" {

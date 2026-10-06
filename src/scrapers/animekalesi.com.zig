@@ -7,6 +7,7 @@ const Allocator = std.mem.Allocator;
 const max_raw_response_bytes = (common.FetchOptions{}).max_response_bytes;
 const HtmlParseOptions: html.ParseOptions = .{};
 const site = "https://animekalesi.com";
+const browser_cookie_scope_url = site ++ "/";
 const series_index_url = site ++ "/tum-anime-serileri.html";
 pub const download_token_prefix = "animekalesi-session:";
 
@@ -34,12 +35,7 @@ pub const Scraper = struct {
         const trimmed = std.mem.trim(u8, query, " \t\r\n");
         if (trimmed.len == 0) return .{ .arena = arena, .items = &.{} };
 
-        const response = try common.fetchBytes(self.client, a, series_index_url, .{
-            .accept = "text/html,application/xhtml+xml,*/*",
-            .cache = false,
-            .max_attempts = 2,
-            .require_public_origin = true,
-        });
+        const response = try fetchProviderHtml(self.client, a, series_index_url, null);
         return parseSeriesIndex(common.takeArena(&arena), response.body, trimmed);
     }
 
@@ -50,13 +46,7 @@ pub const Scraper = struct {
 
         try validateProviderUrl(item.page_url);
 
-        const response = try common.fetchBytes(self.client, a, item.page_url, .{
-            .accept = "text/html,application/xhtml+xml,*/*",
-            .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = series_index_url }},
-            .cache = false,
-            .max_attempts = 2,
-            .require_public_origin = true,
-        });
+        const response = try fetchProviderHtml(self.client, a, item.page_url, series_index_url);
         var parsed = try common.parseHtmlStable(a, response.body);
 
         var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
@@ -98,24 +88,54 @@ pub const Scraper = struct {
         var cookie: ?[]u8 = null;
         defer if (cookie) |value| allocator.free(value);
 
-        var index = try fetchRaw(self.client, allocator, series_index_url, null, null, null);
+        var browser_session: ?cloudflare.Session = null;
+        defer if (browser_session) |*session| session.deinit(allocator);
+        var refreshed_rejected_session = false;
+
+        var index = try fetchRawProviderStep(
+            self.client,
+            allocator,
+            series_index_url,
+            &cookie,
+            null,
+            &browser_session,
+            &refreshed_rejected_session,
+        );
         defer index.deinit(allocator);
-        try updateSessionCookie(allocator, &cookie, index.cookie);
-        if (index.status != .ok) return error.UnexpectedHttpStatus;
 
-        var listing = try fetchRaw(self.client, allocator, parts.listing_url, cookie, series_index_url, null);
+        var listing = try fetchRawProviderStep(
+            self.client,
+            allocator,
+            parts.listing_url,
+            &cookie,
+            series_index_url,
+            &browser_session,
+            &refreshed_rejected_session,
+        );
         defer listing.deinit(allocator);
-        try updateSessionCookie(allocator, &cookie, listing.cookie);
-        if (listing.status != .ok) return error.UnexpectedHttpStatus;
 
-        var episode = try fetchRaw(self.client, allocator, parts.episode_url, cookie, parts.listing_url, null);
+        var episode = try fetchRawProviderStep(
+            self.client,
+            allocator,
+            parts.episode_url,
+            &cookie,
+            parts.listing_url,
+            &browser_session,
+            &refreshed_rejected_session,
+        );
         defer episode.deinit(allocator);
-        try updateSessionCookie(allocator, &cookie, episode.cookie);
-        if (episode.status != .ok) return error.UnexpectedHttpStatus;
 
         const first_url = try parseEpisodeDownloadUrl(allocator, episode.body);
         defer allocator.free(first_url);
-        return fetchPublicDownload(self.client, allocator, first_url, cookie, parts.episode_url);
+        return fetchPublicDownload(
+            self.client,
+            allocator,
+            first_url,
+            cookie,
+            parts.episode_url,
+            &browser_session,
+            &refreshed_rejected_session,
+        );
     }
 };
 
@@ -285,7 +305,6 @@ fn fetchRaw(
     user_agent: ?[]const u8,
 ) !RawResponse {
     try validateProviderUrl(url);
-    try common.ensureClientTlsReady(client);
     const normalized = try common.normalizeUrlForFetch(allocator, url);
     defer allocator.free(normalized);
     const uri = try std.Uri.parse(normalized);
@@ -302,15 +321,28 @@ fn fetchRaw(
     }
     extra_storage[extra_count] = .{ .name = "accept", .value = "text/html,application/xhtml+xml,application/zip,application/octet-stream,*/*" };
     extra_count += 1;
+    try common.validateHttpHeaders(extra_storage[0..extra_count]);
+    if (!common.validHttpHeaderValue(user_agent orelse common.default_user_agent)) return error.InvalidHttpHeader;
 
-    var req = try client.request(.GET, uri, .{
+    var public_client: std.http.Client = undefined;
+    try common.initPublicOriginClient(client, &public_client);
+    defer public_client.deinit();
+    const pinned_connection = try common.connectPinnedPublicHttpUrl(&public_client, allocator, normalized);
+    pinned_connection.closing = true;
+
+    var req = public_client.request(.GET, uri, .{
         .redirect_behavior = .unhandled,
+        .keep_alive = false,
+        .connection = pinned_connection,
         .headers = .{
             .user_agent = .{ .override = user_agent orelse common.default_user_agent },
             .accept_encoding = .{ .override = "identity" },
         },
         .extra_headers = extra_storage[0..extra_count],
-    });
+    }) catch |err| {
+        public_client.connection_pool.release(pinned_connection, public_client.io);
+        return err;
+    };
     defer req.deinit();
     errdefer req.connection.?.closing = true;
     try req.sendBodiless();
@@ -386,6 +418,7 @@ const DownloadDisposition = enum {
     redirect,
     rate_limited,
     challenge,
+    access_blocked,
     unexpected_status,
 };
 
@@ -393,14 +426,226 @@ fn downloadDisposition(response: RawResponse) DownloadDisposition {
     // A provider rate limit remains terminal even if its body is a challenge
     // page. Opening a browser cannot turn a quota response into success.
     if (response.status == .too_many_requests) return .rate_limited;
-    if (cloudflare.isChallengeBody(response.body) or
-        response.status == .forbidden or
-        response.status == .service_unavailable)
-    {
-        return .challenge;
-    }
+    if (cloudflare.isChallengeBody(response.body)) return .challenge;
+    if (response.status == .forbidden) return .access_blocked;
     if (common.isRedirectStatus(response.status)) return .redirect;
     return if (response.status == .ok) .success else .unexpected_status;
+}
+
+fn fetchProviderHtml(
+    client: *std.http.Client,
+    allocator: Allocator,
+    url: []const u8,
+    referer: ?[]const u8,
+) !common.HttpResponse {
+    return fetchProviderHtmlWith(common.fetchBytes, cloudflare.ensureDomainSession, client, allocator, url, referer);
+}
+
+fn fetchProviderHtmlWith(
+    comptime fetch: anytype,
+    comptime ensure_session: anytype,
+    client: *std.http.Client,
+    allocator: Allocator,
+    url: []const u8,
+    referer: ?[]const u8,
+) !common.HttpResponse {
+    try validateProviderUrl(url);
+    if (referer) |value| try validateProviderUrl(value);
+
+    var browser_session: ?cloudflare.Session = null;
+    defer if (browser_session) |*session| session.deinit(allocator);
+    var refreshed_rejected_session = false;
+
+    while (true) {
+        var cookie_header: ?[]u8 = null;
+        defer if (cookie_header) |value| allocator.free(value);
+        var headers: [3]std.http.Header = undefined;
+        var headers_len: usize = 0;
+        if (browser_session) |session| {
+            // common.fetchBytes may follow same-origin redirects while keeping
+            // this static header. Attach only cookies valid for every path on
+            // the origin; manual-hop downloads recalculate cookies per URL.
+            cookie_header = try session.cookieHeaderForUrl(allocator, browser_cookie_scope_url);
+            if (cookie_header) |value| {
+                headers[headers_len] = .{ .name = "cookie", .value = value };
+                headers_len += 1;
+            }
+            headers[headers_len] = .{ .name = "user-agent", .value = session.user_agent };
+            headers_len += 1;
+        }
+        if (referer) |value| {
+            headers[headers_len] = .{ .name = "referer", .value = value };
+            headers_len += 1;
+        }
+
+        const response = try fetch(client, allocator, url, common.FetchOptions{
+            .accept = "text/html,application/xhtml+xml,*/*",
+            .extra_headers = headers[0..headers_len],
+            .allow_non_ok = true,
+            .retry_on_429 = false,
+            .cache = false,
+            .max_attempts = 2,
+            .require_public_origin = true,
+        });
+
+        const disposition = downloadDisposition(.{
+            .status = response.status,
+            .body = response.body,
+            .cookie = null,
+            .location = null,
+        });
+        switch (disposition) {
+            .success => return response,
+            .rate_limited => {
+                allocator.free(response.body);
+                return error.RateLimited;
+            },
+            .challenge => {
+                allocator.free(response.body);
+                if (browser_session) |session| {
+                    if (refreshed_rejected_session) return error.CloudflareChallenge;
+                    const refreshed = try ensure_session(allocator, .{
+                        .domain = "animekalesi.com",
+                        .challenge_url = url,
+                        .force_refresh = true,
+                        .rejected_generation = session.generation,
+                    });
+                    if (browser_session) |*owned| owned.deinit(allocator);
+                    browser_session = refreshed;
+                    refreshed_rejected_session = true;
+                } else {
+                    browser_session = try ensure_session(allocator, .{
+                        .domain = "animekalesi.com",
+                        .challenge_url = url,
+                    });
+                }
+            },
+            .access_blocked => {
+                allocator.free(response.body);
+                return error.ProviderAccessBlocked;
+            },
+            .redirect, .unexpected_status => {
+                allocator.free(response.body);
+                return error.UnexpectedHttpStatus;
+            },
+        }
+    }
+}
+
+fn fetchRawProviderStep(
+    client: *std.http.Client,
+    allocator: Allocator,
+    url: []const u8,
+    asp_cookie: *?[]u8,
+    referer: ?[]const u8,
+    browser_session: *?cloudflare.Session,
+    refreshed_rejected_session: *bool,
+) !RawResponse {
+    return fetchRawProviderStepWith(
+        fetchRaw,
+        cloudflare.ensureDomainSession,
+        client,
+        allocator,
+        url,
+        asp_cookie,
+        referer,
+        browser_session,
+        refreshed_rejected_session,
+    );
+}
+
+fn fetchRawProviderStepWith(
+    comptime fetch: anytype,
+    comptime ensure_session: anytype,
+    client: *std.http.Client,
+    allocator: Allocator,
+    url: []const u8,
+    asp_cookie: *?[]u8,
+    referer: ?[]const u8,
+    browser_session: *?cloudflare.Session,
+    refreshed_rejected_session: *bool,
+) !RawResponse {
+    while (true) {
+        var browser_cookie: ?[]u8 = null;
+        defer if (browser_cookie) |value| allocator.free(value);
+        if (browser_session.*) |session| browser_cookie = try session.cookieHeaderForUrl(allocator, url);
+        const request_cookie = try mergeProviderCookies(allocator, browser_cookie, asp_cookie.*);
+        defer if (request_cookie) |value| allocator.free(value);
+        const request_user_agent = if (browser_session.*) |session| session.user_agent else common.default_user_agent;
+
+        var response = try fetch(client, allocator, url, request_cookie, referer, request_user_agent);
+        updateSessionCookie(allocator, asp_cookie, response.cookie) catch |err| {
+            response.deinit(allocator);
+            return err;
+        };
+        switch (downloadDisposition(response)) {
+            .success => return response,
+            .rate_limited => {
+                response.deinit(allocator);
+                return error.RateLimited;
+            },
+            .challenge => {
+                response.deinit(allocator);
+                if (browser_session.*) |session| {
+                    if (refreshed_rejected_session.*) return error.CloudflareChallenge;
+                    const refreshed = try ensure_session(allocator, .{
+                        .domain = "animekalesi.com",
+                        .challenge_url = url,
+                        .force_refresh = true,
+                        .rejected_generation = session.generation,
+                    });
+                    if (browser_session.*) |*owned| owned.deinit(allocator);
+                    browser_session.* = refreshed;
+                    refreshed_rejected_session.* = true;
+                } else {
+                    browser_session.* = try ensure_session(allocator, .{
+                        .domain = "animekalesi.com",
+                        .challenge_url = url,
+                    });
+                }
+            },
+            .access_blocked => {
+                response.deinit(allocator);
+                return error.ProviderAccessBlocked;
+            },
+            .redirect, .unexpected_status => {
+                response.deinit(allocator);
+                return error.UnexpectedHttpStatus;
+            },
+        }
+    }
+}
+
+fn mergeProviderCookies(allocator: Allocator, browser_cookie: ?[]const u8, asp_cookie: ?[]const u8) !?[]u8 {
+    if (browser_cookie == null and asp_cookie == null) return null;
+    if (asp_cookie == null) return try allocator.dupe(u8, browser_cookie.?);
+
+    const asp = std.mem.trim(u8, asp_cookie.?, " \t\r\n;");
+    const asp_eq = std.mem.indexOfScalar(u8, asp, '=') orelse return error.InvalidSessionPayload;
+    const asp_name = std.mem.trim(u8, asp[0..asp_eq], " \t");
+    if (!isAspSessionCookieName(asp_name)) return error.InvalidSessionPayload;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    if (browser_cookie) |header| {
+        var pairs = std.mem.splitScalar(u8, header, ';');
+        while (pairs.next()) |raw_pair| {
+            const pair = std.mem.trim(u8, raw_pair, " \t");
+            if (pair.len == 0) continue;
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+            const name = std.mem.trim(u8, pair[0..eq], " \t");
+            if (isAspSessionCookieName(name)) continue;
+            if (out.items.len > 0) try out.appendSlice(allocator, "; ");
+            try out.appendSlice(allocator, pair);
+        }
+    }
+    if (out.items.len > 0) try out.appendSlice(allocator, "; ");
+    try out.appendSlice(allocator, asp);
+    return try out.toOwnedSlice(allocator);
+}
+
+fn isAspSessionCookieName(name: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(name, "ASPSESSIONID");
 }
 
 fn fetchPublicDownload(
@@ -409,8 +654,10 @@ fn fetchPublicDownload(
     start_url: []const u8,
     initial_cookie: ?[]const u8,
     initial_referer: []const u8,
+    browser_session: *?cloudflare.Session,
+    refreshed_rejected_session: *bool,
 ) !common.HttpResponse {
-    return fetchPublicDownloadWith(
+    return fetchPublicDownloadWithState(
         fetchRaw,
         cloudflare.ensureDomainSession,
         common.fetchBytes,
@@ -420,6 +667,8 @@ fn fetchPublicDownload(
         initial_cookie,
         initial_referer,
         6,
+        browser_session,
+        refreshed_rejected_session,
     );
 }
 
@@ -433,6 +682,37 @@ fn fetchPublicDownloadWith(
     initial_cookie: ?[]const u8,
     initial_referer: []const u8,
     max_redirects: usize,
+) !common.HttpResponse {
+    var browser_session: ?cloudflare.Session = null;
+    defer if (browser_session) |*session| session.deinit(allocator);
+    var refreshed_rejected_session = false;
+    return fetchPublicDownloadWithState(
+        fetch,
+        ensure_session,
+        fetch_external,
+        client,
+        allocator,
+        start_url,
+        initial_cookie,
+        initial_referer,
+        max_redirects,
+        &browser_session,
+        &refreshed_rejected_session,
+    );
+}
+
+fn fetchPublicDownloadWithState(
+    comptime fetch: anytype,
+    comptime ensure_session: anytype,
+    comptime fetch_external: anytype,
+    client: *std.http.Client,
+    allocator: Allocator,
+    start_url: []const u8,
+    initial_cookie: ?[]const u8,
+    initial_referer: []const u8,
+    max_redirects: usize,
+    browser_session: *?cloudflare.Session,
+    refreshed_rejected_session: *bool,
 ) !common.HttpResponse {
     // Every URL carrying provider session state is constrained to the exact
     // HTTPS provider origin. This also makes an absolute cross-origin href or
@@ -450,24 +730,22 @@ fn fetchPublicDownloadWith(
         null;
     defer if (asp_cookie) |value| allocator.free(value);
 
-    var browser_session: ?cloudflare.Session = null;
-    defer if (browser_session) |*session| session.deinit(allocator);
-    var refreshed_rejected_session = false;
     var redirects: usize = 0;
 
     while (true) {
         var browser_cookie: ?[]u8 = null;
         defer if (browser_cookie) |value| allocator.free(value);
 
-        const request_cookie: ?[]const u8 = if (browser_session) |session| blk: {
-            browser_cookie = try session.cookieHeaderForUrl(allocator, current_url);
-            break :blk browser_cookie;
-        } else asp_cookie;
-        const request_user_agent = if (browser_session) |session| session.user_agent else common.default_user_agent;
+        if (browser_session.*) |session| browser_cookie = try session.cookieHeaderForUrl(allocator, current_url);
+        const owned_request_cookie = try mergeProviderCookies(allocator, browser_cookie, asp_cookie);
+        defer if (owned_request_cookie) |value| allocator.free(value);
+        const request_cookie: ?[]const u8 = owned_request_cookie;
+        const request_user_agent = if (browser_session.*) |session| session.user_agent else common.default_user_agent;
 
         var response = try fetch(client, allocator, current_url, request_cookie, referer, request_user_agent);
         var response_owned = true;
         errdefer if (response_owned) response.deinit(allocator);
+        try updateSessionCookie(allocator, &asp_cookie, response.cookie);
 
         switch (downloadDisposition(response)) {
             .rate_limited => {
@@ -479,24 +757,29 @@ fn fetchPublicDownloadWith(
                 response.deinit(allocator);
                 response_owned = false;
 
-                if (browser_session) |session| {
-                    if (refreshed_rejected_session) return error.CloudflareChallenge;
+                if (browser_session.*) |session| {
+                    if (refreshed_rejected_session.*) return error.CloudflareChallenge;
                     const refreshed = try ensure_session(allocator, .{
                         .domain = "animekalesi.com",
                         .challenge_url = current_url,
                         .force_refresh = true,
                         .rejected_generation = session.generation,
                     });
-                    if (browser_session) |*owned| owned.deinit(allocator);
-                    browser_session = refreshed;
-                    refreshed_rejected_session = true;
+                    if (browser_session.*) |*owned| owned.deinit(allocator);
+                    browser_session.* = refreshed;
+                    refreshed_rejected_session.* = true;
                 } else {
-                    browser_session = try ensure_session(allocator, .{
+                    browser_session.* = try ensure_session(allocator, .{
                         .domain = "animekalesi.com",
                         .challenge_url = current_url,
                     });
                 }
                 continue;
+            },
+            .access_blocked => {
+                response.deinit(allocator);
+                response_owned = false;
+                return error.ProviderAccessBlocked;
             },
             .redirect => {
                 if (redirects >= max_redirects) {
@@ -526,7 +809,6 @@ fn fetchPublicDownloadWith(
                         .require_public_origin = true,
                     });
                 }
-                try updateSessionCookie(allocator, &asp_cookie, response.cookie);
                 response.deinit(allocator);
                 response_owned = false;
 
@@ -575,6 +857,45 @@ fn readBoundedBody(allocator: Allocator, reader: *std.Io.Reader, max_bytes: usiz
     return body.toOwnedSlice(allocator);
 }
 
+fn makeFixtureBrowserSession(
+    allocator: Allocator,
+    clearance_source: []const u8,
+    agent_source: []const u8,
+    generation: u64,
+    cookie_path: []const u8,
+) !cloudflare.Session {
+    const cookies = try allocator.alloc(cloudflare.Cookie, 1);
+    errdefer allocator.free(cookies);
+    const name = try allocator.dupe(u8, "cf_clearance");
+    errdefer allocator.free(name);
+    const value = try allocator.dupe(u8, clearance_source);
+    errdefer allocator.free(value);
+    const domain = try allocator.dupe(u8, "animekalesi.com");
+    errdefer allocator.free(domain);
+    const path = try allocator.dupe(u8, cookie_path);
+    errdefer allocator.free(path);
+    cookies[0] = .{
+        .name = name,
+        .value = value,
+        .domain = domain,
+        .path = path,
+        .secure = true,
+        .host_only = true,
+        .expires_unix_seconds = null,
+    };
+
+    const clearance = try allocator.dupe(u8, clearance_source);
+    errdefer allocator.free(clearance);
+    const user_agent = try allocator.dupe(u8, agent_source);
+    return .{
+        .cookies = cookies,
+        .cf_clearance = clearance,
+        .user_agent = user_agent,
+        .acquired_at_unix = 0,
+        .generation = generation,
+    };
+}
+
 test "raw response body limit accepts exact bounds and rejects excess" {
     const a = std.testing.allocator;
     var exact: std.Io.Reader = .fixed("1234");
@@ -608,6 +929,9 @@ test "animekalesi initial session cookies require the exact provider origin" {
 test "animekalesi final downloads require the exact HTTPS provider origin" {
     var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer client.deinit();
+    var browser_session: ?cloudflare.Session = null;
+    defer if (browser_session) |*session| session.deinit(std.testing.allocator);
+    var refreshed_rejected_session = false;
     for ([_][]const u8{
         "http://127.0.0.1/archive.zip",
         "https://user@example.com/archive.zip",
@@ -618,7 +942,15 @@ test "animekalesi final downloads require the exact HTTPS provider origin" {
     }) |url| {
         try std.testing.expectError(
             error.InvalidDownloadUrl,
-            fetchPublicDownload(&client, std.testing.allocator, url, "ASPSESSIONID=fixture", site ++ "/episode"),
+            fetchPublicDownload(
+                &client,
+                std.testing.allocator,
+                url,
+                "ASPSESSIONID=fixture",
+                site ++ "/episode",
+                &browser_session,
+                &refreshed_rejected_session,
+            ),
         );
     }
 }
@@ -633,8 +965,8 @@ test "animekalesi final response classification keeps rate limits terminal" {
     for ([_]Case{
         .{ .status = .ok, .body = "PK fixture", .expected = .success },
         .{ .status = .ok, .body = challenge, .expected = .challenge },
-        .{ .status = .forbidden, .body = "", .expected = .challenge },
-        .{ .status = .service_unavailable, .body = "", .expected = .challenge },
+        .{ .status = .forbidden, .body = "", .expected = .access_blocked },
+        .{ .status = .service_unavailable, .body = "", .expected = .unexpected_status },
         .{ .status = .too_many_requests, .body = challenge, .expected = .rate_limited },
         .{ .status = .found, .body = "", .expected = .redirect },
         .{ .status = .internal_server_error, .body = "", .expected = .unexpected_status },
@@ -646,6 +978,203 @@ test "animekalesi final response classification keeps rate limits terminal" {
             .location = null,
         }));
     }
+}
+
+test "animekalesi merges browser cookies with the latest ASP session" {
+    const merged = (try mergeProviderCookies(
+        std.testing.allocator,
+        "cf_clearance=fixture; ASPSESSIONIDOLD=stale; theme=dark",
+        "ASPSESSIONIDNEW=fresh",
+    )).?;
+    defer std.testing.allocator.free(merged);
+    try std.testing.expectEqualStrings(
+        "cf_clearance=fixture; theme=dark; ASPSESSIONIDNEW=fresh",
+        merged,
+    );
+
+    try std.testing.expectEqual(@as(?[]u8, null), try mergeProviderCookies(std.testing.allocator, null, null));
+    try std.testing.expectError(
+        error.InvalidSessionPayload,
+        mergeProviderCookies(std.testing.allocator, "cf_clearance=fixture", "other=value"),
+    );
+}
+
+test "animekalesi HTML transport excludes path-scoped browser cookies" {
+    var scoped = try makeFixtureBrowserSession(
+        std.testing.allocator,
+        "scoped-clearance",
+        "fixture-browser",
+        1,
+        "/tum-anime-serileri.html",
+    );
+    defer scoped.deinit(std.testing.allocator);
+    const scoped_header = try scoped.cookieHeaderForUrl(std.testing.allocator, browser_cookie_scope_url);
+    defer if (scoped_header) |value| std.testing.allocator.free(value);
+    try std.testing.expect(scoped_header == null);
+
+    var root = try makeFixtureBrowserSession(
+        std.testing.allocator,
+        "root-clearance",
+        "fixture-browser",
+        2,
+        "/",
+    );
+    defer root.deinit(std.testing.allocator);
+    const root_header = (try root.cookieHeaderForUrl(std.testing.allocator, browser_cookie_scope_url)).?;
+    defer std.testing.allocator.free(root_header);
+    try std.testing.expectEqualStrings("cf_clearance=root-clearance", root_header);
+}
+
+test "animekalesi HTML fetch recovers one browser challenge" {
+    const Mock = struct {
+        var fetch_calls: usize = 0;
+        var session_calls: usize = 0;
+
+        fn fetch(
+            _: *std.http.Client,
+            allocator: Allocator,
+            url: []const u8,
+            options: common.FetchOptions,
+        ) !common.HttpResponse {
+            fetch_calls += 1;
+            try std.testing.expectEqualStrings(series_index_url, url);
+            try std.testing.expect(options.allow_non_ok);
+            try std.testing.expect(!options.retry_on_429);
+            try std.testing.expect(options.require_public_origin);
+            if (fetch_calls == 1) {
+                try std.testing.expectEqual(@as(usize, 0), options.extra_headers.len);
+                return .{
+                    .status = .ok,
+                    .body = try allocator.dupe(u8, "<script>window._cf_chl_opt = {};</script>"),
+                };
+            }
+            if (fetch_calls == 2) {
+                var saw_cookie = false;
+                var saw_user_agent = false;
+                for (options.extra_headers) |header| {
+                    if (std.ascii.eqlIgnoreCase(header.name, "cookie")) {
+                        saw_cookie = true;
+                        try std.testing.expectEqualStrings("cf_clearance=clearance", header.value);
+                    }
+                    if (std.ascii.eqlIgnoreCase(header.name, "user-agent")) {
+                        saw_user_agent = true;
+                        try std.testing.expectEqualStrings("fixture-browser", header.value);
+                    }
+                }
+                try std.testing.expect(saw_cookie);
+                try std.testing.expect(saw_user_agent);
+                return .{ .status = .ok, .body = try allocator.dupe(u8, "<html>series</html>") };
+            }
+            return error.TooManyMockRequests;
+        }
+
+        fn ensureSession(allocator: Allocator, options: cloudflare.EnsureDomainOptions) !cloudflare.Session {
+            session_calls += 1;
+            try std.testing.expectEqual(@as(usize, 1), session_calls);
+            try std.testing.expectEqualStrings("animekalesi.com", options.domain);
+            try std.testing.expectEqualStrings(series_index_url, options.challenge_url.?);
+            return makeFixtureBrowserSession(allocator, "clearance", "fixture-browser", 9, "/");
+        }
+    };
+
+    Mock.fetch_calls = 0;
+    Mock.session_calls = 0;
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    const response = try fetchProviderHtmlWith(
+        Mock.fetch,
+        Mock.ensureSession,
+        &client,
+        std.testing.allocator,
+        series_index_url,
+        null,
+    );
+    defer std.testing.allocator.free(response.body);
+    try std.testing.expectEqualStrings("<html>series</html>", response.body);
+    try std.testing.expectEqual(@as(usize, 2), Mock.fetch_calls);
+    try std.testing.expectEqual(@as(usize, 1), Mock.session_calls);
+}
+
+test "animekalesi preflight challenge recovery merges and rotates session cookies" {
+    const Mock = struct {
+        var fetch_calls: usize = 0;
+        var session_calls: usize = 0;
+
+        fn fetch(
+            _: *std.http.Client,
+            allocator: Allocator,
+            url: []const u8,
+            cookie: ?[]const u8,
+            referer: ?[]const u8,
+            user_agent: ?[]const u8,
+        ) !RawResponse {
+            fetch_calls += 1;
+            try std.testing.expectEqualStrings(site ++ "/episode", url);
+            try std.testing.expectEqualStrings(site ++ "/listing", referer.?);
+            if (fetch_calls == 1) {
+                try std.testing.expectEqualStrings("ASPSESSIONIDOLD=one", cookie.?);
+                try std.testing.expectEqualStrings(common.default_user_agent, user_agent.?);
+                return .{
+                    .status = .forbidden,
+                    .body = try allocator.dupe(u8, "<html><script>window._cf_chl_opt = {};</script></html>"),
+                    .cookie = try allocator.dupe(u8, "ASPSESSIONIDROTATED=two"),
+                    .location = null,
+                };
+            }
+            if (fetch_calls == 2) {
+                try std.testing.expectEqualStrings(
+                    "cf_clearance=clearance; ASPSESSIONIDROTATED=two",
+                    cookie.?,
+                );
+                try std.testing.expectEqualStrings("fixture-browser", user_agent.?);
+                return .{
+                    .status = .ok,
+                    .body = try allocator.dupe(u8, "episode payload"),
+                    .cookie = try allocator.dupe(u8, "ASPSESSIONIDFINAL=three"),
+                    .location = null,
+                };
+            }
+            return error.TooManyMockRequests;
+        }
+
+        fn ensureSession(allocator: Allocator, options: cloudflare.EnsureDomainOptions) !cloudflare.Session {
+            session_calls += 1;
+            try std.testing.expectEqual(@as(usize, 1), session_calls);
+            try std.testing.expectEqualStrings("animekalesi.com", options.domain);
+            try std.testing.expectEqualStrings(site ++ "/episode", options.challenge_url.?);
+            try std.testing.expect(!options.force_refresh);
+            return makeFixtureBrowserSession(allocator, "clearance", "fixture-browser", 7, "/");
+        }
+    };
+
+    Mock.fetch_calls = 0;
+    Mock.session_calls = 0;
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var asp_cookie: ?[]u8 = try std.testing.allocator.dupe(u8, "ASPSESSIONIDOLD=one");
+    defer if (asp_cookie) |value| std.testing.allocator.free(value);
+    var browser_session: ?cloudflare.Session = null;
+    defer if (browser_session) |*session| session.deinit(std.testing.allocator);
+    var refreshed_rejected_session = false;
+
+    var response = try fetchRawProviderStepWith(
+        Mock.fetch,
+        Mock.ensureSession,
+        &client,
+        std.testing.allocator,
+        site ++ "/episode",
+        &asp_cookie,
+        site ++ "/listing",
+        &browser_session,
+        &refreshed_rejected_session,
+    );
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("episode payload", response.body);
+    try std.testing.expectEqualStrings("ASPSESSIONIDFINAL=three", asp_cookie.?);
+    try std.testing.expect(browser_session != null);
+    try std.testing.expect(!refreshed_rejected_session);
+    try std.testing.expectEqual(@as(usize, 2), Mock.fetch_calls);
+    try std.testing.expectEqual(@as(usize, 1), Mock.session_calls);
 }
 
 test "animekalesi challenge recovery refreshes one rejected browser session" {
@@ -670,13 +1199,13 @@ test "animekalesi challenge recovery refreshes one rejected browser session" {
                     try std.testing.expectEqualStrings(common.default_user_agent, user_agent.?);
                     return .{
                         .status = .forbidden,
-                        .body = try allocator.dupe(u8, "forbidden"),
+                        .body = try allocator.dupe(u8, "<html><script>window._cf_chl_opt = {};</script></html>"),
                         .cookie = null,
                         .location = null,
                     };
                 },
                 2 => {
-                    try std.testing.expectEqualStrings("cf_clearance=first-clearance", cookie.?);
+                    try std.testing.expectEqualStrings("cf_clearance=first-clearance; ASPSESSIONID=fixture", cookie.?);
                     try std.testing.expectEqualStrings("fixture-browser-1", user_agent.?);
                     return .{
                         .status = .ok,
@@ -686,7 +1215,7 @@ test "animekalesi challenge recovery refreshes one rejected browser session" {
                     };
                 },
                 3 => {
-                    try std.testing.expectEqualStrings("cf_clearance=second-clearance", cookie.?);
+                    try std.testing.expectEqualStrings("cf_clearance=second-clearance; ASPSESSIONID=fixture", cookie.?);
                     try std.testing.expectEqualStrings("fixture-browser-2", user_agent.?);
                     return .{
                         .status = .ok,
@@ -706,48 +1235,14 @@ test "animekalesi challenge recovery refreshes one rejected browser session" {
             if (session_calls == 1) {
                 try std.testing.expect(!options.force_refresh);
                 try std.testing.expectEqual(@as(?u64, null), options.rejected_generation);
-                return makeSession(allocator, "first-clearance", "fixture-browser-1", 41);
+                return makeFixtureBrowserSession(allocator, "first-clearance", "fixture-browser-1", 41, "/download/");
             }
             if (session_calls == 2) {
                 try std.testing.expect(options.force_refresh);
                 try std.testing.expectEqual(@as(?u64, 41), options.rejected_generation);
-                return makeSession(allocator, "second-clearance", "fixture-browser-2", 42);
+                return makeFixtureBrowserSession(allocator, "second-clearance", "fixture-browser-2", 42, "/download/");
             }
             return error.TooManyMockSessions;
-        }
-
-        fn makeSession(allocator: Allocator, clearance_source: []const u8, agent_source: []const u8, generation: u64) !cloudflare.Session {
-            const cookies = try allocator.alloc(cloudflare.Cookie, 1);
-            errdefer allocator.free(cookies);
-            const name = try allocator.dupe(u8, "cf_clearance");
-            errdefer allocator.free(name);
-            const value = try allocator.dupe(u8, clearance_source);
-            errdefer allocator.free(value);
-            const domain = try allocator.dupe(u8, "animekalesi.com");
-            errdefer allocator.free(domain);
-            const path = try allocator.dupe(u8, "/download/");
-            errdefer allocator.free(path);
-            cookies[0] = .{
-                .name = name,
-                .value = value,
-                .domain = domain,
-                .path = path,
-                .secure = true,
-                .host_only = true,
-                .expires_unix_seconds = null,
-            };
-
-            const clearance = try allocator.dupe(u8, clearance_source);
-            errdefer allocator.free(clearance);
-            const user_agent = try allocator.dupe(u8, agent_source);
-            return .{
-                .cookies = cookies,
-                .cf_clearance = clearance,
-                .user_agent = user_agent,
-                .csrf_token = null,
-                .acquired_at_unix = 0,
-                .generation = generation,
-            };
         }
     };
 
@@ -823,6 +1318,11 @@ test "animekalesi builds subtitle listing URL and token" {
     const parsed = parseDownloadToken(token).?;
     try std.testing.expectEqualStrings(url, parsed.listing_url);
     try std.testing.expectEqualStrings("https://animekalesi.com/indir_bolum-71-death-note-1-bolum.html", parsed.episode_url);
+
+    const tampered = download_token_prefix ++
+        "https://animekalesi.com/listing\r\nx-injected: yes|https://animekalesi.com/episode";
+    const tampered_parts = parseDownloadToken(tampered).?;
+    try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl(tampered_parts.listing_url));
 }
 
 test "live animekalesi search listing and session download" {

@@ -1917,7 +1917,7 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
 
                     for (seasons.seasons) |season| {
                         var season_data = scraper.fetchTvSeasonByLink(item.link, season.number) catch |err| {
-                            if (err == error.Canceled or err == error.OutOfMemory) return err;
+                            if (common.mustPropagateOptionalFailure(err)) return err;
                             continue;
                         };
                         defer season_data.deinit();
@@ -3060,7 +3060,8 @@ pub fn downloadSubtitleWithProgressAndOptions(
     const grupahatak_download = subdl.grupahatak_pl.parseDownloadToken(source_url) != null;
     const subs4free_download = subdl.subs4free_info.parseDownloadToken(source_url) != null;
     const tsukihime_download = subdl.tsukihime_org.parseDownloadToken(source_url) != null;
-    const url = if (greeksubs_download or indexsubtitle_download or titrari_download or subs_sab_download or animekalesi_download or animesub_download or animetosho_download or subhd_download or fansubs_download or grupahatak_download or subs4free_download or tsukihime_download)
+    const subsource_details_path = parseSubsourceRemoteToken(source_url);
+    const url = if (greeksubs_download or indexsubtitle_download or titrari_download or subs_sab_download or animekalesi_download or animesub_download or animetosho_download or subhd_download or fansubs_download or grupahatak_download or subs4free_download or tsukihime_download or subsource_details_path != null)
         try allocator.dupe(u8, source_url)
     else
         try resolveDownloadUrlIfNeeded(allocator, client, source_url);
@@ -3103,6 +3104,11 @@ pub fn downloadSubtitleWithProgressAndOptions(
     } else if (tsukihime_download) blk: {
         var scraper = subdl.tsukihime_org.Scraper.init(allocator, client);
         break :blk try scraper.fetchDownloadByToken(allocator, source_url);
+    } else if (subsource_details_path) |details_path| blk: {
+        var scraper = subdl.subsource_net.Scraper.init(allocator, client);
+        break :blk try scraper.fetchDownloadByDetailsPathWithOptions(allocator, details_path, .{
+            .auto_cloudflare_session = true,
+        });
     } else try fetchDownloadBytes(client, allocator, url);
     defer allocator.free(response.body);
     if (response.status != .ok) return error.UnexpectedHttpStatus;
@@ -3310,10 +3316,12 @@ fn downloadSubtitlecatTranslated(
         .accept = "text/plain,*/*",
         .allow_non_ok = true,
         .max_attempts = 2,
+        .retry_on_429 = false,
+        .cache = false,
         .require_public_origin = true,
     });
     defer allocator.free(source_response.body);
-    if (source_response.status != .ok) return error.UnexpectedHttpStatus;
+    try requireSubtitlecatSourceStatus(source_response.status);
     try validateSubtitleDownloadBody(allocator, source_response.body);
 
     const target_lang = languageToGoogleCode(token.target_lang) orelse "";
@@ -3348,6 +3356,11 @@ fn downloadSubtitlecatTranslated(
         .translation_incomplete = translation_incomplete,
         .source_url = owned_source,
     };
+}
+
+fn requireSubtitlecatSourceStatus(status: std.http.Status) !void {
+    if (status == .too_many_requests) return error.RateLimited;
+    if (status != .ok) return error.UnexpectedHttpStatus;
 }
 
 fn languageToGoogleCode(input: []const u8) ?[]const u8 {
@@ -3627,13 +3640,6 @@ fn resolveDownloadUrlIfNeeded(allocator: Allocator, client: *std.http.Client, do
         return error.InvalidDownloadUrl;
     }
 
-    if (parseSubsourceRemoteToken(download_url)) |details_path| {
-        var scraper = subdl.subsource_net.Scraper.init(allocator, client);
-        return try scraper.resolveDownloadUrlWithOptions(allocator, details_path, .{
-            .auto_cloudflare_session = true,
-        }) orelse error.InvalidDownloadUrl;
-    }
-
     if (std.mem.indexOf(u8, download_url, "my-subs.co/downloads/") != null) {
         var scraper = subdl.my_subs_co.Scraper.init(allocator, client);
         return scraper.resolveDownloadPageUrl(allocator, download_url);
@@ -3660,11 +3666,14 @@ fn fetchDownloadBytes(client: *std.http.Client, allocator: Allocator, url: []con
     const primary = try common.fetchBytes(client, allocator, url, .{
         .accept = "*/*",
         .extra_headers = provider_headers,
+        .cache = false,
         .allow_non_ok = true,
         .max_attempts = max_attempts,
+        .retry_on_429 = false,
         .require_public_origin = true,
     });
 
+    const target = cloudflareTargetForUrl(url);
     const was_challenge = cf.isChallengeBody(primary.body);
     const was_rate_limited = primary.status == .too_many_requests;
     if (primary.status == .ok and !was_challenge) return primary;
@@ -3672,19 +3681,21 @@ fn fetchDownloadBytes(client: *std.http.Client, allocator: Allocator, url: []con
 
     if (was_rate_limited) return error.RateLimited;
     if (was_challenge) {
-        if (cloudflareTargetForUrl(url)) |target| {
-            const with_cf = try fetchBytesWithCloudflareSession(client, allocator, url, target.domain, target.challenge_url, "*/*", download_referer);
-            const still_challenged = cf.isChallengeBody(with_cf.body);
+        if (target) |cf_target| {
+            const with_cf = try fetchBytesWithCloudflareSession(client, allocator, url, cf_target.domain, cf_target.challenge_url, "*/*", download_referer);
+            const still_challenged = isOpenSubtitlesChallengeResponse(with_cf.status, with_cf.body);
             if (with_cf.status == .ok and !still_challenged) return with_cf;
             const retry_rate_limited = with_cf.status == .too_many_requests;
             allocator.free(with_cf.body);
             if (retry_rate_limited) return error.RateLimited;
             if (still_challenged) return error.CloudflareChallenge;
+            if (with_cf.status == .forbidden) return error.ProviderAccessBlocked;
             return error.UnexpectedHttpStatus;
         }
         return error.CloudflareChallenge;
     }
 
+    if (primary.status == .forbidden) return error.ProviderAccessBlocked;
     return error.UnexpectedHttpStatus;
 }
 
@@ -3701,6 +3712,8 @@ const CloudflareTarget = struct {
     challenge_url: []const u8,
 };
 
+const opensubtitles_session_root = "https://www.opensubtitles.com/";
+
 fn cloudflareTargetForUrl(url: []const u8) ?CloudflareTarget {
     if (isOpenSubtitlesSessionUrl(url)) {
         return .{
@@ -3710,6 +3723,10 @@ fn cloudflareTargetForUrl(url: []const u8) ?CloudflareTarget {
     }
 
     return null;
+}
+
+fn isOpenSubtitlesChallengeResponse(_: std.http.Status, body: []const u8) bool {
+    return cf.isChallengeBody(body);
 }
 
 fn isOpenSubtitlesSessionUrl(url: []const u8) bool {
@@ -3748,7 +3765,7 @@ fn fetchBytesWithCloudflareSession(
     defer session.deinit(allocator);
 
     const first = try fetchBytesUsingSession(client, allocator, url, accept, referer, session);
-    if (first.status == .too_many_requests or !cf.isChallengeBody(first.body)) return first;
+    if (first.status == .too_many_requests or !isOpenSubtitlesChallengeResponse(first.status, first.body)) return first;
     allocator.free(first.body);
 
     var refreshed = try cf.ensureDomainSession(allocator, .{
@@ -3769,27 +3786,59 @@ fn fetchBytesUsingSession(
     referer: ?[]const u8,
     session: cf.Session,
 ) !common.HttpResponse {
+    return fetchBytesUsingSessionWith(common.fetchBytes, client, allocator, url, accept, referer, session);
+}
+
+fn fetchBytesUsingSessionWith(
+    comptime fetch: anytype,
+    client: *std.http.Client,
+    allocator: Allocator,
+    url: []const u8,
+    accept: []const u8,
+    referer: ?[]const u8,
+    session: cf.Session,
+) !common.HttpResponse {
     // Recheck the destination at the boundary that attaches private cookies.
     if (!isOpenSubtitlesSessionUrl(url)) return error.InvalidDownloadUrl;
     var headers = std.ArrayList(std.http.Header).empty;
     defer headers.deinit(allocator);
 
-    const cookie_header = try session.cookieHeaderForUrl(allocator, url);
-    defer if (cookie_header) |value| allocator.free(value);
-    if (cookie_header) |value| try headers.append(allocator, .{ .name = "cookie", .value = value });
+    // Redirects on the same origin reuse this static header, so select only
+    // cookies that are valid for every path on the OpenSubtitles origin.
+    const cookie_header = (try session.cookieHeaderForUrl(allocator, opensubtitles_session_root)) orelse
+        return error.CloudflareSessionUnavailable;
+    defer allocator.free(cookie_header);
+    const clearance = cookieHeaderValue(cookie_header, "cf_clearance") orelse
+        return error.CloudflareSessionUnavailable;
+    if (session.cf_clearance.len == 0 or !std.mem.eql(u8, clearance, session.cf_clearance))
+        return error.CloudflareSessionUnavailable;
+    try headers.append(allocator, .{ .name = "cookie", .value = cookie_header });
     try headers.append(allocator, .{ .name = "user-agent", .value = session.user_agent });
     if (referer) |value| {
         try headers.append(allocator, .{ .name = "referer", .value = value });
     }
 
-    return common.fetchBytes(client, allocator, url, .{
+    return fetch(client, allocator, url, .{
         .accept = accept,
         .extra_headers = headers.items,
         .allow_non_ok = true,
         .max_attempts = 2,
+        .retry_on_429 = false,
         .cache = false,
         .require_public_origin = true,
     });
+}
+
+fn cookieHeaderValue(header: []const u8, wanted_name: []const u8) ?[]const u8 {
+    var pairs = std.mem.splitScalar(u8, header, ';');
+    while (pairs.next()) |raw_pair| {
+        const pair = std.mem.trim(u8, raw_pair, " \t");
+        const equals = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const name = std.mem.trim(u8, pair[0..equals], " \t");
+        if (!std.ascii.eqlIgnoreCase(name, wanted_name)) continue;
+        return std.mem.trim(u8, pair[equals + 1 ..], " \t");
+    }
+    return null;
 }
 
 const ArchiveKind = enum {
@@ -4597,6 +4646,7 @@ test "active provider registry excludes retired providers" {
         "gestdown_info",
         "subsunacs_net",
         "subtitles_ajatt_top",
+        "subtis_io",
         "greeksubs_net",
         "indexsubtitle_cc",
         "sous_titres_eu",
@@ -4666,7 +4716,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("greek-subtitles.com") == null);
     try std.testing.expect(parseProvider("subsunacs.net") == .subsunacs_net);
     try std.testing.expect(parseProvider("subtitles.ajatt.top") == .subtitles_ajatt_top);
-    try std.testing.expect(parseProvider("subtis.io") == null);
+    try std.testing.expect(parseProvider("subtis.io") == .subtis_io);
     try std.testing.expect(parseProvider("greeksubs.net") == .greeksubs_net);
     try std.testing.expect(parseProvider("indexsubtitle.cc") == .indexsubtitle_cc);
     try std.testing.expect(parseProvider("sous-titres.eu") == .sous_titres_eu);
@@ -4716,6 +4766,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expectError(error.UnknownProvider, resolveProvider("greek_subtitles"));
     try std.testing.expect(try resolveProvider("subsunacs") == .subsunacs_net);
     try std.testing.expect(try resolveProvider("subtitles_ajatt") == .subtitles_ajatt_top);
+    try std.testing.expect(try resolveProvider("subtis") == .subtis_io);
     try std.testing.expect(try resolveProvider("greeksubs") == .greeksubs_net);
     try std.testing.expect(try resolveProvider("indexsubtitle") == .indexsubtitle_cc);
     try std.testing.expect(try resolveProvider("sous_titres") == .sous_titres_eu);
@@ -4865,6 +4916,12 @@ test "subtitlecat translate token helpers" {
     try std.testing.expect((try parseSubtitlecatTranslateToken(allocator, "https://example.com/file.srt")) == null);
 }
 
+test "subtitlecat source download preserves rate limits" {
+    try requireSubtitlecatSourceStatus(.ok);
+    try std.testing.expectError(error.RateLimited, requireSubtitlecatSourceStatus(.too_many_requests));
+    try std.testing.expectError(error.UnexpectedHttpStatus, requireSubtitlecatSourceStatus(.service_unavailable));
+}
+
 test "google translate result parser extracts text chunks" {
     const allocator = std.testing.allocator;
     const raw =
@@ -4888,6 +4945,13 @@ test "download referer is scoped to providers that require it" {
 test "cloudflare target excludes yify downloads" {
     try std.testing.expect(cloudflareTargetForUrl("https://yifysubtitles.ch/subtitle/test.zip") == null);
     try std.testing.expect(cloudflareTargetForUrl("https://www.opensubtitles.com/nocache/download/123") != null);
+    try std.testing.expect(!isOpenSubtitlesChallengeResponse(.forbidden, "ordinary denial"));
+    try std.testing.expect(!isOpenSubtitlesChallengeResponse(.service_unavailable, ""));
+    try std.testing.expect(!isOpenSubtitlesChallengeResponse(.bad_gateway, "ordinary outage"));
+    try std.testing.expect(isOpenSubtitlesChallengeResponse(
+        .ok,
+        "<html><script>window._cf_chl_opt = {};</script></html>",
+    ));
 }
 
 test "OpenSubtitles session cookies require the exact HTTPS origin" {
@@ -4931,7 +4995,6 @@ test "OpenSubtitles session cookies require the exact HTTPS origin" {
         .cookies = &cookies,
         .cf_clearance = "fixture",
         .user_agent = "fixture",
-        .csrf_token = null,
         .acquired_at_unix = 0,
         .generation = 1,
     };
@@ -4942,6 +5005,89 @@ test "OpenSubtitles session cookies require the exact HTTPS origin" {
     }
     try std.testing.expectError(error.InvalidDownloadUrl, fetchBytesWithCloudflareSession(&client, std.testing.allocator, "https://www.opensubtitles.com/file", "other.test", "https://www.opensubtitles.com/", "*/*", null));
     try std.testing.expectError(error.InvalidDownloadUrl, fetchBytesWithCloudflareSession(&client, std.testing.allocator, "https://www.opensubtitles.com/file", "www.opensubtitles.com", "https://other.test/", "*/*", null));
+}
+
+test "OpenSubtitles session static cookie header excludes path-scoped cookies" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, _: []const u8, options: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            try std.testing.expect(options.allow_non_ok);
+            try std.testing.expect(!options.cache);
+            try std.testing.expect(!options.retry_on_429);
+
+            var cookie: ?[]const u8 = null;
+            for (options.extra_headers) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, "cookie")) cookie = header.value;
+            }
+            try std.testing.expectEqualStrings("cf_clearance=clearance; root=ok", cookie orelse return error.TestUnexpectedResult);
+            return .{ .status = .ok, .body = try allocator.dupe(u8, "subtitle") };
+        }
+    };
+    const cookies = [_]cf.Cookie{
+        .{ .name = "cf_clearance", .value = "clearance", .domain = "www.opensubtitles.com", .path = "/", .secure = true, .host_only = true, .expires_unix_seconds = null },
+        .{ .name = "root", .value = "ok", .domain = "www.opensubtitles.com", .path = "/", .secure = true, .host_only = true, .expires_unix_seconds = null },
+        .{ .name = "path_secret", .value = "must-not-follow", .domain = "www.opensubtitles.com", .path = "/download", .secure = true, .host_only = true, .expires_unix_seconds = null },
+    };
+    const session: cf.Session = .{
+        .cookies = &cookies,
+        .cf_clearance = "clearance",
+        .user_agent = "fixture-agent",
+        .acquired_at_unix = 0,
+        .generation = 1,
+    };
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    const response = try fetchBytesUsingSessionWith(
+        Fixture.fetch,
+        &fixture.client,
+        std.testing.allocator,
+        "https://www.opensubtitles.com/download/private/file.zip",
+        "*/*",
+        null,
+        session,
+    );
+    defer std.testing.allocator.free(response.body);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+}
+
+test "OpenSubtitles session requires root-scoped cf_clearance before fetching" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, _: Allocator, _: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            return error.TestUnexpectedResult;
+        }
+    };
+    const cookies = [_]cf.Cookie{
+        .{ .name = "cf_clearance", .value = "scoped", .domain = "www.opensubtitles.com", .path = "/download", .secure = true, .host_only = true, .expires_unix_seconds = null },
+        .{ .name = "root", .value = "ok", .domain = "www.opensubtitles.com", .path = "/", .secure = true, .host_only = true, .expires_unix_seconds = null },
+    };
+    const session: cf.Session = .{
+        .cookies = &cookies,
+        .cf_clearance = "scoped",
+        .user_agent = "fixture-agent",
+        .acquired_at_unix = 0,
+        .generation = 1,
+    };
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    try std.testing.expectError(error.CloudflareSessionUnavailable, fetchBytesUsingSessionWith(
+        Fixture.fetch,
+        &fixture.client,
+        std.testing.allocator,
+        "https://www.opensubtitles.com/download/private/file.zip",
+        "*/*",
+        null,
+        session,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
 }
 
 test "subtitle downloads reject response pages and preserve subtitle formats" {

@@ -52,10 +52,11 @@ pub const Scraper = struct {
             .accept = "text/html",
             .allow_non_ok = true,
             .max_attempts = 2,
+            .retry_on_429 = false,
+            .cache = false,
             .require_public_origin = true,
         });
-        // This endpoint commonly returns 500 with usable HTML.
-        _ = response.status;
+        try requireSearchResponse(response.status, response.body);
 
         // This site frequently returns malformed HTML that is unsafe in turbo mode.
         var parsed = try common.parseHtmlStable(a, response.body);
@@ -166,7 +167,7 @@ pub const Scraper = struct {
                 break :blk_good null;
             };
 
-            const download_url = detailToDownloadUrl(a, details_url) orelse details_url;
+            const download_url = (try detailToDownloadUrl(a, details_url)) orelse details_url;
             try subtitles.append(a, .{
                 .language_code = language_code,
                 .filename = filename,
@@ -216,6 +217,25 @@ fn appendSearchItemsFromRawHtml(allocator: Allocator, html_body: []const u8, ite
     }
 }
 
+fn requireSearchResponse(status: std.http.Status, body: []const u8) !void {
+    if (status == .too_many_requests) return error.RateLimited;
+    if (status == .ok) return;
+    // This legacy endpoint commonly returns 500 alongside a complete search
+    // page, including valid zero-result pages. Accept only its recognizable
+    // page shell plus either results or the provider's no-results marker.
+    if (status == .internal_server_error and hasSearchPageMarkup(body)) return;
+    return error.UnexpectedHttpStatus;
+}
+
+fn hasSearchPageMarkup(body: []const u8) bool {
+    if (std.mem.indexOf(u8, body, "<title>Moviesubtitles.org") == null or
+        std.mem.indexOf(u8, body, "<h2>Search</h2>") == null or
+        std.mem.indexOf(u8, body, "Search results") == null) return false;
+    return (std.mem.indexOf(u8, body, "/movie-") != null and
+        std.mem.indexOf(u8, body, ".html") != null) or
+        std.mem.indexOf(u8, body, "No results found") != null;
+}
+
 fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
     const resolved = try common.resolveUrl(allocator, site, href);
     errdefer allocator.free(resolved);
@@ -250,9 +270,9 @@ fn findDescendantImgWithSrcFragment(node: HtmlNode, src_fragment: []const u8) ?H
     return null;
 }
 
-fn detailToDownloadUrl(allocator: Allocator, details_url: []const u8) ?[]const u8 {
+fn detailToDownloadUrl(allocator: Allocator, details_url: []const u8) !?[]const u8 {
     const idx = std.mem.indexOf(u8, details_url, "/subtitle-") orelse return null;
-    var out = allocator.dupe(u8, details_url) catch return null;
+    var out = try allocator.dupe(u8, details_url);
     std.mem.copyForwards(u8, out[idx + 1 .. idx + "subtitle".len + 1], "download");
     return out;
 }
@@ -260,9 +280,27 @@ fn detailToDownloadUrl(allocator: Allocator, details_url: []const u8) ?[]const u
 test "moviesubtitles.org detail url rewrite" {
     const allocator = std.testing.allocator;
     const src = "https://www.moviesubtitles.org/subtitle-12345.html";
-    const out = detailToDownloadUrl(allocator, src) orelse return error.TestUnexpectedResult;
+    const out = (try detailToDownloadUrl(allocator, src)) orelse return error.TestUnexpectedResult;
     defer allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "/download-") != null);
+}
+
+test "moviesubtitles.org accepts only recognizable legacy 500 results" {
+    try requireSearchResponse(.ok, "<html></html>");
+    const shell = "<title>Moviesubtitles.org - Top</title><h2>Search</h2><p>Search results</p>";
+    try requireSearchResponse(.internal_server_error, shell ++ "<a href=\"/movie-the-matrix-1999.html\">The Matrix</a>");
+    try requireSearchResponse(.internal_server_error, shell ++ "<div>No results found</div>");
+    try std.testing.expectError(error.RateLimited, requireSearchResponse(.too_many_requests, "busy"));
+    try std.testing.expectError(error.UnexpectedHttpStatus, requireSearchResponse(.internal_server_error, "<h1>Internal Server Error</h1>"));
+    try std.testing.expectError(error.UnexpectedHttpStatus, requireSearchResponse(.service_unavailable, shell ++ "<a href=\"/movie-valid.html\">x</a>"));
+}
+
+test "moviesubtitles.org detail url rewrite preserves allocation errors" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        detailToDownloadUrl(failing.allocator(), "https://www.moviesubtitles.org/subtitle-12345.html"),
+    );
 }
 
 test "moviesubtitles.org rejects unsafe provider links before fetch" {

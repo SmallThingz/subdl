@@ -4,6 +4,8 @@ const common = @import("common.zig");
 const Allocator = std.mem.Allocator;
 const site = "http://www.subsynchro.com";
 const search_endpoint = site ++ "/include/ajax/subMarin.php";
+const payload_max_attempts: usize = 2;
+const payload_retry_delay_ms: u64 = 350;
 
 pub const SearchItem = struct {
     title: []const u8,
@@ -26,56 +28,89 @@ pub const Scraper = struct {
     }
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        errdefer arena.deinit();
-        const a = arena.allocator();
-
         const trimmed = std.mem.trim(u8, query, " \t\r\n");
-        if (trimmed.len == 0) return .{ .arena = arena, .items = &.{} };
+        if (trimmed.len == 0) return .{ .arena = std.heap.ArenaAllocator.init(self.allocator), .items = &.{} };
 
-        const url = try buildSearchUrl(a, trimmed, null);
-        const response = try common.fetchBytes(self.client, a, url, .{
-            .accept = "application/json,*/*",
-            .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = site }},
-            .cache = false,
-            .max_attempts = 2,
-            .require_public_origin = true,
-        });
-        return parseSearchJson(common.takeArena(&arena), response.body, trimmed);
+        var payload_attempt: usize = 0;
+        while (payload_attempt < payload_max_attempts) : (payload_attempt += 1) {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+
+            const url = try buildSearchUrl(a, trimmed, null);
+            const response = try common.fetchBytes(self.client, a, url, .{
+                .accept = "application/json,*/*",
+                .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = site }},
+                .cache = false,
+                .max_attempts = 2,
+                .require_public_origin = true,
+            });
+            const parsed = parseSearchJson(common.takeArena(&arena), response.body, trimmed) catch |err| {
+                if (!shouldRetryPayloadError(err, payload_attempt)) return err;
+                try common.sleepMillisecondsCancelable(payload_retry_delay_ms);
+                continue;
+            };
+            return parsed;
+        }
+        unreachable;
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        errdefer arena.deinit();
-        const a = arena.allocator();
-
         try validateProviderEndpoint(item.page_url);
-        const response = try common.fetchBytes(self.client, a, item.page_url, .{
-            .accept = "application/json,*/*",
-            .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = site }},
-            .cache = false,
-            .max_attempts = 2,
-            .require_public_origin = true,
-        });
-        var parsed = try parseSubtitlesJson(common.takeArena(&arena), response.body, item);
+        var parsed = parsed_response: {
+            var payload_attempt: usize = 0;
+            while (payload_attempt < payload_max_attempts) : (payload_attempt += 1) {
+                var arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena.deinit();
+                const a = arena.allocator();
+
+                const response = try common.fetchBytes(self.client, a, item.page_url, .{
+                    .accept = "application/json,*/*",
+                    .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = site }},
+                    .cache = false,
+                    .max_attempts = 2,
+                    .require_public_origin = true,
+                });
+                const value = parseSubtitlesJson(common.takeArena(&arena), response.body, item) catch |err| {
+                    if (!shouldRetryPayloadError(err, payload_attempt)) return err;
+                    try common.sleepMillisecondsCancelable(payload_retry_delay_ms);
+                    continue;
+                };
+                break :parsed_response value;
+            }
+            unreachable;
+        };
         errdefer parsed.deinit();
-        const parsed_allocator = parsed.arena.allocator();
-        var resolved: std.ArrayListUnmanaged(SubtitleItem) = .empty;
-        for (parsed.subtitles) |subtitle| {
-            const direct_url = resolveDownloadRedirect(self.client, parsed_allocator, subtitle.download_url) catch |err| {
-                if (err == error.Canceled or err == error.OutOfMemory) return err;
-                continue;
-            };
-            try resolved.append(parsed_allocator, .{
-                .language_code = subtitle.language_code,
-                .filename = subtitle.filename,
-                .download_url = direct_url,
-            });
-        }
-        parsed.subtitles = try resolved.toOwnedSlice(parsed_allocator);
+        try resolveSubtitleRedirectsUsing(resolveDownloadRedirect, self.client, &parsed);
         return parsed;
     }
 };
+
+fn resolveSubtitleRedirectsUsing(
+    comptime resolve: anytype,
+    client: *std.http.Client,
+    parsed: *SubtitlesResponse,
+) !void {
+    const parsed_allocator = parsed.arena.allocator();
+    var resolved: std.ArrayListUnmanaged(SubtitleItem) = .empty;
+    for (parsed.subtitles) |subtitle| {
+        const direct_url = resolve(client, parsed_allocator, subtitle.download_url) catch |err| {
+            if (common.mustPropagateOptionalFailure(err)) return err;
+            continue;
+        };
+        try resolved.append(parsed_allocator, .{
+            .language_code = subtitle.language_code,
+            .filename = subtitle.filename,
+            .download_url = direct_url,
+        });
+    }
+    parsed.subtitles = try resolved.toOwnedSlice(parsed_allocator);
+}
+
+fn shouldRetryPayloadError(err: anyerror, attempt: usize) bool {
+    if (attempt + 1 >= payload_max_attempts) return false;
+    return !common.mustPropagateOptionalFailure(err);
+}
 
 fn buildSearchUrl(allocator: Allocator, title: []const u8, year: ?i64) ![]u8 {
     const encoded = try common.encodeUriComponent(allocator, title);
@@ -229,7 +264,6 @@ fn normalizeProviderUrl(allocator: Allocator, raw_url: []const u8) ![]const u8 {
 
 fn resolveDownloadRedirect(client: *std.http.Client, allocator: Allocator, url: []const u8) ![]const u8 {
     try validateProviderEndpoint(url);
-    try common.ensureClientTlsReady(client);
     const normalized = try common.normalizeUrlForFetch(allocator, url);
     defer allocator.free(normalized);
     const uri = try std.Uri.parse(normalized);
@@ -238,21 +272,34 @@ fn resolveDownloadRedirect(client: *std.http.Client, allocator: Allocator, url: 
         .{ .name = "referer", .value = site },
         .{ .name = "accept", .value = "application/zip,application/octet-stream,*/*" },
     };
-    var req = try client.request(.HEAD, uri, .{
+    try common.validateHttpHeaders(&headers);
+    var public_client: std.http.Client = undefined;
+    try common.initPublicOriginClient(client, &public_client);
+    defer public_client.deinit();
+    const pinned_connection = try common.connectPinnedPublicHttpUrl(&public_client, allocator, normalized);
+    pinned_connection.closing = true;
+
+    var req = public_client.request(.HEAD, uri, .{
         .redirect_behavior = .unhandled,
+        .keep_alive = false,
+        .connection = pinned_connection,
         .headers = .{
             .user_agent = .{ .override = common.default_user_agent },
             .accept_encoding = .{ .override = "identity" },
         },
         .extra_headers = &headers,
-    });
+    }) catch |err| {
+        public_client.connection_pool.release(pinned_connection, public_client.io);
+        return err;
+    };
     defer req.deinit();
+    errdefer req.connection.?.closing = true;
     try req.sendBodiless();
 
     var head_buffer: [16 * 1024]u8 = undefined;
     const response = try req.receiveHead(&head_buffer);
+    try requireRedirectResponseStatus(response.head.status);
     if (response.head.status == .ok) return try allocator.dupe(u8, url);
-    if (!common.isRedirectStatus(response.head.status)) return error.UnexpectedHttpStatus;
 
     const location = try extractHeader(allocator, response.head.bytes, "location") orelse return error.MissingField;
     defer allocator.free(location);
@@ -265,6 +312,12 @@ fn resolveDownloadRedirect(client: *std.http.Client, allocator: Allocator, url: 
     const resolved = try common.resolveUrl(allocator, site, location_for_resolve);
     defer allocator.free(resolved);
     return try normalizeProviderUrl(allocator, resolved);
+}
+
+fn requireRedirectResponseStatus(status: std.http.Status) !void {
+    if (status == .too_many_requests) return error.RateLimited;
+    if (status == .unauthorized or status == .forbidden) return error.ProviderAccessBlocked;
+    if (status != .ok and !common.isRedirectStatus(status)) return error.UnexpectedHttpStatus;
 }
 
 fn validateProviderEndpoint(url: []const u8) !void {
@@ -340,6 +393,46 @@ test "subsynchro rejects unsafe provider redirect targets before fetch" {
     try std.testing.expectError(error.UnsafeHttpTarget, normalizeProviderUrl(std.testing.allocator, "http://127.0.0.1/private"));
     try std.testing.expectError(error.UnsafeHttpTarget, normalizeProviderUrl(std.testing.allocator, "https://user:pass@www.subsynchro.com/private"));
     try std.testing.expectError(error.UnsafeHttpTarget, normalizeProviderUrl(std.testing.allocator, "https://www.google.com/private"));
+}
+
+test "subsynchro classifies redirect response failures" {
+    try requireRedirectResponseStatus(.ok);
+    try requireRedirectResponseStatus(.moved_permanently);
+    try std.testing.expectError(error.RateLimited, requireRedirectResponseStatus(.too_many_requests));
+    try std.testing.expectError(error.ProviderAccessBlocked, requireRedirectResponseStatus(.unauthorized));
+    try std.testing.expectError(error.ProviderAccessBlocked, requireRedirectResponseStatus(.forbidden));
+    try std.testing.expectError(error.UnexpectedHttpStatus, requireRedirectResponseStatus(.internal_server_error));
+}
+
+test "subsynchro only retries non-terminal malformed payload failures" {
+    try std.testing.expect(shouldRetryPayloadError(error.UnexpectedEndOfInput, 0));
+    try std.testing.expect(!shouldRetryPayloadError(error.Canceled, 0));
+    try std.testing.expect(!shouldRetryPayloadError(error.OutOfMemory, 0));
+    try std.testing.expect(!shouldRetryPayloadError(error.RateLimited, 0));
+    try std.testing.expect(!shouldRetryPayloadError(error.ProviderAccessBlocked, 0));
+    try std.testing.expect(!shouldRetryPayloadError(error.UnsafeHttpTarget, 0));
+    try std.testing.expect(!shouldRetryPayloadError(error.InvalidDownloadUrl, 0));
+    try std.testing.expect(!shouldRetryPayloadError(error.UnexpectedEndOfInput, payload_max_attempts - 1));
+}
+
+test "subsynchro skips one ordinary redirect failure" {
+    const Resolve = struct {
+        fn redirect(_: *std.http.Client, allocator: Allocator, url: []const u8) anyerror![]const u8 {
+            if (std.mem.indexOf(u8, url, "file-1") != null) return error.ConnectionResetByPeer;
+            return allocator.dupe(u8, "http://www.subsynchro.com/archive.zip");
+        }
+    };
+    var response = try parseSubtitlesJson(
+        std.heap.ArenaAllocator.init(std.testing.allocator),
+        "{\"status\":200,\"data\":[{\"filename\":\"one.srt\",\"titre\":\"Movie\",\"telechargement\":\"http://www.subsynchro.com/file-1\"},{\"filename\":\"two.srt\",\"titre\":\"Movie\",\"telechargement\":\"http://www.subsynchro.com/file-2\"}]}",
+        .{ .title = "Movie", .year = null, .page_url = "unused" },
+    );
+    defer response.deinit();
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    try resolveSubtitleRedirectsUsing(Resolve.redirect, &client, &response);
+    try std.testing.expectEqual(@as(usize, 1), response.subtitles.len);
+    try std.testing.expectEqualStrings("two.srt", response.subtitles[0].filename);
 }
 
 test "live subsynchro movie search, listing and download" {

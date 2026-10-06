@@ -34,6 +34,10 @@ pub const Scraper = struct {
     }
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
+        return self.searchUsing(common.fetchBytes, query);
+    }
+
+    fn searchUsing(self: *Scraper, comptime fetch: anytype, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -43,12 +47,16 @@ pub const Scraper = struct {
 
         const encoded = try common.encodeUriComponent(a, trimmed);
         const url = try std.fmt.allocPrint(a, "{s}/search?search={s}&per_page=20", .{ api, encoded });
-        const response = try common.fetchBytes(self.client, a, url, .{
+        const response = try fetch(self.client, a, url, .{
             .accept = "application/json",
             .cache = false,
             .max_attempts = 2,
+            .retry_on_429 = false,
+            .allow_non_ok = true,
             .require_public_origin = true,
         });
+        if (response.status == .too_many_requests) return error.RateLimited;
+        if (response.status != .ok) return error.UnexpectedHttpStatus;
 
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
         const array = switch (root) {
@@ -77,13 +85,23 @@ pub const Scraper = struct {
             inspected += 1;
 
             const detail_url = try std.fmt.allocPrint(a, "{s}/anime/{d}", .{ api, anime_id });
-            const detail_response = common.fetchBytes(self.client, a, detail_url, .{
+            const detail_response = fetch(self.client, a, detail_url, .{
                 .accept = "application/json",
                 .cache = false,
                 .max_attempts = 2,
+                .retry_on_429 = false,
+                .allow_non_ok = true,
                 .require_public_origin = true,
-            }) catch continue;
-            const detail = try std.json.parseFromSliceLeaky(std.json.Value, a, detail_response.body, .{});
+            }) catch |err| {
+                if (common.mustPropagateOptionalFailure(err)) return err;
+                continue;
+            };
+            if (detail_response.status == .too_many_requests) return error.RateLimited;
+            if (detail_response.status != .ok) continue;
+            const detail = std.json.parseFromSliceLeaky(std.json.Value, a, detail_response.body, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => continue,
+            };
             const detail_obj = switch (detail) {
                 .object => |value| value,
                 else => continue,
@@ -140,8 +158,11 @@ pub const Scraper = struct {
             .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = item.page_url }},
             .cache = false,
             .max_attempts = 2,
+            .retry_on_429 = false,
+            .allow_non_ok = true,
             .require_public_origin = true,
         });
+        if (response.status == .too_many_requests) return error.RateLimited;
         if (response.status != .ok) return error.UnexpectedHttpStatus;
 
         var parsed = try common.parseHtmlStable(a, response.body);
@@ -245,6 +266,80 @@ test "miraianime rejects unsafe provider URLs before fetch" {
     try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("http://127.0.0.1/private"));
     try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("https://user:pass@miraianime.net/private"));
     try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("https://www.google.com/private"));
+}
+
+test "miraianime stops detail fallback on rate limits and cancellation" {
+    const Scenario = enum { limited, canceled, out_of_memory };
+    const Case = struct { scenario: Scenario, expected_error: anyerror };
+    const Fixture = struct {
+        client: std.http.Client,
+        scenario: Scenario,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, url: []const u8, options: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            try std.testing.expect(!options.retry_on_429);
+            if (std.mem.indexOf(u8, url, "/search?") != null) {
+                return .{
+                    .status = .ok,
+                    .body = try allocator.dupe(u8, "[{\"subtype\":\"anime\",\"id\":1,\"title\":\"First\",\"url\":\"https://miraianime.net/anime/first/\"}," ++
+                        "{\"subtype\":\"anime\",\"id\":2,\"title\":\"Second\",\"url\":\"https://miraianime.net/anime/second/\"}]"),
+                };
+            }
+            try std.testing.expectEqual(@as(usize, 2), self.calls);
+            return switch (self.scenario) {
+                .limited => .{ .status = .too_many_requests, .body = try allocator.dupe(u8, "limited") },
+                .canceled => error.Canceled,
+                .out_of_memory => error.OutOfMemory,
+            };
+        }
+    };
+
+    for ([_]Case{
+        .{ .scenario = .limited, .expected_error = error.RateLimited },
+        .{ .scenario = .canceled, .expected_error = error.Canceled },
+        .{ .scenario = .out_of_memory, .expected_error = error.OutOfMemory },
+    }) |case| {
+        var fixture: Fixture = .{
+            .client = .{ .allocator = std.testing.allocator, .io = std.testing.io },
+            .scenario = case.scenario,
+        };
+        defer fixture.client.deinit();
+        var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+        try std.testing.expectError(case.expected_error, scraper.searchUsing(Fixture.fetch, "First"));
+        try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    }
+}
+
+test "miraianime skips one ordinary detail failure" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, url: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            if (std.mem.indexOf(u8, url, "/search?") != null) return .{
+                .status = .ok,
+                .body = try allocator.dupe(u8, "[{\"subtype\":\"anime\",\"id\":1,\"title\":\"Broken\",\"url\":\"https://miraianime.net/anime/broken/\"},{\"subtype\":\"anime\",\"id\":2,\"title\":\"Second\",\"url\":\"https://miraianime.net/anime/second/\"}]"),
+            };
+            if (std.mem.endsWith(u8, url, "/anime/1")) return error.ConnectionResetByPeer;
+            return .{
+                .status = .ok,
+                .body = try allocator.dupe(u8, "{\"title\":{\"rendered\":\"Second\"},\"acf\":{\"basic_data\":{\"type\":\"3\",\"episodes\":1}}}"),
+            };
+        }
+    };
+
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+    var response = try scraper.searchUsing(Fixture.fetch, "Second");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(usize, 1), response.items.len);
+    try std.testing.expectEqualStrings("Second", response.items[0].title);
+    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
 }
 
 test "live miraianime movie and tv subtitle packs" {

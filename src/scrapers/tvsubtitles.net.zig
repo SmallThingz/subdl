@@ -115,7 +115,7 @@ pub const Scraper = struct {
 
             var rows = doc.doc.queryAll("table#table5 tr[align='middle']");
             while (rows.next()) |row| {
-                const episode_title = episodeTitle(row, a) catch null;
+                const episode_title = try episodeTitle(row, a);
 
                 var anchors = row.queryAll("a[href*='subtitle-']");
                 while (anchors.next()) |anchor| {
@@ -133,7 +133,7 @@ pub const Scraper = struct {
                     }
 
                     const lang = try common.dupOptional(a, languageFromSubtitleAnchor(anchor, href));
-                    const filename = buildFilename(a, episode_title, lang) catch "subtitle.zip";
+                    const filename = try buildFilename(a, episode_title, lang);
 
                     try subtitles.append(a, .{
                         .language_code = lang,
@@ -213,6 +213,7 @@ fn fetchSearchPage(client: *std.http.Client, allocator: Allocator, page_url: []c
 fn fetchSearchPageWith(client: *std.http.Client, allocator: Allocator, page_url: []const u8, comptime fetch: anytype) !common.HttpResponse {
     var response = try fetch(client, allocator, page_url, common.FetchOptions{
         .accept = "text/html",
+        .cache = false,
         .max_attempts = 2,
         .retry_on_429 = false,
         .allow_non_ok = true,
@@ -230,6 +231,7 @@ fn fetchSearchPageWith(client: *std.http.Client, allocator: Allocator, page_url:
         allocator.free(response.body);
         response = try fetch(client, allocator, site ++ "/tvshows.html", common.FetchOptions{
             .accept = "text/html",
+            .cache = false,
             .max_attempts = 2,
             .retry_on_429 = false,
             .allow_non_ok = true,
@@ -243,6 +245,7 @@ fn fetchTvHtml(client: *std.http.Client, allocator: Allocator, canonical_url: []
     try validateProviderUrl(canonical_url);
     const response = try common.fetchBytes(client, allocator, canonical_url, .{
         .accept = "text/html",
+        .cache = false,
         .max_attempts = 2,
         .retry_on_429 = false,
         .allow_non_ok = true,
@@ -522,6 +525,21 @@ test "tvsub parse subtitle id" {
     try std.testing.expect(parseSubtitleId("https://x/subtitle-abc.html") == null);
 }
 
+test "tvsub optional row fields preserve allocation failures" {
+    const source = "<table><tr><td>1</td><td><a><b>Episode Title</b></a></td></tr></table>";
+    var parsed = try common.parseHtmlStable(std.testing.allocator, source);
+    defer parsed.deinit();
+    const row = parsed.doc.queryOne("tr") orelse return error.TestUnexpectedResult;
+
+    var failing_title = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, episodeTitle(row, failing_title.allocator()));
+    try std.testing.expect(failing_title.has_induced_failure);
+
+    var failing_filename = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, buildFilename(failing_filename.allocator(), null, null));
+    try std.testing.expect(failing_filename.has_induced_failure);
+}
+
 test "tvsub rejects unsafe provider urls before fetch" {
     for ([_][]const u8{
         "http://127.0.0.1/tvshow-1.html",
@@ -563,7 +581,8 @@ test "tvsub rejects failed HTTP and access-block pages" {
 
 test "tvsub failed search falls back to a successful catalog only" {
     const Mock = struct {
-        fn fallback(_: *std.http.Client, a: Allocator, url: []const u8, _: common.FetchOptions) !common.HttpResponse {
+        fn fallback(_: *std.http.Client, a: Allocator, url: []const u8, options: common.FetchOptions) !common.HttpResponse {
+            try std.testing.expect(!options.cache);
             const catalog = std.mem.endsWith(u8, url, "/tvshows.html");
             return .{
                 .status = if (catalog) .ok else .not_found,
@@ -592,9 +611,10 @@ test "tvsub rate limits stop acquisition before the catalog fallback" {
         client: std.http.Client,
         calls: usize = 0,
 
-        fn fetch(client: *std.http.Client, a: Allocator, _: []const u8, _: common.FetchOptions) !common.HttpResponse {
+        fn fetch(client: *std.http.Client, a: Allocator, _: []const u8, options: common.FetchOptions) !common.HttpResponse {
             const self: *@This() = @fieldParentPtr("client", client);
             self.calls += 1;
+            try std.testing.expect(!options.cache);
             return .{
                 .status = if (self.calls == 1) .too_many_requests else .ok,
                 .body = try a.dupe(u8, "<a href='tvshow-1.html'>Show</a>"),

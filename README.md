@@ -36,6 +36,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `gestdown_info` | `gestdown.info` |
 | `subsunacs_net` | `subsunacs.net` |
 | `subtitles_ajatt_top` | `subtitles.ajatt.top` |
+| `subtis_io` | `subtis.io` |
 | `greeksubs_net` | `greeksubs.net` |
 | `indexsubtitle_cc` | `indexsubtitle.cc` |
 | `sous_titres_eu` | `sous-titres.eu` |
@@ -73,14 +74,15 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 
 Retained inactive implementations are `opensubtitles_org` and `tvsubtitles_net`
 because their current user path is blocked by the Australian website-block page,
-`moviesubtitlesrt_com` because its live search path currently returns a non-success
-HTTP status, `greeksubtitles_com` because its live search endpoint currently stalls
-and returns non-success responses, and `my_subs_co`, `podnapisi_net`, `subtis_io`, and
-`animesubtitle_ir` because their required upstream hosts currently have no usable
-DNS address. They remain covered by focused live tests so upstream recovery can
-be detected without advertising a known-unusable provider in the CLI/TUI.
+`moviesubtitlesrt_com` because its host is currently unreachable,
+`greek_subtitles_com` because its live search endpoint stalls or returns HTTP 524,
+and `my_subs_co`, `podnapisi_net`, and `animesubtitle_ir` because their required
+upstream hosts currently have no usable address.
+They remain covered by focused live tests so upstream recovery can be detected
+without advertising a provider whose complete user path is known to be unreliable.
 
 `gestdown_info` is TV-only. `yifysubtitles_ch` is movie-only.
+`subtis_io` is movie-only.
 `subtitles_ajatt_top` focuses on Japanese subtitles for anime TV and movies.
 `greeksubs_net` provides Greek subtitles for movies and TV.
 `sous_titres_eu` provides French subtitles for movies and TV.
@@ -184,6 +186,21 @@ Enable browser automation support:
 zig build -Denable-alldriver=true
 ```
 
+On Linux, Cloudflare session handoff launches a locally installed
+Chromium-family browser through a private, deadline-bounded CDP pipe.
+Auto-discovery covers Chrome, Chromium, Edge, Brave, and Vivaldi; the root CDP
+product must report Chrome or Chromium 154 or newer. DNS is restricted to pinned
+public addresses for the challenged host and Cloudflare's challenge host, and
+proxies are disabled. Page-session requests are intercepted before navigation
+and limited to those HTTPS origins; other document redirects and local/private
+targets fail closed through interception and Chromium's local-network controls.
+Graphical environments use a visible window by default; set
+`SUBDL_CF_HEADLESS=1` only where manual challenge completion is not needed. Set
+`SUBDL_CHROMIUM_PATH` to an absolute browser path when auto-discovery does not
+cover the installation. macOS and FreeBSD fail closed until browser DNS can be
+cancelled at the deadline; Windows fails closed pending secure native handle and
+DACL support. This feature neither solves CAPTCHAs nor bypasses access controls.
+
 ## Build Flags
 
 - `-Doptimize=debug|safe|fast|small`
@@ -207,7 +224,6 @@ Use `-Dllvm=true` if the native GNU build hits host CRT `.sframe` relocation err
 ## Docs
 
 - [DOCUMENTATION.md](./DOCUMENTATION.md)
-- [ISSUES.md](./ISSUES.md)
 - [CONTRIBUTIONS.md](./CONTRIBUTIONS.md)
 - [SECURITY.md](./SECURITY.md)
 - [LICENCE](./LICENCE)

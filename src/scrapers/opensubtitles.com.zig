@@ -1,5 +1,6 @@
 const std = @import("std");
 const common = @import("common.zig");
+const cf = @import("opensubtitles_com_cf.zig");
 
 const Allocator = std.mem.Allocator;
 const site = "https://rest.opensubtitles.com";
@@ -153,10 +154,10 @@ pub const Scraper = struct {
             };
             if (cols.items.len == 0) continue;
 
-            const language = parseLanguageFromCell(a, cols.items, 1) catch null;
-            const filename = parseFilenameFromCell(a, cols.items, 2) catch null;
-            const row_summary = summarizeRow(a, cols.items) catch null;
-            const remote = parseRemoteEndpoint(a, cols.items) catch continue;
+            const language = try parseLanguageFromCell(a, cols.items, 1);
+            const filename = try parseFilenameFromCell(a, cols.items, 2);
+            const row_summary = try summarizeRow(a, cols.items);
+            const remote = (try parseOptionalRemoteEndpoint(a, cols.items)) orelse continue;
 
             const should_resolve = options.resolve_downloads and
                 (options.resolve_limit == 0 or resolved_count < options.resolve_limit);
@@ -230,19 +231,36 @@ pub const Scraper = struct {
 const SessionFetchOptions = struct {
     accept: ?[]const u8 = null,
     extra_headers: []const std.http.Header = &.{},
-    allow_non_ok: bool = false,
 };
 
 fn fetchPublic(client: *std.http.Client, allocator: Allocator, url: []const u8, options: SessionFetchOptions) ![]u8 {
-    const response = try common.fetchBytes(client, allocator, url, .{
+    return fetchPublicUsing(common.fetchBytes, client, allocator, url, options);
+}
+
+fn fetchPublicUsing(comptime fetch: anytype, client: *std.http.Client, allocator: Allocator, url: []const u8, options: SessionFetchOptions) ![]u8 {
+    const response = try fetch(client, allocator, url, .{
         .accept = options.accept,
         .extra_headers = options.extra_headers,
         .allow_non_ok = true,
         .max_attempts = 2,
+        .retry_on_429 = false,
+        .cache = false,
         .require_public_origin = true,
     });
 
-    if (!options.allow_non_ok and response.status != .ok) {
+    if (response.status == .too_many_requests) {
+        allocator.free(response.body);
+        return error.RateLimited;
+    }
+    if (cf.isChallengeBody(response.body)) {
+        allocator.free(response.body);
+        return error.CloudflareChallenge;
+    }
+    if (response.status == .forbidden) {
+        allocator.free(response.body);
+        return error.ProviderAccessBlocked;
+    }
+    if (response.status != .ok) {
         allocator.free(response.body);
         return error.UnexpectedHttpStatus;
     }
@@ -324,6 +342,13 @@ fn parseRemoteEndpoint(allocator: Allocator, cols: []const std.json.Value) ![]co
     errdefer allocator.free(resolved);
     try validateProviderEndpoint(resolved);
     return resolved;
+}
+
+fn parseOptionalRemoteEndpoint(allocator: Allocator, cols: []const std.json.Value) !?[]const u8 {
+    return parseRemoteEndpoint(allocator, cols) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return null;
+    };
 }
 
 fn firstHtmlAttribute(allocator: Allocator, fragment: []const u8, name: []const u8) !?[]const u8 {
@@ -508,6 +533,27 @@ test "opensubtitles.com parses listing cells without reparsing html documents" {
     try std.testing.expectEqualStrings("https://rest.opensubtitles.com/nocache/download/1/subreq.js?direct_dl=true&locale=en", remote);
 }
 
+test "opensubtitles.com optional listing parsers preserve allocation errors" {
+    const cols = [_]std.json.Value{
+        .{ .string = "en" },
+        .{ .string = "<a title=\"English\">English</a>" },
+        .{ .string = "<a>The Matrix</a>" },
+        .{ .string = "<a data-remote=\"true\" href=\"/download\">Direct</a>" },
+    };
+
+    var failing_language = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, parseLanguageFromCell(failing_language.allocator(), &cols, 1));
+
+    var failing_filename = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, parseFilenameFromCell(failing_filename.allocator(), &cols, 2));
+
+    var failing_summary = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, summarizeRow(failing_summary.allocator(), &cols));
+
+    var failing_remote = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, parseOptionalRemoteEndpoint(failing_remote.allocator(), &cols));
+}
+
 test "opensubtitles.com rejects untrusted provider endpoints before fetch" {
     const allocator = std.testing.allocator;
     const cases = [_][]const u8{
@@ -537,6 +583,98 @@ test "opensubtitles.com rejects untrusted provider endpoints before fetch" {
     try std.testing.expectError(error.UnsafeHttpTarget, normalizePublicDownloadUrl(allocator, "http://127.0.0.1/subtitle.zip"));
     try std.testing.expectError(error.UnsafeHttpTarget, normalizePublicDownloadUrl(allocator, "http://169.254.169.254/latest/meta-data"));
     try std.testing.expectError(error.UnsafeHttpTarget, normalizePublicDownloadUrl(allocator, "https://user:pass@cdn.opensubtitles.com/subtitle.zip"));
+}
+
+test "opensubtitles.com REST metadata classifies terminal responses without retrying" {
+    const challenge = "<!doctype html><html><title>Just a moment...</title><script>window._cf_chl_opt = {};</script></html>";
+    const Case = struct {
+        status: std.http.Status,
+        body: []const u8,
+        expected_error: anyerror,
+    };
+    const Fixture = struct {
+        client: std.http.Client,
+        status: std.http.Status,
+        body: []const u8,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, _: []const u8, options: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            try std.testing.expect(options.allow_non_ok);
+            try std.testing.expect(!options.retry_on_429);
+            try std.testing.expect(!options.cache);
+            try std.testing.expectEqual(@as(usize, 2), options.max_attempts);
+            return .{ .status = self.status, .body = try allocator.dupe(u8, self.body) };
+        }
+    };
+
+    for ([_]Case{
+        .{ .status = .too_many_requests, .body = challenge, .expected_error = error.RateLimited },
+        .{ .status = .ok, .body = challenge, .expected_error = error.CloudflareChallenge },
+        .{ .status = .forbidden, .body = "forbidden", .expected_error = error.ProviderAccessBlocked },
+        .{ .status = .service_unavailable, .body = "unavailable", .expected_error = error.UnexpectedHttpStatus },
+        .{ .status = .bad_gateway, .body = "upstream failure", .expected_error = error.UnexpectedHttpStatus },
+    }) |case| {
+        var fixture: Fixture = .{
+            .client = .{ .allocator = std.testing.allocator, .io = std.testing.io },
+            .status = case.status,
+            .body = case.body,
+        };
+        defer fixture.client.deinit();
+        try std.testing.expectError(case.expected_error, fetchPublicUsing(
+            Fixture.fetch,
+            &fixture.client,
+            std.testing.allocator,
+            site ++ "/en/en/search/autocomplete/matrix.json",
+            .{ .accept = "application/json" },
+        ));
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    }
+
+    var success: Fixture = .{
+        .client = .{ .allocator = std.testing.allocator, .io = std.testing.io },
+        .status = .ok,
+        .body = "{\"title\":\"Just a moment\"}",
+    };
+    defer success.client.deinit();
+    const body = try fetchPublicUsing(Fixture.fetch, &success.client, std.testing.allocator, site ++ "/metadata.json", .{});
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("{\"title\":\"Just a moment\"}", body);
+    try std.testing.expectEqual(@as(usize, 1), success.calls);
+}
+
+test "opensubtitles.com REST metadata preserves cancellation and allocation failure" {
+    const Fixture = struct {
+        client: std.http.Client,
+        failure: anyerror,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, _: Allocator, _: []const u8, options: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            try std.testing.expect(options.allow_non_ok);
+            try std.testing.expect(!options.retry_on_429);
+            try std.testing.expect(!options.cache);
+            return self.failure;
+        }
+    };
+
+    inline for (.{ error.Canceled, error.OutOfMemory }) |failure| {
+        var fixture: Fixture = .{
+            .client = .{ .allocator = std.testing.allocator, .io = std.testing.io },
+            .failure = failure,
+        };
+        defer fixture.client.deinit();
+        try std.testing.expectError(failure, fetchPublicUsing(
+            Fixture.fetch,
+            &fixture.client,
+            std.testing.allocator,
+            site ++ "/metadata.json",
+            .{},
+        ));
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    }
 }
 
 test "live opensubtitles.com search and resolve" {

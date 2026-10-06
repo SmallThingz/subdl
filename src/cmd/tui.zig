@@ -666,6 +666,7 @@ fn isRemoteSearchFailure(err: anyerror) bool {
         error.SessionExpired,
         error.ProviderAccessBlocked,
         error.InvalidDownloadUrl,
+        error.UnsafeHttpTarget,
         error.ConnectionRefused,
         error.ConnectionResetByPeer,
         error.ConnectionTimedOut,
@@ -5567,6 +5568,7 @@ fn friendlyErrorMessage(err: anyerror) []const u8 {
         error.EndOfStream, error.ReadFailed => "Provider connection ended while reading the response.",
         error.ParseFailed, error.MissingField, error.InvalidField, error.InvalidFieldType => "Provider response format was not as expected.",
         error.InvalidDownloadUrl => "Provider returned an invalid download URL.",
+        error.UnsafeHttpTarget => "Provider attempted an unsafe redirect or network target; the request was blocked.",
         error.ProviderAccessBlocked => "Provider blocked access from this connection or region.",
         error.CloudflareChallenge, error.CloudflareSessionUnavailable, error.SessionExpired => "Cloudflare session is missing or expired for this provider.",
         error.InvalidSessionPayload => "Provider session data was invalid or incomplete.",
@@ -5596,6 +5598,10 @@ test "friendly errors explain common provider network failures" {
     try std.testing.expectEqualStrings(
         "Provider blocked access from this connection or region.",
         friendlyErrorMessage(error.ProviderAccessBlocked),
+    );
+    try std.testing.expectEqualStrings(
+        "Provider attempted an unsafe redirect or network target; the request was blocked.",
+        friendlyErrorMessage(error.UnsafeHttpTarget),
     );
 }
 
@@ -7988,6 +7994,7 @@ test "remote search failures do not count as application failures" {
     try std.testing.expect(isRemoteSearchFailure(error.CloudflareSessionUnavailable));
     try std.testing.expect(isRemoteSearchFailure(error.InvalidSessionPayload));
     try std.testing.expect(isRemoteSearchFailure(error.ProviderAccessBlocked));
+    try std.testing.expect(isRemoteSearchFailure(error.UnsafeHttpTarget));
     try std.testing.expect(!isRemoteSearchFailure(error.OutOfMemory));
 
     const allocator = std.testing.allocator;

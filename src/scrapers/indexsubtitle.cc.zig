@@ -90,8 +90,12 @@ pub const Scraper = struct {
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
+            .retry_on_429 = false,
+            .allow_non_ok = true,
             .require_public_origin = true,
         });
+        if (response.status == .too_many_requests) return error.RateLimited;
+        if (response.status != .ok) return error.UnexpectedHttpStatus;
 
         const rows_json = extractRowsJson(response.body) orelse return error.MissingField;
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, rows_json, .{});
@@ -136,9 +140,12 @@ pub const Scraper = struct {
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
+            .retry_on_429 = false,
+            .allow_non_ok = true,
             .require_public_origin = true,
         });
         defer allocator.free(page.body);
+        if (page.status == .too_many_requests) return error.RateLimited;
         if (page.status != .ok) return error.UnexpectedHttpStatus;
         const ttl = parsePageTtl(page.body) orelse return error.MissingField;
 
@@ -180,13 +187,24 @@ pub const Scraper = struct {
         );
         defer allocator.free(download_url);
 
-        return common.fetchBytes(self.client, allocator, download_url, .{
+        const download = try common.fetchBytes(self.client, allocator, download_url, .{
             .accept = "application/zip,application/octet-stream,*/*",
             .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = parts.page_url }},
             .cache = false,
             .max_attempts = 2,
+            .retry_on_429 = false,
+            .allow_non_ok = true,
             .require_public_origin = true,
         });
+        if (download.status == .too_many_requests) {
+            allocator.free(download.body);
+            return error.RateLimited;
+        }
+        if (download.status != .ok) {
+            allocator.free(download.body);
+            return error.UnexpectedHttpStatus;
+        }
+        return download;
     }
 };
 
@@ -203,10 +221,22 @@ fn fetchPostWithStatusRetry(
     payload: []const u8,
     headers: []const std.http.Header,
 ) !common.HttpResponse {
-    const max_status_attempts: usize = 4;
+    return fetchPostWithStatusRetryUsing(common.fetchBytes, common.sleepMillisecondsCancelable, client, allocator, url, payload, headers);
+}
+
+fn fetchPostWithStatusRetryUsing(
+    comptime fetch: anytype,
+    comptime sleep: anytype,
+    client: *std.http.Client,
+    allocator: Allocator,
+    url: []const u8,
+    payload: []const u8,
+    headers: []const std.http.Header,
+) !common.HttpResponse {
+    const max_attempts: usize = 4;
     var attempt: usize = 0;
-    while (attempt < max_status_attempts) : (attempt += 1) {
-        const response = try common.fetchBytes(client, allocator, url, .{
+    while (attempt < max_attempts) : (attempt += 1) {
+        const response = fetch(client, allocator, url, .{
             .method = .POST,
             .payload = payload,
             .content_type = "application/x-www-form-urlencoded",
@@ -214,21 +244,35 @@ fn fetchPostWithStatusRetry(
             .extra_headers = headers,
             .cache = false,
             .allow_non_ok = true,
-            .max_attempts = 2,
+            // This helper owns status retries. Keeping the transport helper to
+            // one attempt prevents the two retry loops from multiplying POSTs.
+            .max_attempts = 1,
+            .retry_on_429 = false,
             .require_public_origin = true,
-        });
+        }) catch |err| switch (err) {
+            else => {
+                if (common.mustNotRetryFetchError(err)) return err;
+                if (attempt + 1 >= max_attempts) return err;
+                try sleep(@as(u64, 1000) << @intCast(@min(attempt, 2)));
+                continue;
+            },
+        };
         if (response.status == .ok) return response;
+        if (response.status == .too_many_requests) {
+            allocator.free(response.body);
+            return error.RateLimited;
+        }
 
-        const retry = isTransientStatus(response.status) and attempt + 1 < max_status_attempts;
+        const retry = isTransientStatus(response.status) and attempt + 1 < max_attempts;
         allocator.free(response.body);
         if (!retry) return error.UnexpectedHttpStatus;
 
         const code = @backingInt(response.status);
-        const delay_ms: u64 = if (code == 429 or code == 403)
+        const delay_ms: u64 = if (code == 403)
             5500
         else
             @as(u64, 1000) << @intCast(@min(attempt, 2));
-        common.sleepMilliseconds(delay_ms);
+        try sleep(delay_ms);
     }
     return error.UnexpectedHttpStatus;
 }
@@ -238,7 +282,6 @@ fn isTransientStatus(status: std.http.Status) bool {
     return code == 403 or
         code == 408 or
         code == 425 or
-        code == 429 or
         (code >= 500 and code <= 504);
 }
 
@@ -373,9 +416,112 @@ test "indexsubtitle rejects non-provider page targets" {
 
 test "indexsubtitle retries transient search statuses" {
     try std.testing.expect(isTransientStatus(.forbidden));
-    try std.testing.expect(isTransientStatus(.too_many_requests));
+    try std.testing.expect(!isTransientStatus(.too_many_requests));
     try std.testing.expect(isTransientStatus(.service_unavailable));
     try std.testing.expect(!isTransientStatus(.not_found));
+}
+
+test "indexsubtitle treats rate limits as a single terminal POST" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, _: []const u8, options: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 1), options.max_attempts);
+            try std.testing.expect(!options.retry_on_429);
+            return .{ .status = .too_many_requests, .body = try allocator.dupe(u8, "limited") };
+        }
+
+        fn noSleep(_: u64) !void {}
+    };
+
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    try std.testing.expectError(error.RateLimited, fetchPostWithStatusRetryUsing(
+        Fixture.fetch,
+        Fixture.noSleep,
+        &fixture.client,
+        std.testing.allocator,
+        site ++ "/search",
+        "query=matrix",
+        &.{},
+    ));
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+}
+
+test "indexsubtitle preserves terminal transport errors without retrying" {
+    const Fixture = struct {
+        client: std.http.Client,
+        failure: anyerror,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, _: Allocator, _: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            return self.failure;
+        }
+
+        fn noSleep(_: u64) !void {}
+    };
+
+    inline for (.{
+        error.Canceled,
+        error.OutOfMemory,
+        error.UnsafeHttpTarget,
+        error.InvalidDownloadUrl,
+        error.UnsupportedCompressionMethod,
+        error.TooManyCompressedMembers,
+        error.ResponseTooLarge,
+        error.UnexpectedEncodedPayload,
+    }) |failure| {
+        var fixture: Fixture = .{
+            .client = .{ .allocator = std.testing.allocator, .io = std.testing.io },
+            .failure = failure,
+        };
+        defer fixture.client.deinit();
+        try std.testing.expectError(failure, fetchPostWithStatusRetryUsing(
+            Fixture.fetch,
+            Fixture.noSleep,
+            &fixture.client,
+            std.testing.allocator,
+            site ++ "/search",
+            "query=matrix",
+            &.{},
+        ));
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    }
+}
+
+test "indexsubtitle cancellation during POST backoff prevents another request" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, _: Allocator, _: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            return error.ConnectionResetByPeer;
+        }
+
+        fn cancel(_: u64) !void {
+            return error.Canceled;
+        }
+    };
+
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    try std.testing.expectError(error.Canceled, fetchPostWithStatusRetryUsing(
+        Fixture.fetch,
+        Fixture.cancel,
+        &fixture.client,
+        std.testing.allocator,
+        site ++ "/search",
+        "query=matrix",
+        &.{},
+    ));
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
 }
 
 test "live indexsubtitle movie and tv search/list/download" {

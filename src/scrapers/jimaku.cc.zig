@@ -116,7 +116,7 @@ fn parseCatalog(arena: std.heap.ArenaAllocator, body: []const u8, query: []const
 
         const metadata_raw = common.getAttributeValueSafe(row, "data-extra") orelse continue;
         const metadata = try decodeHtmlEntities(a, metadata_raw);
-        const json = std.json.parseFromSliceLeaky(std.json.Value, a, metadata, .{}) catch continue;
+        const json = (try parseCatalogMetadata(a, metadata)) orelse continue;
         const obj = switch (json) {
             .object => |value| value,
             else => continue,
@@ -160,6 +160,13 @@ fn parseCatalog(arena: std.heap.ArenaAllocator, body: []const u8, query: []const
     try items.appendSlice(a, exact.items);
     try items.appendSlice(a, partial.items);
     return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) });
+}
+
+fn parseCatalogMetadata(allocator: Allocator, metadata: []const u8) Allocator.Error!?std.json.Value {
+    return std.json.parseFromSliceLeaky(std.json.Value, allocator, metadata, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
 }
 
 fn parseEntryId(href: []const u8) ?i64 {
@@ -270,6 +277,16 @@ test "jimaku parses movie and tv catalog entries" {
     defer tv.deinit();
     try std.testing.expectEqual(@as(usize, 1), tv.items.len);
     try std.testing.expectEqual(MediaKind.tv, tv.items[0].media_kind);
+}
+
+test "jimaku catalog metadata skips malformed JSON and preserves allocation errors" {
+    try std.testing.expect((try parseCatalogMetadata(std.testing.allocator, "not-json")) == null);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        parseCatalogMetadata(failing.allocator(), "{\"name\":\"test\"}"),
+    );
 }
 
 test "live jimaku movie and tv direct downloads" {

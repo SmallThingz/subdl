@@ -72,7 +72,7 @@ pub const Scraper = struct {
         const page_url = parseDownloadToken(token) orelse return error.InvalidDownloadUrl;
         var page = try fetchDetailPage(self.client, allocator, page_url);
         defer page.deinit(allocator);
-        if (page.status != .ok) return error.UnexpectedHttpStatus;
+        try requireDetailStatus(page.status);
         const cookie = page.cookie orelse return error.SessionExpired;
 
         const id = try parseDownloadId(allocator, page.body) orelse return error.MissingField;
@@ -115,9 +115,13 @@ const DetailPage = struct {
     }
 };
 
+fn requireDetailStatus(status: std.http.Status) !void {
+    if (status == .too_many_requests) return error.RateLimited;
+    if (status != .ok) return error.UnexpectedHttpStatus;
+}
+
 fn fetchDetailPage(client: *std.http.Client, allocator: Allocator, url: []const u8) !DetailPage {
     try validateProviderEndpoint(url);
-    try common.ensureClientTlsReady(client);
     const normalized = try common.normalizeUrlForFetch(allocator, url);
     defer allocator.free(normalized);
     const uri = try std.Uri.parse(normalized);
@@ -125,14 +129,26 @@ fn fetchDetailPage(client: *std.http.Client, allocator: Allocator, url: []const 
         .{ .name = "referer", .value = site },
         .{ .name = "accept", .value = "text/html,application/xhtml+xml,*/*" },
     };
-    var req = try client.request(.GET, uri, .{
+    try common.validateHttpHeaders(&headers);
+    var public_client: std.http.Client = undefined;
+    try common.initPublicOriginClient(client, &public_client);
+    defer public_client.deinit();
+    const pinned_connection = try common.connectPinnedPublicHttpUrl(&public_client, allocator, normalized);
+    pinned_connection.closing = true;
+
+    var req = public_client.request(.GET, uri, .{
         .redirect_behavior = .unhandled,
+        .keep_alive = false,
+        .connection = pinned_connection,
         .headers = .{
             .user_agent = .{ .override = common.default_user_agent },
             .accept_encoding = .{ .override = "identity" },
         },
         .extra_headers = &headers,
-    });
+    }) catch |err| {
+        public_client.connection_pool.release(pinned_connection, public_client.io);
+        return err;
+    };
     defer req.deinit();
     errdefer req.connection.?.closing = true;
     try req.sendBodiless();
@@ -370,6 +386,12 @@ test "subs4free parses download id" {
     const id = (try parseDownloadId(std.testing.allocator, "<form><input type=\"hidden\" name=\"id\" value=\"abc123\"></form>")).?;
     defer std.testing.allocator.free(id);
     try std.testing.expectEqualStrings("abc123", id);
+}
+
+test "subs4free raw detail page classifies rate limits" {
+    try requireDetailStatus(.ok);
+    try std.testing.expectError(error.RateLimited, requireDetailStatus(.too_many_requests));
+    try std.testing.expectError(error.UnexpectedHttpStatus, requireDetailStatus(.service_unavailable));
 }
 
 test "subs4free rejects unsafe detail targets before fetch" {

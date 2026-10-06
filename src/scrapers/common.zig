@@ -64,6 +64,13 @@ const FetchCacheGuard = struct {
         return .{};
     }
 
+    fn lockCancelable() !FetchCacheGuard {
+        while (fetch_cache_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            try sleepMillisecondsCancelable(5);
+        }
+        return .{};
+    }
+
     fn unlock(_: FetchCacheGuard) void {
         fetch_cache_lock.store(0, .release);
     }
@@ -73,6 +80,38 @@ pub fn configureFetchCache(config: FetchCacheConfig) void {
     const guard = FetchCacheGuard.lock();
     defer guard.unlock();
     fetch_cache_config = config;
+}
+
+/// Optional child/enrichment requests may fail without invalidating an entire
+/// provider result, but process cancellation and provider-wide policy errors
+/// must never be hidden by that fallback behavior.
+pub fn mustPropagateOptionalFailure(err: anyerror) bool {
+    return err == error.Canceled or
+        err == error.OutOfMemory or
+        err == error.RateLimited or
+        err == error.ProviderAccessBlocked or
+        err == error.CloudflareChallenge or
+        err == error.UnsafeHttpTarget or
+        err == error.InvalidDownloadUrl or
+        err == error.PublicOriginProxyUnsupported;
+}
+
+/// Errors caused by cancellation, local policy, or a deterministic response
+/// shape cannot become successful by repeating the same request.
+pub fn mustNotRetryFetchError(err: anyerror) bool {
+    return err == error.Canceled or
+        err == error.OutOfMemory or
+        err == error.UnsafeHttpTarget or
+        err == error.InvalidDownloadUrl or
+        err == error.PublicOriginProxyUnsupported or
+        err == error.UnsupportedProtocolUpgrade or
+        err == error.TooManyInformationalResponses or
+        err == error.TooManyHttpRedirects or
+        err == error.HttpRedirectLocationMissing or
+        err == error.UnsupportedCompressionMethod or
+        err == error.TooManyCompressedMembers or
+        err == error.ResponseTooLarge or
+        err == error.UnexpectedEncodedPayload;
 }
 
 pub const ParsedHtml = struct {
@@ -210,8 +249,16 @@ pub fn compatUnixTimestamp() i64 {
     return @intCast(@divTrunc(ns, std.time.ns_per_s));
 }
 
+pub fn sleepMillisecondsCancelable(ms: u64) std.Io.Cancelable!void {
+    const bounded_ms = @min(ms, std.math.maxInt(i64));
+    try runtime_io.get().sleep(.fromMilliseconds(@intCast(bounded_ms)), .awake);
+}
+
+/// Use only where cancellation cannot be returned to the caller, such as
+/// lock polling and best-effort progress reporting. Request workflows should
+/// use sleepMillisecondsCancelable instead.
 pub fn sleepMilliseconds(ms: u64) void {
-    runtime_io.get().sleep(.fromMilliseconds(@intCast(ms)), .awake) catch {};
+    sleepMillisecondsCancelable(ms) catch {};
 }
 
 pub fn isAustralianWebsiteBlockPage(body: []const u8) bool {
@@ -286,33 +333,46 @@ pub fn fetchBytes(client: *std.http.Client, allocator: Allocator, url: []const u
 }
 
 fn fetchBytesWith(comptime fetch: anytype, comptime backoff: anytype, client: *std.http.Client, allocator: Allocator, url: []const u8, opts: FetchOptions) !HttpResponse {
+    try validateFetchHeaders(opts);
     if (opts.require_public_origin) try validatePublicHttpUrl(url);
     if (try loadFetchCache(allocator, url, opts)) |cached| return cached;
 
+    const logging_enabled = livePhaseLoggingEnabled();
+    const owned_log_url = if (logging_enabled) redactUrlForLog(allocator, url) catch null else null;
+    defer if (owned_log_url) |value| allocator.free(value);
+    const log_url = owned_log_url orelse "<redacted-url>";
+
     var attempts: usize = 0;
     while (true) : (attempts += 1) {
-        if (livePhaseLoggingEnabled()) {
+        if (logging_enabled) {
             std.debug.print(
                 "[live][phase][http.fetch] method={s} attempt={d}/{d} url={s}\n",
-                .{ @tagName(opts.method), attempts + 1, opts.max_attempts, url },
+                .{ @tagName(opts.method), attempts + 1, opts.max_attempts, log_url },
             );
         }
 
         const response = fetch(client, allocator, url, opts) catch |err| {
-            if (err == error.Canceled or err == error.OutOfMemory) return err;
+            if (mustNotRetryFetchError(err)) return err;
             if (attempts + 1 < opts.max_attempts) {
                 try backoff(opts.retry_initial_backoff_ms, attempts);
                 continue;
             }
             return err;
         };
-        if (response.status == .too_many_requests and opts.retry_on_429 and attempts + 1 < opts.max_attempts) {
-            allocator.free(response.body);
-            try backoff(opts.retry_initial_backoff_ms, attempts);
-            continue;
+        if (response.status == .too_many_requests) {
+            if (opts.retry_on_429 and attempts + 1 < opts.max_attempts) {
+                allocator.free(response.body);
+                try backoff(opts.retry_initial_backoff_ms, attempts);
+                continue;
+            }
+            if (!opts.allow_non_ok) {
+                if (logging_enabled) std.debug.print("[live][http.status] code={d} url={s}\n", .{ @intFromEnum(response.status), log_url });
+                allocator.free(response.body);
+                return error.RateLimited;
+            }
         }
         if (!opts.allow_non_ok and response.status != .ok) {
-            if (livePhaseLoggingEnabled()) std.debug.print("[live][http.status] code={d} url={s}\n", .{ @intFromEnum(response.status), url });
+            if (logging_enabled) std.debug.print("[live][http.status] code={d} url={s}\n", .{ @intFromEnum(response.status), log_url });
             allocator.free(response.body);
             return error.UnexpectedHttpStatus;
         }
@@ -322,18 +382,37 @@ fn fetchBytesWith(comptime fetch: anytype, comptime backoff: anytype, client: *s
     }
 }
 
+/// Keep diagnostics useful without persisting bearer-like query or path
+/// capabilities. This is public so browser-session handoff messages can use
+/// exactly the same policy as the HTTP transport.
+pub fn redactUrlForLog(allocator: Allocator, url: []const u8) ![]u8 {
+    const uri = std.Uri.parse(url) catch return allocator.dupe(u8, "<invalid-url>");
+    const host_component = uri.host orelse return allocator.dupe(u8, "<invalid-url>");
+    const host = switch (host_component) {
+        .raw, .percent_encoded => |value| value,
+    };
+    const safe_scheme = try sanitizeUtf8ForLog(allocator, uri.scheme);
+    defer allocator.free(safe_scheme);
+    const safe_host = try sanitizeUtf8ForLog(allocator, host);
+    defer allocator.free(safe_host);
+    if (uri.port) |port| {
+        return std.fmt.allocPrint(allocator, "{s}://{s}:{d}/<redacted>", .{ safe_scheme, safe_host, port });
+    }
+    return std.fmt.allocPrint(allocator, "{s}://{s}/<redacted>", .{ safe_scheme, safe_host });
+}
+
 const fetch_cache_magic = "subdl-http-cache-v3\n";
 
 fn loadFetchCache(allocator: Allocator, url: []const u8, opts: FetchOptions) !?HttpResponse {
     if (!opts.cache) return null;
-    const config = currentFetchCacheConfig();
+    const config = try currentFetchCacheConfig();
     if (!config.enabled or config.ttl_seconds < 0) return null;
     const root = config.root_dir orelse return null;
 
     const path = try fetchCachePath(allocator, root, url, opts);
     defer allocator.free(path);
 
-    const guard = FetchCacheGuard.lock();
+    const guard = try FetchCacheGuard.lockCancelable();
     defer guard.unlock();
 
     const data = std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), path, allocator, .limited(128 * 1024 * 1024)) catch |err| switch (err) {
@@ -369,7 +448,7 @@ fn loadFetchCache(allocator: Allocator, url: []const u8, opts: FetchOptions) !?H
 fn storeFetchCache(allocator: Allocator, url: []const u8, opts: FetchOptions, response: HttpResponse) !void {
     if (!opts.cache) return;
     if (opts.method != .GET and opts.method != .POST) return;
-    const config = currentFetchCacheConfig();
+    const config = try currentFetchCacheConfig();
     if (!config.enabled or config.ttl_seconds < 0) return;
     const root = config.root_dir orelse return;
     if (response.status != .ok) return;
@@ -389,7 +468,7 @@ fn storeFetchCache(allocator: Allocator, url: []const u8, opts: FetchOptions, re
     try data.appendSlice(allocator, header);
     try data.appendSlice(allocator, response.body);
 
-    const guard = FetchCacheGuard.lock();
+    const guard = try FetchCacheGuard.lockCancelable();
     defer guard.unlock();
     writeFetchCacheAtomically(path, data.items) catch |err| {
         if (err == error.Canceled) return err;
@@ -410,8 +489,8 @@ fn writeFetchCacheAtomically(path: []const u8, bytes: []const u8) !void {
     try atomic.replace(io);
 }
 
-fn currentFetchCacheConfig() FetchCacheConfig {
-    const guard = FetchCacheGuard.lock();
+fn currentFetchCacheConfig() !FetchCacheConfig {
+    const guard = try FetchCacheGuard.lockCancelable();
     defer guard.unlock();
     return fetch_cache_config;
 }
@@ -454,35 +533,41 @@ pub fn ensureParentDir(path: []const u8) !void {
 
 fn fetchBytesViaHttp(client: *std.http.Client, allocator: Allocator, url: []const u8, opts: FetchOptions) !HttpResponse {
     if (opts.require_public_origin) {
-        // A proxy resolves or connects to the origin outside this process, so
-        // the validated address cannot be bound to the actual socket. Check
-        // both proxy kinds because a redirect may switch protocols.
-        if (client.http_proxy != null or client.https_proxy != null) {
-            return error.PublicOriginProxyUnsupported;
-        }
-
         // Public-origin requests use a short-lived client with an empty pool
         // and no proxy. Each hop is connected to one validated DNS answer, so
         // a connection opened by an unrestricted request cannot redirect this
         // request into a private network.
-        try ensureClientTlsReady(client);
-        var public_client: std.http.Client = .{
-            .allocator = client.allocator,
-            .io = client.io,
-            .tls_buffer_size = client.tls_buffer_size,
-            .ssl_key_log = client.ssl_key_log,
-            .read_buffer_size = client.read_buffer_size,
-            .write_buffer_size = client.write_buffer_size,
-        };
+        var public_client: std.http.Client = undefined;
+        try initPublicOriginClient(client, &public_client);
         defer public_client.deinit();
-        // Preserve caller-supplied roots and validation time. Rescanning the
-        // system store here could silently discard a custom trust policy.
-        try copyClientTrust(client, &public_client);
         return fetchBytesViaReadyClient(&public_client, allocator, url, opts);
     }
 
     try ensureClientTlsReady(client);
     return fetchBytesViaReadyClient(client, allocator, url, opts);
+}
+
+/// Initialize an isolated client suitable for a request whose resolved socket
+/// must remain bound to a validated public address. Proxies are rejected
+/// because they move DNS resolution and the actual connection out of process.
+pub fn initPublicOriginClient(source: *std.http.Client, destination: *std.http.Client) !void {
+    if (source.http_proxy != null or source.https_proxy != null) {
+        return error.PublicOriginProxyUnsupported;
+    }
+
+    try ensureClientTlsReady(source);
+    destination.* = .{
+        .allocator = source.allocator,
+        .io = source.io,
+        .tls_buffer_size = source.tls_buffer_size,
+        .ssl_key_log = source.ssl_key_log,
+        .read_buffer_size = source.read_buffer_size,
+        .write_buffer_size = source.write_buffer_size,
+    };
+    errdefer destination.deinit();
+    // Preserve caller-supplied roots and validation time. Rescanning the
+    // system store here could silently discard a custom trust policy.
+    try copyClientTrust(source, destination);
 }
 
 fn copyClientTrust(source: *std.http.Client, destination: *std.http.Client) !void {
@@ -506,7 +591,9 @@ fn copyClientTrust(source: *std.http.Client, destination: *std.http.Client) !voi
 }
 
 fn fetchBytesViaReadyClient(client: *std.http.Client, allocator: Allocator, url: []const u8, opts: FetchOptions) !HttpResponse {
-    var phase = LivePhase.init("http.fetch", url);
+    const owned_log_url = if (livePhaseLoggingEnabled()) redactUrlForLog(allocator, url) catch null else null;
+    defer if (owned_log_url) |value| allocator.free(value);
+    var phase = LivePhase.init("http.fetch", owned_log_url orelse "<redacted-url>");
     phase.start();
     defer phase.finish();
 
@@ -701,7 +788,7 @@ fn fetchWithRedirects(client: *std.http.Client, allocator: Allocator, start_url:
 }
 
 pub fn ensureClientTlsReady(client: *std.http.Client) !void {
-    while (client_init_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) sleepMilliseconds(1);
+    try acquireClientInitLockUsing(sleepMillisecondsCancelable);
     defer client_init_lock.store(0, .release);
     if (client.now != null) return;
 
@@ -712,6 +799,12 @@ pub fn ensureClientTlsReady(client: *std.http.Client) !void {
     client.now = now;
     std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
     bundle.deinit(client.allocator);
+}
+
+fn acquireClientInitLockUsing(comptime pause: anytype) !void {
+    while (client_init_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+        try pause(1);
+    }
 }
 
 fn findHeaderValue(headers: []const std.http.Header, wanted_name: []const u8) ?[]const u8 {
@@ -897,6 +990,53 @@ fn resolvePublicHttpAddresses(allocator: Allocator, io: std.Io, url: []const u8)
     }
 }
 
+/// Resolve a public HTTP(S) origin once, reject the complete answer set when
+/// any address is non-public, and select an IPv4 address suitable for an
+/// external client's resolver-pinning configuration.
+fn resolvePublicHttpIpv4Unbounded(allocator: Allocator, io: std.Io, url: []const u8) ![4]u8 {
+    try validatePublicHttpUrl(url);
+    const addresses = try resolvePublicHttpAddresses(allocator, io, url);
+    defer allocator.free(addresses);
+    for (addresses) |address| switch (address) {
+        .ip4 => |ip4| return ip4.bytes,
+        .ip6 => {},
+    };
+    return error.NoAddressReturned;
+}
+
+/// Deadline-supervised form used when an external process will rely on the
+/// returned address as an egress policy. Concurrency is required so a stalled
+/// platform resolver cannot outlive the caller's absolute wall-clock budget.
+pub fn resolvePublicHttpIpv4(allocator: Allocator, io: std.Io, url: []const u8, deadline_ms: i64) ![4]u8 {
+    const now = compatMilliTimestamp();
+    if (now >= deadline_ms) return error.Timeout;
+    const duration: std.Io.Clock.Duration = .{
+        .raw = std.Io.Duration.fromMilliseconds(@intCast(deadline_ms - now)),
+        .clock = .awake,
+    };
+    const timeout: std.Io.Timeout = .{ .deadline = std.Io.Clock.Timestamp.fromNow(io, duration) };
+
+    const LookupResult = @typeInfo(@TypeOf(resolvePublicHttpIpv4Unbounded)).@"fn".return_type.?;
+    const TimeoutResult = @typeInfo(@TypeOf(std.Io.Timeout.sleep)).@"fn".return_type.?;
+    const Selection = union(enum) {
+        lookup: LookupResult,
+        timeout: TimeoutResult,
+    };
+    var selection_buffer: [2]Selection = undefined;
+    var selection = std.Io.Select(Selection).init(io, &selection_buffer);
+    defer selection.cancelDiscard();
+    try selection.concurrent(.lookup, resolvePublicHttpIpv4Unbounded, .{ allocator, io, url });
+    try selection.concurrent(.timeout, std.Io.Timeout.sleep, .{ timeout, io });
+
+    return switch (try selection.await()) {
+        .lookup => |result| result,
+        .timeout => |result| {
+            try result;
+            return error.Timeout;
+        },
+    };
+}
+
 /// Format a resolver result as a numeric host without its port. Zig's resolver
 /// recognizes these strings as literals before consulting hosts files or DNS.
 fn formatNumericHost(address: std.Io.net.IpAddress, buffer: []u8) ![]u8 {
@@ -919,7 +1059,8 @@ fn formatNumericHost(address: std.Io.net.IpAddress, buffer: []u8) ![]u8 {
 
 /// Connect to one of the validated resolver results while retaining the
 /// original hostname for the HTTP Host field and TLS certificate/SNI checks.
-fn connectPinnedPublicHttpUrl(client: *std.http.Client, allocator: Allocator, url: []const u8) !*std.http.Client.Connection {
+pub fn connectPinnedPublicHttpUrl(client: *std.http.Client, allocator: Allocator, url: []const u8) !*std.http.Client.Connection {
+    try validatePublicHttpUrl(url);
     const uri = try std.Uri.parse(url);
     const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.InvalidDownloadUrl;
     var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
@@ -943,12 +1084,17 @@ fn connectPinnedPublicHttpUrl(client: *std.http.Client, allocator: Allocator, ur
             .proxied_host = origin_host,
             .proxied_port = port,
         }) catch |err| {
-            last_error = err;
+            try rememberRetryableConnectError(&last_error, err);
             continue;
         };
         return connection;
     }
     return last_error;
+}
+
+fn rememberRetryableConnectError(last_error: *anyerror, err: anyerror) !void {
+    if (err == error.Canceled or err == error.OutOfMemory) return err;
+    last_error.* = err;
 }
 
 fn parseIpv4Address(host: []const u8) ?[4]u8 {
@@ -989,6 +1135,40 @@ fn hasHeader(headers: []const std.http.Header, wanted_name: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(h.name, wanted_name)) return true;
     }
     return false;
+}
+
+fn validHttpHeaderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |byte| {
+        if (std.ascii.isAlphanumeric(byte)) continue;
+        if (std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", byte) != null) continue;
+        return false;
+    }
+    return true;
+}
+
+pub fn validHttpHeaderValue(value: []const u8) bool {
+    for (value) |byte| {
+        // RFC 9110 field values may contain horizontal tabs, visible ASCII,
+        // and obs-text. Every other control byte is unsafe to serialize.
+        if (byte == '\t') continue;
+        if (byte < 0x20 or byte == 0x7f) return false;
+    }
+    return true;
+}
+
+pub fn validateHttpHeaders(headers: []const std.http.Header) !void {
+    for (headers) |header| {
+        if (!validHttpHeaderName(header.name) or !validHttpHeaderValue(header.value)) {
+            return error.InvalidHttpHeader;
+        }
+    }
+}
+
+fn validateFetchHeaders(opts: FetchOptions) !void {
+    if (opts.accept) |value| if (!validHttpHeaderValue(value)) return error.InvalidHttpHeader;
+    if (opts.content_type) |value| if (!validHttpHeaderValue(value)) return error.InvalidHttpHeader;
+    try validateHttpHeaders(opts.extra_headers);
 }
 
 pub fn parseHtmlTurbo(allocator: Allocator, source: []const u8) !ParsedHtml {
@@ -1463,6 +1643,10 @@ pub fn resolveUrl(allocator: Allocator, base: []const u8, href: []const u8) ![]c
 }
 
 pub fn sameOrigin(left: []const u8, right: []const u8) !bool {
+    // Origin equality is commonly used immediately before a URL is promoted
+    // into a Referer value. Do not let parsed path/query control bytes survive
+    // that trust decision.
+    if (!validHttpHeaderValue(left) or !validHttpHeaderValue(right)) return false;
     const l = try std.Uri.parse(left);
     const r = try std.Uri.parse(right);
     const lh = switch (l.host orelse return false) {
@@ -1497,6 +1681,7 @@ test "URL resolution follows document relative and origin semantics" {
     try std.testing.expect(try sameOrigin("https://EXAMPLE.test/a", "https://example.test:443/b"));
     try std.testing.expect(!try sameOrigin("https://example.test/a", "http://example.test/b"));
     try std.testing.expect(!try sameOrigin("http://localhost:8080/a", "http://localhost:8081/b"));
+    try std.testing.expect(!try sameOrigin("https://example.test/a", "https://example.test/path\r\nx-injected: yes"));
 }
 
 test "untrusted HTTP targets reject credentials and local address spellings" {
@@ -1590,18 +1775,44 @@ pub fn liveProviderFilter() ?[]const u8 {
 }
 
 pub fn getenv(name: []const u8) ?[]const u8 {
-    if (builtin.os.tag == .windows or name.len > 256) return null;
+    if (name.len > 256) return null;
 
     var name_z: [256:0]u8 = undefined;
     @memcpy(name_z[0..name.len], name);
     name_z[name.len] = 0;
-    const value = PosixEnvironment.getenv(&name_z) orelse return null;
+    const value = CEnvironment.getenv(&name_z) orelse return null;
     return std.mem.span(value);
 }
 
-const PosixEnvironment = if (builtin.os.tag == .windows) struct {} else struct {
+const CEnvironment = struct {
     extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 };
+
+pub const GetenvOwnedError = Allocator.Error || error{InvalidWtf8};
+
+/// Returns an owned copy of an environment value. Windows uses the process's
+/// native UTF-16 environment block so paths and credentials are not lossy.
+pub fn getenvOwned(allocator: Allocator, name: []const u8) GetenvOwnedError!?[]u8 {
+    if (comptime builtin.os.tag == .windows) {
+        const environ: std.process.Environ = .{ .block = .global };
+        return std.process.Environ.getAlloc(environ, allocator, name) catch |err| switch (err) {
+            error.EnvironmentVariableMissing => null,
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidWtf8 => error.InvalidWtf8,
+        };
+    }
+
+    const value = getenv(name) orelse return null;
+    return @as(?[]u8, try allocator.dupe(u8, value));
+}
+
+pub fn hasEnv(comptime name: []const u8) bool {
+    if (comptime builtin.os.tag == .windows) {
+        const environ: std.process.Environ = .{ .block = .global };
+        return std.process.Environ.containsConstant(environ, name);
+    }
+    return getenv(name) != null;
+}
 
 pub fn providerMatchesLiveFilter(filter: ?[]const u8, provider_name: []const u8) bool {
     const f = filter orelse return true;
@@ -1675,9 +1886,23 @@ pub fn sanitizeUtf8ForLog(allocator: Allocator, input: []const u8) ![]u8 {
 
 pub fn livePrintField(allocator: Allocator, label: []const u8, value: []const u8) !void {
     try validateLiveUtf8(value);
-    const safe = try sanitizeUtf8ForLog(allocator, value);
+    const printable = if (isSensitiveLiveFieldLabel(label)) "<redacted>" else value;
+    const safe = try sanitizeUtf8ForLog(allocator, printable);
     defer allocator.free(safe);
     std.debug.print("[live] {s}: {s}\n", .{ label, safe });
+}
+
+fn isSensitiveLiveFieldLabel(label: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(label, "url") or
+        std.ascii.endsWithIgnoreCase(label, "_url") or
+        std.ascii.eqlIgnoreCase(label, "link") or
+        std.ascii.endsWithIgnoreCase(label, "_link") or
+        std.ascii.eqlIgnoreCase(label, "endpoint") or
+        std.ascii.endsWithIgnoreCase(label, "_endpoint") or
+        std.ascii.eqlIgnoreCase(label, "token") or
+        std.ascii.endsWithIgnoreCase(label, "_token") or
+        std.ascii.eqlIgnoreCase(label, "cookie") or
+        std.ascii.endsWithIgnoreCase(label, "_cookie");
 }
 
 pub fn livePrintOptionalField(allocator: Allocator, label: []const u8, value: ?[]const u8) !void {
@@ -1832,7 +2057,7 @@ fn sleepBackoff(initial_ms: u64, attempt: usize) std.Io.Cancelable!void {
     const shift: u6 = @intCast(@min(attempt, 6));
     const multiplier = (@as(u64, 1) << shift);
     const delay = std.math.mul(u64, initial_ms, multiplier) catch std.math.maxInt(u64);
-    try runtime_io.get().sleep(.fromMilliseconds(@intCast(@min(delay, std.math.maxInt(i64)))), .awake);
+    try sleepMillisecondsCancelable(delay);
 }
 
 pub fn appendHexEscape(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), value: u8) !void {
@@ -2053,6 +2278,50 @@ test "sanitize utf8 for log preserves valid unicode" {
     try std.testing.expect(std.unicode.utf8ValidateSlice(safe));
 }
 
+test "transport URL logging redacts paths queries fragments and credentials" {
+    const allocator = std.testing.allocator;
+    const safe = try redactUrlForLog(
+        allocator,
+        "https://user:secret@downloads.example:8443/download/bearer-token/subfile/movie.srt?token=query-secret#fragment-secret",
+    );
+    defer allocator.free(safe);
+
+    try std.testing.expectEqualStrings("https://downloads.example:8443/<redacted>", safe);
+    for ([_][]const u8{ "user", "secret", "bearer-token", "movie.srt", "query-secret", "fragment-secret" }) |sensitive| {
+        try std.testing.expect(std.mem.indexOf(u8, safe, sensitive) == null);
+    }
+}
+
+test "live result logging classifies capability-bearing fields as sensitive" {
+    for ([_][]const u8{
+        "url",
+        "download_url",
+        "link",
+        "bucket_link",
+        "remote_endpoint",
+        "download_token",
+        "session_cookie",
+    }) |label| try std.testing.expect(isSensitiveLiveFieldLabel(label));
+    for ([_][]const u8{ "title", "filename", "language_code", "download_ok" }) |label| {
+        try std.testing.expect(!isSensitiveLiveFieldLabel(label));
+    }
+}
+
+test "HTTP header validation rejects injection controls" {
+    try validateHttpHeaders(&.{
+        .{ .name = "referer", .value = "https://fixture.invalid/path" },
+        .{ .name = "x-fixture", .value = "value\twith-tab\x80" },
+    });
+    try std.testing.expectError(error.InvalidHttpHeader, validateHttpHeaders(&.{.{
+        .name = "referer",
+        .value = "https://fixture.invalid/\r\nx-injected: yes",
+    }}));
+    try std.testing.expectError(error.InvalidHttpHeader, validateHttpHeaders(&.{.{
+        .name = "bad name",
+        .value = "value",
+    }}));
+}
+
 test "validate live utf8 rejects invalid and replacement" {
     try std.testing.expectError(error.InvalidUtf8Data, validateLiveUtf8(&.{0xAA}));
     try std.testing.expectError(error.InvalidUtf8Data, validateLiveUtf8("\xEF\xBF\xBD"));
@@ -2064,6 +2333,21 @@ test "detect Australian website block page" {
         "<h2>Access to Website Disabled</h2><p>the Federal Court of Australia has determined that the website infringes</p>",
     ));
     try std.testing.expect(!isAustralianWebsiteBlockPage("<title>Provider</title>"));
+}
+
+test "optional provider fallbacks preserve terminal failures" {
+    inline for (.{
+        error.Canceled,
+        error.OutOfMemory,
+        error.RateLimited,
+        error.ProviderAccessBlocked,
+        error.CloudflareChallenge,
+        error.UnsafeHttpTarget,
+        error.InvalidDownloadUrl,
+        error.PublicOriginProxyUnsupported,
+    }) |err| try std.testing.expect(mustPropagateOptionalFailure(err));
+    try std.testing.expect(!mustPropagateOptionalFailure(error.ConnectionResetByPeer));
+    try std.testing.expect(!mustPropagateOptionalFailure(error.UnexpectedHttpStatus));
 }
 
 test "provider filter matching" {
@@ -2119,6 +2403,65 @@ test "HTTP cancellation and allocation failure never retry" {
     try std.testing.expectError(error.OutOfMemory, fetchBytesWith(Mock.oom, Mock.noBackoff, &client, std.testing.allocator, "https://fixture.invalid", .{ .cache = false, .max_attempts = 3 }));
     try std.testing.expectEqual(@as(usize, 1), Mock.calls);
 }
+
+test "HTTP deterministic response and policy failures never retry" {
+    const Fixture = struct {
+        client: std.http.Client,
+        failure: anyerror,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, _: Allocator, _: []const u8, _: FetchOptions) anyerror!HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            return self.failure;
+        }
+
+        fn noBackoff(_: u64, _: usize) anyerror!void {
+            return error.UnexpectedBackoff;
+        }
+    };
+
+    inline for (.{
+        error.UnsafeHttpTarget,
+        error.InvalidDownloadUrl,
+        error.PublicOriginProxyUnsupported,
+        error.UnsupportedProtocolUpgrade,
+        error.TooManyInformationalResponses,
+        error.TooManyHttpRedirects,
+        error.HttpRedirectLocationMissing,
+        error.UnsupportedCompressionMethod,
+        error.TooManyCompressedMembers,
+        error.ResponseTooLarge,
+        error.UnexpectedEncodedPayload,
+    }) |failure| {
+        var fixture: Fixture = .{
+            .client = .{ .allocator = std.testing.allocator, .io = std.testing.io },
+            .failure = failure,
+        };
+        defer fixture.client.deinit();
+        try std.testing.expectError(failure, fetchBytesWith(
+            Fixture.fetch,
+            Fixture.noBackoff,
+            &fixture.client,
+            std.testing.allocator,
+            "https://fixture.invalid",
+            .{ .cache = false, .max_attempts = 3 },
+        ));
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    }
+}
+
+test "TLS initialization lock wait preserves cancellation" {
+    const Pause = struct {
+        fn cancel(_: u64) !void {
+            return error.Canceled;
+        }
+    };
+    client_init_lock.store(1, .release);
+    defer client_init_lock.store(0, .release);
+    try std.testing.expectError(error.Canceled, acquireClientInitLockUsing(Pause.cancel));
+}
+
 test "HTTP backoff cancellation prevents the next network attempt" {
     const Mock = struct {
         var calls: usize = 0;
@@ -2135,6 +2478,58 @@ test "HTTP backoff cancellation prevents the next network attempt" {
     Mock.calls = 0;
     try std.testing.expectError(error.Canceled, fetchBytesWith(Mock.fail, Mock.cancel, &client, std.testing.allocator, "https://fixture.invalid", .{ .cache = false, .max_attempts = 3 }));
     try std.testing.expectEqual(@as(usize, 1), Mock.calls);
+}
+
+test "HTTP 429 becomes rate limited after retry exhaustion" {
+    const Mock = struct {
+        var calls: usize = 0;
+        var backoffs: usize = 0;
+
+        fn rateLimited(_: *std.http.Client, allocator: Allocator, _: []const u8, _: FetchOptions) anyerror!HttpResponse {
+            calls += 1;
+            return .{
+                .status = .too_many_requests,
+                .body = try allocator.dupe(u8, "slow down"),
+            };
+        }
+
+        fn backoff(_: u64, _: usize) anyerror!void {
+            backoffs += 1;
+        }
+    };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+
+    Mock.calls = 0;
+    Mock.backoffs = 0;
+    try std.testing.expectError(error.RateLimited, fetchBytesWith(Mock.rateLimited, Mock.backoff, &client, std.testing.allocator, "https://fixture.invalid", .{
+        .cache = false,
+        .max_attempts = 3,
+    }));
+    try std.testing.expectEqual(@as(usize, 3), Mock.calls);
+    try std.testing.expectEqual(@as(usize, 2), Mock.backoffs);
+
+    Mock.calls = 0;
+    Mock.backoffs = 0;
+    try std.testing.expectError(error.RateLimited, fetchBytesWith(Mock.rateLimited, Mock.backoff, &client, std.testing.allocator, "https://fixture.invalid", .{
+        .cache = false,
+        .max_attempts = 3,
+        .retry_on_429 = false,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), Mock.calls);
+    try std.testing.expectEqual(@as(usize, 0), Mock.backoffs);
+}
+
+test "pinned address fallback preserves terminal connect errors" {
+    var last_error: anyerror = error.NoAddressReturned;
+
+    try std.testing.expectError(error.Canceled, rememberRetryableConnectError(&last_error, error.Canceled));
+    try std.testing.expect(last_error == error.NoAddressReturned);
+    try std.testing.expectError(error.OutOfMemory, rememberRetryableConnectError(&last_error, error.OutOfMemory));
+    try std.testing.expect(last_error == error.NoAddressReturned);
+
+    try rememberRetryableConnectError(&last_error, error.FixtureConnectFailed);
+    try std.testing.expect(last_error == error.FixtureConnectFailed);
 }
 
 fn failAfterArenaTransfer(allocator: Allocator) !void {

@@ -112,6 +112,7 @@ Supported canonical provider IDs:
 - `gestdown_info`
 - `subsunacs_net`
 - `subtitles_ajatt_top`
+- `subtis_io`
 - `greeksubs_net`
 - `indexsubtitle_cc`
 - `sous_titres_eu`
@@ -147,14 +148,15 @@ Supported canonical provider IDs:
 - `grupahatak_pl`
 - `jimaku_cc`
 
-The eight retained inactive implementations are `opensubtitles_org`,
+The seven retained inactive implementations are `opensubtitles_org`,
 `moviesubtitlesrt_com`, `podnapisi_net`, `my_subs_co`, `tvsubtitles_net`,
-`greek_subtitles_com`, `subtis_io`, and `animesubtitle_ir`. Their last observed
+`greek_subtitles_com`, and `animesubtitle_ir`. Their last observed
 upstream failures are described in the README. Targeted live tests retain
 recovery coverage. Activation requires anonymous search, subtitle listing and
 a real file download for each advertised media class.
 
 `gestdown_info` is TV-only. `yifysubtitles_ch` is movie-only.
+`subtis_io` is movie-only.
 `subtitles_ajatt_top` focuses on Japanese subtitles for anime TV and movies.
 `greeksubs_net` provides Greek subtitles for movies and TV.
 `sous_titres_eu` provides French subtitles for movies and TV.
@@ -432,7 +434,14 @@ Runtime and provider controls:
 
 - `SUBSOURCE_CF_CLEARANCE`
 - `SUBSOURCE_USER_AGENT`
-- `SUBDL_CF_HEADLESS`
+- `SUBDL_CHROMIUM_PATH`: absolute path to a local Chrome, Chromium, Edge,
+  Brave, or Vivaldi executable. Its root CDP product must report Chrome or
+  Chromium 154 or newer. Browser session handoff is supported on Linux. macOS
+  and FreeBSD fail closed until browser DNS can be cancelled at the deadline;
+  Windows fails closed pending secure native handle and DACL support.
+- `SUBDL_CF_HEADLESS`: accepts `1`/`true`/`yes` or `0`/`false`/`no`.
+  Browser handoff defaults to a visible window in graphical Linux environments
+  and to headless when neither `DISPLAY` nor `WAYLAND_DISPLAY` is available.
 
 Live test controls:
 
@@ -501,7 +510,26 @@ The extensive suite primarily checks metadata. Smoke/all modes exercise applicat
 search, listing and downloads, including TV selection where advertised. CAPTCHA
 and access-block responses must remain explicit failures; qualification does not
 solve challenges or bypass access controls. Browser support supplies an ordinary
-session handoff when explicitly enabled, not a CAPTCHA solver.
+session handoff when explicitly enabled, not a CAPTCHA solver. On Linux it uses
+a private, deadline-bounded pipe to a local Chromium-family browser.
+Auto-discovery covers Chrome, Chromium, Edge, Brave, and Vivaldi, while
+the root CDP product must report Chrome or Chromium 154 or newer. DNS permits
+only pinned public answers for the challenged host and Cloudflare's challenge
+host, proxies are disabled, and page-session requests are intercepted before
+navigation and restricted to those HTTPS origins. Chromium local-network
+controls fail closed for literal/private targets outside that interception.
+Firefox is not supported. macOS and FreeBSD handoff fails closed until their
+blocking resolver path can be cancelled reliably; Windows fails closed pending
+secure native handle/DACL support. Deadline checks cover queueing, DNS, browser
+I/O, and normal cache work; a single kernel filesystem operation stuck on
+pathological remote or FUSE storage cannot be preempted, so the session cache
+should reside on local storage.
+
+Outside browser handoff, public-origin-pinned HTTP requests still use the host
+resolver. On macOS and FreeBSD, Zig 0.16 delegates that lookup to blocking libc
+`getaddrinfo`; cancellation waits for the syscall to return. Public-address
+validation still applies, but cancellation latency for that lookup is not a hard
+deadline on those platforms.
 
 ## Upstream Dependencies
 

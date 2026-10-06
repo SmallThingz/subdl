@@ -370,7 +370,6 @@ fn fetchRaw(
 ) !RawResponse {
     try validateProviderEndpoint(url);
     if (referer) |value| try validateProviderEndpoint(value);
-    try common.ensureClientTlsReady(client);
     const normalized = try common.normalizeUrlForFetch(allocator, url);
     defer allocator.free(normalized);
     const uri = try std.Uri.parse(normalized);
@@ -387,16 +386,29 @@ fn fetchRaw(
     }
     extra_storage[count] = .{ .name = "accept", .value = "application/json,text/html,*/*" };
     count += 1;
+    try common.validateHttpHeaders(extra_storage[0..count]);
+    if (content_type) |value| if (!common.validHttpHeaderValue(value)) return error.InvalidHttpHeader;
 
-    var req = try client.request(method, uri, .{
+    var public_client: std.http.Client = undefined;
+    try common.initPublicOriginClient(client, &public_client);
+    defer public_client.deinit();
+    const pinned_connection = try common.connectPinnedPublicHttpUrl(&public_client, allocator, normalized);
+    pinned_connection.closing = true;
+
+    var req = public_client.request(method, uri, .{
         .redirect_behavior = .unhandled,
+        .keep_alive = false,
+        .connection = pinned_connection,
         .headers = .{
             .user_agent = .{ .override = common.default_user_agent },
             .accept_encoding = .{ .override = "identity" },
             .content_type = if (content_type) |value| .{ .override = value } else .default,
         },
         .extra_headers = extra_storage[0..count],
-    });
+    }) catch |err| {
+        public_client.connection_pool.release(pinned_connection, public_client.io);
+        return err;
+    };
     defer req.deinit();
     errdefer if (req.connection) |connection| {
         connection.closing = true;

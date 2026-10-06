@@ -125,9 +125,8 @@ pub const Scraper = struct {
             if (seen.contains(href)) continue;
             try seen.put(a, try a.dupe(u8, href), {});
 
-            const download_url = resolvePublicDownloadUrl(a, href) catch continue;
-            const filename = filenameNearHref(a, content, pos, item.title) catch
-                try std.fmt.allocPrint(a, "{s}.zip", .{item.title});
+            const download_url = (try resolveOptionalPublicDownloadUrl(a, href)) orelse continue;
+            const filename = try filenameNearHref(a, content, pos, item.title);
             try subtitles.append(a, .{
                 .language_code = "fa",
                 .filename = filename,
@@ -196,6 +195,13 @@ fn resolvePublicDownloadUrl(allocator: Allocator, href: []const u8) ![]const u8 
     return resolved;
 }
 
+fn resolveOptionalPublicDownloadUrl(allocator: Allocator, href: []const u8) !?[]const u8 {
+    return resolvePublicDownloadUrl(allocator, href) catch |err| {
+        if (err == error.OutOfMemory or err == error.Canceled) return err;
+        return null;
+    };
+}
+
 fn nestedString(root: std.json.ObjectMap, path: []const []const u8) ?[]const u8 {
     if (path.len == 0) return null;
     var value = root.get(path[0]) orelse return null;
@@ -232,6 +238,21 @@ test "animesubtitle rejects unsafe provider download URLs" {
     }) |url| {
         try std.testing.expectError(error.UnsafeHttpTarget, resolvePublicDownloadUrl(allocator, url));
     }
+}
+
+test "animesubtitle optional fields preserve allocation failures" {
+    var failing_url = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, resolveOptionalPublicDownloadUrl(failing_url.allocator(), "/download/subtitle.zip"));
+    try std.testing.expect(failing_url.has_induced_failure);
+
+    var failing_filename = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, filenameNearHref(failing_filename.allocator(), "href=\"/download/subtitle.zip\"><strong>subtitle.zip</strong>", 0, "Anime"));
+    try std.testing.expect(failing_filename.has_induced_failure);
+
+    const fallback = try filenameNearHref(std.testing.allocator, "href=\"/download/subtitle.zip\">", 0, "Anime");
+    defer std.testing.allocator.free(fallback);
+    try std.testing.expectEqualStrings("Anime.zip", fallback);
+    try std.testing.expect((try resolveOptionalPublicDownloadUrl(std.testing.allocator, "http://127.0.0.1/download/subtitle.zip")) == null);
 }
 
 test "live animesubtitle ir movie and tv downloads" {

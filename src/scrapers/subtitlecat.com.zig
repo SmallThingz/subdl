@@ -128,7 +128,7 @@ pub const Scraper = struct {
 
                 if (findDescendantByTagWithAttr(action, "button", "onclick")) |button| {
                     const onclick = common.getAttributeValueSafe(button, "onclick") orelse continue;
-                    const spec = parseTranslateSpec(a, onclick) catch null;
+                    const spec = try parseOptionalTranslateSpec(a, onclick);
                     const source = if (spec) |s| s.source_url else null;
                     const code = if (language_code) |c|
                         c
@@ -136,7 +136,7 @@ pub const Scraper = struct {
                         try a.dupe(u8, id)
                     else
                         null;
-                    const filename = inferTranslatedFilename(a, source, code) catch "translated.srt";
+                    const filename = try inferTranslatedFilename(a, source, code);
                     try subtitles.append(a, .{
                         .language_code = code,
                         .language_label = language_label,
@@ -205,6 +205,13 @@ fn parseTranslateSpec(allocator: Allocator, onclick: []const u8) !TranslateSpec 
     return .{ .source_url = null };
 }
 
+fn parseOptionalTranslateSpec(allocator: Allocator, onclick: []const u8) !?TranslateSpec {
+    return parseTranslateSpec(allocator, onclick) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return null;
+    };
+}
+
 fn extractQuotedArgs(allocator: Allocator, input: []const u8) ![]const []const u8 {
     var args: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer args.deinit(allocator);
@@ -271,6 +278,17 @@ test "subtitlecat translate spec parser" {
     const spec = try parseTranslateSpec(allocator, "translate_from_server_folder('id','file.srt','/folder/path')");
     defer if (spec.source_url) |s| allocator.free(s);
     try std.testing.expect(spec.source_url != null);
+}
+
+test "subtitlecat optional translation parsing preserves allocation errors" {
+    var failing_spec = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        parseOptionalTranslateSpec(failing_spec.allocator(), "translate_from_server_folder('id','file.srt','/folder/path')"),
+    );
+
+    var failing_filename = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, inferTranslatedFilename(failing_filename.allocator(), null, "en"));
 }
 
 test "live subtitlecat search and subtitles" {

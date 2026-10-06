@@ -39,6 +39,10 @@ pub const Scraper = struct {
     }
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
+        return self.searchUsing(common.fetchBytes, query);
+    }
+
+    fn searchUsing(self: *Scraper, comptime fetch: anytype, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -47,31 +51,43 @@ pub const Scraper = struct {
         if (trimmed.len == 0) return .{ .arena = arena, .items = &.{} };
         const encoded = try common.encodeUriComponent(a, trimmed);
         const payload = try std.fmt.allocPrint(a, "searchval={s}&searchtype=all", .{encoded});
-        const response = try common.fetchBytes(self.client, a, search_url, .{
+        const response = try fetch(self.client, a, search_url, .{
             .method = .POST,
             .payload = payload,
             .content_type = "application/x-www-form-urlencoded",
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
+            .retry_on_429 = false,
+            .allow_non_ok = true,
             .require_public_origin = true,
         });
+        if (response.status == .too_many_requests) return error.RateLimited;
+        if (response.status != .ok) return error.UnexpectedHttpStatus;
         return parseSearchHtml(common.takeArena(&arena), response.body, trimmed);
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
+        return self.fetchSubtitlesBySearchItemUsing(common.fetchBytes, item);
+    }
+
+    fn fetchSubtitlesBySearchItemUsing(self: *Scraper, comptime fetch: anytype, item: SearchItem) !SubtitlesResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
 
         try validateProviderUrl(item.page_url);
 
-        const response = try common.fetchBytes(self.client, a, item.page_url, .{
+        const response = try fetch(self.client, a, item.page_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
+            .retry_on_429 = false,
+            .allow_non_ok = true,
             .require_public_origin = true,
         });
+        if (response.status == .too_many_requests) return error.RateLimited;
+        if (response.status != .ok) return error.UnexpectedHttpStatus;
         var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
         var seen = std.StringHashMapUnmanaged(void).empty;
         try collectSubtitleRows(a, response.body, item.page_url, &subtitles, &seen);
@@ -92,12 +108,19 @@ pub const Scraper = struct {
                 try seen_pages.put(a, page_url, {});
                 followed += 1;
 
-                const child = common.fetchBytes(self.client, a, page_url, .{
+                const child = fetch(self.client, a, page_url, .{
                     .accept = "text/html,application/xhtml+xml,*/*",
                     .cache = false,
                     .max_attempts = 2,
+                    .retry_on_429 = false,
+                    .allow_non_ok = true,
                     .require_public_origin = true,
-                }) catch continue;
+                }) catch |err| {
+                    if (common.mustPropagateOptionalFailure(err)) return err;
+                    continue;
+                };
+                if (child.status == .too_many_requests) return error.RateLimited;
+                if (child.status != .ok) continue;
                 try collectSubtitleRows(a, child.body, page_url, &subtitles, &seen);
             }
         }
@@ -114,6 +137,7 @@ pub const Scraper = struct {
         try validateProviderUrl(parts.page_url);
         var page = try fetchRaw(self.client, allocator, parts.page_url, &.{});
         defer page.deinit(allocator);
+        if (page.status == .too_many_requests) return error.RateLimited;
         if (page.status != .ok) return error.UnexpectedHttpStatus;
         const cookie = page.cookie orelse return error.SessionExpired;
 
@@ -131,6 +155,7 @@ pub const Scraper = struct {
         defer if (download.cookie) |value| allocator.free(value);
         if (download.status != .ok) {
             allocator.free(download.body);
+            if (download.status == .too_many_requests) return error.RateLimited;
             return error.UnexpectedHttpStatus;
         }
         return .{ .status = download.status, .body = download.body };
@@ -177,19 +202,30 @@ const RawResponse = common.RawResponse;
 
 fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, extra_headers: []const std.http.Header) !RawResponse {
     try validateProviderUrl(url);
-    try common.ensureClientTlsReady(client);
+    try common.validateHttpHeaders(extra_headers);
     const normalized = try common.normalizeUrlForFetch(allocator, url);
     defer allocator.free(normalized);
     const uri = try std.Uri.parse(normalized);
 
-    var req = try client.request(.GET, uri, .{
+    var public_client: std.http.Client = undefined;
+    try common.initPublicOriginClient(client, &public_client);
+    defer public_client.deinit();
+    const pinned_connection = try common.connectPinnedPublicHttpUrl(&public_client, allocator, normalized);
+    pinned_connection.closing = true;
+
+    var req = public_client.request(.GET, uri, .{
         .redirect_behavior = .unhandled,
+        .keep_alive = false,
+        .connection = pinned_connection,
         .headers = .{
             .user_agent = .{ .override = common.default_user_agent },
             .accept_encoding = .{ .override = "identity" },
         },
         .extra_headers = extra_headers,
-    });
+    }) catch |err| {
+        public_client.connection_pool.release(pinned_connection, public_client.io);
+        return err;
+    };
     defer req.deinit();
     errdefer req.connection.?.closing = true;
     try req.sendBodiless();
@@ -414,6 +450,86 @@ test "greeksubs rejects non-provider session targets" {
     }) |url| {
         try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl(url));
     }
+}
+
+test "greeksubs stops season fallback on rate limits and cancellation" {
+    const Scenario = enum { limited, canceled, out_of_memory };
+    const Case = struct { scenario: Scenario, expected_error: anyerror };
+    const Fixture = struct {
+        client: std.http.Client,
+        scenario: Scenario,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, url: []const u8, options: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            try std.testing.expect(!options.retry_on_429);
+            if (std.mem.eql(u8, url, "https://greeksubs.net/en/view/show")) {
+                return .{
+                    .status = .ok,
+                    .body = try allocator.dupe(u8, "<a href='/en/view/show-season-1'>Season 1</a>" ++
+                        "<a href='/en/view/show-season-2'>Season 2</a>"),
+                };
+            }
+            try std.testing.expectEqual(@as(usize, 2), self.calls);
+            return switch (self.scenario) {
+                .limited => .{ .status = .too_many_requests, .body = try allocator.dupe(u8, "limited") },
+                .canceled => error.Canceled,
+                .out_of_memory => error.OutOfMemory,
+            };
+        }
+    };
+
+    for ([_]Case{
+        .{ .scenario = .limited, .expected_error = error.RateLimited },
+        .{ .scenario = .canceled, .expected_error = error.Canceled },
+        .{ .scenario = .out_of_memory, .expected_error = error.OutOfMemory },
+    }) |case| {
+        var fixture: Fixture = .{
+            .client = .{ .allocator = std.testing.allocator, .io = std.testing.io },
+            .scenario = case.scenario,
+        };
+        defer fixture.client.deinit();
+        var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+        try std.testing.expectError(case.expected_error, scraper.fetchSubtitlesBySearchItemUsing(Fixture.fetch, .{
+            .title = "Show",
+            .year = null,
+            .media_kind = .tv,
+            .page_url = "https://greeksubs.net/en/view/show",
+        }));
+        try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    }
+}
+
+test "greeksubs continues after one ordinary season failure" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, url: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            if (std.mem.endsWith(u8, url, "/show")) return .{
+                .status = .ok,
+                .body = try allocator.dupe(u8, "<a href='/en/view/show-season-1'>Season 1</a><a href='/en/view/show-season-2'>Season 2</a>"),
+            };
+            if (std.mem.endsWith(u8, url, "season-1")) return error.ConnectionResetByPeer;
+            return .{ .status = .ok, .body = try allocator.dupe(u8, "<html><body>No rows</body></html>") };
+        }
+    };
+
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+    var response = try scraper.fetchSubtitlesBySearchItemUsing(Fixture.fetch, .{
+        .title = "Show",
+        .year = null,
+        .media_kind = .tv,
+        .page_url = "https://greeksubs.net/en/view/show",
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(usize, 0), response.subtitles.len);
+    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
 }
 
 test "live greeksubs movie search, listing and session download" {

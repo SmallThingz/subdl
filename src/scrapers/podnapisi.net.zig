@@ -47,6 +47,10 @@ pub const Scraper = struct {
     }
 
     pub fn searchWithOptions(self: *Scraper, query: []const u8, options: SearchOptions) !SearchResponse {
+        return self.searchWithOptionsUsing(common.fetchBytes, query, options);
+    }
+
+    fn searchWithOptionsUsing(self: *Scraper, comptime fetch: anytype, query: []const u8, options: SearchOptions) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -70,10 +74,10 @@ pub const Scraper = struct {
 
             // JSON endpoint (better metadata) only supports first-page suggestions.
             if (page == 1) {
-                try self.appendJsonSearchItems(a, query, &page_items);
+                try self.appendJsonSearchItemsUsing(fetch, a, query, &page_items);
             }
 
-            try self.appendHtmlSearchItems(a, query, page, &page_items, &page_has_next);
+            try self.appendHtmlSearchItemsUsing(fetch, a, query, page, &page_items, &page_has_next);
             dedupeSearchItemsById(&page_items);
 
             try items.appendSlice(a, page_items.items);
@@ -89,8 +93,9 @@ pub const Scraper = struct {
         });
     }
 
-    fn appendJsonSearchItems(
+    fn appendJsonSearchItemsUsing(
         self: *Scraper,
+        comptime fetch: anytype,
         allocator: Allocator,
         query: []const u8,
         out: *std.ArrayListUnmanaged(SearchItem),
@@ -99,26 +104,34 @@ pub const Scraper = struct {
         const url = try std.fmt.allocPrint(allocator, "{s}/moviedb/search/?keywords={s}", .{ site, encoded });
 
         const headers = [_]std.http.Header{.{ .name = "x-requested-with", .value = "XMLHttpRequest" }};
-        const response = common.fetchBytes(self.client, allocator, url, .{
+        const response = fetch(self.client, allocator, url, .{
             .accept = "application/json",
             .extra_headers = &headers,
+            .cache = false,
             .max_attempts = 3,
             .retry_initial_backoff_ms = 1500,
-            .retry_on_429 = true,
+            .retry_on_429 = false,
             .allow_non_ok = true,
             .require_public_origin = true,
-        }) catch return;
+        }) catch |err| {
+            if (common.mustPropagateOptionalFailure(err)) return err;
+            return;
+        };
 
+        if (response.status == .too_many_requests) return error.RateLimited;
         if (response.status != .ok) return;
 
-        const root = std.json.parseFromSliceLeaky(std.json.Value, allocator, response.body, .{}) catch return;
+        const root = std.json.parseFromSliceLeaky(std.json.Value, allocator, response.body, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return,
+        };
         const obj = switch (root) {
             .object => |o| o,
             else => return,
         };
 
         if (obj.get("status")) |status_val| {
-            if (status_val == .string and std.ascii.eqlIgnoreCase(status_val.string, "too-many-requests")) return;
+            if (status_val == .string and std.ascii.eqlIgnoreCase(status_val.string, "too-many-requests")) return error.RateLimited;
         }
 
         const data = obj.get("data") orelse return;
@@ -164,8 +177,9 @@ pub const Scraper = struct {
         }
     }
 
-    fn appendHtmlSearchItems(
+    fn appendHtmlSearchItemsUsing(
         self: *Scraper,
+        comptime fetch: anytype,
         allocator: Allocator,
         query: []const u8,
         page: usize,
@@ -178,19 +192,19 @@ pub const Scraper = struct {
         else
             try std.fmt.allocPrint(allocator, "{s}/subtitles/search/?keywords={s}&page={d}", .{ site, encoded, page });
 
-        const response = try common.fetchBytes(self.client, allocator, url, .{
+        const response = try fetch(self.client, allocator, url, .{
             .accept = "text/html",
             .max_attempts = 3,
             .retry_initial_backoff_ms = 1500,
             .allow_non_ok = true,
-            .retry_on_429 = true,
+            .retry_on_429 = false,
             .require_public_origin = true,
         });
         if (response.status == .too_many_requests) return error.RateLimited;
         if (response.status != .ok) return error.UnexpectedHttpStatus;
 
         var parsed = try common.parseHtmlStable(allocator, response.body);
-        has_next_page.* = hasNextHtmlSearchPage(&parsed.doc, page) catch false;
+        has_next_page.* = hasNextHtmlSearchPage(&parsed.doc, page);
 
         var anchors = parsed.doc.queryAll("a[href*='/subtitles/search/']");
         while (anchors.next()) |anchor| {
@@ -233,7 +247,7 @@ pub const Scraper = struct {
             .max_attempts = 3,
             .retry_initial_backoff_ms = 1500,
             .allow_non_ok = true,
-            .retry_on_429 = true,
+            .retry_on_429 = false,
             .require_public_origin = true,
         });
 
@@ -271,11 +285,11 @@ pub const Scraper = struct {
             else
                 null;
 
-            const fps = common.tableCellTextByColumnIndex(a, row, fps_col) catch null;
-            const cds = common.tableCellTextByColumnIndex(a, row, cds_col) catch null;
-            const rating = common.tableCellTextByColumnIndex(a, row, rating_col) catch null;
-            const uploader = common.tableCellTextByColumnIndex(a, row, uploader_col) catch null;
-            const uploaded_at = common.tableCellTextByColumnIndex(a, row, uploaded_at_col) catch null;
+            const fps = try common.tableCellTextByColumnIndex(a, row, fps_col);
+            const cds = try common.tableCellTextByColumnIndex(a, row, cds_col);
+            const rating = try common.tableCellTextByColumnIndex(a, row, rating_col);
+            const uploader = try common.tableCellTextByColumnIndex(a, row, uploader_col);
+            const uploaded_at = try common.tableCellTextByColumnIndex(a, row, uploaded_at_col);
 
             try out.append(a, .{
                 .language = language,
@@ -417,7 +431,7 @@ fn slugToTitle(allocator: Allocator, slug: []const u8) ![]const u8 {
     return duped;
 }
 
-fn hasNextHtmlSearchPage(doc: *const HtmlDocument, current_page: usize) !bool {
+fn hasNextHtmlSearchPage(doc: *const HtmlDocument, current_page: usize) bool {
     if (doc.queryOne("link[rel='next'][href]")) |_| return true;
     if (doc.queryOne("a[rel='next'][href]")) |_| return true;
     if (doc.queryOne("a.next[href]")) |_| return true;
@@ -496,10 +510,75 @@ fn findDescendantSpanWithClass(node: HtmlNode, class_fragment: []const u8) ?Html
 
 fn SubtitlesStatusFixture(comptime status: std.http.Status) type {
     return struct {
-        fn fetch(_: *std.http.Client, allocator: Allocator, _: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+        fn fetch(_: *std.http.Client, allocator: Allocator, _: []const u8, options: common.FetchOptions) anyerror!common.HttpResponse {
+            try std.testing.expect(!options.retry_on_429);
             return .{ .status = status, .body = try allocator.dupe(u8, "<html><body>No subtitles found</body></html>") };
         }
     };
+}
+
+test "podnapisi rate limits stop before the HTML search fallback" {
+    const Scenario = enum { limited, canceled, out_of_memory };
+    const Case = struct { scenario: Scenario, expected_error: anyerror };
+    const Fixture = struct {
+        client: std.http.Client,
+        scenario: Scenario,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, _: []const u8, options: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 1), self.calls);
+            try std.testing.expect(!options.retry_on_429);
+            return switch (self.scenario) {
+                .limited => .{ .status = .too_many_requests, .body = try allocator.dupe(u8, "limited") },
+                .canceled => error.Canceled,
+                .out_of_memory => error.OutOfMemory,
+            };
+        }
+    };
+
+    for ([_]Case{
+        .{ .scenario = .limited, .expected_error = error.RateLimited },
+        .{ .scenario = .canceled, .expected_error = error.Canceled },
+        .{ .scenario = .out_of_memory, .expected_error = error.OutOfMemory },
+    }) |case| {
+        var fixture: Fixture = .{
+            .client = .{ .allocator = std.testing.allocator, .io = std.testing.io },
+            .scenario = case.scenario,
+        };
+        defer fixture.client.deinit();
+        var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+        try std.testing.expectError(case.expected_error, scraper.searchWithOptionsUsing(Fixture.fetch, "Matrix", .{}));
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    }
+}
+
+test "podnapisi uses HTML fallback after an ordinary suggestion failure" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, url: []const u8, options: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            if (self.calls == 1) {
+                try std.testing.expect(std.mem.indexOf(u8, url, "/moviedb/search/") != null);
+                try std.testing.expect(!options.cache);
+                return error.ConnectionResetByPeer;
+            }
+            try std.testing.expect(std.mem.indexOf(u8, url, "/subtitles/search/") != null);
+            return .{ .status = .ok, .body = try allocator.dupe(u8, "<html><body>No results</body></html>") };
+        }
+    };
+
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+    var response = try scraper.searchWithOptionsUsing(Fixture.fetch, "Matrix", .{});
+    defer response.deinit();
+    try std.testing.expectEqual(@as(usize, 0), response.items.len);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
 }
 
 test "podnapisi rejects non-ok subtitle pages before empty parsing" {
