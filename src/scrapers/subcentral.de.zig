@@ -4,6 +4,7 @@ const common = @import("common.zig");
 const Allocator = std.mem.Allocator;
 const site = "https://www.subcentral.de";
 const home_url = site ++ "/";
+const max_raw_response_bytes = (common.FetchOptions{}).max_response_bytes;
 
 pub const SearchItem = struct {
     title: []const u8,
@@ -43,6 +44,7 @@ pub const Scraper = struct {
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         const board = try findBoard(a, home.body, trimmed) orelse return .{ .arena = arena, .items = &.{} };
 
@@ -51,6 +53,7 @@ pub const Scraper = struct {
             .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = home_url }},
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         const items = try parseBoardThreads(a, board_page.body, board.title, board.url);
@@ -282,7 +285,7 @@ fn parseRevealedAttachments(allocator: Allocator, body: []const u8, series_title
                     try seen.put(allocator, try allocator.dupe(u8, attachment_id), {});
 
                     const decoded_href = try htmlUnescapeUrl(allocator, href_raw);
-                    const download_url = try common.resolveUrl(allocator, site, decoded_href);
+                    const download_url = try resolveAttachmentUrl(allocator, decoded_href);
                     const slugged = try common.asciiSlug(allocator, series_title);
                     try out.append(allocator, .{
                         .language_code = try allocator.dupe(u8, language),
@@ -423,6 +426,8 @@ fn allDigits(value: []const u8) bool {
 const RawResponse = common.RawResponse;
 
 fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, cookie: ?[]const u8, referer: ?[]const u8) !RawResponse {
+    try validateProviderEndpoint(url);
+    if (referer) |value| try validateProviderEndpoint(value);
     try common.ensureClientTlsReady(client);
     const normalized = try common.normalizeUrlForFetch(allocator, url);
     defer allocator.free(normalized);
@@ -442,6 +447,7 @@ fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, coo
     count += 1;
 
     var req = try client.request(.GET, uri, .{
+        .redirect_behavior = .unhandled,
         .headers = .{
             .user_agent = .{ .override = common.default_user_agent },
             .accept_encoding = .{ .override = "identity" },
@@ -449,6 +455,7 @@ fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, coo
         .extra_headers = headers[0..count],
     });
     defer req.deinit();
+    errdefer req.connection.?.closing = true;
     try req.sendBodiless();
 
     var head_buffer: [24 * 1024]u8 = undefined;
@@ -458,15 +465,83 @@ fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, coo
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
-    var writer = std.Io.Writer.Allocating.init(allocator);
-    defer writer.deinit();
-    _ = try reader.streamRemaining(&writer.writer);
+    const body = readBoundedBody(allocator, reader, max_raw_response_bytes) catch |err| {
+        if (err == error.ReadFailed) {
+            if (response.bodyErr()) |body_err| return body_err;
+            if (req.connection.?.stream_reader.err) |stream_err| return stream_err;
+        }
+        return err;
+    };
+    errdefer allocator.free(body);
+    switch (req.reader.state) {
+        .body_remaining_content_length => |left| if (left != 0) return error.HttpBodyTruncated,
+        .body_remaining_chunk_len => return error.HttpChunkTruncated,
+        else => {},
+    }
 
     return .{
         .status = response.head.status,
-        .body = try allocator.dupe(u8, writer.writer.buffered()),
+        .body = body,
         .cookie = cookie_value,
     };
+}
+
+fn readBoundedBody(allocator: Allocator, reader: *std.Io.Reader, max_bytes: usize) ![]u8 {
+    var writer = std.Io.Writer.Allocating.init(allocator);
+    defer writer.deinit();
+    var received: usize = 0;
+    while (true) {
+        if (received == max_bytes) {
+            _ = reader.takeByte() catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            return error.ResponseTooLarge;
+        }
+        const count = reader.stream(&writer.writer, .limited(max_bytes - received)) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        received += count;
+    }
+    var body = writer.toArrayList();
+    errdefer body.deinit(allocator);
+    return body.toOwnedSlice(allocator);
+}
+
+test "raw response body limit accepts exact bounds and rejects excess" {
+    const a = std.testing.allocator;
+    var exact: std.Io.Reader = .fixed("1234");
+    const body = try readBoundedBody(a, &exact, 4);
+    defer a.free(body);
+    try std.testing.expectEqualStrings("1234", body);
+    var oversized: std.Io.Reader = .fixed("12345");
+    try std.testing.expectError(error.ResponseTooLarge, readBoundedBody(a, &oversized, 4));
+    var empty: std.Io.Reader = .fixed("");
+    const empty_body = try readBoundedBody(a, &empty, 0);
+    defer a.free(empty_body);
+    try std.testing.expectEqual(@as(usize, 0), empty_body.len);
+    var zero_limit: std.Io.Reader = .fixed("1");
+    try std.testing.expectError(error.ResponseTooLarge, readBoundedBody(a, &zero_limit, 0));
+}
+
+fn validateProviderEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+}
+
+fn resolveAttachmentUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+    const legacy_prefix = "http://www.subcentral.de/index.php?page=Attachment";
+    const has_exact_legacy_prefix = std.mem.startsWith(u8, href, legacy_prefix) and
+        (href.len == legacy_prefix.len or href[legacy_prefix.len] == '&' or href[legacy_prefix.len] == '#');
+
+    const resolved = if (has_exact_legacy_prefix)
+        try std.fmt.allocPrint(allocator, "https://www.subcentral.de{s}", .{href["http://www.subcentral.de".len..]})
+    else
+        try common.resolveUrl(allocator, site, href);
+    errdefer allocator.free(resolved);
+    try validateProviderEndpoint(resolved);
+    return resolved;
 }
 
 fn extractCookie(allocator: Allocator, headers: []const u8) !?[]u8 {
@@ -486,6 +561,60 @@ fn extractCookie(allocator: Allocator, headers: []const u8) !?[]u8 {
 test "subcentral parses season and episode" {
     try std.testing.expectEqual(@as(?i64, 1), parseSeason("Breaking Bad - Staffel 1 - [DE-Subs]"));
     try std.testing.expectEqual(@as(?i64, 1), parseEpisode("E01 - Pilot"));
+}
+
+test "subcentral rejects unsafe raw request targets before fetch" {
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("http://127.0.0.1/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("https://user:pass@www.subcentral.de/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("https://www.google.com/private"));
+}
+
+test "subcentral normalizes only the exact legacy HTTP attachment prefix" {
+    const legacy = try resolveAttachmentUrl(
+        std.testing.allocator,
+        "http://www.subcentral.de/index.php?page=Attachment&attachmentID=42",
+    );
+    defer std.testing.allocator.free(legacy);
+    try std.testing.expectEqualStrings(
+        "https://www.subcentral.de/index.php?page=Attachment&attachmentID=42",
+        legacy,
+    );
+
+    const relative = try resolveAttachmentUrl(
+        std.testing.allocator,
+        "/index.php?page=Attachment&attachmentID=43",
+    );
+    defer std.testing.allocator.free(relative);
+    try std.testing.expectEqualStrings(
+        "https://www.subcentral.de/index.php?page=Attachment&attachmentID=43",
+        relative,
+    );
+
+    for ([_][]const u8{
+        "http://user:pass@www.subcentral.de/index.php?page=Attachment&attachmentID=1",
+        "http://www.subcentral.de:80/index.php?page=Attachment&attachmentID=1",
+        "http://www.subcentral.de.evil.example/index.php?page=Attachment&attachmentID=1",
+        "http://subcentral.de/index.php?page=Attachment&attachmentID=1",
+        "http://www.subcentral.de/elsewhere?page=Attachment&attachmentID=1",
+        "http://www.subcentral.de/index.php?page=AttachmentLookalike&attachmentID=1",
+    }) |unsafe| {
+        try std.testing.expectError(error.UnsafeHttpTarget, resolveAttachmentUrl(std.testing.allocator, unsafe));
+    }
+}
+
+test "subcentral parser normalizes legacy HTTP attachment links" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body =
+        "<img src=\"flags/de.png\">" ++
+        "<tr class=\"aktiv\"><td class=\"release\">S01E01 - Pilot</td>" ++
+        "<td><a href=\"http://www.subcentral.de/index.php?page=Attachment&amp;attachmentID=42\">Download</a></td></tr>";
+    const subtitles = try parseRevealedAttachments(arena.allocator(), body, "Example", 1);
+    try std.testing.expectEqual(@as(usize, 1), subtitles.len);
+    try std.testing.expectEqualStrings(
+        "https://www.subcentral.de/index.php?page=Attachment&attachmentID=42",
+        subtitles[0].download_url,
+    );
 }
 
 test "live subcentral breaking bad listing and download" {
@@ -518,6 +647,7 @@ test "live subcentral breaking bad listing and download" {
     const download = try common.fetchBytes(&client, std.testing.allocator, subtitles.subtitles[0].download_url, .{
         .accept = "application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(download.body);
     try std.testing.expect(download.body.len > 8);

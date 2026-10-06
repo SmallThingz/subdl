@@ -55,6 +55,7 @@ pub const Scraper = struct {
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = true,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         const entries = try parseCatalog(a, response.body);
         const wanted = try common.normalizeTitle(a, parsed_query.title);
@@ -123,10 +124,12 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        try validateProviderEndpoint(item.page_url);
         const response = try common.fetchBytes(self.client, a, item.page_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         const links = try parseDownloadLinks(a, response.body);
 
@@ -205,7 +208,7 @@ fn parseCatalog(allocator: Allocator, body: []const u8) ![]const CatalogEntry {
             const text_end = tag_end + 1 + close_rel;
             const label = try htmlFragmentText(allocator, body[tag_end + 1 .. text_end]);
             if (title.len > 0 and label.len > 0) {
-                const page_url = try common.resolveUrl(allocator, site, href_raw);
+                const page_url = try resolveProviderUrl(allocator, href_raw);
                 try out.append(allocator, .{
                     .title = try allocator.dupe(u8, title),
                     .release_label = label,
@@ -248,7 +251,7 @@ fn parseDownloadLinks(allocator: Allocator, body: []const u8) ![]const []const u
         const label = try htmlFragmentText(allocator, body[tag_end + 1 .. text_end]);
         if (indexOfIgnoreCase(label, "Titulky") != null) {
             const decoded_href = try decodeBasicEntities(allocator, href_raw);
-            const url = try common.resolveUrl(allocator, site, decoded_href);
+            const url = try resolveProviderUrl(allocator, decoded_href);
             if (!seen.contains(url)) {
                 try seen.put(allocator, url, {});
                 try out.append(allocator, url);
@@ -258,6 +261,18 @@ fn parseDownloadLinks(allocator: Allocator, body: []const u8) ![]const []const u
     }
 
     return out.toOwnedSlice(allocator);
+}
+
+fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+    const resolved = try common.resolveUrl(allocator, site, href);
+    errdefer allocator.free(resolved);
+    try validateProviderEndpoint(resolved);
+    return resolved;
+}
+
+fn validateProviderEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
 }
 
 fn releaseMatchesSeason(entry: CatalogEntry, season: u16) bool {
@@ -463,6 +478,12 @@ test "nyasub parses SxxExx queries" {
     try std.testing.expectEqualStrings("Spy x Family", parsed.title);
     try std.testing.expectEqual(@as(?u16, 1), parsed.season);
     try std.testing.expectEqual(@as(?u16, 1), parsed.episode);
+}
+
+test "nyasub rejects unsafe provider links before fetch" {
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "http://127.0.0.1/?wpdmdl=1"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://user:pass@nyasub.cz/?wpdmdl=1"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://www.google.com/?wpdmdl=1"));
 }
 
 test "live nyasub tv search and subtitle listing" {

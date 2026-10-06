@@ -3,12 +3,12 @@
 Subtitle scrapers in Zig with a shared provider API and a single `scrapers` binary.
 
 ![Zig](https://img.shields.io/badge/Zig-0.17.0-f7a41d)
-![Providers](https://img.shields.io/badge/Active_Providers-43-2ea44f)
+![Providers](https://img.shields.io/badge/Active_Providers-46-2ea44f)
 ![Runtime](https://img.shields.io/badge/HTTP-std.http%20(Client)-0366d6)
 
 ## Overview
 
-- 43 currently active providers behind one app layer: `providers_app`
+- 46 currently active providers behind one app layer: `providers_app`
 - 53 provider implementations retained and covered by targeted live tests
 - One binary: `scrapers`
 - CLI mode by default
@@ -40,6 +40,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `indexsubtitle_cc` | `indexsubtitle.cc` |
 | `sous_titres_eu` | `sous-titres.eu` |
 | `cc_edatribe_com` | `cc.edatribe.com` |
+| `subtitrari_noi_ro` | `subtitrari-noi.ro` |
 | `subclub_eu` | `subclub.eu` |
 | `subs_ro` | `subs.ro` |
 | `subs4free_info` | `subs4free.info` |
@@ -60,6 +61,7 @@ Subtitle scrapers in Zig with a shared provider API and a single `scrapers` bina
 | `thesubtitledb_org` | `thesubtitledb.org` |
 | `napisy24_pl` | `napisy24.pl` |
 | `nyasub_cz` | `nyasub.cz` |
+| `subhd_tv` | `subhd.tv` |
 | `fansubs_ru` | `fansubs.ru` |
 | `legendei_net` | `legendei.net` |
 | `zoom_lk` | `zoom.lk` |
@@ -73,9 +75,7 @@ Retained inactive implementations are `opensubtitles_org` and `tvsubtitles_net`
 because their current user path is blocked by the Australian website-block page,
 `moviesubtitlesrt_com` because its live search path currently returns a non-success
 HTTP status, `greeksubtitles_com` because its live search endpoint currently stalls
-and returns non-success responses, `subhd_tv` because its search endpoint currently
-returns HTTP 502, `subtitrari_noi_ro` because its search endpoint currently refuses
-connections, and `my_subs_co`, `podnapisi_net`, `subtis_io`, and
+and returns non-success responses, and `my_subs_co`, `podnapisi_net`, `subtis_io`, and
 `animesubtitle_ir` because their required upstream hosts currently have no usable
 DNS address. They remain covered by focused live tests so upstream recovery can
 be detected without advertising a known-unusable provider in the CLI/TUI.
@@ -85,6 +85,7 @@ be detected without advertising a known-unusable provider in the CLI/TUI.
 `greeksubs_net` provides Greek subtitles for movies and TV.
 `sous_titres_eu` provides French subtitles for movies and TV.
 `cc_edatribe_com` provides English anime movie and TV captions.
+`subtitrari_noi_ro` provides Romanian movie and TV subtitle archives.
 `subclub_eu` provides Estonian subtitles for movies and TV episodes via direct subtitle files.
 `subs_ro` provides Romanian and English subtitles for movies and TV.
 `subs4free_info` is movie-only and provides Greek and English subtitles through a session-bound archive download flow.
@@ -105,6 +106,7 @@ be detected without advertising a known-unusable provider in the CLI/TUI.
 `thesubtitledb_org` provides public multi-language movie and TV subtitles via IMDb title resolution and TheSubtitleDB's direct file API; no API key is required.
 `napisy24_pl` provides Polish and selected English movie/TV subtitles through Napisy24's anonymous XML API and direct ZIP download endpoint.
 `nyasub_cz` provides Czech anime movie/OVA and TV subtitles from NyaSub's public finished-translations catalog and direct WPDM subtitle links.
+`subhd_tv` provides movie and TV subtitles through SubHD's public prepare-download flow.
 `fansubs_ru` provides Russian anime movie and TV subtitles.
 `legendei_net` provides Portuguese movie and TV subtitle archives, with language-specific posts when available.
 `zoom_lk` provides Sinhala movie and TV season subtitle archives.
@@ -170,10 +172,10 @@ Run the TUI:
 zig build run -- --tui
 ```
 
-Enable archive extraction for `--extract`:
+Extract downloaded archives with `--extract`:
 
 ```bash
-zig build -Denable-unarr=true run -- --providers subsource_net --query "The Matrix" --extract
+zig build run -- --providers subsource_net --query "The Matrix" --extract
 ```
 
 Enable browser automation support:
@@ -181,8 +183,6 @@ Enable browser automation support:
 ```bash
 zig build -Denable-alldriver=true
 ```
-
-Tracked upstream issues are documented in [ISSUES.md](./ISSUES.md).
 
 ## Build Flags
 
@@ -228,9 +228,22 @@ extracting them. The CLI/TUI explicitly report this state.
 
 `zig build test` runs deterministic offline tests. `zig build test-http` is a
 separate native-only integration gate requiring Python 3 and loopback sockets.
-Network suites are opt-in; `-Dlive-max-jobs=3` bounds concurrent provider probes
-and `-Dlive-timeout-seconds=45` supplies their default deadline. A live skip or
-upstream failure is not proof of a working provider.
+Network suites are opt-in. The fanout defaults to four concurrent providers and
+a 60-second subprocess deadline; individual registry entries have longer defaults.
+`-Dlive-max-jobs=N` and positive `-Dlive-timeout-seconds=N` configure these limits.
+An explicit deadline replaces the registry defaults.
+Single/serial suite execution has one deadline for the entire subprocess.
+The exact `active` selection always fans out so every active provider is visible in
+the summary. Convenience live targets retain native feature, optimization, limit,
+and job options while deliberately ignoring cross-target/CPU settings. They also
+override ambient provider-filter variables so `test-live-all` and
+`test-live-active` cannot silently narrow their documented provider sets.
+Unknown provider filter tokens fail configuration. A live skip or upstream failure
+is not proof of a working provider.
+
+Live-test execution currently requires a native Linux host, Bash 4.3 or newer,
+GNU `timeout`, Python 3 for `test-http`, and normal network access. Cross-target
+builds remain available through `build-all-targets`.
 
 Translation downloads preserve source text for missing or malformed translated
 segments and explicitly warn when the result is incomplete. Unicode filenames

@@ -57,6 +57,7 @@ pub const Scraper = struct {
         const response = try common.fetchBytes(self.client, a, url, .{
             .accept = "application/json,*/*",
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         const items = try parseSearchBody(a, response.body, parsed_query);
@@ -73,6 +74,7 @@ pub const Scraper = struct {
         const a = arena.allocator();
 
         const language = providerLanguageCode(language_code) orelse "en";
+        if (!isImdbTitleId(item.imdb_id)) return error.InvalidDownloadUrl;
         const encoded_language = try common.encodeUriComponent(a, language);
         const url = if (item.media_kind == .tv and item.season != null and item.episode != null)
             try std.fmt.allocPrint(
@@ -90,6 +92,7 @@ pub const Scraper = struct {
         const response = try common.fetchBytes(self.client, a, url, .{
             .accept = "application/json,*/*",
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         const parsed = try parseSubtitlesBody(a, response.body, item.title, language);
@@ -205,6 +208,8 @@ fn parseSubtitlesBody(
 }
 
 pub fn providerLanguageCode(input: []const u8) ?[]const u8 {
+    if (std.ascii.eqlIgnoreCase(input, "pb")) return "pb";
+    if (std.ascii.eqlIgnoreCase(input, "zt")) return "zt";
     if (common.normalizeLanguageCode(input)) |normalized| {
         if (std.mem.eql(u8, normalized, "pt-br")) return "pb";
         if (std.mem.eql(u8, normalized, "zh-tw")) return "zt";
@@ -328,6 +333,8 @@ test "thesubtitledb normalizes provider language codes" {
     try std.testing.expectEqualStrings("en", providerLanguageCode("eng").?);
     try std.testing.expectEqualStrings("pb", providerLanguageCode("pt-BR").?);
     try std.testing.expectEqualStrings("zt", providerLanguageCode("zh-TW").?);
+    try std.testing.expectEqualStrings("pb", providerLanguageCode(providerLanguageCode("pt-BR").?).?);
+    try std.testing.expectEqualStrings("zt", providerLanguageCode(providerLanguageCode("zh-TW").?).?);
 }
 
 test "live thesubtitledb movie search subtitles and download" {
@@ -367,6 +374,7 @@ test "live thesubtitledb movie search subtitles and download" {
         .accept = "text/plain,application/x-subrip,*/*",
         .cache = false,
         .max_attempts = 2,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(download.body);
     try std.testing.expect(download.body.len > 32);

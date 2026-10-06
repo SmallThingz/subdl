@@ -39,6 +39,7 @@ pub const Scraper = struct {
             .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = site }},
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         return parseSearchJson(common.takeArena(&arena), response.body, trimmed);
     }
@@ -48,11 +49,13 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        try validateProviderEndpoint(item.page_url);
         const response = try common.fetchBytes(self.client, a, item.page_url, .{
             .accept = "application/json,*/*",
             .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = site }},
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         var parsed = try parseSubtitlesJson(common.takeArena(&arena), response.body, item);
         errdefer parsed.deinit();
@@ -213,12 +216,19 @@ fn parseSubtitlesJson(arena: std.heap.ArenaAllocator, body: []const u8, item: Se
 fn normalizeProviderUrl(allocator: Allocator, raw_url: []const u8) ![]const u8 {
     const absolute = try common.resolveUrl(allocator, site, raw_url);
     if (std.mem.startsWith(u8, absolute, "https://www.subsynchro.com/")) {
-        return try std.fmt.allocPrint(allocator, "http://{s}", .{absolute["https://".len..]});
+        const normalized = try std.fmt.allocPrint(allocator, "http://{s}", .{absolute["https://".len..]});
+        allocator.free(absolute);
+        errdefer allocator.free(normalized);
+        try validateProviderEndpoint(normalized);
+        return normalized;
     }
+    errdefer allocator.free(absolute);
+    try validateProviderEndpoint(absolute);
     return absolute;
 }
 
 fn resolveDownloadRedirect(client: *std.http.Client, allocator: Allocator, url: []const u8) ![]const u8 {
+    try validateProviderEndpoint(url);
     try common.ensureClientTlsReady(client);
     const normalized = try common.normalizeUrlForFetch(allocator, url);
     defer allocator.free(normalized);
@@ -253,7 +263,13 @@ fn resolveDownloadRedirect(client: *std.http.Client, allocator: Allocator, url: 
     else
         try std.fmt.allocPrint(allocator, "/{s}", .{location});
     const resolved = try common.resolveUrl(allocator, site, location_for_resolve);
+    defer allocator.free(resolved);
     return try normalizeProviderUrl(allocator, resolved);
+}
+
+fn validateProviderEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
 }
 
 fn extractHeader(allocator: Allocator, headers: []const u8, wanted: []const u8) !?[]u8 {
@@ -320,6 +336,12 @@ test "subsynchro parses subtitle rows and normalizes provider download scheme" {
     );
 }
 
+test "subsynchro rejects unsafe provider redirect targets before fetch" {
+    try std.testing.expectError(error.UnsafeHttpTarget, normalizeProviderUrl(std.testing.allocator, "http://127.0.0.1/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, normalizeProviderUrl(std.testing.allocator, "https://user:pass@www.subsynchro.com/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, normalizeProviderUrl(std.testing.allocator, "https://www.google.com/private"));
+}
+
 test "live subsynchro movie search, listing and download" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
     if (!common.providerMatchesLiveFilter(common.liveProviderFilter(), "subsynchro.com")) return error.SkipZigTest;
@@ -340,6 +362,7 @@ test "live subsynchro movie search, listing and download" {
         .accept = "application/zip,application/octet-stream,*/*",
         .cache = false,
         .max_attempts = 2,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(download.body);
     try std.testing.expect(download.body.len > 4);

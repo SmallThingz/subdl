@@ -83,7 +83,7 @@ pub const Scraper = struct {
             while (anchors.next()) |anchor| {
                 const href = anchor.getAttributeValue("href") orelse continue;
                 const title = try common.innerTextTrimmedOwned(a, anchor);
-                const movie_page_url = try common.resolveUrl(a, site, href);
+                const movie_page_url = try resolveProviderUrl(a, href);
                 try items.append(a, .{ .title = title, .page_url = movie_page_url });
             }
 
@@ -176,31 +176,42 @@ pub const Scraper = struct {
     }
 
     fn fetchHtml(self: *Scraper, allocator: Allocator, url: []const u8) !common.HttpResponse {
-        const response = common.fetchBytes(self.client, self.allocator, url, .{
-            .accept = "text/html",
-            .allow_non_ok = true,
-            .max_attempts = 2,
-        }) catch |err| {
-            if (err != error.ConnectionRefused or !std.mem.startsWith(u8, url, "https://www.opensubtitles.org/")) return err;
-
-            const diagnostic_url = try std.fmt.allocPrint(allocator, "http://www.opensubtitles.org/{s}", .{url["https://www.opensubtitles.org/".len..]});
-            const diagnostic = common.fetchBytes(self.client, self.allocator, diagnostic_url, .{
-                .accept = "text/html",
-                .allow_non_ok = true,
-                .max_attempts = 1,
-                .cache = false,
-            }) catch return err;
-            defer self.allocator.free(diagnostic.body);
-            if (common.isAustralianWebsiteBlockPage(diagnostic.body)) return error.ProviderAccessBlocked;
-            return err;
-        };
-        if (common.isAustralianWebsiteBlockPage(response.body)) {
-            self.allocator.free(response.body);
-            return error.ProviderAccessBlocked;
-        }
-        return response;
+        try validateProviderEndpoint(url);
+        return fetchHtmlWith(common.fetchBytes, self.client, allocator, url);
     }
 };
+
+fn fetchHtmlWith(comptime fetch: anytype, client: *std.http.Client, allocator: Allocator, url: []const u8) !common.HttpResponse {
+    const response = fetch(client, allocator, url, .{
+        .accept = "text/html",
+        .allow_non_ok = true,
+        .max_attempts = 2,
+        .require_public_origin = true,
+    }) catch |err| {
+        if (err != error.ConnectionRefused or !std.mem.startsWith(u8, url, "https://www.opensubtitles.org/")) return err;
+
+        const diagnostic_url = try std.fmt.allocPrint(allocator, "http://www.opensubtitles.org/{s}", .{url["https://www.opensubtitles.org/".len..]});
+        defer allocator.free(diagnostic_url);
+        const diagnostic = fetch(client, allocator, diagnostic_url, .{
+            .accept = "text/html",
+            .allow_non_ok = true,
+            .max_attempts = 1,
+            .cache = false,
+            .require_public_origin = true,
+        }) catch |diagnostic_err| switch (diagnostic_err) {
+            error.OutOfMemory, error.Canceled => return diagnostic_err,
+            else => return err,
+        };
+        defer allocator.free(diagnostic.body);
+        if (common.isAustralianWebsiteBlockPage(diagnostic.body)) return error.ProviderAccessBlocked;
+        return err;
+    };
+    errdefer allocator.free(response.body);
+    if (common.isAustralianWebsiteBlockPage(response.body)) return error.ProviderAccessBlocked;
+    if (response.status == .too_many_requests) return error.RateLimited;
+    if (response.status != .ok) return error.UnexpectedHttpStatus;
+    return response;
+}
 
 fn dedupeSearchItems(allocator: Allocator, items: []const SearchItem) ![]const SearchItem {
     var seen = std.StringHashMapUnmanaged(void).empty;
@@ -216,6 +227,18 @@ fn dedupeSearchItems(allocator: Allocator, items: []const SearchItem) ![]const S
     }
 
     return try out.toOwnedSlice(allocator);
+}
+
+fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+    const resolved = try common.resolveUrl(allocator, site, href);
+    errdefer allocator.free(resolved);
+    try validateProviderEndpoint(resolved);
+    return resolved;
+}
+
+fn validateProviderEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
 }
 
 fn addOrReplaceOffsetPage(allocator: Allocator, base_url: []const u8, page: usize) ![]const u8 {
@@ -245,7 +268,7 @@ fn addOrReplaceOffsetPage(allocator: Allocator, base_url: []const u8, page: usiz
 fn extractNextPageUrl(allocator: Allocator, doc: *HtmlDocument, current_url: []const u8) !?[]const u8 {
     if (doc.queryOne("link[rel='next'][href]")) |n| {
         if (n.getAttributeValue("href")) |href| {
-            const resolved = try common.resolveUrl(allocator, site, href);
+            const resolved = try resolveProviderUrl(allocator, href);
             if (!std.mem.eql(u8, resolved, current_url)) return resolved;
         }
     }
@@ -254,7 +277,7 @@ fn extractNextPageUrl(allocator: Allocator, doc: *HtmlDocument, current_url: []c
         const href = anchor.getAttributeValue("href") orelse return null;
         const text = try common.innerTextTrimmedOwned(allocator, anchor);
         if (std.mem.eql(u8, text, ">>") or std.mem.eql(u8, text, "›") or std.mem.eql(u8, text, ">")) {
-            const resolved = try common.resolveUrl(allocator, site, href);
+            const resolved = try resolveProviderUrl(allocator, href);
             if (!std.mem.eql(u8, resolved, current_url)) return resolved;
         }
     }
@@ -309,7 +332,7 @@ fn appendSubtitleFromRow(
         row.queryOne("a.bnone[href*='/subtitles/']") orelse
         row.queryOne("a[href*='/subtitles/']") orelse return;
     const details_href = subtitle_anchor.getAttributeValue("href") orelse return;
-    const details_url = try common.resolveUrl(allocator, site, details_href);
+    const details_url = try resolveProviderUrl(allocator, details_href);
     if (seen_details.contains(details_url)) return;
     try seen_details.put(allocator, details_url, {});
 
@@ -385,6 +408,83 @@ fn languageToOpenSubtitles3(code: []const u8) ?[]const u8 {
 test "opensubtitles language mapping" {
     try std.testing.expectEqualStrings("eng", languageToOpenSubtitles3("en").?);
     try std.testing.expect(languageToOpenSubtitles3("xx") == null);
+}
+
+test "opensubtitles.org rejects unsafe provider links before fetch" {
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "http://127.0.0.1/search/idmovie-1"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://user:pass@www.opensubtitles.org/search/idmovie-1"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://www.google.com/search/idmovie-1"));
+}
+
+const OwnedHtmlFixture = struct {
+    fn fetch(_: *std.http.Client, allocator: Allocator, url: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+        if (std.mem.eql(u8, url, "https://www.opensubtitles.org/diagnostic")) return error.ConnectionRefused;
+        const body = if (std.mem.endsWith(u8, url, "/blocked") or std.mem.eql(u8, url, "http://www.opensubtitles.org/diagnostic"))
+            "Access to Website Disabled Federal Court of Australia"
+        else
+            "<html><body>ordinary provider page</body></html>";
+        return .{ .status = .ok, .body = try allocator.dupe(u8, body) };
+    }
+};
+
+fn checkHtmlOwnership(allocator: Allocator) !void {
+    var client: std.http.Client = .{ .allocator = allocator, .io = std.testing.io };
+    defer client.deinit();
+    for (0..4) |_| {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const response = try fetchHtmlWith(OwnedHtmlFixture.fetch, &client, arena.allocator(), "https://fixture.invalid/page");
+        try std.testing.expectEqualStrings("<html><body>ordinary provider page</body></html>", response.body);
+    }
+    try checkBlockedHtml(&client, allocator, "https://fixture.invalid/blocked");
+    try checkBlockedHtml(&client, allocator, "https://www.opensubtitles.org/diagnostic");
+}
+
+fn checkBlockedHtml(client: *std.http.Client, allocator: Allocator, url: []const u8) !void {
+    const rejected = fetchHtmlWith(OwnedHtmlFixture.fetch, client, allocator, url) catch |err| switch (err) {
+        error.ProviderAccessBlocked => return,
+        else => return err,
+    };
+    allocator.free(rejected.body);
+    return error.TestUnexpectedResult;
+}
+
+test "opensubtitles html bodies belong to caller and free on rejection" {
+    try checkHtmlOwnership(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkHtmlOwnership, .{});
+}
+
+fn HtmlStatusFixture(comptime status: std.http.Status, comptime body: []const u8) type {
+    return struct {
+        fn fetch(_: *std.http.Client, allocator: Allocator, _: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+            return .{ .status = status, .body = try allocator.dupe(u8, body) };
+        }
+    };
+}
+
+test "opensubtitles rejects non-ok HTML and frees rejected bodies" {
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    inline for (.{ std.http.Status.forbidden, std.http.Status.not_found, std.http.Status.internal_server_error, std.http.Status.service_unavailable, std.http.Status.moved_permanently }) |status| {
+        try std.testing.expectError(error.UnexpectedHttpStatus, fetchHtmlWith(
+            HtmlStatusFixture(status, "<html><body>No results</body></html>").fetch,
+            &client,
+            std.testing.allocator,
+            "https://fixture.invalid/page",
+        ));
+    }
+    try std.testing.expectError(error.RateLimited, fetchHtmlWith(
+        HtmlStatusFixture(.too_many_requests, "<html><body>Try again later</body></html>").fetch,
+        &client,
+        std.testing.allocator,
+        "https://fixture.invalid/page",
+    ));
+    try std.testing.expectError(error.ProviderAccessBlocked, fetchHtmlWith(
+        HtmlStatusFixture(.forbidden, "Access to Website Disabled Federal Court of Australia").fetch,
+        &client,
+        std.testing.allocator,
+        "https://fixture.invalid/page",
+    ));
 }
 
 test "live opensubtitles.org search and subtitles" {

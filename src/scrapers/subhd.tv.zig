@@ -1,7 +1,9 @@
 const std = @import("std");
 const common = @import("common.zig");
+const cf_shared = @import("opensubtitles_com_cf.zig");
 
 const Allocator = std.mem.Allocator;
+const max_raw_response_bytes = (common.FetchOptions{}).max_response_bytes;
 const site = "https://subhd.tv";
 const prepare_url = site ++ "/api/sub/prepare-download";
 const download_api_url = site ++ "/api/sub/down";
@@ -56,6 +58,7 @@ pub const Scraper = struct {
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         const items = try parseSearchItems(a, response.body, trimmed);
@@ -67,18 +70,21 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        try validateProviderEndpoint(item.detail_url);
         var language_code = item.language_code;
         var filename = item.filename;
-        const detail_response = common.fetchBytes(self.client, a, item.detail_url, .{
+        const detail_response = try common.fetchBytes(self.client, a, item.detail_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
+            .allow_non_ok = true,
             .cache = false,
             .max_attempts = 2,
-        }) catch null;
-        if (detail_response) |detail_http| {
-            if (parseDetail(detail_http.body) catch null) |detail| {
-                language_code = detail.language_code;
-                filename = detail.filename;
-            }
+            .retry_on_429 = false,
+            .require_public_origin = true,
+        });
+        try requireProviderResponseSuccess(detail_response.status, detail_response.body);
+        if (try parseDetail(detail_response.body)) |detail| {
+            language_code = detail.language_code;
+            filename = detail.filename;
         }
 
         const subtitles = try a.alloc(SubtitleItem, 1);
@@ -96,27 +102,13 @@ pub const Scraper = struct {
 
     pub fn fetchDownloadByToken(self: *Scraper, allocator: Allocator, token: []const u8) !common.HttpResponse {
         const parts = parseDownloadToken(token) orelse return error.InvalidDownloadUrl;
-
-        if (try directCdnUrlFromFilename(allocator, parts.filename)) |cdn_url| {
-            defer allocator.free(cdn_url);
-            const direct = try common.fetchBytes(self.client, allocator, cdn_url, .{
-                .accept = "application/octet-stream,text/plain,application/zip,*/*",
-                .allow_non_ok = true,
-                .cache = false,
-                .max_attempts = 1,
-            });
-            if (direct.status == .ok and direct.body.len > 0 and !common.looksLikeHtml(direct.body)) return direct;
-            allocator.free(direct.body);
-        }
+        try validateProviderEndpoint(parts.detail_url);
 
         const prepare_payload = try std.fmt.allocPrint(allocator, "{{\"sid\":\"{s}\"}}", .{parts.subtitle_id});
         defer allocator.free(prepare_payload);
         var prepared = try fetchRaw(self.client, allocator, .POST, prepare_url, prepare_payload, null, parts.detail_url, "application/json");
         defer prepared.deinit(allocator);
-        if (prepared.status != .ok) {
-            if (prepared.status == .forbidden and isDownloadRateLimit(prepared.body)) return error.RateLimited;
-            return error.UnexpectedHttpStatus;
-        }
+        try requireProviderResponseSuccess(prepared.status, prepared.body);
         const prepare_cookie = prepared.cookie orelse return error.SessionExpired;
         const temporary_path = try parseJsonStringField(allocator, prepared.body, "url");
         defer allocator.free(temporary_path);
@@ -126,7 +118,7 @@ pub const Scraper = struct {
 
         var temporary = try fetchRaw(self.client, allocator, .GET, temporary_url, null, prepare_cookie, parts.detail_url, null);
         defer temporary.deinit(allocator);
-        if (temporary.status != .ok) return error.UnexpectedHttpStatus;
+        try requireProviderResponseSuccess(temporary.status, temporary.body);
         const down_cookie = temporary.cookie orelse return error.SessionExpired;
 
         const combined_cookie = try std.fmt.allocPrint(allocator, "{s}; {s}", .{ prepare_cookie, down_cookie });
@@ -135,10 +127,7 @@ pub const Scraper = struct {
         defer allocator.free(down_payload);
         var down = try fetchRaw(self.client, allocator, .POST, download_api_url, down_payload, combined_cookie, temporary_url, "application/json");
         defer down.deinit(allocator);
-        if (down.status != .ok) {
-            if (down.status == .forbidden and isDownloadRateLimit(down.body)) return error.RateLimited;
-            return error.UnexpectedHttpStatus;
-        }
+        try requireProviderResponseSuccess(down.status, down.body);
 
         const pass = try parseJsonBoolField(allocator, down.body, "pass");
         if (!pass) return error.ProviderAccessBlocked;
@@ -146,34 +135,16 @@ pub const Scraper = struct {
         defer allocator.free(final_url);
         if (!std.mem.startsWith(u8, final_url, "https://") and !std.mem.startsWith(u8, final_url, "http://"))
             return error.InvalidDownloadUrl;
+        try common.validatePublicHttpUrl(final_url);
 
         return common.fetchBytes(self.client, allocator, final_url, .{
             .accept = "application/octet-stream,text/plain,application/zip,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
     }
 };
-
-fn directCdnUrlFromFilename(allocator: Allocator, filename: []const u8) !?[]u8 {
-    const basename = std.fs.path.basename(filename);
-    const dot = std.mem.lastIndexOfScalar(u8, basename, '.') orelse return null;
-    if (dot < 13 or dot + 1 >= basename.len) return null;
-    const stem = basename[0..dot];
-    for (stem) |c| if (!std.ascii.isDigit(c)) return null;
-
-    const millis = std.fmt.parseInt(u64, stem, 10) catch return null;
-    const seconds = millis / 1000;
-    const year_day = (std.time.epoch.EpochSeconds{ .secs = seconds }).getEpochDay().calculateYearDay();
-    const month = year_day.calculateMonthDay().month.numeric();
-    if (year_day.year < 2000 or year_day.year > 2200) return null;
-
-    return try std.fmt.allocPrint(
-        allocator,
-        "https://dl.subhd.me/{d}/{d:0>2}/{s}",
-        .{ year_day.year, month, basename },
-    );
-}
 
 fn parseSearchItems(allocator: Allocator, body: []const u8, query: []const u8) ![]const SearchItem {
     const wanted_title = std.mem.trim(u8, stripEpisodeTag(query), " \t\r\n");
@@ -397,6 +368,8 @@ fn fetchRaw(
     referer: ?[]const u8,
     content_type: ?[]const u8,
 ) !RawResponse {
+    try validateProviderEndpoint(url);
+    if (referer) |value| try validateProviderEndpoint(value);
     try common.ensureClientTlsReady(client);
     const normalized = try common.normalizeUrlForFetch(allocator, url);
     defer allocator.free(normalized);
@@ -416,6 +389,7 @@ fn fetchRaw(
     count += 1;
 
     var req = try client.request(method, uri, .{
+        .redirect_behavior = .unhandled,
         .headers = .{
             .user_agent = .{ .override = common.default_user_agent },
             .accept_encoding = .{ .override = "identity" },
@@ -424,6 +398,9 @@ fn fetchRaw(
         .extra_headers = extra_storage[0..count],
     });
     defer req.deinit();
+    errdefer if (req.connection) |connection| {
+        connection.closing = true;
+    };
     if (payload) |body_const| {
         const body = try allocator.dupe(u8, body_const);
         defer allocator.free(body);
@@ -437,15 +414,53 @@ fn fetchRaw(
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
-    var writer = std.Io.Writer.Allocating.init(allocator);
-    defer writer.deinit();
-    _ = try reader.streamRemaining(&writer.writer);
+    const body = readRawBody(allocator, reader, max_raw_response_bytes) catch |err| {
+        if (err == error.ReadFailed) {
+            if (response.bodyErr()) |body_err| return body_err;
+            if (req.connection.?.stream_reader.err) |stream_err| return stream_err;
+        }
+        return err;
+    };
+    errdefer allocator.free(body);
+    switch (req.reader.state) {
+        .body_remaining_content_length => |left| if (left != 0) return error.HttpBodyTruncated,
+        .body_remaining_chunk_len => return error.HttpChunkTruncated,
+        else => {},
+    }
 
     return .{
         .status = response.head.status,
-        .body = try allocator.dupe(u8, writer.writer.buffered()),
+        .body = body,
         .cookie = response_cookie,
     };
+}
+
+fn readRawBody(allocator: Allocator, reader: *std.Io.Reader, max_bytes: usize) ![]u8 {
+    var writer = std.Io.Writer.Allocating.init(allocator);
+    defer writer.deinit();
+    var received: usize = 0;
+    while (true) {
+        if (received == max_bytes) {
+            _ = reader.takeByte() catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            return error.ResponseTooLarge;
+        }
+        const count = reader.stream(&writer.writer, .limited(max_bytes - received)) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        received += count;
+    }
+    var body = writer.toArrayList();
+    errdefer body.deinit(allocator);
+    return body.toOwnedSlice(allocator);
+}
+
+fn validateProviderEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
 }
 
 fn extractCookie(allocator: Allocator, headers: []const u8) !?[]u8 {
@@ -496,6 +511,14 @@ fn isDownloadRateLimit(body: []const u8) bool {
         std.mem.indexOf(u8, body, "too frequent") != null;
 }
 
+fn requireProviderResponseSuccess(status: std.http.Status, body: []const u8) !void {
+    if (status == .too_many_requests or (status == .forbidden and isDownloadRateLimit(body)))
+        return error.RateLimited;
+    if (cf_shared.isChallengeBody(body)) return error.CloudflareChallenge;
+    if (status == .forbidden or status == .unauthorized) return error.ProviderAccessBlocked;
+    if (status != .ok) return error.UnexpectedHttpStatus;
+}
+
 test "subhd parses detail and session token" {
     const body =
         "<div class=\"f16 fw-bold mb-2 subtitle-edition\">Chernobyl.S01E01.WEB</div>" ++
@@ -542,9 +565,35 @@ test "subhd detects explicit download throttle response" {
     try std.testing.expect(isDownloadRateLimit("{\"success\":false,\"msg\":\"下载频率过高，请稍后再试。\"}"));
 }
 
-test "subhd derives public CDN path from timestamp filename" {
+test "subhd rejects unsafe session targets before fetch" {
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("http://127.0.0.1/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("https://user:pass@subhd.tv/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("https://www.google.com/private"));
+}
+
+test "subhd detail and download steps stop on rate limits and access barriers" {
+    try std.testing.expectError(error.RateLimited, requireProviderResponseSuccess(.too_many_requests, ""));
+    try std.testing.expectError(error.RateLimited, requireProviderResponseSuccess(.too_many_requests, "{\"pass\":true,\"url\":\"https://dl.subhd.me/example.srt\"}"));
+    try std.testing.expectError(error.RateLimited, requireProviderResponseSuccess(.forbidden, "下载频率过高，请稍后再试。"));
+    try std.testing.expectError(error.ProviderAccessBlocked, requireProviderResponseSuccess(.forbidden, "access denied"));
+    try std.testing.expectError(error.ProviderAccessBlocked, requireProviderResponseSuccess(.unauthorized, "login required"));
+    try std.testing.expectError(error.CloudflareChallenge, requireProviderResponseSuccess(.ok, "<html><title>Just a moment...</title><script>window._cf_chl_opt = {};</script></html>"));
+    try std.testing.expectError(error.UnexpectedHttpStatus, requireProviderResponseSuccess(.found, ""));
+    try requireProviderResponseSuccess(.ok, "{\"pass\":true}");
+}
+
+test "subhd raw response limit accepts exact bounds and rejects excess" {
     const allocator = std.testing.allocator;
-    const url = (try directCdnUrlFromFilename(allocator, "1772600046334.srt")).?;
-    defer allocator.free(url);
-    try std.testing.expectEqualStrings("https://dl.subhd.me/2026/03/1772600046334.srt", url);
+    var exact: std.Io.Reader = .fixed("1234");
+    const body = try readRawBody(allocator, &exact, 4);
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("1234", body);
+    var oversized: std.Io.Reader = .fixed("12345");
+    try std.testing.expectError(error.ResponseTooLarge, readRawBody(allocator, &oversized, 4));
+    var empty: std.Io.Reader = .fixed("");
+    const empty_body = try readRawBody(allocator, &empty, 0);
+    defer allocator.free(empty_body);
+    try std.testing.expectEqual(@as(usize, 0), empty_body.len);
+    var zero_limit: std.Io.Reader = .fixed("1");
+    try std.testing.expectError(error.ResponseTooLarge, readRawBody(allocator, &zero_limit, 0));
 }

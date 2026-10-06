@@ -57,8 +57,10 @@ pub const Scraper = struct {
         if (title.len == 0) return .{ .arena = arena, .items = &.{} };
 
         var items: std.ArrayListUnmanaged(SearchItem) = .empty;
-        if (try self.resolveCandidate(a, title, .movie, parts.season, parts.episode)) |item|
-            try items.append(a, item);
+        if (parts.episode == null) {
+            if (try self.resolveCandidate(a, title, .movie, parts.season, parts.episode)) |item|
+                try items.append(a, item);
+        }
         if (try self.resolveCandidate(a, title, .tv, parts.season, parts.episode)) |item|
             try items.append(a, item);
 
@@ -76,6 +78,7 @@ pub const Scraper = struct {
             .accept = "application/json",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         if (response.status != .ok) return error.UnexpectedHttpStatus;
 
@@ -114,6 +117,18 @@ pub const Scraper = struct {
         requested_season: ?i64,
         requested_episode: ?i64,
     ) !?SearchItem {
+        return self.resolveCandidateWith(allocator, title, media_kind, requested_season, requested_episode, common.fetchBytes);
+    }
+
+    fn resolveCandidateWith(
+        self: *Scraper,
+        allocator: Allocator,
+        title: []const u8,
+        media_kind: MediaKind,
+        requested_season: ?i64,
+        requested_episode: ?i64,
+        comptime fetch: anytype,
+    ) !?SearchItem {
         const encoded_title = try common.encodeUriComponent(allocator, title);
         const kind_name = switch (media_kind) {
             .movie => "movie",
@@ -124,21 +139,22 @@ pub const Scraper = struct {
             "{s}/search/{s}?api_key={s}&query={s}&language=en",
             .{ tmdb_site, kind_name, tmdb_api_key, encoded_title },
         );
-        const response = common.fetchBytes(self.client, allocator, search_url, .{
+        const response = try fetch(self.client, allocator, search_url, common.FetchOptions{
             .accept = "application/json",
             .cache = false,
             .max_attempts = 2,
-        }) catch return null;
-        if (response.status != .ok) return null;
+            .require_public_origin = true,
+        });
+        if (response.status != .ok) return error.UnexpectedHttpStatus;
 
-        const root = std.json.parseFromSliceLeaky(std.json.Value, allocator, response.body, .{}) catch return null;
+        const root = try std.json.parseFromSliceLeaky(std.json.Value, allocator, response.body, .{});
         const root_obj = switch (root) {
             .object => |value| value,
-            else => return null,
+            else => return error.InvalidFieldType,
         };
-        const results = switch (root_obj.get("results") orelse return null) {
+        const results = switch (root_obj.get("results") orelse return error.MissingField) {
             .array => |value| value,
-            else => return null,
+            else => return error.InvalidFieldType,
         };
         if (results.items.len == 0) return null;
 
@@ -155,10 +171,9 @@ pub const Scraper = struct {
                 .tv => common.jsonString(obj, "name") orelse continue,
             };
             const normalized = try common.normalizeTitle(allocator, candidate_title);
-            var score: i32 = 0;
-            if (std.mem.eql(u8, normalized, wanted)) score += 100;
-            if (std.mem.indexOf(u8, normalized, wanted) != null) score += 30;
-            score += @intCast(@min(@as(i64, 20), common.jsonIntField(obj, "popularity") orelse 0));
+            if (!matchesTitle(normalized, wanted)) continue;
+            var score: i32 = if (std.mem.eql(u8, normalized, wanted)) 100 else 30;
+            score += @intCast(std.math.clamp(common.jsonIntField(obj, "popularity") orelse 0, 0, 20));
             if (score > chosen_score) {
                 chosen = obj;
                 chosen_score = score;
@@ -177,17 +192,18 @@ pub const Scraper = struct {
             "{s}/{s}?api_key={s}&language=en",
             .{ tmdb_site, detail_path, tmdb_api_key },
         );
-        const detail_response = common.fetchBytes(self.client, allocator, detail_url, .{
+        const detail_response = try fetch(self.client, allocator, detail_url, common.FetchOptions{
             .accept = "application/json",
             .cache = false,
             .max_attempts = 2,
-        }) catch return null;
-        if (detail_response.status != .ok) return null;
+            .require_public_origin = true,
+        });
+        if (detail_response.status != .ok) return error.UnexpectedHttpStatus;
 
-        const detail_root = std.json.parseFromSliceLeaky(std.json.Value, allocator, detail_response.body, .{}) catch return null;
+        const detail_root = try std.json.parseFromSliceLeaky(std.json.Value, allocator, detail_response.body, .{});
         const detail_obj = switch (detail_root) {
             .object => |value| value,
-            else => return null,
+            else => return error.InvalidFieldType,
         };
         const imdb_id = common.jsonString(detail_obj, "imdb_id") orelse return null;
         if (!std.mem.startsWith(u8, imdb_id, "tt")) return null;
@@ -225,7 +241,7 @@ fn appendMovieSubtitles(
 ) !void {
     const array = switch (subs_value) {
         .array => |value| value,
-        else => return,
+        else => return error.InvalidFieldType,
     };
     for (array.items) |entry| {
         const obj = switch (entry) {
@@ -245,7 +261,7 @@ fn appendTvSubtitles(
 ) !void {
     const seasons_obj = switch (subs_value) {
         .object => |value| value,
-        else => return,
+        else => return error.InvalidFieldType,
     };
     var season_it = seasons_obj.iterator();
     while (season_it.next()) |season_entry| {
@@ -335,6 +351,62 @@ fn parseQuery(query: []const u8) QueryParts {
     return .{ .title = query, .season = null, .episode = null };
 }
 
+fn matchesTitle(candidate: []const u8, wanted: []const u8) bool {
+    if (wanted.len == 0) return false;
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, candidate, cursor, wanted)) |start| {
+        const end = start + wanted.len;
+        if ((start == 0 or candidate[start - 1] == ' ') and
+            (end == candidate.len or candidate[end] == ' ')) return true;
+        cursor = start + 1;
+    }
+    return false;
+}
+
+test "wizdom propagates acquisition failures and rejects unrelated candidates" {
+    const Mock = struct {
+        fn canceled(_: *std.http.Client, _: Allocator, _: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+            return error.Canceled;
+        }
+        fn oom(_: *std.http.Client, _: Allocator, _: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+            return error.OutOfMemory;
+        }
+        fn badContract(_: *std.http.Client, a: Allocator, _: []const u8, _: common.FetchOptions) !common.HttpResponse {
+            return .{ .status = .ok, .body = try a.dupe(u8, "{}") };
+        }
+        fn forbidden(_: *std.http.Client, a: Allocator, _: []const u8, _: common.FetchOptions) !common.HttpResponse {
+            return .{ .status = .forbidden, .body = try a.dupe(u8, "Forbidden") };
+        }
+        fn invalidJson(_: *std.http.Client, a: Allocator, _: []const u8, _: common.FetchOptions) !common.HttpResponse {
+            return .{ .status = .ok, .body = try a.dupe(u8, "<html>challenge</html>") };
+        }
+        fn unrelated(_: *std.http.Client, a: Allocator, _: []const u8, _: common.FetchOptions) !common.HttpResponse {
+            return .{ .status = .ok, .body = try a.dupe(u8, "{\"results\":[{\"id\":1,\"title\":\"Unrelated\",\"popularity\":100}]}") };
+        }
+        fn matching(_: *std.http.Client, a: Allocator, url: []const u8, _: common.FetchOptions) !common.HttpResponse {
+            return .{ .status = .ok, .body = try a.dupe(u8, if (std.mem.indexOf(u8, url, "/search/") != null)
+                "{\"results\":[{\"id\":1,\"title\":\"Unrelated\",\"popularity\":100},{\"id\":2,\"title\":\"The Matrix\",\"popularity\":1}]}"
+            else
+                "{\"imdb_id\":\"tt0133093\"}") };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &client);
+    const a = arena.allocator();
+    try std.testing.expectError(error.Canceled, scraper.resolveCandidateWith(a, "The Matrix", .movie, null, null, Mock.canceled));
+    try std.testing.expectError(error.OutOfMemory, scraper.resolveCandidateWith(a, "The Matrix", .movie, null, null, Mock.oom));
+    try std.testing.expectError(error.MissingField, scraper.resolveCandidateWith(a, "The Matrix", .movie, null, null, Mock.badContract));
+    try std.testing.expectError(error.UnexpectedHttpStatus, scraper.resolveCandidateWith(a, "The Matrix", .movie, null, null, Mock.forbidden));
+    try std.testing.expectError(error.SyntaxError, scraper.resolveCandidateWith(a, "The Matrix", .movie, null, null, Mock.invalidJson));
+    try std.testing.expect((try scraper.resolveCandidateWith(a, "The Matrix", .movie, null, null, Mock.unrelated)) == null);
+    const chosen = (try scraper.resolveCandidateWith(a, "The Matrix", .movie, null, null, Mock.matching)).?;
+    try std.testing.expectEqualStrings("tt0133093", chosen.imdb_id);
+    try std.testing.expect(!matchesTitle("matrixed", "matrix"));
+}
+
 fn parseYear(date: []const u8) ?i64 {
     if (date.len < 4) return null;
     for (date[0..4]) |c| if (!std.ascii.isDigit(c)) return null;
@@ -374,6 +446,7 @@ test "live wizdom movie and tv downloads" {
     const movie_download = try common.fetchBytes(&client, std.testing.allocator, movie_subtitles.subtitles[0].download_url, .{
         .accept = "application/zip,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(movie_download.body);
     try std.testing.expect(movie_download.body.len > 4);
@@ -391,6 +464,7 @@ test "live wizdom movie and tv downloads" {
     const tv_download = try common.fetchBytes(&client, std.testing.allocator, tv_subtitles.subtitles[0].download_url, .{
         .accept = "application/zip,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(tv_download.body);
     try std.testing.expect(tv_download.body.len > 4);

@@ -41,6 +41,7 @@ pub const Scraper = struct {
             .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = site ++ "/" }},
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         return parseSearchHtml(common.takeArena(&arena), response.body, trimmed);
@@ -50,6 +51,9 @@ pub const Scraper = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+
+        try validateProviderUrl(item.page_url);
+        try validateProviderUrl(item.download_url);
 
         const subtitles = try a.alloc(SubtitleItem, 1);
         subtitles[0] = .{
@@ -113,6 +117,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
 
         const detail_url = try std.fmt.allocPrint(a, "{s}/index.php?tipus=adatlap&azon=a_{s}", .{ site, subtitle_id });
         const download_url = try common.resolveUrl(a, site, href);
+        validateProviderUrl(download_url) catch continue;
         const item: SearchItem = .{
             .title = try a.dupe(u8, split.title),
             .year = split.year,
@@ -132,6 +137,12 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     try items.appendSlice(a, exact.items);
     try items.appendSlice(a, partial.items);
     return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) });
+}
+
+fn validateProviderUrl(url: []const u8) !void {
+    const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
+    if (uri.user != null or uri.password != null) return error.InvalidDownloadUrl;
+    if (!(common.sameOrigin(site, url) catch false)) return error.InvalidDownloadUrl;
 }
 
 const TitleYear = common.TitleYear;
@@ -214,6 +225,17 @@ test "supersubtitles parses exact movie rows" {
     try std.testing.expectEqualStrings("en", response.items[0].language_code);
 }
 
+test "supersubtitles rejects non-provider download targets" {
+    try validateProviderUrl("https://feliratok.eu/index.php?action=letolt&felirat=1");
+    for ([_][]const u8{
+        "http://127.0.0.1/index.php?action=letolt",
+        "https://feliratok.eu.example/index.php?action=letolt",
+        "https://user@feliratok.eu/index.php?action=letolt",
+    }) |url| {
+        try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl(url));
+    }
+}
+
 test "live supersubtitles movie search and download" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
     if (!common.providerMatchesLiveFilter(common.liveProviderFilter(), "feliratok.eu")) return error.SkipZigTest;
@@ -233,6 +255,7 @@ test "live supersubtitles movie search and download" {
         .accept = "application/text,text/plain,*/*",
         .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = search.items[0].page_url }},
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(download.body);
     try std.testing.expect(download.body.len > 32);

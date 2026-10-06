@@ -72,24 +72,30 @@ pub const Scraper = struct {
     }
 
     pub fn fetchSubtitlesByShowLinkWithOptions(self: *Scraper, show_url: []const u8, options: SubtitlesOptions) !SubtitlesResponse {
+        return self.fetchSubtitlesByShowLinkWithOptionsUsing(show_url, options, fetchTvHtml);
+    }
+
+    fn fetchSubtitlesByShowLinkWithOptionsUsing(self: *Scraper, show_url: []const u8, options: SubtitlesOptions, comptime fetch_html: anytype) !SubtitlesResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        const root_response = try fetchTvHtml(self.client, a, show_url);
+        try validateProviderUrl(show_url);
+
+        const root_response = try fetch_html(self.client, a, show_url);
         if (root_response.body.len == 0) return .{ .arena = arena, .subtitles = &.{} };
 
         var root_doc = try common.parseHtmlStable(a, root_response.body);
 
         var season_urls: std.ArrayListUnmanaged([]const u8) = .empty;
-        try season_urls.append(a, show_url);
+        try season_urls.append(a, try a.dupe(u8, show_url));
 
         if (options.include_all_seasons) {
             var season_links = root_doc.doc.queryAll("p.description a[href*='tvshow-']");
             while (season_links.next()) |anchor| {
                 const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
                 if (std.mem.indexOf(u8, href, "tvshow-") == null) continue;
-                const url = try common.resolveUrl(a, site, href);
+                const url = try resolveProviderUrl(a, href);
                 try season_urls.append(a, url);
             }
         }
@@ -102,7 +108,7 @@ pub const Scraper = struct {
             if (seen_season.contains(initial_season_url)) continue;
             try seen_season.put(a, initial_season_url, {});
 
-            const response = try fetchTvHtml(self.client, a, initial_season_url);
+            const response = try fetch_html(self.client, a, initial_season_url);
             if (response.body.len == 0) continue;
 
             var doc = try common.parseHtmlStable(a, response.body);
@@ -114,7 +120,7 @@ pub const Scraper = struct {
                 var anchors = row.queryAll("a[href*='subtitle-']");
                 while (anchors.next()) |anchor| {
                     const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
-                    const subtitle_page_url = try common.resolveUrl(a, site, href);
+                    const subtitle_page_url = try resolveProviderUrl(a, href);
                     if (seen_subtitle.contains(subtitle_page_url)) continue;
                     try seen_subtitle.put(a, subtitle_page_url, {});
 
@@ -123,7 +129,7 @@ pub const Scraper = struct {
 
                     var direct_zip_url: ?[]const u8 = null;
                     if (options.resolve_download_links) {
-                        direct_zip_url = self.resolveDownloadUrl(a, download_page_url) catch null;
+                        direct_zip_url = try self.resolveDownloadUrl(a, download_page_url);
                     }
 
                     const lang = try common.dupOptional(a, languageFromSubtitleAnchor(anchor, href));
@@ -164,13 +170,13 @@ pub const Scraper = struct {
             defer allocator.free(script_path);
             const escaped = try escapeUrlPath(allocator, script_path);
             defer allocator.free(escaped);
-            return try common.resolveUrl(allocator, site, escaped);
+            return try resolveProviderUrl(allocator, escaped);
         }
 
         const script_path = parseZipPathFromHtml(response.body) orelse return error.MissingField;
         const escaped = try escapeUrlPath(allocator, script_path);
         defer allocator.free(escaped);
-        return try common.resolveUrl(allocator, site, escaped);
+        return try resolveProviderUrl(allocator, escaped);
     }
 };
 
@@ -192,7 +198,7 @@ fn collectSearchItemsRaw(allocator: Allocator, body: []const u8, query: []const 
         const title_end = std.mem.indexOfPos(u8, body, title_start, "</b>") orelse continue;
         const title = std.mem.trim(u8, body[title_start..title_end], " \t\r\n");
         if (title.len == 0 or std.ascii.findIgnoreCase(title, std.mem.trim(u8, query, " \t\r\n")) == null) continue;
-        const show_url = try common.resolveUrl(allocator, site, body[href_start..href_end]);
+        const show_url = try resolveProviderUrl(allocator, body[href_start..href_end]);
         if (seen.contains(show_url)) continue;
         try seen.put(allocator, show_url, {});
         try out.append(allocator, .{ .title = try allocator.dupe(u8, title), .show_url = show_url });
@@ -200,23 +206,63 @@ fn collectSearchItemsRaw(allocator: Allocator, body: []const u8, query: []const 
 }
 
 fn fetchSearchPage(client: *std.http.Client, allocator: Allocator, page_url: []const u8) !common.HttpResponse {
-    var response = try fetchTvHtml(client, allocator, page_url);
-    if (response.status != .ok or response.body.len == 0 or std.mem.indexOf(u8, response.body, "tvshow-") == null) {
-        allocator.free(response.body);
-        response = try fetchTvHtml(client, allocator, site ++ "/tvshows.html");
-    }
-    return response;
+    try validateProviderUrl(page_url);
+    return fetchSearchPageWith(client, allocator, page_url, common.fetchBytes);
 }
 
-fn fetchTvHtml(client: *std.http.Client, allocator: Allocator, canonical_url: []const u8) !common.HttpResponse {
-    const response = try common.fetchBytes(client, allocator, canonical_url, .{
+fn fetchSearchPageWith(client: *std.http.Client, allocator: Allocator, page_url: []const u8, comptime fetch: anytype) !common.HttpResponse {
+    var response = try fetch(client, allocator, page_url, common.FetchOptions{
         .accept = "text/html",
         .max_attempts = 2,
+        .retry_on_429 = false,
         .allow_non_ok = true,
+        .require_public_origin = true,
     });
+    if (response.status == .too_many_requests) {
+        allocator.free(response.body);
+        return error.RateLimited;
+    }
     if (common.isAustralianWebsiteBlockPage(response.body)) {
         allocator.free(response.body);
         return error.ProviderAccessBlocked;
+    }
+    if (response.status != .ok or response.body.len == 0 or std.mem.indexOf(u8, response.body, "tvshow-") == null) {
+        allocator.free(response.body);
+        response = try fetch(client, allocator, site ++ "/tvshows.html", common.FetchOptions{
+            .accept = "text/html",
+            .max_attempts = 2,
+            .retry_on_429 = false,
+            .allow_non_ok = true,
+            .require_public_origin = true,
+        });
+    }
+    return acceptTvHtmlResponse(allocator, response);
+}
+
+fn fetchTvHtml(client: *std.http.Client, allocator: Allocator, canonical_url: []const u8) !common.HttpResponse {
+    try validateProviderUrl(canonical_url);
+    const response = try common.fetchBytes(client, allocator, canonical_url, .{
+        .accept = "text/html",
+        .max_attempts = 2,
+        .retry_on_429 = false,
+        .allow_non_ok = true,
+        .require_public_origin = true,
+    });
+    return acceptTvHtmlResponse(allocator, response);
+}
+
+fn acceptTvHtmlResponse(allocator: Allocator, response: common.HttpResponse) !common.HttpResponse {
+    if (response.status == .too_many_requests) {
+        allocator.free(response.body);
+        return error.RateLimited;
+    }
+    if (common.isAustralianWebsiteBlockPage(response.body)) {
+        allocator.free(response.body);
+        return error.ProviderAccessBlocked;
+    }
+    if (response.status != .ok) {
+        allocator.free(response.body);
+        return error.UnexpectedHttpStatus;
     }
     return response;
 }
@@ -229,7 +275,7 @@ fn collectSearchItems(allocator: Allocator, doc: *const HtmlDocument, query: []c
         if (std.mem.indexOf(u8, href, "tvshow-") == null) continue;
         if (std.mem.indexOf(u8, href, ".html") == null) continue;
 
-        const show_url = try common.resolveUrl(allocator, site, href);
+        const show_url = try resolveProviderUrl(allocator, href);
         if (seen.contains(show_url)) continue;
         try seen.put(allocator, show_url, {});
 
@@ -247,7 +293,7 @@ fn collectSearchItems(allocator: Allocator, doc: *const HtmlDocument, query: []c
             if (std.mem.indexOf(u8, href, "tvshow-") == null) continue;
             if (std.mem.indexOf(u8, href, ".html") == null) continue;
 
-            const show_url = try common.resolveUrl(allocator, site, href);
+            const show_url = try resolveProviderUrl(allocator, href);
             if (seen.contains(show_url)) continue;
             try seen.put(allocator, show_url, {});
 
@@ -377,7 +423,7 @@ fn parseDocumentLocationFromScript(allocator: Allocator, html_body: []const u8) 
         const part = std.mem.trim(u8, part_raw, " \t\r\n");
         if (part.len == 0) continue;
 
-        if ((part[0] == '\'' and part[part.len - 1] == '\'') or (part[0] == '"' and part[part.len - 1] == '"')) {
+        if (part.len >= 2 and ((part[0] == '\'' and part[part.len - 1] == '\'') or (part[0] == '"' and part[part.len - 1] == '"'))) {
             const decoded = try decodeJsString(allocator, part[1 .. part.len - 1]);
             defer allocator.free(decoded);
             try out.appendSlice(allocator, decoded);
@@ -459,9 +505,31 @@ fn escapeUrlPath(allocator: Allocator, path: []const u8) ![]const u8 {
     return try out.toOwnedSlice(allocator);
 }
 
+fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+    const resolved = try common.resolveUrl(allocator, site, href);
+    errdefer allocator.free(resolved);
+    try validateProviderUrl(resolved);
+    return resolved;
+}
+
+fn validateProviderUrl(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+}
+
 test "tvsub parse subtitle id" {
     try std.testing.expectEqualStrings("321398", parseSubtitleId("https://www.tvsubtitles.net/subtitle-321398.html").?);
     try std.testing.expect(parseSubtitleId("https://x/subtitle-abc.html") == null);
+}
+
+test "tvsub rejects unsafe provider urls before fetch" {
+    for ([_][]const u8{
+        "http://127.0.0.1/tvshow-1.html",
+        "http://user@www.tvsubtitles.net/tvshow-1.html",
+        "http://www.tvsubtitles.net.attacker.example/tvshow-1.html",
+    }) |url| {
+        try std.testing.expectError(error.UnsafeHttpTarget, validateProviderUrl(url));
+    }
 }
 
 test "tvsub parse document.location concat" {
@@ -471,4 +539,95 @@ test "tvsub parse document.location concat" {
     const parsed = (try parseDocumentLocationFromScript(allocator, html_snippet)).?;
     defer allocator.free(parsed);
     try std.testing.expectEqualStrings("files/TheName.en.zip", parsed);
+}
+
+test "tvsub malformed script quote returns no path" {
+    try std.testing.expect((try parseDocumentLocationFromScript(std.testing.allocator, "document.location = ';")) == null);
+    try std.testing.expect((try parseDocumentLocationFromScript(std.testing.allocator, "document.location = \";")) == null);
+}
+
+test "tvsub rejects failed HTTP and access-block pages" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.UnexpectedHttpStatus, acceptTvHtmlResponse(a, .{
+        .status = .forbidden,
+        .body = try a.dupe(u8, "<html>Forbidden</html>"),
+    }));
+    try std.testing.expectError(error.ProviderAccessBlocked, acceptTvHtmlResponse(a, .{
+        .status = .ok,
+        .body = try a.dupe(u8, "Access to Website Disabled Federal Court of Australia"),
+    }));
+    const accepted = try acceptTvHtmlResponse(a, .{ .status = .ok, .body = try a.dupe(u8, "fixture") });
+    defer a.free(accepted.body);
+    try std.testing.expectEqualStrings("fixture", accepted.body);
+}
+
+test "tvsub failed search falls back to a successful catalog only" {
+    const Mock = struct {
+        fn fallback(_: *std.http.Client, a: Allocator, url: []const u8, _: common.FetchOptions) !common.HttpResponse {
+            const catalog = std.mem.endsWith(u8, url, "/tvshows.html");
+            return .{
+                .status = if (catalog) .ok else .not_found,
+                .body = try a.dupe(u8, if (catalog) "<a href='tvshow-1.html'>Show</a>" else "Search unavailable"),
+            };
+        }
+        fn failedCatalog(_: *std.http.Client, a: Allocator, _: []const u8, _: common.FetchOptions) !common.HttpResponse {
+            return .{ .status = .service_unavailable, .body = try a.dupe(u8, "Unavailable") };
+        }
+        fn canceled(_: *std.http.Client, _: Allocator, _: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+            return error.Canceled;
+        }
+    };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    const a = std.testing.allocator;
+    const response = try fetchSearchPageWith(&client, a, site ++ "/search.php?qs=Show", Mock.fallback);
+    defer a.free(response.body);
+    try std.testing.expectEqualStrings("<a href='tvshow-1.html'>Show</a>", response.body);
+    try std.testing.expectError(error.UnexpectedHttpStatus, fetchSearchPageWith(&client, a, site ++ "/search.php", Mock.failedCatalog));
+    try std.testing.expectError(error.Canceled, fetchSearchPageWith(&client, a, site ++ "/search.php", Mock.canceled));
+}
+
+test "tvsub rate limits stop acquisition before the catalog fallback" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, a: Allocator, _: []const u8, _: common.FetchOptions) !common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            return .{
+                .status = if (self.calls == 1) .too_many_requests else .ok,
+                .body = try a.dupe(u8, "<a href='tvshow-1.html'>Show</a>"),
+            };
+        }
+    };
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    try std.testing.expectError(error.RateLimited, fetchSearchPageWith(&fixture.client, std.testing.allocator, site ++ "/search.php", Fixture.fetch));
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expectError(error.RateLimited, acceptTvHtmlResponse(std.testing.allocator, .{
+        .status = .too_many_requests,
+        .body = try std.testing.allocator.dupe(u8, "Rate limited"),
+    }));
+}
+
+test "tvsub subtitle response owns the caller show URL" {
+    const Mock = struct {
+        fn fetch(_: *std.http.Client, a: Allocator, _: []const u8) !common.HttpResponse {
+            return .{ .status = .ok, .body = try a.dupe(
+                u8,
+                "<table id='table5'><tr align='middle'><td>1</td><td><a><b>Pilot</b></a></td>" ++
+                    "<td><a href='/subtitle-123.html'><img alt='en'></a></td></tr></table>",
+            ) };
+        }
+    };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &client);
+    var show_url = (site ++ "/tvshow-1.html").*;
+    var response = try scraper.fetchSubtitlesByShowLinkWithOptionsUsing(&show_url, .{ .include_all_seasons = false }, Mock.fetch);
+    defer response.deinit();
+    @memset(&show_url, 'x');
+    try std.testing.expectEqual(@as(usize, 1), response.subtitles.len);
+    try std.testing.expectEqualStrings(site ++ "/tvshow-1.html", response.subtitles[0].season_page_url);
 }

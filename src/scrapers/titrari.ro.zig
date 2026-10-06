@@ -51,6 +51,7 @@ pub const Scraper = struct {
             .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = site ++ "/" }},
             .cache = false,
             .max_attempts = 3,
+            .require_public_origin = true,
         });
         var parsed = try parseSearchHtml(common.takeArena(&arena), response.body, trimmed);
         errdefer parsed.deinit();
@@ -63,6 +64,7 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        try validateProviderEndpoint(item.page_url);
         const filename = try std.fmt.allocPrint(a, "titrari-{s}-{s}", .{ item.subtitle_id, try common.asciiSlug(a, item.title) });
         const subtitles = try a.alloc(SubtitleItem, 1);
         subtitles[0] = .{
@@ -79,6 +81,7 @@ pub const Scraper = struct {
 
     pub fn fetchDownloadByToken(self: *Scraper, allocator: Allocator, token: []const u8) !common.HttpResponse {
         const parsed = parseDownloadToken(token) orelse return error.InvalidDownloadUrl;
+        try validateProviderEndpoint(parsed.page_url);
         const url = try std.fmt.allocPrint(allocator, "{s}/get.php?id={s}", .{ site, parsed.subtitle_id });
         defer allocator.free(url);
         const response = try common.fetchBytes(self.client, allocator, url, .{
@@ -86,6 +89,7 @@ pub const Scraper = struct {
             .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = parsed.page_url }},
             .cache = false,
             .max_attempts = 3,
+            .require_public_origin = true,
         });
         if (response.status != .ok) {
             allocator.free(response.body);
@@ -102,7 +106,7 @@ pub const Scraper = struct {
         if (response.items.len < 2) return;
         const first = response.items[0];
         if (first.media_kind != .movie) return;
-        if (try self.probeArchiveKind(allocator, first) != .rar) return;
+        if (try optionalArchiveProbe(self.probeArchiveKind(allocator, first)) != .rar) return;
 
         const max_probe = @min(response.items.len, @as(usize, 6));
         var idx: usize = 1;
@@ -111,7 +115,7 @@ pub const Scraper = struct {
             if (candidate.media_kind != .movie) continue;
             if (!std.ascii.eqlIgnoreCase(candidate.title, first.title)) continue;
             if (candidate.year != first.year) continue;
-            if (try self.probeArchiveKind(allocator, candidate) != .zip) continue;
+            if (try optionalArchiveProbe(self.probeArchiveKind(allocator, candidate)) != .zip) continue;
 
             const reordered = try allocator.alloc(SearchItem, response.items.len);
             @memcpy(reordered, response.items);
@@ -122,6 +126,8 @@ pub const Scraper = struct {
     }
 
     fn probeArchiveKind(self: *Scraper, allocator: Allocator, item: SearchItem) !ArchiveHint {
+        try validateProviderEndpoint(item.download_url);
+        try validateProviderEndpoint(item.page_url);
         try common.ensureClientTlsReady(self.client);
         const normalized = try common.normalizeUrlForFetch(allocator, item.download_url);
         defer allocator.free(normalized);
@@ -145,12 +151,31 @@ pub const Scraper = struct {
     }
 };
 
+fn validateProviderEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+}
+
 const ArchiveHint = enum {
     unknown,
     zip,
     rar,
     seven_z,
 };
+
+fn optionalArchiveProbe(result: anyerror!ArchiveHint) !ArchiveHint {
+    return result catch |err| switch (err) {
+        error.Canceled, error.OutOfMemory => return err,
+        else => .unknown,
+    };
+}
+
+test "titrari archive preference preserves search on probe failure" {
+    try std.testing.expectEqual(ArchiveHint.unknown, try optionalArchiveProbe(error.ConnectionTimedOut));
+    try std.testing.expectEqual(ArchiveHint.zip, try optionalArchiveProbe(.zip));
+    try std.testing.expectError(error.Canceled, optionalArchiveProbe(error.Canceled));
+    try std.testing.expectError(error.OutOfMemory, optionalArchiveProbe(error.OutOfMemory));
+}
 
 fn archiveHintFromHeaders(headers: []const u8) ArchiveHint {
     var lines = std.mem.splitSequence(u8, headers, "\r\n");
@@ -284,6 +309,12 @@ test "titrari parses movie and season pack results" {
     const token = try makeDownloadToken(std.testing.allocator, "142095", response.items[0].page_url);
     defer std.testing.allocator.free(token);
     try std.testing.expectEqualStrings("142095", parseDownloadToken(token).?.subtitle_id);
+}
+
+test "titrari rejects unsafe token and probe targets before fetch" {
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("http://127.0.0.1/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("https://user:pass@www.titrari.ro/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("https://www.google.com/private"));
 }
 
 test "live titrari movie and tv downloads" {

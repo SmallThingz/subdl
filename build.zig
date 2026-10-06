@@ -28,7 +28,23 @@ pub fn build(b: *std.Build) void {
     const live_parallel_on_all = b.option(bool, "live-parallel-on-all", "Run one live subprocess per provider when -Dlive-providers=all/*") orelse true;
     const live_max_jobs = b.option(u32, "live-max-jobs", "Maximum concurrent live provider subprocesses") orelse 4;
     if (live_max_jobs == 0) @panic("live-max-jobs must be positive");
-    const live_timeout_seconds = b.option(u32, "live-timeout-seconds", "Hard deadline for each parallel live provider") orelse 60;
+    const live_timeout_option = b.option(u32, "live-timeout-seconds", "Hard deadline for a live subprocess (overrides provider defaults)");
+    const live_timeout_seconds = live_timeout_option orelse 60;
+    if (live_timeout_seconds == 0) @panic("live-timeout-seconds must be positive");
+    validateLiveProviderFilter(live_providers);
+    // Convenience targets configure their child build explicitly. Their outer
+    // build remains in `off` mode and must not be narrowed (or rejected) by an
+    // ambient filter intended for direct live-test execution.
+    const effective_live_filter = if (std.mem.eql(u8, live_mode, "off"))
+        live_providers
+    else
+        b.graph.environ_map.get("SCRAPERS_LIVE_PROVIDER_FILTER") orelse
+            b.graph.environ_map.get("SCRAPERS_LIVE_PROVIDERS") orelse live_providers;
+    validateLiveProviderFilter(effective_live_filter);
+    const non_fanout_timeout_seconds = if (live_timeout_option != null)
+        live_timeout_seconds
+    else
+        defaultLiveSubprocessTimeout(effective_live_filter, live_timeout_seconds);
 
     const valid_mode = std.mem.eql(u8, live_mode, "off") or
         std.mem.eql(u8, live_mode, "smoke") or
@@ -40,6 +56,9 @@ pub fn build(b: *std.Build) void {
     }
 
     const live_tests_enabled = !std.mem.eql(u8, live_mode, "off");
+    if (live_tests_enabled and (!target.query.isNative() or target.result.os.tag != .linux)) {
+        @panic("live tests require a native Linux target with Bash 4.3+ and GNU timeout");
+    }
     const live_extensive_suite = live_tests_enabled and
         (std.mem.eql(u8, live_mode, "extensive") or std.mem.eql(u8, live_mode, "all"));
     const live_tui_suite = live_tests_enabled and
@@ -56,6 +75,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_alldriver", enable_alldriver);
     build_options.addOption(bool, "enable_unarr", enable_unarr);
     build_options.addOption([]const u8, "live_provider_filter", if (live_tests_enabled) live_providers else "");
+    build_options.addOption([]const u8, "active_live_provider_filter", activeLiveProviderFilter(b));
     const build_options_mod = build_options.createModule();
     const host_modules = createTargetModuleSet(
         b,
@@ -257,7 +277,9 @@ pub fn build(b: *std.Build) void {
         .use_llvm = llvm,
     });
     const run_scrapers_mod_tests = b.addRunArtifact(scrapers_mod_tests);
-    const run_scrapers_mod_tests_live = b.addSystemCommand(&.{ "bash", "-lc", "exec \"$1\"", "_" });
+    const run_scrapers_mod_tests_live = b.addSystemCommand(&.{
+        "timeout", "--signal=TERM", "--kill-after=5s", b.fmt("{d}s", .{non_fanout_timeout_seconds}),
+    });
     run_scrapers_mod_tests_live.addFileArg(scrapers_mod_tests.getEmittedBin());
     run_scrapers_mod_tests_live.stdio = .inherit;
 
@@ -314,17 +336,24 @@ pub fn build(b: *std.Build) void {
     // Keep ordinary/cross-target unit tests independent of host Python/runners.
 
     const test_live_single_step = b.step("test-live-single", "Run live tests for the current provider filter");
-    test_live_single_step.dependOn(&run_scrapers_mod_tests_live.step);
+    if (live_tests_enabled) {
+        test_live_single_step.dependOn(&run_scrapers_mod_tests_live.step);
+    } else {
+        test_live_single_step.dependOn(&b.addFail("test-live-single requires -Dlive=smoke|named|extensive|all").step);
+    }
 
     const test_live_step = b.step("test-live", "Run live tests using -Dlive and -Dlive-providers");
-    if (live_tests_enabled and live_parallel_on_all and
-        (isAllLiveProviderSelection(live_providers) or isActiveLiveProviderSelection(live_providers)))
+    if (!live_tests_enabled) {
+        test_live_step.dependOn(&b.addFail("test-live requires -Dlive=smoke|named|extensive|all").step);
+    } else if ((isActiveLiveProviderSelection(effective_live_filter) or
+        (live_parallel_on_all and isAllLiveProviderSelection(effective_live_filter))))
     {
         const script = makeParallelLiveRunScript(
             b,
             live_timeout_seconds,
             live_max_jobs,
-            isActiveLiveProviderSelection(live_providers),
+            isActiveLiveProviderSelection(effective_live_filter),
+            live_timeout_option == null,
         );
         const fanout_cmd = b.addSystemCommand(&.{ "bash", "-lc", script, "_test_bin_" });
         fanout_cmd.setCwd(b.path("."));
@@ -335,26 +364,85 @@ pub fn build(b: *std.Build) void {
     }
 
     const test_live_all_step = b.step("test-live-all", "Run all providers live");
-    const live_all_cmd = b.addSystemCommand(&.{
-        "zig",
-        "build",
-        "test-live",
-        "-Dlive=all",
-        "-Dlive-providers=*",
-    });
+    const live_all_cmd = addLiveConvenienceCommand(b, "*");
     live_all_cmd.setCwd(b.path("."));
     test_live_all_step.dependOn(&live_all_cmd.step);
 
     const test_live_active_step = b.step("test-live-active", "Run all active CLI/TUI providers live");
-    const live_active_cmd = b.addSystemCommand(&.{
-        "zig",
-        "build",
-        "test-live",
-        "-Dlive=all",
-        "-Dlive-providers=active",
-    });
+    const live_active_cmd = addLiveConvenienceCommand(b, "active");
     live_active_cmd.setCwd(b.path("."));
     test_live_active_step.dependOn(&live_active_cmd.step);
+}
+
+fn activeLiveProviderFilter(b: *std.Build) []const u8 {
+    var filter: std.ArrayListUnmanaged(u8) = .empty;
+    for (provider_registry.all) |info| {
+        if (!info.active) continue;
+        if (filter.items.len != 0) filter.append(b.allocator, ',') catch @panic("oom");
+        filter.appendSlice(b.allocator, info.live_name) catch @panic("oom");
+    }
+    return filter.toOwnedSlice(b.allocator) catch @panic("oom");
+}
+
+fn addLiveConvenienceCommand(b: *std.Build, selection: []const u8) *std.Build.Step.Run {
+    const command = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "test-live", "-Dlive=all", b.fmt("-Dlive-providers={s}", .{selection}) });
+    // The convenience target defines its provider set even when the parent
+    // environment contains an ad-hoc filter. Live artifacts must be native,
+    // so target and CPU options deliberately stay on the outer build only.
+    command.setEnvironmentVariable("SCRAPERS_LIVE_PROVIDER_FILTER", selection);
+    command.removeEnvironmentVariable("SCRAPERS_LIVE_PROVIDERS");
+    var options = b.user_input_options.iterator();
+    while (options.next()) |entry| {
+        const name = entry.key_ptr.*;
+        if (std.mem.eql(u8, name, "live") or
+            std.mem.eql(u8, name, "live-providers") or
+            std.mem.eql(u8, name, "target") or
+            std.mem.eql(u8, name, "cpu")) continue;
+        switch (entry.value_ptr.value) {
+            .flag => command.addArg(b.fmt("-D{s}", .{name})),
+            .scalar => |value| command.addArg(b.fmt("-D{s}={s}", .{ name, value })),
+            .list => |values| for (values.items) |value| command.addArg(b.fmt("-D{s}={s}", .{ name, value })),
+            else => @panic("unsupported nested live build option"),
+        }
+    }
+    if (b.graph.max_jobs) |jobs| command.addArg(b.fmt("-j{d}", .{jobs}));
+    return command;
+}
+
+fn validateLiveProviderFilter(raw_filter: []const u8) void {
+    const trimmed = std.mem.trim(u8, raw_filter, " \t\r\n");
+    if (trimmed.len == 0 or isAllLiveProviderSelection(trimmed) or isActiveLiveProviderSelection(trimmed)) return;
+    var tokens = std.mem.splitScalar(u8, trimmed, ',');
+    var count: usize = 0;
+    while (tokens.next()) |raw_token| {
+        const token = std.mem.trim(u8, raw_token, " \t\r\n");
+        if (token.len == 0) continue;
+        count += 1;
+        if (isAllLiveProviderSelection(token)) {
+            @panic("'*' or 'all' must be the only live provider filter token");
+        }
+        var matched = false;
+        for (provider_registry.all) |info| {
+            if (liveProviderNameContains(info.id, token) or liveProviderNameContains(info.live_name, token)) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) std.debug.panic("unknown live provider filter: {s}", .{token});
+    }
+    if (count == 0) @panic("live provider filter contains no provider names");
+}
+
+fn liveProviderNameContains(name: []const u8, token: []const u8) bool {
+    if (token.len > name.len) return false;
+    for (0..name.len - token.len + 1) |start| {
+        for (token, name[start..][0..token.len]) |a, c| {
+            const normalized_a = if (a == '.' or a == '-') '_' else std.ascii.toLower(a);
+            const normalized_c = if (c == '.' or c == '-') '_' else std.ascii.toLower(c);
+            if (normalized_a != normalized_c) break;
+        } else return true;
+    }
+    return false;
 }
 
 fn isAllLiveProviderSelection(raw_filter: []const u8) bool {
@@ -369,11 +457,40 @@ fn isActiveLiveProviderSelection(raw_filter: []const u8) bool {
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, raw_filter, " \t\r\n"), "active");
 }
 
+fn defaultLiveSubprocessTimeout(raw_filter: []const u8, fallback_seconds: u32) u32 {
+    var selected = [_]bool{false} ** provider_registry.all.len;
+    const select_all = isAllLiveProviderSelection(raw_filter);
+    const active_only = isActiveLiveProviderSelection(raw_filter);
+
+    if (select_all or active_only) {
+        for (provider_registry.all, 0..) |info, index| {
+            selected[index] = !active_only or info.active;
+        }
+    } else {
+        var tokens = std.mem.splitScalar(u8, raw_filter, ',');
+        while (tokens.next()) |raw_token| {
+            const token = std.mem.trim(u8, raw_token, " \t\r\n");
+            if (token.len == 0) continue;
+            for (provider_registry.all, 0..) |info, index| {
+                if (liveProviderNameContains(info.id, token) or liveProviderNameContains(info.live_name, token)) selected[index] = true;
+            }
+        }
+    }
+
+    var total: u32 = 0;
+    for (provider_registry.all, 0..) |info, index| {
+        if (!selected[index]) continue;
+        total = std.math.add(u32, total, info.live_timeout_seconds orelse fallback_seconds) catch return std.math.maxInt(u32);
+    }
+    return if (total == 0) fallback_seconds else total;
+}
+
 fn makeParallelLiveRunScript(
     b: *std.Build,
     timeout_seconds: u32,
     max_jobs: u32,
     active_only: bool,
+    use_provider_deadlines: bool,
 ) []const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(b.allocator);
@@ -399,7 +516,7 @@ fn makeParallelLiveRunScript(
             \\done
             \\
         ) catch @panic("oom");
-        const provider_timeout_seconds = target_info.live_timeout_seconds orelse timeout_seconds;
+        const provider_timeout_seconds = if (use_provider_deadlines) target_info.live_timeout_seconds orelse timeout_seconds else timeout_seconds;
         out.print(b.allocator,
             \\echo "[live][runner] START {s}"
             \\
@@ -474,7 +591,7 @@ fn makeParallelLiveRunScript(
     for (provider_registry.all) |target_info| {
         if (!target_info.live_serial) continue;
         if (active_only and !target_info.active) continue;
-        const provider_timeout_seconds = target_info.live_timeout_seconds orelse timeout_seconds;
+        const provider_timeout_seconds = if (use_provider_deadlines) target_info.live_timeout_seconds orelse timeout_seconds else timeout_seconds;
         out.print(b.allocator,
             \\echo "[live][runner] START {s} mode=serial"
             \\set +e

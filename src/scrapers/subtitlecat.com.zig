@@ -48,7 +48,11 @@ pub const Scraper = struct {
 
         const encoded = try common.encodeUriComponent(a, query);
         const url = try std.fmt.allocPrint(a, "{s}/index.php?search={s}&show=10000", .{ site, encoded });
-        const response = try common.fetchBytes(self.client, a, url, .{ .accept = "text/html", .max_attempts = 2 });
+        const response = try common.fetchBytes(self.client, a, url, .{
+            .accept = "text/html",
+            .max_attempts = 2,
+            .require_public_origin = true,
+        });
 
         var parsed = try common.parseHtmlStable(a, response.body);
 
@@ -57,7 +61,7 @@ pub const Scraper = struct {
         while (anchors.next()) |anchor| {
             const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
             const title = try common.innerTextTrimmedOwned(a, anchor);
-            const details_url = try common.resolveUrl(a, site, href);
+            const details_url = try resolveProviderUrl(a, href);
             const first_cell = anchor.parentNode() orelse continue;
             const raw = try common.innerTextTrimmedOwned(a, first_cell);
             const source_language = parseTranslatedFrom(raw);
@@ -72,8 +76,13 @@ pub const Scraper = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+        try validateProviderEndpoint(details_url);
 
-        const response = try common.fetchBytes(self.client, a, details_url, .{ .accept = "text/html", .max_attempts = 2 });
+        const response = try common.fetchBytes(self.client, a, details_url, .{
+            .accept = "text/html",
+            .max_attempts = 2,
+            .require_public_origin = true,
+        });
         var parsed = try common.parseHtmlStable(a, response.body);
 
         var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
@@ -103,7 +112,7 @@ pub const Scraper = struct {
             if (spans[2]) |action| {
                 if (findDescendantByTagWithAttr(action, "a", "href")) |download_anchor| {
                     const href = common.getAttributeValueSafe(download_anchor, "href") orelse continue;
-                    const url = try common.resolveUrl(a, site, href);
+                    const url = try resolveProviderUrl(a, href);
                     const filename = inferFilenameFromUrl(url) orelse "subtitle.srt";
                     try subtitles.append(a, .{
                         .language_code = language_code,
@@ -169,11 +178,11 @@ fn parseTranslateSpec(allocator: Allocator, onclick: []const u8) !TranslateSpec 
 
         const path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ folder_norm, filename });
         defer allocator.free(path);
-        return .{ .source_url = try common.resolveUrl(allocator, site, path) };
+        return .{ .source_url = try resolveProviderUrl(allocator, path) };
     }
 
     if (args.len >= 2 and std.mem.startsWith(u8, onclick, "translate_from_server")) {
-        return .{ .source_url = try common.resolveUrl(allocator, site, args[1]) };
+        return .{ .source_url = try resolveProviderUrl(allocator, args[1]) };
     }
 
     var filename: ?[]const u8 = null;
@@ -187,11 +196,11 @@ fn parseTranslateSpec(allocator: Allocator, onclick: []const u8) !TranslateSpec 
         if (folder) |folder_value| {
             const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ folder_value, filename_value });
             defer allocator.free(path);
-            return .{ .source_url = try common.resolveUrl(allocator, site, path) };
+            return .{ .source_url = try resolveProviderUrl(allocator, path) };
         }
     }
 
-    if (filename) |f| return .{ .source_url = try common.resolveUrl(allocator, site, f) };
+    if (filename) |f| return .{ .source_url = try resolveProviderUrl(allocator, f) };
 
     return .{ .source_url = null };
 }
@@ -237,6 +246,24 @@ fn findDescendantByTagWithAttr(node: HtmlNode, tag_name: []const u8, attr_name: 
         if (findDescendantByTagWithAttr(child, tag_name, attr_name)) |nested| return nested;
     }
     return null;
+}
+
+fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+    const resolved = try common.resolveUrl(allocator, site, href);
+    errdefer allocator.free(resolved);
+    try validateProviderEndpoint(resolved);
+    return resolved;
+}
+
+fn validateProviderEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+}
+
+test "subtitlecat rejects unsafe provider links" {
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "http://127.0.0.1/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://user:pass@www.subtitlecat.com/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://www.subtitlecat.com.evil.com/private"));
 }
 
 test "subtitlecat translate spec parser" {

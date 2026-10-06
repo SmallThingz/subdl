@@ -44,6 +44,7 @@ pub const Scraper = struct {
             .accept = "application/json",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
@@ -64,6 +65,7 @@ pub const Scraper = struct {
             const title = common.jsonString(obj, "title") orelse continue;
             const page_url = common.jsonString(obj, "url") orelse continue;
             if (post_id <= 0 or title.len == 0 or page_url.len == 0) continue;
+            validateProviderUrl(page_url) catch continue;
 
             const se = common.parseSeasonEpisode(title);
             const media_kind: MediaKind = if (se.episode != null) .tv else .movie;
@@ -99,10 +101,13 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        try validateProviderUrl(item.page_url);
+
         const response = try common.fetchBytes(self.client, a, item.page_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         const download_url = try parseDownloadHref(a, response.body, item.page_url, item.post_id);
 
@@ -122,7 +127,7 @@ pub const Scraper = struct {
 
 fn parseDownloadHref(allocator: Allocator, body: []const u8, page_url: []const u8, post_id: i64) ![]const u8 {
     if (anchorHrefBeforeText(body, "BAIXAR LEGENDA")) |href|
-        return common.resolveUrl(allocator, page_url, href);
+        return resolvePublicDownloadUrl(allocator, page_url, href);
 
     const patterns = [_][]const u8{ "?dl_id=", "?download=" };
     for (patterns) |pattern| {
@@ -130,7 +135,7 @@ fn parseDownloadHref(allocator: Allocator, body: []const u8, page_url: []const u
             const quote_start = std.mem.lastIndexOfScalar(u8, body[0..pos], '"') orelse continue;
             const tail = body[quote_start + 1 ..];
             const quote_end = std.mem.indexOfScalar(u8, tail, '"') orelse continue;
-            return common.resolveUrl(allocator, page_url, tail[0..quote_end]);
+            return resolvePublicDownloadUrl(allocator, page_url, tail[0..quote_end]);
         }
     }
 
@@ -139,6 +144,19 @@ fn parseDownloadHref(allocator: Allocator, body: []const u8, page_url: []const u
         "{s}/wp-content/themes/simple-grid/zip-attachments.php?post_id={d}",
         .{ site, post_id },
     );
+}
+
+fn resolvePublicDownloadUrl(allocator: Allocator, page_url: []const u8, href: []const u8) ![]const u8 {
+    const resolved = try common.resolveUrl(allocator, page_url, href);
+    errdefer allocator.free(resolved);
+    try common.validatePublicHttpUrl(resolved);
+    return resolved;
+}
+
+fn validateProviderUrl(url: []const u8) !void {
+    const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
+    if (uri.user != null or uri.password != null) return error.InvalidDownloadUrl;
+    if (!(common.sameOrigin(site, url) catch false)) return error.InvalidDownloadUrl;
 }
 
 fn anchorHrefBeforeText(body: []const u8, needle: []const u8) ?[]const u8 {
@@ -216,6 +234,16 @@ test "legendei parses media hints and download anchor" {
     try std.testing.expectEqualStrings("https://legendei.net/?dl_id=26215", url);
 }
 
+test "legendei rejects unsafe provider and download targets" {
+    try validateProviderUrl("https://legendei.net/post/example");
+    try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl("https://legendei.net.example/post/example"));
+    try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl("https://user@legendei.net/post/example"));
+    try std.testing.expectError(
+        error.UnsafeHttpTarget,
+        resolvePublicDownloadUrl(std.testing.allocator, site ++ "/post/example", "http://127.0.0.1/archive.zip"),
+    );
+}
+
 test "live legendei movie and tv downloads" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
     if (!common.providerMatchesLiveFilter(common.liveProviderFilter(), "legendei.net")) return error.SkipZigTest;
@@ -232,6 +260,7 @@ test "live legendei movie and tv downloads" {
     const movie_dl = try common.fetchBytes(&client, std.testing.allocator, movie_subs.subtitles[0].download_url, .{
         .accept = "application/zip,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(movie_dl.body);
     try std.testing.expect(movie_dl.body.len > 4);
@@ -245,6 +274,7 @@ test "live legendei movie and tv downloads" {
     const tv_dl = try common.fetchBytes(&client, std.testing.allocator, tv_subs.subtitles[0].download_url, .{
         .accept = "application/zip,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(tv_dl.body);
     try std.testing.expect(tv_dl.body.len > 4);

@@ -48,6 +48,7 @@ pub const Scraper = struct {
 
         const parsed_query = parseQuery(query);
         if (parsed_query.title.len == 0) return .{ .arena = arena, .items = &.{} };
+        try validateSeasonSelection(parsed_query.season);
 
         const encoded = try common.encodeUriComponent(a, parsed_query.title);
         const search_url = try std.fmt.allocPrint(
@@ -59,6 +60,7 @@ pub const Scraper = struct {
             .accept = "application/json,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, search_response.body, .{});
@@ -110,6 +112,7 @@ pub const Scraper = struct {
                 .accept = "application/json,*/*",
                 .cache = false,
                 .max_attempts = 2,
+                .require_public_origin = true,
             });
             const meta_root = try std.json.parseFromSliceLeaky(std.json.Value, a, meta_response.body, .{});
             const meta_obj = common.jsonObject(meta_root) orelse continue;
@@ -160,14 +163,18 @@ pub const Scraper = struct {
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
+        try validateSeasonSelection(item.season);
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+
+        try validateApiUrl(item.page_url);
 
         const response = try common.fetchBytes(self.client, a, item.page_url, .{
             .accept = "application/json,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
         const root_obj = common.jsonObject(root) orelse return error.InvalidFieldType;
@@ -226,6 +233,7 @@ pub const Scraper = struct {
             .accept = "application/x-xz,application/octet-stream,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         defer allocator.free(response.body);
         if (response.status != .ok) return error.UnexpectedHttpStatus;
@@ -245,6 +253,16 @@ const DownloadToken = struct {
     attachment_id: i64,
     extension: []const u8,
 };
+
+fn validateSeasonSelection(season: ?u16) !void {
+    // The qualified provider path uses unseasoned episode numbering as season 1.
+    if (season) |value| if (value != 1) return error.UnsupportedSeasonSelection;
+}
+
+fn validateApiUrl(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(api, url))) return error.UnsafeHttpTarget;
+}
 
 pub fn makeDownloadToken(allocator: Allocator, attachment_id: i64, extension: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}{d}|{s}", .{ download_token_prefix, attachment_id, extension });
@@ -332,6 +350,26 @@ test "tsukihime parses episode query" {
     try std.testing.expectEqual(@as(?u16, 1), parsed.episode);
 }
 
+test "tsukihime rejects unverified season claims before acquisition" {
+    try validateSeasonSelection(null);
+    try validateSeasonSelection(1);
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &client);
+    try std.testing.expectError(error.UnsupportedSeasonSelection, scraper.search("Death Note S02E01"));
+    try std.testing.expectError(error.UnsupportedSeasonSelection, scraper.search("Death Note S00E01"));
+    try std.testing.expectError(error.UnsupportedSeasonSelection, scraper.fetchSubtitlesBySearchItem(.{
+        .title = "Death Note",
+        .year = null,
+        .media_kind = .tv,
+        .torrent_id = 1,
+        .season = 2,
+        .episode = 1,
+        .release = "fixture",
+        .page_url = "https://fixture.invalid",
+    }));
+}
+
 test "tsukihime download token and native storage path" {
     const token = try makeDownloadToken(std.testing.allocator, 12765, "ass");
     defer std.testing.allocator.free(token);
@@ -344,6 +382,16 @@ test "tsukihime download token and native storage path" {
         "https://storage.tsukihime.org/attach/000031DD/12765.xz",
         url,
     );
+}
+
+test "tsukihime rejects unsafe api urls before fetch" {
+    for ([_][]const u8{
+        "http://127.0.0.1/torrents/1",
+        "https://user@api.tsukihime.org/v1/torrents/1",
+        "https://api.tsukihime.org.attacker.example/v1/torrents/1",
+    }) |url| {
+        try std.testing.expectError(error.UnsafeHttpTarget, validateApiUrl(url));
+    }
 }
 
 test "live tsukihime movie and episode downloads" {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const common = @import("common.zig");
+const cf = @import("opensubtitles_com_cf.zig");
 const html = @import("htmlparser");
 
 const Allocator = std.mem.Allocator;
@@ -44,6 +45,7 @@ pub const Scraper = struct {
             .allow_non_ok = true,
             .max_attempts = 2,
             .cache = false,
+            .require_public_origin = true,
         });
         if (isCloudflareChallenge(response.status, response.body)) return error.CloudflareChallenge;
         if (response.status != .ok) return error.UnexpectedHttpStatus;
@@ -54,10 +56,13 @@ pub const Scraper = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+        try validateProviderEndpoint(page_url);
         const response = try common.fetchBytes(self.client, a, page_url, .{
             .accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             .allow_non_ok = true,
             .max_attempts = 2,
+            .cache = false,
+            .require_public_origin = true,
         });
         if (isCloudflareChallenge(response.status, response.body)) return error.CloudflareChallenge;
         if (response.status != .ok) return error.UnexpectedHttpStatus;
@@ -140,7 +145,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8) !SearchResp
         try seen.put(a, href, {});
         try items.append(a, .{
             .title = title,
-            .page_url = try common.resolveUrl(a, site, href),
+            .page_url = try resolveProviderUrl(a, href),
         });
     }
     return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) });
@@ -176,7 +181,7 @@ fn parseSubtitlesHtml(arena: std.heap.ArenaAllocator, body: []const u8) !Subtitl
             .hearing_impaired = if (hi_text) |value| !isBlankCell(value) else false,
             .uploader = try optionalText(a, row.queryOne("td.a5")),
             .comment = try optionalText(a, row.queryOne("td.a6")),
-            .details_url = try common.resolveUrl(a, site, href),
+            .details_url = try resolveProviderUrl(a, href),
             .download_url = try std.fmt.allocPrint(a, "{s}/download/{s}", .{ site, id }),
         });
     }
@@ -193,11 +198,36 @@ fn isBlankCell(value: []const u8) bool {
     return trimmed.len == 0 or std.mem.eql(u8, trimmed, "&nbsp;") or std.mem.eql(u8, trimmed, "\xc2\xa0");
 }
 
-fn isCloudflareChallenge(status: std.http.Status, body: []const u8) bool {
-    if (status != .forbidden and status != .service_unavailable) return false;
-    return std.mem.indexOf(u8, body, "cf-chl-") != null or
-        std.mem.indexOf(u8, body, "Just a moment") != null or
-        std.mem.indexOf(u8, body, "challenge-platform") != null;
+fn isCloudflareChallenge(_: std.http.Status, body: []const u8) bool {
+    return cf.isChallengeBody(body);
+}
+
+fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+    const resolved = try common.resolveUrl(allocator, site, href);
+    errdefer allocator.free(resolved);
+    try validateProviderEndpoint(resolved);
+    return resolved;
+}
+
+fn validateProviderEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+}
+
+test "sub-scene rejects unsafe provider endpoints" {
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("http://127.0.0.1/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("https://user:pass@sub-scene.com/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("https://sub-scene.com.evil.com/private"));
+}
+
+test "sub-scene detects positive challenge pages independently of status" {
+    const challenge = "<!DOCTYPE html><html><title>Just a moment...</title><script src='/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1'></script></html>";
+    for ([_]std.http.Status{ .ok, .forbidden, .service_unavailable }) |status| {
+        try std.testing.expect(isCloudflareChallenge(status, challenge));
+        try std.testing.expect(!isCloudflareChallenge(status, "{\"name\":\"Just a moment\",\"description\":\"cf-chl-test\"}"));
+        try std.testing.expect(!isCloudflareChallenge(status, "<html><body>Just a moment: a movie title</body></html>"));
+        try std.testing.expect(!isCloudflareChallenge(status, "<html><body>Subtitle details<script src='/cdn-cgi/challenge-platform/scripts/jsd/main.js'></script></body></html>"));
+    }
 }
 
 test "sub-scene parses search and subtitle pages" {

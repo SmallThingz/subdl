@@ -103,10 +103,10 @@ Supported canonical provider IDs:
 
 - `subdl_com`
 - `opensubtitles_com`
+- `moviesubtitles_org`
 - `yifysubtitles_ch`
 - `subtitlecat_com`
 - `isubtitles_org`
-- `my_subs_co`
 - `subsource_net`
 - `sub_scene_com`
 - `gestdown_info`
@@ -116,6 +116,13 @@ Supported canonical provider IDs:
 - `indexsubtitle_cc`
 - `sous_titres_eu`
 - `cc_edatribe_com`
+- `subtitrari_noi_ro`
+- `subclub_eu`
+- `subs_ro`
+- `subs4free_info`
+- `tsukihime_org`
+- `subtitri_nekur_net`
+- `subsynchro_com`
 - `titrari_ro`
 - `subs_sab_bz`
 - `subtitri_do_am`
@@ -125,6 +132,11 @@ Supported canonical provider IDs:
 - `subtitulamos_tv`
 - `feliratok_eu`
 - `animesub_info`
+- `animetosho_xyz`
+- `kitsunekko_net`
+- `thesubtitledb_org`
+- `napisy24_pl`
+- `nyasub_cz`
 - `subhd_tv`
 - `fansubs_ru`
 - `legendei_net`
@@ -132,24 +144,22 @@ Supported canonical provider IDs:
 - `justsubtitles_com`
 - `wizdom_xyz`
 - `miraianime_net`
-- `animesubtitle_ir`
 - `grupahatak_pl`
 - `jimaku_cc`
 
-The repository also retains inactive implementations for
-`opensubtitles_org`, `moviesubtitles_org`, `moviesubtitlesrt_com`,
-`podnapisi_net`, `tvsubtitles_net`, `greek_subtitles_com` while its
-movie search is currently unreliable, `subtitrari_noi_ro` while its
-upstream host is refusing connections,
-`subtis_io` while `api.subt.is` has no DNS A record. Targeted live tests still cover
-those modules, but the CLI/TUI registry does not expose them while their
-current upstream/network path cannot complete a search.
+The eight retained inactive implementations are `opensubtitles_org`,
+`moviesubtitlesrt_com`, `podnapisi_net`, `my_subs_co`, `tvsubtitles_net`,
+`greek_subtitles_com`, `subtis_io`, and `animesubtitle_ir`. Their last observed
+upstream failures are described in the README. Targeted live tests retain
+recovery coverage. Activation requires anonymous search, subtitle listing and
+a real file download for each advertised media class.
 
 `gestdown_info` is TV-only. `yifysubtitles_ch` is movie-only.
 `subtitles_ajatt_top` focuses on Japanese subtitles for anime TV and movies.
 `greeksubs_net` provides Greek subtitles for movies and TV.
 `sous_titres_eu` provides French subtitles for movies and TV.
 `cc_edatribe_com` provides English anime movie and TV captions.
+`subtitrari_noi_ro` provides Romanian movie and TV subtitle archives.
 `titrari_ro` provides Romanian and English subtitles for movies and TV.
 `subs_sab_bz` provides English and Bulgarian subtitles for movies and TV.
 `subtitri_do_am` is movie-only and provides Latvian subtitles.
@@ -440,7 +450,7 @@ Debug flags:
 Smoke suite:
 
 ```bash
-zig build test-live -Dlive=smoke -Dlive-providers=*
+zig build test-live -Dlive=smoke '-Dlive-providers=*'
 ```
 
 Extensive suite for one provider:
@@ -464,8 +474,34 @@ zig build test-live-all
 Parallel fan-out mode:
 
 ```bash
-zig build test-live -Dlive=all -Dlive-providers=* -Dlive-parallel-on-all=true -Dlive-max-jobs=3
+zig build test-live -Dlive=all '-Dlive-providers=*' -Dlive-parallel-on-all=true -Dlive-max-jobs=3
 ```
+
+Live fanout defaults to four jobs and a 60-second deadline, with longer defaults
+for selected registry entries. `-Dlive-timeout-seconds=N` must be positive.
+An explicit deadline replaces all registry deadlines.
+`test-live-single` and execution with `-Dlive-parallel-on-all=false` use one deadline
+for the whole test subprocess, except an exact `active` selection on `test-live`
+always fans out so each provider has a visible result. `test-live-active` and
+`test-live-all` preserve the caller's native feature, optimization, live-limit
+and build-job options, but deliberately ignore target/CPU options because live
+binaries execute on the host. They override ambient provider-filter variables
+and their selected suite remains `all`. Provider filters accept canonical IDs,
+dotted names and partial names; unknown tokens fail configuration, including
+environment overrides. `*` or `all` must be the only filter token. Check
+completed tests and exit status: skipped probes and phase-end log lines do not
+establish success.
+
+Live execution requires a native Linux target, Bash 4.3 or newer, GNU `timeout`,
+and network access. `test-http` additionally requires Python 3 and loopback
+sockets. These host restrictions do not apply to deterministic tests or
+`build-all-targets` cross-compilation.
+
+The extensive suite primarily checks metadata. Smoke/all modes exercise application
+search, listing and downloads, including TV selection where advertised. CAPTCHA
+and access-block responses must remain explicit failures; qualification does not
+solve challenges or bypass access controls. Browser support supplies an ordinary
+session handoff when explicitly enabled, not a CAPTCHA solver.
 
 ## Upstream Dependencies
 

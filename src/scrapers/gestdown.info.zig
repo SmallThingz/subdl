@@ -95,10 +95,11 @@ pub const Scraper = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+        const encoded_id = try common.encodeUriComponent(a, item.id);
 
         var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
         for (item.seasons) |season| {
-            const url = try std.fmt.allocPrint(a, "{s}/shows/{s}/{d}/English", .{ site, item.id, season });
+            const url = try std.fmt.allocPrint(a, "{s}/shows/{s}/{d}/English", .{ site, encoded_id, season });
             const response = try fetchJson(self.client, a, url);
             const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
             const obj = switch (root) {
@@ -156,7 +157,7 @@ pub const Scraper = struct {
                         .hearing_impaired = hearing_impaired,
                         .source = if (source) |value| try a.dupe(u8, value) else null,
                         .filename = filename,
-                        .download_url = try common.resolveUrl(a, site, download_uri),
+                        .download_url = resolvePublicDownloadUrl(a, download_uri) catch continue,
                     });
                 }
             }
@@ -170,6 +171,13 @@ pub const Scraper = struct {
     }
 };
 
+fn resolvePublicDownloadUrl(allocator: Allocator, download_uri: []const u8) ![]const u8 {
+    const resolved = try common.resolveUrl(allocator, site, download_uri);
+    errdefer allocator.free(resolved);
+    try common.validatePublicHttpUrl(resolved);
+    return resolved;
+}
+
 fn fetchJson(client: *std.http.Client, allocator: Allocator, url: []const u8) !common.HttpResponse {
     var attempt: usize = 0;
     while (attempt < 3) : (attempt += 1) {
@@ -178,6 +186,7 @@ fn fetchJson(client: *std.http.Client, allocator: Allocator, url: []const u8) !c
             .allow_non_ok = true,
             .max_attempts = 2,
             .retry_on_429 = true,
+            .require_public_origin = true,
         });
         if (response.status == .ok) return response;
         if (@backingInt(response.status) == 423 and attempt + 1 < 3) {
@@ -210,6 +219,20 @@ test "gestdown parses show and episode payloads" {
     try std.testing.expectEqualStrings("Chernobyl", shows.items[0].object.get("name").?.string);
 }
 
+test "gestdown rejects unsafe provider download targets" {
+    const allocator = std.testing.allocator;
+    const valid = try resolvePublicDownloadUrl(allocator, "/subtitles/episode.srt");
+    defer allocator.free(valid);
+    try std.testing.expectEqualStrings("https://api.gestdown.info/subtitles/episode.srt", valid);
+
+    for ([_][]const u8{
+        "http://127.0.0.1/subtitles/episode.srt",
+        "https://user@example.com/subtitles/episode.srt",
+    }) |url| {
+        try std.testing.expectError(error.UnsafeHttpTarget, resolvePublicDownloadUrl(allocator, url));
+    }
+}
+
 test "live gestdown search, subtitles and download" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
     if (!common.providerMatchesLiveFilter(common.liveProviderFilter(), "gestdown.info")) return error.SkipZigTest;
@@ -229,6 +252,7 @@ test "live gestdown search, subtitles and download" {
     const download = try common.fetchBytes(&client, std.testing.allocator, subtitles.subtitles[0].download_url, .{
         .accept = "text/plain,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(download.body);
     try std.testing.expect(download.body.len > 32);

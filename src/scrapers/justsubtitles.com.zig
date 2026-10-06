@@ -41,6 +41,7 @@ pub const Scraper = struct {
             .accept = "application/json",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
@@ -94,10 +95,13 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        try validateProviderUrl(item.page_url);
+
         const response = try common.fetchBytes(self.client, a, item.page_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         const flight = try extractNextFlightText(a, response.body);
@@ -109,6 +113,12 @@ pub const Scraper = struct {
         });
     }
 };
+
+fn validateProviderUrl(url: []const u8) !void {
+    const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
+    if (uri.user != null or uri.password != null) return error.InvalidDownloadUrl;
+    if (!(common.sameOrigin(site, url) catch false)) return error.InvalidDownloadUrl;
+}
 
 fn extractNextFlightText(allocator: Allocator, body: []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -249,6 +259,17 @@ fn lowerAscii(allocator: Allocator, value: []const u8) ![]u8 {
     return out;
 }
 
+test "justsubtitles rejects non-provider movie targets" {
+    try validateProviderUrl("https://www.justsubtitles.com/movie/1/title");
+    for ([_][]const u8{
+        "http://127.0.0.1/movie/1/title",
+        "https://www.justsubtitles.com.example/movie/1/title",
+        "https://user@www.justsubtitles.com/movie/1/title",
+    }) |url| {
+        try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl(url));
+    }
+}
+
 test "justsubtitles parses next flight subtitle rows" {
     const allocator = std.testing.allocator;
     const flight =
@@ -297,6 +318,7 @@ test "live justsubtitles movie search listing and download" {
         .accept = "application/zip,application/octet-stream,*/*",
         .cache = false,
         .max_attempts = 2,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(download.body);
     try std.testing.expect(download.body.len > 4);

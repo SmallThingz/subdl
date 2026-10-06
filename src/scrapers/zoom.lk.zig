@@ -35,19 +35,22 @@ pub const Scraper = struct {
 
         const trimmed = std.mem.trim(u8, query, " \t\r\n");
         if (trimmed.len == 0) return .{ .arena = arena, .items = &.{} };
+        const parsed_query = try parseSearchQuery(trimmed);
 
-        const encoded = try common.encodeUriComponent(a, trimmed);
+        const encoded = try common.encodeUriComponent(a, parsed_query.title);
         const url = try std.fmt.allocPrint(a, "{s}/?s={s}", .{ site, encoded });
         const response = try common.fetchBytes(self.client, a, url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         return parseSearchHtml(common.takeArena(&arena), response.body, trimmed);
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
+        try validateZoomUrl(item.page_url);
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -56,6 +59,7 @@ pub const Scraper = struct {
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         const download_url = try parseDownloadUrl(a, response.body);
         const download_id = trailingNumericSegment(download_url) orelse "subtitle";
@@ -79,7 +83,9 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     errdefer owned_arena.deinit();
     const a = owned_arena.allocator();
 
-    const wanted = try common.normalizeTitle(a, stripQueryNoise(query));
+    const parsed_query = try parseSearchQuery(query);
+    const wanted = try common.normalizeTitle(a, parsed_query.title);
+    if (wanted.len == 0) return .{ .arena = owned_arena, .items = &.{} };
     var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
     var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
     var seen = std.StringHashMapUnmanaged(void).empty;
@@ -93,11 +99,14 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
 
         const href = attributeValue(block, "href") orelse continue;
         const raw_title = attributeValue(block, "title") orelse continue;
-        if (!std.mem.startsWith(u8, href, site)) continue;
+        validateZoomUrl(href) catch continue;
         if (seen.contains(href)) continue;
 
         const parsed_title = parsePostTitle(raw_title);
         if (parsed_title.title.len == 0) continue;
+        if (parsed_query.season) |season| {
+            if (parsed_title.media_kind != .tv or parsed_title.season != season) continue;
+        }
         const normalized = try common.normalizeTitle(a, parsed_title.title);
         if (normalized.len == 0) continue;
         if (std.mem.indexOf(u8, normalized, wanted) == null and
@@ -131,6 +140,23 @@ const ParsedTitle = struct {
     season: ?i64,
 };
 
+fn validateZoomUrl(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    for (url) |byte| {
+        if (byte <= 0x20 or byte == 0x7f or byte == '\\') return error.UnsafeHttpTarget;
+    }
+    const uri = std.Uri.parse(url) catch return error.UnsafeHttpTarget;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.UnsafeHttpTarget;
+    if (uri.user != null or uri.password != null) return error.UnsafeHttpTarget;
+    if (uri.port) |port| if (port != 443) return error.UnsafeHttpTarget;
+    const host = uri.host orelse return error.UnsafeHttpTarget;
+    const host_bytes = switch (host) {
+        .raw, .percent_encoded => |bytes| bytes,
+    };
+    if (!std.ascii.eqlIgnoreCase(host_bytes, "zoom.lk")) return error.UnsafeHttpTarget;
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+}
+
 fn parsePostTitle(raw: []const u8) ParsedTitle {
     const suffixes = [_][]const u8{
         " Sinhala Subtitle",
@@ -156,11 +182,10 @@ fn parsePostTitle(raw: []const u8) ParsedTitle {
         if (end > 0) season = std.fmt.parseInt(i64, tail[0..end], 10) catch null;
         core = std.mem.trimEnd(u8, core[0..pos], " \t");
         media_kind = .tv;
-    } else if (parseSeasonToken(core)) |parsed_season| {
-        season = parsed_season;
+    } else if (findSeasonToken(core)) |token| {
+        season = token.season;
         media_kind = .tv;
-        if (std.ascii.findIgnoreCase(core, " S0")) |pos|
-            core = std.mem.trimEnd(u8, core[0..pos], " \t-:");
+        core = std.mem.trimEnd(u8, core[0..token.start], " \t-:");
     }
 
     if (parseTrailingYear(core)) |year_info| {
@@ -192,25 +217,32 @@ fn parseTrailingYear(value: []const u8) ?YearInfo {
     };
 }
 
-fn parseSeasonToken(value: []const u8) ?i64 {
+const SeasonToken = struct { start: usize, season: i64 };
+
+fn findSeasonToken(value: []const u8) ?SeasonToken {
     var i: usize = 0;
-    while (i + 2 < value.len) : (i += 1) {
+    while (i + 1 < value.len) : (i += 1) {
         if (value[i] != 's' and value[i] != 'S') continue;
         if (i > 0 and std.ascii.isAlphanumeric(value[i - 1])) continue;
         var p = i + 1;
-        while (p < value.len and value[p] == '0') : (p += 1) {}
         const start = p;
         while (p < value.len and std.ascii.isDigit(value[p])) : (p += 1) {}
         if (p == start) continue;
-        return std.fmt.parseInt(i64, value[start..p], 10) catch null;
+        if (p < value.len and std.ascii.isAlphanumeric(value[p])) continue;
+        const season = std.fmt.parseInt(i64, value[start..p], 10) catch continue;
+        return .{ .start = i, .season = season };
     }
     return null;
 }
 
-fn stripQueryNoise(value: []const u8) []const u8 {
-    if (std.ascii.findIgnoreCase(value, " S0")) |pos|
-        return std.mem.trimEnd(u8, value[0..pos], " \t-:");
-    return std.mem.trim(u8, value, " \t\r\n");
+fn parseSearchQuery(value: []const u8) !struct { title: []const u8, season: ?i64 } {
+    if (common.parseEpisodeQuery(value).episode != null) return error.UnsupportedEpisodeSelection;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (findSeasonToken(trimmed)) |token| return .{
+        .title = std.mem.trimEnd(u8, trimmed[0..token.start], " \t-:"),
+        .season = token.season,
+    };
+    return .{ .title = trimmed, .season = null };
 }
 
 fn parseDownloadUrl(allocator: Allocator, body: []const u8) ![]const u8 {
@@ -219,7 +251,10 @@ fn parseDownloadUrl(allocator: Allocator, body: []const u8) ![]const u8 {
     var end = pos + marker.len;
     while (end < body.len and std.ascii.isDigit(body[end])) : (end += 1) {}
     if (end == pos + marker.len) return error.MissingField;
-    return allocator.dupe(u8, body[pos..end]);
+    const url = try allocator.dupe(u8, body[pos..end]);
+    errdefer allocator.free(url);
+    try validateZoomUrl(url);
+    return url;
 }
 
 fn trailingNumericSegment(url: []const u8) ?[]const u8 {
@@ -262,6 +297,62 @@ test "zoom parses movie and tv titles" {
     try std.testing.expect(tv.media_kind == .tv);
 }
 
+test "zoom verifies season packs and rejects unsupported episode selection" {
+    const fixture =
+        "<h3 class=\"entry-title td-module-title\"><a href=\"https://zoom.lk/season1\" title=\"Teen Wolf (2012) S01 Sinhala Subtitle\">x</a></h3>" ++
+        "<h3 class=\"entry-title td-module-title\"><a href=\"https://zoom.lk/season10\" title=\"Teen Wolf (2012) S10 Sinhala Subtitle\">x</a></h3>";
+    var response = try parseSearchHtml(std.heap.ArenaAllocator.init(std.testing.allocator), fixture, "Teen Wolf S10");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(usize, 1), response.items.len);
+    try std.testing.expectEqualStrings("Teen Wolf", response.items[0].title);
+    try std.testing.expectEqual(@as(?i64, 10), response.items[0].season);
+    const special = parsePostTitle("Teen Wolf (2012) S00 Sinhala Subtitle");
+    try std.testing.expectEqual(@as(?i64, 0), special.season);
+    try std.testing.expectEqualStrings("Teen Wolf", special.title);
+    try std.testing.expectError(error.UnsupportedEpisodeSelection, parseSearchQuery("Teen Wolf S01E01"));
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &client);
+    try std.testing.expectError(error.UnsupportedEpisodeSelection, scraper.search("Teen Wolf S10E01"));
+}
+
+test "zoom only accepts the exact public HTTPS origin before acquisition" {
+    try validateZoomUrl("https://zoom.lk/post");
+    try validateZoomUrl("HTTPS://ZOOM.LK:443/post");
+    for ([_][]const u8{
+        "https://zoom.lk.attacker.example/post",
+        "https://zoom.lk@attacker.example/post",
+        "https://user@zoom.lk/post",
+        "https://zoom.lk:444/post",
+        "http://zoom.lk/post",
+        "https://%7aoom.lk/post",
+        "https://zoom.lk./post",
+        "https://zoom.lk\\@attacker.example/post",
+        "https://zoom.lk/post\n",
+    }) |url| try std.testing.expectError(error.UnsafeHttpTarget, validateZoomUrl(url));
+    try std.testing.expectError(error.InvalidDownloadUrl, validateZoomUrl("file:///post"));
+
+    const fixture =
+        "<h3 class=\"entry-title td-module-title\"><a href=\"https://zoom.lk.attacker.example/post\" title=\"Centigrade (2020) Sinhala Subtitle\">x</a></h3>" ++
+        "<h3 class=\"entry-title td-module-title\"><a href=\"https://user@zoom.lk/post\" title=\"Centigrade (2020) Sinhala Subtitle\">x</a></h3>" ++
+        "<h3 class=\"entry-title td-module-title\"><a href=\"https://zoom.lk/post\" title=\"Centigrade (2020) Sinhala Subtitle\">x</a></h3>";
+    var response = try parseSearchHtml(std.heap.ArenaAllocator.init(std.testing.allocator), fixture, "Centigrade");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(usize, 1), response.items.len);
+    try std.testing.expectEqualStrings("https://zoom.lk/post", response.items[0].page_url);
+
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &client);
+    try std.testing.expectError(error.UnsafeHttpTarget, scraper.fetchSubtitlesBySearchItem(.{
+        .title = "Centigrade",
+        .year = 2020,
+        .media_kind = .movie,
+        .season = null,
+        .page_url = "https://zoom.lk.attacker.example/post",
+    }));
+}
+
 test "live zoom movie and tv downloads" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
     if (!common.providerMatchesLiveFilter(common.liveProviderFilter(), "zoom.lk")) return error.SkipZigTest;
@@ -279,6 +370,7 @@ test "live zoom movie and tv downloads" {
     const movie_dl = try common.fetchBytes(&client, std.testing.allocator, movie_subs.subtitles[0].download_url, .{
         .accept = "application/octet-stream,application/x-rar-compressed,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(movie_dl.body);
     try std.testing.expect(movie_dl.body.len > 8);
@@ -295,6 +387,7 @@ test "live zoom movie and tv downloads" {
     const tv_dl = try common.fetchBytes(&client, std.testing.allocator, tv_subs.subtitles[0].download_url, .{
         .accept = "application/octet-stream,application/x-rar-compressed,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(tv_dl.body);
     try std.testing.expect(tv_dl.body.len > 8);

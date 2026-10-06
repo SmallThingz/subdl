@@ -2,6 +2,7 @@ const std = @import("std");
 const common = @import("common.zig");
 
 const Allocator = std.mem.Allocator;
+const max_raw_response_bytes = (common.FetchOptions{}).max_response_bytes;
 const site = "http://animesub.info";
 const search_path = site ++ "/szukaj.php";
 const download_path = site ++ "/sciagnij.php";
@@ -37,6 +38,10 @@ pub const Scraper = struct {
     }
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
+        return self.searchWithFetcher(query, fetchRawGet);
+    }
+
+    fn searchWithFetcher(self: *Scraper, query: []const u8, comptime fetch: anytype) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -47,12 +52,15 @@ pub const Scraper = struct {
         var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
         var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
         var seen = std.StringHashMapUnmanaged(void).empty;
+        var successful_variants: usize = 0;
 
         for ([_][]const u8{ "org", "en", "pl" }) |title_type| {
             const url = try buildSearchUrl(a, trimmed, title_type);
-            var response = try fetchRawGet(self.client, a, url);
+            var response = try fetch(self.client, a, url);
             defer response.deinit(a);
+            if (response.status == .too_many_requests) return error.RateLimited;
             if (response.status != .ok) continue;
+            successful_variants += 1;
             try appendSearchRows(
                 a,
                 response.body,
@@ -67,6 +75,7 @@ pub const Scraper = struct {
             if (exact.items.len > 0 and title_type[0] != 'o') break;
         }
 
+        if (successful_variants == 0) return error.UnexpectedHttpStatus;
         var items: std.ArrayListUnmanaged(SearchItem) = .empty;
         try items.appendSlice(a, exact.items);
         try items.appendSlice(a, partial.items);
@@ -92,7 +101,18 @@ pub const Scraper = struct {
     }
 
     pub fn fetchDownloadByToken(self: *Scraper, allocator: Allocator, token: []const u8) !common.HttpResponse {
+        return self.fetchDownloadByTokenWithFetchers(allocator, token, fetchRawGet, common.fetchBytes);
+    }
+
+    fn fetchDownloadByTokenWithFetchers(
+        self: *Scraper,
+        allocator: Allocator,
+        token: []const u8,
+        comptime fetch_search: anytype,
+        comptime fetch_download: anytype,
+    ) !common.HttpResponse {
         const parts = parseDownloadToken(token) orelse return error.InvalidDownloadUrl;
+        try validateProviderUrl(parts.search_url);
         if (parts.download_hash.len > 0 and parts.session_cookie.len > 0) {
             const response = try postDownload(
                 self.client,
@@ -101,13 +121,19 @@ pub const Scraper = struct {
                 parts.download_hash,
                 parts.session_cookie,
                 parts.search_url,
+                fetch_download,
             );
+            if (response.status == .too_many_requests) {
+                allocator.free(response.body);
+                return error.RateLimited;
+            }
             if (downloadResponseIsValid(response)) return response;
             allocator.free(response.body);
         }
 
-        var search_response = try fetchRawGet(self.client, allocator, parts.search_url);
+        var search_response = try fetch_search(self.client, allocator, parts.search_url);
         defer search_response.deinit(allocator);
+        if (search_response.status == .too_many_requests) return error.RateLimited;
         if (search_response.status != .ok) return error.UnexpectedHttpStatus;
         const cookie = search_response.cookie orelse return error.SessionExpired;
         const hash = findHashForId(search_response.body, parts.subtitle_id) orelse return error.MissingField;
@@ -119,7 +145,12 @@ pub const Scraper = struct {
             hash,
             cookie,
             parts.search_url,
+            fetch_download,
         );
+        if (response.status == .too_many_requests) {
+            allocator.free(response.body);
+            return error.RateLimited;
+        }
         if (!downloadResponseIsValid(response)) {
             allocator.free(response.body);
             return error.UnexpectedResponseType;
@@ -135,6 +166,7 @@ fn postDownload(
     hash: []const u8,
     cookie: []const u8,
     search_url: []const u8,
+    comptime fetch: anytype,
 ) !common.HttpResponse {
     const id_encoded = try common.encodeUriComponent(allocator, subtitle_id);
     defer allocator.free(id_encoded);
@@ -149,7 +181,7 @@ fn postDownload(
     );
     defer allocator.free(payload);
 
-    return common.fetchBytes(client, allocator, download_path, .{
+    return fetch(client, allocator, download_path, common.FetchOptions{
         .method = .POST,
         .payload = payload,
         .content_type = "application/x-www-form-urlencoded",
@@ -161,6 +193,8 @@ fn postDownload(
         .allow_non_ok = true,
         .cache = false,
         .max_attempts = 2,
+        .retry_on_429 = false,
+        .require_public_origin = true,
     });
 }
 
@@ -380,6 +414,7 @@ fn fetchRawGet(client: *std.http.Client, allocator: Allocator, url: []const u8) 
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         return fetchRawGetOnce(client, allocator, url) catch |err| {
+            if (err == error.Canceled or err == error.OutOfMemory or err == error.ResponseTooLarge) return err;
             if (attempt + 1 >= 4) return err;
             const shift: u6 = @intCast(@min(attempt, 4));
             common.sleepMilliseconds(@as(u64, 250) << shift);
@@ -389,12 +424,14 @@ fn fetchRawGet(client: *std.http.Client, allocator: Allocator, url: []const u8) 
 }
 
 fn fetchRawGetOnce(client: *std.http.Client, allocator: Allocator, url: []const u8) !RawResponse {
+    try validateProviderUrl(url);
     try common.ensureClientTlsReady(client);
     const normalized = try common.normalizeUrlForFetch(allocator, url);
     defer allocator.free(normalized);
     const uri = try std.Uri.parse(normalized);
 
     var req = try client.request(.GET, uri, .{
+        .redirect_behavior = .unhandled,
         .headers = .{
             .user_agent = .{ .override = "Sub-Zero/2" },
             .accept_encoding = .{ .override = "identity" },
@@ -404,6 +441,7 @@ fn fetchRawGetOnce(client: *std.http.Client, allocator: Allocator, url: []const 
         },
     });
     defer req.deinit();
+    errdefer req.connection.?.closing = true;
     try req.sendBodiless();
 
     var head_buffer: [24 * 1024]u8 = undefined;
@@ -413,15 +451,31 @@ fn fetchRawGetOnce(client: *std.http.Client, allocator: Allocator, url: []const 
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
-    var writer = std.Io.Writer.Allocating.init(allocator);
-    defer writer.deinit();
-    _ = try reader.streamRemaining(&writer.writer);
+    const body = readBoundedBody(allocator, reader, max_raw_response_bytes) catch |err| {
+        if (err == error.ReadFailed) {
+            if (response.bodyErr()) |body_err| return body_err;
+            if (req.connection.?.stream_reader.err) |stream_err| return stream_err;
+        }
+        return err;
+    };
+    errdefer allocator.free(body);
+    switch (req.reader.state) {
+        .body_remaining_content_length => |left| if (left != 0) return error.HttpBodyTruncated,
+        .body_remaining_chunk_len => return error.HttpChunkTruncated,
+        else => {},
+    }
 
     return .{
         .status = response.head.status,
-        .body = try allocator.dupe(u8, writer.writer.buffered()),
+        .body = body,
         .cookie = cookie,
     };
+}
+
+fn validateProviderUrl(url: []const u8) !void {
+    const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
+    if (uri.user != null or uri.password != null) return error.InvalidDownloadUrl;
+    if (!(common.sameOrigin(site, url) catch false)) return error.InvalidDownloadUrl;
 }
 
 fn extractCookie(allocator: Allocator, headers: []const u8) !?[]u8 {
@@ -436,6 +490,194 @@ fn extractCookie(allocator: Allocator, headers: []const u8) !?[]u8 {
         return @as(?[]u8, try allocator.dupe(u8, value[0..end]));
     }
     return null;
+}
+
+fn readBoundedBody(allocator: Allocator, reader: *std.Io.Reader, max_bytes: usize) ![]u8 {
+    var writer = std.Io.Writer.Allocating.init(allocator);
+    defer writer.deinit();
+    var received: usize = 0;
+    while (true) {
+        if (received == max_bytes) {
+            _ = reader.takeByte() catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            return error.ResponseTooLarge;
+        }
+        const count = reader.stream(&writer.writer, .limited(max_bytes - received)) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        received += count;
+    }
+    var body = writer.toArrayList();
+    errdefer body.deinit(allocator);
+    return body.toOwnedSlice(allocator);
+}
+
+test "raw response body limit accepts exact bounds and rejects excess" {
+    const a = std.testing.allocator;
+    var exact: std.Io.Reader = .fixed("1234");
+    const body = try readBoundedBody(a, &exact, 4);
+    defer a.free(body);
+    try std.testing.expectEqualStrings("1234", body);
+    var oversized: std.Io.Reader = .fixed("12345");
+    try std.testing.expectError(error.ResponseTooLarge, readBoundedBody(a, &oversized, 4));
+    var empty: std.Io.Reader = .fixed("");
+    const empty_body = try readBoundedBody(a, &empty, 0);
+    defer a.free(empty_body);
+    try std.testing.expectEqual(@as(usize, 0), empty_body.len);
+    var zero_limit: std.Io.Reader = .fixed("1");
+    try std.testing.expectError(error.ResponseTooLarge, readBoundedBody(a, &zero_limit, 0));
+}
+
+test "animesubinfo rejects non-provider session targets before fetching" {
+    try validateProviderUrl("http://animesub.info/szukaj.php?szukane=test");
+    for ([_][]const u8{
+        "http://127.0.0.1/szukaj.php",
+        "http://animesub.info.example/szukaj.php",
+        "http://user@animesub.info/szukaj.php",
+        "https://animesub.info/szukaj.php",
+    }) |url| {
+        try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl(url));
+    }
+}
+
+test "animesubinfo distinguishes failed variants from a successful fallback" {
+    const Mock = struct {
+        fn blocked(_: *std.http.Client, a: Allocator, _: []const u8) !RawResponse {
+            return .{ .status = .forbidden, .body = try a.dupe(u8, "blocked"), .cookie = null };
+        }
+        fn limited(_: *std.http.Client, a: Allocator, _: []const u8) !RawResponse {
+            return .{ .status = .too_many_requests, .body = try a.dupe(u8, "limited"), .cookie = null };
+        }
+        fn fallback(_: *std.http.Client, a: Allocator, url: []const u8) !RawResponse {
+            return .{
+                .status = if (std.mem.indexOf(u8, url, "pTitle=en") != null) .ok else .forbidden,
+                .body = try a.dupe(u8, ""),
+                .cookie = null,
+            };
+        }
+    };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &client);
+    try std.testing.expectError(error.UnexpectedHttpStatus, scraper.searchWithFetcher("Show", Mock.blocked));
+    try std.testing.expectError(error.RateLimited, scraper.searchWithFetcher("Show", Mock.limited));
+    var fallback = try scraper.searchWithFetcher("Show", Mock.fallback);
+    defer fallback.deinit();
+    try std.testing.expectEqual(@as(usize, 0), fallback.items.len);
+}
+
+test "animesubinfo stops at a rate-limited title variant" {
+    const Fixture = struct {
+        client: std.http.Client,
+        limited_call: usize,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, a: Allocator, _: []const u8) !RawResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            return .{
+                .status = if (self.calls == self.limited_call) .too_many_requests else .ok,
+                .body = try a.dupe(u8, ""),
+                .cookie = null,
+            };
+        }
+    };
+    for ([_]usize{ 1, 2 }) |limited_call| {
+        var fixture: Fixture = .{
+            .client = .{ .allocator = std.testing.allocator, .io = std.testing.io },
+            .limited_call = limited_call,
+        };
+        defer fixture.client.deinit();
+        var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+        try std.testing.expectError(error.RateLimited, scraper.searchWithFetcher("Show", Fixture.fetch));
+        try std.testing.expectEqual(limited_call, fixture.calls);
+    }
+}
+
+test "animesubinfo download recovery stops on rate limits and refreshes at most once" {
+    const Scenario = struct {
+        initial_status: std.http.Status = .forbidden,
+        search_status: std.http.Status = .ok,
+        retry_status: std.http.Status = .ok,
+        expected_error: ?anyerror = null,
+        expected_posts: usize,
+        expected_searches: usize,
+    };
+    const Fixture = struct {
+        client: std.http.Client,
+        scenario: Scenario,
+        requests: usize = 0,
+        posts: usize = 0,
+        searches: usize = 0,
+
+        fn search(client: *std.http.Client, a: Allocator, url: []const u8) !RawResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.requests += 1;
+            self.searches += 1;
+            try std.testing.expectEqual(@as(usize, 2), self.requests);
+            try std.testing.expectEqual(@as(usize, 1), self.searches);
+            try std.testing.expectEqualStrings(search_path ++ "?fixture=1", url);
+            const body = try a.dupe(u8, "<input name=\"id\" value=\"7\"><input name=\"sh\" value=\"fresh-hash\">");
+            errdefer a.free(body);
+            return .{
+                .status = self.scenario.search_status,
+                .body = body,
+                .cookie = try a.dupe(u8, "ansi_sciagnij=fresh"),
+            };
+        }
+
+        fn download(client: *std.http.Client, a: Allocator, url: []const u8, options: common.FetchOptions) !common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.requests += 1;
+            self.posts += 1;
+            try std.testing.expect(self.posts <= 2);
+            try std.testing.expectEqual(@as(usize, if (self.posts == 1) 1 else 3), self.requests);
+            try std.testing.expectEqualStrings(download_path, url);
+            try std.testing.expectEqual(std.http.Method.POST, options.method);
+            try std.testing.expect(!options.retry_on_429);
+            try std.testing.expectEqualStrings(
+                if (self.posts == 1) "ansi_sciagnij=initial" else "ansi_sciagnij=fresh",
+                options.extra_headers[0].value,
+            );
+            const expected_hash = if (self.posts == 1) "sh=initial-hash" else "sh=fresh-hash";
+            try std.testing.expect(std.mem.indexOf(u8, options.payload.?, expected_hash) != null);
+            const status = if (self.posts == 1) self.scenario.initial_status else self.scenario.retry_status;
+            return .{
+                .status = status,
+                .body = try a.dupe(u8, if (status == .ok) "PK\x03\x04fixture" else "Unavailable"),
+            };
+        }
+    };
+    const scenarios = [_]Scenario{
+        .{ .initial_status = .too_many_requests, .expected_error = error.RateLimited, .expected_posts = 1, .expected_searches = 0 },
+        .{ .search_status = .too_many_requests, .expected_error = error.RateLimited, .expected_posts = 1, .expected_searches = 1 },
+        .{ .retry_status = .too_many_requests, .expected_error = error.RateLimited, .expected_posts = 2, .expected_searches = 1 },
+        .{ .initial_status = .ok, .expected_posts = 1, .expected_searches = 0 },
+        .{ .expected_posts = 2, .expected_searches = 1 },
+        .{ .search_status = .forbidden, .expected_error = error.UnexpectedHttpStatus, .expected_posts = 1, .expected_searches = 1 },
+        .{ .retry_status = .forbidden, .expected_error = error.UnexpectedResponseType, .expected_posts = 2, .expected_searches = 1 },
+    };
+    const token = download_token_prefix ++ "7|initial-hash|ansi_sciagnij=initial|" ++ search_path ++ "?fixture=1";
+    for (scenarios) |scenario| {
+        var fixture: Fixture = .{
+            .client = .{ .allocator = std.testing.allocator, .io = std.testing.io },
+            .scenario = scenario,
+        };
+        defer fixture.client.deinit();
+        var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+        if (scenario.expected_error) |expected_error| {
+            try std.testing.expectError(expected_error, scraper.fetchDownloadByTokenWithFetchers(std.testing.allocator, token, Fixture.search, Fixture.download));
+        } else {
+            const response = try scraper.fetchDownloadByTokenWithFetchers(std.testing.allocator, token, Fixture.search, Fixture.download);
+            defer std.testing.allocator.free(response.body);
+            try std.testing.expect(downloadResponseIsValid(response));
+        }
+        try std.testing.expectEqual(scenario.expected_posts, fixture.posts);
+        try std.testing.expectEqual(scenario.expected_searches, fixture.searches);
+    }
 }
 
 test "animesubinfo parses movie and episode rows" {

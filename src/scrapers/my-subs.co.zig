@@ -1,5 +1,6 @@
 const std = @import("std");
 const common = @import("common.zig");
+const cloudflare = @import("opensubtitles_com_cf.zig");
 const html = @import("htmlparser");
 const HtmlParseOptions: html.ParseOptions = .{};
 const HtmlDocument = HtmlParseOptions.GetDocument();
@@ -58,7 +59,7 @@ pub const Scraper = struct {
         var seen = std.StringHashMapUnmanaged(void).empty;
 
         const page_url = try buildSearchUrl(a, query);
-        const response = try common.fetchBytes(self.client, a, page_url, .{ .accept = "text/html", .max_attempts = 2, .allow_non_ok = true });
+        const response = try fetchHtmlWith(common.fetchBytes, self.client, a, page_url);
         if (response.body.len > 0) {
             var parsed = try common.parseHtmlStable(a, response.body);
 
@@ -101,6 +102,10 @@ pub const Scraper = struct {
     }
 
     pub fn fetchSubtitlesByDetailsLinkWithOptions(self: *Scraper, details_url: []const u8, media_kind: MediaKind, options: SubtitlesOptions) !SubtitlesResponse {
+        return self.fetchSubtitlesByDetailsLinkUsing(common.fetchBytes, details_url, media_kind, options);
+    }
+
+    fn fetchSubtitlesByDetailsLinkUsing(self: *Scraper, comptime fetch: anytype, details_url: []const u8, media_kind: MediaKind, options: SubtitlesOptions) !SubtitlesResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -109,9 +114,9 @@ pub const Scraper = struct {
         var seen = std.StringHashMapUnmanaged(void).empty;
 
         var page_urls: std.ArrayListUnmanaged([]const u8) = .empty;
-        try page_urls.append(a, details_url);
+        try page_urls.append(a, try a.dupe(u8, details_url));
 
-        const root_response = try common.fetchBytes(self.client, a, details_url, .{ .accept = "text/html", .max_attempts = 2, .allow_non_ok = true });
+        const root_response = try fetchHtmlWith(fetch, self.client, a, details_url);
         if (root_response.body.len == 0) return .{ .arena = arena, .subtitles = &.{} };
 
         var root = try common.parseHtmlStable(a, root_response.body);
@@ -127,11 +132,11 @@ pub const Scraper = struct {
 
         var entry_seen = std.StringHashMapUnmanaged(void).empty;
 
-        for (page_urls.items) |entry_url| {
+        for (page_urls.items, 0..) |entry_url, entry_index| {
             if (entry_seen.contains(entry_url)) continue;
             try entry_seen.put(a, entry_url, {});
 
-            const response = try common.fetchBytes(self.client, a, entry_url, .{ .accept = "text/html", .max_attempts = 2, .allow_non_ok = true });
+            const response = if (entry_index == 0) root_response else try fetchHtmlWith(fetch, self.client, a, entry_url);
             if (response.body.len == 0) continue;
 
             var parsed = try common.parseHtmlStable(a, response.body);
@@ -149,7 +154,7 @@ pub const Scraper = struct {
                 try seen.put(a, download_page_url, {});
 
                 const lang_meta = extractLanguage(anchor);
-                const release_version = extractReleaseVersion(anchor, a) catch null;
+                const release_version = try extractReleaseVersion(anchor, a);
 
                 var filename = if (release_version) |rv| rv else page_title;
                 if (filename.len == 0) {
@@ -163,11 +168,9 @@ pub const Scraper = struct {
                 var resolved_download_url: ?[]const u8 = null;
                 var is_archive: ?bool = null;
                 if (options.resolve_download_links) {
-                    const resolved = self.resolveDownloadPage(a, download_page_url) catch null;
-                    if (resolved) |url| {
-                        resolved_download_url = url;
-                        is_archive = looksArchive(url);
-                    }
+                    const url = try self.resolveDownloadPageUsing(fetch, a, download_page_url);
+                    resolved_download_url = url;
+                    is_archive = looksArchive(url);
                 }
 
                 try subtitles.append(a, .{
@@ -197,15 +200,28 @@ pub const Scraper = struct {
     }
 
     fn resolveDownloadPage(self: *Scraper, allocator: Allocator, download_page_url: []const u8) ![]const u8 {
-        const response = try common.fetchBytes(self.client, allocator, download_page_url, .{ .accept = "text/html", .max_attempts = 2, .allow_non_ok = true });
+        return self.resolveDownloadPageUsing(common.fetchBytes, allocator, download_page_url);
+    }
+
+    fn resolveDownloadPageUsing(self: *Scraper, comptime fetch: anytype, allocator: Allocator, download_page_url: []const u8) ![]const u8 {
+        const response = try fetchHtmlWith(fetch, self.client, allocator, download_page_url);
         defer allocator.free(response.body);
-        if (response.status != .ok) return error.UnexpectedHttpStatus;
 
         const real_url = (try parseRealUrlFromPage(allocator, response.body)) orelse return error.MissingField;
         defer allocator.free(real_url);
         return try common.resolveUrl(allocator, site, real_url);
     }
 };
+
+fn fetchHtmlWith(comptime fetch: anytype, client: *std.http.Client, allocator: Allocator, url: []const u8) !common.HttpResponse {
+    const response = try fetch(client, allocator, url, .{ .accept = "text/html", .max_attempts = 2, .allow_non_ok = true });
+    errdefer allocator.free(response.body);
+    if (common.isAustralianWebsiteBlockPage(response.body)) return error.ProviderAccessBlocked;
+    if (cloudflare.isChallengeBody(response.body)) return error.CloudflareChallenge;
+    if (response.status == .too_many_requests) return error.RateLimited;
+    if (response.status != .ok) return error.UnexpectedHttpStatus;
+    return response;
+}
 
 fn buildSearchUrl(allocator: Allocator, query: []const u8) ![]const u8 {
     const encoded = try common.encodeUriComponent(allocator, query);
@@ -333,6 +349,136 @@ fn looksArchive(url: []const u8) bool {
         std.mem.endsWith(u8, url, ".rar") or
         std.mem.indexOf(u8, url, ".zip?") != null or
         std.mem.indexOf(u8, url, ".rar?") != null;
+}
+
+fn SubtitleFixture(comptime resolver_error: ?anyerror, comptime resolver_status: std.http.Status, comptime resolver_body: []const u8) type {
+    return struct {
+        fn fetch(_: *std.http.Client, allocator: Allocator, url: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+            if (std.mem.indexOf(u8, url, "/downloads/") != null) {
+                if (resolver_error) |err| return err;
+                return .{ .status = resolver_status, .body = try allocator.dupe(u8, resolver_body) };
+            }
+            return .{ .status = .ok, .body = try allocator.dupe(u8, "<h1>The Matrix</h1><a href='/downloads/matrix'><strong>The.Matrix.1999.en</strong></a>") };
+        }
+    };
+}
+
+fn RejectedPageFixture(comptime status: std.http.Status) type {
+    return struct {
+        fn fetch(_: *std.http.Client, allocator: Allocator, _: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+            return .{ .status = status, .body = try allocator.dupe(u8, "<html><body>No results</body></html>") };
+        }
+    };
+}
+
+fn checkSubtitleOwnership(allocator: Allocator) !void {
+    var client: std.http.Client = .{ .allocator = allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(allocator, &client);
+    var details_url = "https://my-subs.co/film-versions-matrix".*;
+    var response = try scraper.fetchSubtitlesByDetailsLinkUsing(
+        SubtitleFixture(null, .ok, "var REAL_URL='/files/matrix.zip';").fetch,
+        &details_url,
+        .movie,
+        .{ .resolve_download_links = true },
+    );
+    defer response.deinit();
+    @memset(&details_url, 'x');
+    try std.testing.expectEqual(@as(usize, 1), response.subtitles.len);
+    const subtitle = response.subtitles[0];
+    try std.testing.expectEqualStrings("https://my-subs.co/film-versions-matrix", subtitle.details_url);
+    try std.testing.expectEqualStrings("The.Matrix.1999.en", subtitle.release_version.?);
+    try std.testing.expectEqualStrings("https://my-subs.co/files/matrix.zip", subtitle.resolved_download_url.?);
+    try std.testing.expectEqual(@as(?bool, true), subtitle.is_archive);
+}
+
+const RootFetchOnceFixture = struct {
+    client: std.http.Client,
+    root_requests: usize = 0,
+    season_requests: usize = 0,
+
+    fn fetch(client: *std.http.Client, allocator: Allocator, url: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+        const self: *RootFetchOnceFixture = @fieldParentPtr("client", client);
+        const body = if (std.mem.eql(u8, url, "https://my-subs.co/showlistsubtitles-matrix")) blk: {
+            self.root_requests += 1;
+            if (self.root_requests > 1) return error.TestUnexpectedDuplicateRequest;
+            break :blk "<h1>The Matrix</h1><div id='saison'><a href='/versions-matrix-season-1-subtitles'>Season 1</a></div><a href='/downloads/root'>Root subtitle</a>";
+        } else if (std.mem.eql(u8, url, "https://my-subs.co/versions-matrix-season-1-subtitles")) blk: {
+            self.season_requests += 1;
+            break :blk "<h1>The Matrix Season 1</h1><a href='/downloads/season'>Season subtitle</a>";
+        } else return error.TestUnexpectedUrl;
+        return .{ .status = .ok, .body = try allocator.dupe(u8, body) };
+    }
+};
+
+test "my-subs fetches the root only once for movie and season results" {
+    inline for (.{ MediaKind.movie, MediaKind.tv }) |media_kind| {
+        var fixture: RootFetchOnceFixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+        defer fixture.client.deinit();
+        var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+        var details_url = "https://my-subs.co/showlistsubtitles-matrix".*;
+        var response = try scraper.fetchSubtitlesByDetailsLinkUsing(RootFetchOnceFixture.fetch, &details_url, media_kind, .{});
+        defer response.deinit();
+        @memset(&details_url, 'x');
+        const expected_seasons: usize = if (media_kind == .tv) 1 else 0;
+        try std.testing.expectEqual(@as(usize, 1), fixture.root_requests);
+        try std.testing.expectEqual(expected_seasons, fixture.season_requests);
+        try std.testing.expectEqual(1 + expected_seasons, response.subtitles.len);
+        try std.testing.expectEqualStrings("https://my-subs.co/showlistsubtitles-matrix", response.subtitles[0].details_url);
+    }
+}
+
+test "my-subs owns caller details URL and propagates allocation failures" {
+    try checkSubtitleOwnership(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkSubtitleOwnership, .{});
+}
+
+test "my-subs rejects failed details pages and propagates resolver failures" {
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &client);
+    const details_url = "https://my-subs.co/film-versions-matrix";
+    inline for (.{ std.http.Status.forbidden, std.http.Status.internal_server_error, std.http.Status.service_unavailable }) |status| {
+        try std.testing.expectError(error.UnexpectedHttpStatus, scraper.fetchSubtitlesByDetailsLinkUsing(
+            RejectedPageFixture(status).fetch,
+            details_url,
+            .movie,
+            .{},
+        ));
+        try std.testing.expectError(error.UnexpectedHttpStatus, scraper.fetchSubtitlesByDetailsLinkUsing(
+            SubtitleFixture(null, status, "No results").fetch,
+            details_url,
+            .movie,
+            .{ .resolve_download_links = true },
+        ));
+    }
+    inline for (.{ error.Canceled, error.OutOfMemory, error.ProviderAccessBlocked }) |err| {
+        try std.testing.expectError(err, scraper.fetchSubtitlesByDetailsLinkUsing(
+            SubtitleFixture(err, .ok, "").fetch,
+            details_url,
+            .movie,
+            .{ .resolve_download_links = true },
+        ));
+    }
+    try std.testing.expectError(error.ProviderAccessBlocked, scraper.fetchSubtitlesByDetailsLinkUsing(
+        SubtitleFixture(null, .ok, "Access to Website Disabled Federal Court of Australia").fetch,
+        details_url,
+        .movie,
+        .{ .resolve_download_links = true },
+    ));
+    inline for ([_][]const u8{
+        "<script src='/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1'></script>",
+        "\xef\xbb\xbf <!-- preface --><HTML><SCRIPT>window._cf_chl_opt = {};</SCRIPT></HTML>",
+        "<!-- preface -->\n<HEAD><SCRIPT SRC='/CDN-CGI/CHALLENGE-PLATFORM/h/g/orchestrate/chl_page/v1'></SCRIPT></HEAD>",
+        "<BODY><DIV CLASS='CF-CHL-WIDGET'></DIV></BODY>",
+    }) |challenge_body| {
+        try std.testing.expectError(error.CloudflareChallenge, scraper.fetchSubtitlesByDetailsLinkUsing(
+            SubtitleFixture(null, .ok, challenge_body).fetch,
+            details_url,
+            .movie,
+            .{ .resolve_download_links = true },
+        ));
+    }
 }
 
 test "my-subs parse REAL_URL" {

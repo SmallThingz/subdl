@@ -79,7 +79,7 @@ pub const Scraper = struct {
         var seen = std.AutoHashMapUnmanaged(i64, void).empty;
 
         if (common.jsonArray(obj.get("attachments") orelse .null)) |attachments| {
-            try appendAttachments(a, &normal, &forced, &seen, item, attachments, null);
+            try appendRootAttachments(a, &normal, &forced, &seen, item, attachments);
         }
 
         if (common.jsonArray(obj.get("files") orelse .null)) |files| {
@@ -192,6 +192,23 @@ fn parseSearchBody(arena: std.heap.ArenaAllocator, body: []const u8, parsed_quer
     }
 
     return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) });
+}
+
+fn appendRootAttachments(
+    allocator: Allocator,
+    normal: *std.ArrayListUnmanaged(SubtitleItem),
+    forced: *std.ArrayListUnmanaged(SubtitleItem),
+    seen: *std.AutoHashMapUnmanaged(i64, void),
+    item: SearchItem,
+    attachments: std.json.Array,
+) !void {
+    // Root tracks belong to the release as a whole. A batch cannot prove
+    // that these tracks belong to an explicitly requested episode.
+    if (item.episode) |episode| {
+        if (isBatchRelease(item.release)) return;
+        if (!fileMatchesEpisode(item.release, item.season orelse 1, episode)) return;
+    }
+    try appendAttachments(allocator, normal, forced, seen, item, attachments, null);
 }
 
 fn appendAttachments(
@@ -359,17 +376,192 @@ fn seasonMarkerIndex(title: []const u8) ?usize {
     return null;
 }
 
+fn isBatchRelease(value: []const u8) bool {
+    if (std.ascii.indexOfIgnoreCase(value, "batch") != null or
+        std.ascii.indexOfIgnoreCase(value, "complete") != null) return true;
+    for (value, 0..) |c, separator| {
+        if ((c == '-' or c == '~') and isEpisodeRangeAt(value, separator)) return true;
+    }
+    return false;
+}
+
+fn isEpisodeRangeAt(value: []const u8, separator: usize) bool {
+    var right_start = separator + 1;
+    while (right_start < value.len and std.ascii.isWhitespace(value[right_start])) : (right_start += 1) {}
+    if (right_start < value.len and std.ascii.toLower(value[right_start]) == 'e') right_start += 1;
+    const right = parseEpisodeNumber(value, right_start) orelse return false;
+    if (right.end - right_start > 3 or isDecimalNumber(value, right_start, right.end)) return false;
+    _ = episodeTokenEnd(value, right.end) orelse return false;
+
+    var left_end = separator;
+    while (left_end > 0 and std.ascii.isWhitespace(value[left_end - 1])) : (left_end -= 1) {}
+    var left_start = left_end;
+    while (left_start > 0 and std.ascii.isDigit(value[left_start - 1])) : (left_start -= 1) {}
+    if (left_start == left_end or left_end - left_start > 3) return false;
+    if (left_start > 0 and std.ascii.toLower(value[left_start - 1]) != 'e' and std.ascii.isAlphanumeric(value[left_start - 1])) return false;
+    if (isDecimalNumber(value, left_start, left_end)) return false;
+    _ = std.fmt.parseInt(u16, value[left_start..left_end], 10) catch return false;
+    return true;
+}
+
 fn fileMatchesEpisode(filename: []const u8, season: u16, episode: u16) bool {
-    var token_buf: [16]u8 = undefined;
-    const token = std.fmt.bufPrint(&token_buf, "S{d:0>2}E{d:0>2}", .{ season, episode }) catch return false;
-    return indexOfIgnoreCase(filename, token) != null;
+    if (explicitEpisodeMarkerMatches(filename, season, episode)) |matches| return matches;
+    if (season != 1) return false;
+    if (releaseEpisodeMarkerMatches(filename, episode)) |matches| return matches;
+    return bareEpisodeNumberMatches(filename, episode);
+}
+
+const ParsedEpisodeNumber = struct {
+    value: u16,
+    end: usize,
+};
+
+fn parseEpisodeNumber(value: []const u8, start: usize) ?ParsedEpisodeNumber {
+    if (start >= value.len or !std.ascii.isDigit(value[start])) return null;
+    var end = start + 1;
+    while (end < value.len and std.ascii.isDigit(value[end])) : (end += 1) {}
+    const number = std.fmt.parseInt(u16, value[start..end], 10) catch return null;
+    return .{ .value = number, .end = end };
+}
+
+fn episodeTokenEnd(value: []const u8, number_end: usize) ?usize {
+    var end = number_end;
+    if (end < value.len and std.ascii.toLower(value[end]) == 'v') {
+        end += 1;
+        const revision_start = end;
+        while (end < value.len and std.ascii.isDigit(value[end])) : (end += 1) {}
+        if (end == revision_start) return null;
+    }
+    if (end < value.len and std.ascii.isAlphanumeric(value[end])) return null;
+    return end;
+}
+
+fn explicitEpisodeMarkerMatches(value: []const u8, season: u16, episode: u16) ?bool {
+    var found = false;
+    var i: usize = 0;
+    while (i < value.len) : (i += 1) {
+        if (i > 0 and std.ascii.isAlphanumeric(value[i - 1])) continue;
+
+        const lower = std.ascii.toLower(value[i]);
+        if (lower == 's') {
+            const parsed_season = parseEpisodeNumber(value, i + 1) orelse continue;
+            if (parsed_season.end >= value.len or std.ascii.toLower(value[parsed_season.end]) != 'e') continue;
+            const parsed_episode = parseEpisodeNumber(value, parsed_season.end + 1) orelse continue;
+            _ = episodeTokenEnd(value, parsed_episode.end) orelse continue;
+            found = true;
+            if (parsed_season.value == season and parsed_episode.value == episode) return true;
+            continue;
+        }
+
+        if (std.ascii.isDigit(value[i])) {
+            const parsed_season = parseEpisodeNumber(value, i) orelse continue;
+            if (parsed_season.value > 99 or parsed_season.end >= value.len or std.ascii.toLower(value[parsed_season.end]) != 'x') continue;
+            const parsed_episode = parseEpisodeNumber(value, parsed_season.end + 1) orelse continue;
+            if (parsed_episode.value > 999) continue;
+            _ = episodeTokenEnd(value, parsed_episode.end) orelse continue;
+            found = true;
+            if (parsed_season.value == season and parsed_episode.value == episode) return true;
+            continue;
+        }
+
+        if (lower == 'e') {
+            var cursor = i + 1;
+            const word = "episode";
+            if (i + word.len <= value.len and std.ascii.eqlIgnoreCase(value[i .. i + word.len], word)) cursor = i + word.len;
+            while (cursor < value.len and (std.ascii.isWhitespace(value[cursor]) or value[cursor] == '.' or value[cursor] == '_' or value[cursor] == '-')) : (cursor += 1) {}
+            const parsed_episode = parseEpisodeNumber(value, cursor) orelse continue;
+            _ = episodeTokenEnd(value, parsed_episode.end) orelse continue;
+            found = true;
+            if (parsed_episode.value == episode and episodeOnlySeasonMatches(value, season)) return true;
+        }
+    }
+    return if (found) false else null;
+}
+
+fn episodeOnlySeasonMatches(value: []const u8, season: u16) bool {
+    var found = false;
+    for (value, 0..) |c, i| {
+        if (i > 0 and std.ascii.isAlphanumeric(value[i - 1])) continue;
+        if (std.ascii.isDigit(c)) {
+            const parsed = parseEpisodeNumber(value, i) orelse continue;
+            if (parsed.value > 99 or parsed.end >= value.len or std.ascii.toLower(value[parsed.end]) != 'x') continue;
+            const episode = parseEpisodeNumber(value, parsed.end + 1) orelse continue;
+            if (episode.value > 999) continue;
+            _ = episodeTokenEnd(value, episode.end) orelse continue;
+            found = true;
+            if (parsed.value != season) return false;
+            continue;
+        }
+        if (std.ascii.toLower(c) != 's') continue;
+
+        var number_start = i + 1;
+        const word = "season";
+        if (i + word.len <= value.len and std.ascii.eqlIgnoreCase(value[i .. i + word.len], word)) {
+            number_start = i + word.len;
+            while (number_start < value.len and (std.ascii.isWhitespace(value[number_start]) or
+                value[number_start] == '.' or value[number_start] == '_' or value[number_start] == '-')) : (number_start += 1)
+            {}
+        }
+        const parsed = parseEpisodeNumber(value, number_start) orelse continue;
+        if (parsed.end < value.len and std.ascii.isAlphanumeric(value[parsed.end])) {
+            // A compact S02E03 is also explicit season context for a later E-only token.
+            if (std.ascii.toLower(value[parsed.end]) != 'e') continue;
+            const episode = parseEpisodeNumber(value, parsed.end + 1) orelse continue;
+            _ = episodeTokenEnd(value, episode.end) orelse continue;
+        }
+        found = true;
+        if (parsed.value != season) return false;
+    }
+    return found or season == 1;
+}
+
+fn releaseEpisodeMarkerMatches(value: []const u8, episode: u16) ?bool {
+    for (value, 0..) |c, i| {
+        if (c != '-') continue;
+        var start = i + 1;
+        while (start < value.len and std.ascii.isWhitespace(value[start])) : (start += 1) {}
+        const parsed = parseEpisodeNumber(value, start) orelse continue;
+        if (parsed.end - start > 3 or isDecimalNumber(value, start, parsed.end)) continue;
+        _ = episodeTokenEnd(value, parsed.end) orelse continue;
+        return parsed.value == episode;
+    }
+    return null;
+}
+
+fn isDecimalNumber(value: []const u8, start: usize, end: usize) bool {
+    return (start >= 2 and value[start - 1] == '.' and std.ascii.isDigit(value[start - 2])) or
+        (end + 1 < value.len and value[end] == '.' and std.ascii.isDigit(value[end + 1]));
+}
+
+fn bareEpisodeNumberMatches(value: []const u8, episode: u16) bool {
+    var i: usize = 0;
+    while (i < value.len) {
+        if (!std.ascii.isDigit(value[i]) or (i > 0 and std.ascii.isAlphanumeric(value[i - 1]))) {
+            i += 1;
+            continue;
+        }
+        const start = i;
+        while (i < value.len and std.ascii.isDigit(value[i])) : (i += 1) {}
+        const digits_end = i;
+        const number = std.fmt.parseInt(u16, value[start..i], 10) catch continue;
+        if (isDecimalNumber(value, start, digits_end)) continue;
+        var end = i;
+        if (end < value.len and std.ascii.toLower(value[end]) == 'v') {
+            end += 1;
+            const revision_start = end;
+            while (end < value.len and std.ascii.isDigit(value[end])) : (end += 1) {}
+            if (end == revision_start) continue;
+        }
+        if (end < value.len and std.ascii.isAlphanumeric(value[end])) continue;
+        if (digits_end - start == 4 and number >= 1900 and number <= 2099) continue;
+        return number == episode;
+    }
+    return false;
 }
 
 fn isReleaseBoundary(c: u8) bool {
     return c == ' ' or c == '.' or c == '-' or c == '_' or c == '[' or c == '(';
 }
-
-const indexOfIgnoreCase = std.ascii.findIgnoreCase;
 
 fn parseYear(input: []const u8) ?i64 {
     if (input.len < 4) return null;
@@ -415,6 +607,9 @@ test "animetosho parses query and download token" {
     try std.testing.expectEqual(@as(?u16, 1), parsed.episode);
     try std.testing.expect(fileMatchesEpisode("DEATH.NOTE.S01E01.Rebirth.mkv", 1, 1));
     try std.testing.expect(!fileMatchesEpisode("DEATH.NOTE.S01E02.Confrontation.mkv", 1, 1));
+    try std.testing.expect(!fileMatchesEpisode("DEATH.NOTE.S01E010.mkv", 1, 1));
+    try std.testing.expect(!fileMatchesEpisode("DEATH.NOTES01E01.mkv", 1, 1));
+    try std.testing.expect(fileMatchesEpisode("DEATH.NOTE.S01E01v2.mkv", 1, 1));
 
     const token = try makeDownloadToken(std.testing.allocator, 692954, 3637452, "srt");
     defer std.testing.allocator.free(token);
@@ -422,6 +617,95 @@ test "animetosho parses query and download token" {
     try std.testing.expectEqual(@as(i64, 692954), decoded.release_id);
     try std.testing.expectEqual(@as(i64, 3637452), decoded.attachment_id);
     try std.testing.expectEqualStrings("srt", decoded.extension);
+}
+
+test "animetosho root attachments require the requested release episode" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, "[{\"id\":1,\"type\":\"subtitle\",\"info\":{\"format\":\"srt\",\"language_code\":\"eng\"}}]", .{});
+    var normal: std.ArrayListUnmanaged(SubtitleItem) = .empty;
+    var forced: std.ArrayListUnmanaged(SubtitleItem) = .empty;
+    var seen = std.AutoHashMapUnmanaged(i64, void).empty;
+    var item: SearchItem = .{
+        .title = "Show",
+        .year = null,
+        .media_kind = .tv,
+        .season = 1,
+        .episode = 1,
+        .release_id = 1,
+        .release = "Show S01 batch",
+        .page_url = "https://fixture.invalid/1",
+    };
+    try appendRootAttachments(a, &normal, &forced, &seen, item, root.array);
+    try std.testing.expectEqual(@as(usize, 0), normal.items.len);
+    item.release = "Show S01E010";
+    try appendRootAttachments(a, &normal, &forced, &seen, item, root.array);
+    try std.testing.expectEqual(@as(usize, 0), normal.items.len);
+    for ([_][]const u8{ "Show - 010", "Show - 01-12", "Show S01E01-E12", "Show - 01 Complete" }) |release| {
+        item.release = release;
+        try appendRootAttachments(a, &normal, &forced, &seen, item, root.array);
+        try std.testing.expectEqual(@as(usize, 0), normal.items.len);
+    }
+    try std.testing.expect(isBatchRelease("Show - 01-12"));
+    try std.testing.expect(isBatchRelease("Show S01E01-E12"));
+    item.release = "Show S01E01 - 1080p";
+    try std.testing.expect(!isBatchRelease(item.release));
+    try appendRootAttachments(a, &normal, &forced, &seen, item, root.array);
+    try std.testing.expectEqual(@as(usize, 1), normal.items.len);
+    item.release = "[Group] Show - 01v2 [1080p]";
+    try appendRootAttachments(a, &normal, &forced, &seen, item, root.array);
+    try std.testing.expectEqual(@as(usize, 1), normal.items.len);
+    item.release = "Show S01E01";
+    try appendRootAttachments(a, &normal, &forced, &seen, item, root.array);
+    try std.testing.expectEqual(@as(usize, 1), normal.items.len);
+}
+
+test "animetosho episode markers reject unrelated release and audio numbers" {
+    for ([_][]const u8{
+        "Show - 03 [FLAC 2.0]",
+        "Show - 03 [02]",
+        "Show S01E03 [02]",
+        "Show Episode 3 [02]",
+        "Show 01x03 [02]",
+        "Show S02E02 [02]",
+        "Show [FLAC 2.0]",
+    }) |release| try std.testing.expect(!fileMatchesEpisode(release, 1, 2));
+    for ([_][]const u8{ "Show S1E2", "Show 1x2", "Show Episode 02", "Show - 02 [FLAC 2.0]" }) |release| try std.testing.expect(fileMatchesEpisode(release, 1, 2));
+}
+
+test "animetosho later-season selection requires a season-qualified episode" {
+    for ([_][]const u8{ "Show Episode 02.mkv", "Show E02.mkv", "Show S01E02.mkv" }) |name| {
+        try std.testing.expect(!fileMatchesEpisode(name, 2, 2));
+    }
+    for ([_][]const u8{ "Show S02E02.mkv", "Show 2x02.mkv" }) |name| {
+        try std.testing.expect(fileMatchesEpisode(name, 2, 2));
+    }
+}
+
+test "animetosho E-only markers respect separated season context" {
+    for ([_][]const u8{
+        "Show S02 E02.mkv",
+        "Show Season 2 Episode 02.mkv",
+        "Show Season.2.Episode.02.mkv",
+        "Show E02 S02.mkv",
+        "Show 2x03 E02.mkv",
+        "Show E02 2x03.mkv",
+    }) |name| {
+        try std.testing.expect(!fileMatchesEpisode(name, 1, 2));
+        try std.testing.expect(fileMatchesEpisode(name, 2, 2));
+    }
+    for ([_][]const u8{ "Show E02.mkv", "Show Episode 02.mkv", "Show S01 E02.mkv", "Show Season 1 Episode 02.mkv" }) |name| {
+        try std.testing.expect(fileMatchesEpisode(name, 1, 2));
+        try std.testing.expect(!fileMatchesEpisode(name, 2, 2));
+    }
+    try std.testing.expect(!fileMatchesEpisode("Show S01 Season 2 Episode 02.mkv", 1, 2));
+    try std.testing.expect(!fileMatchesEpisode("Show S01 Season 2 Episode 02.mkv", 2, 2));
+    try std.testing.expect(!fileMatchesEpisode("Show S02E03 E02.mkv", 1, 2));
+    try std.testing.expect(fileMatchesEpisode("Show S02E02.mkv", 2, 2));
+    try std.testing.expect(fileMatchesEpisode("Show 100x03 E02.mkv", 1, 2));
+    try std.testing.expect(fileMatchesEpisode("Show 2x1000 E02.mkv", 1, 2));
+    try std.testing.expect(fileMatchesEpisode("Show 2x03audio E02.mkv", 1, 2));
 }
 
 test "animetosho parses completed title search results" {

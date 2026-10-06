@@ -46,6 +46,7 @@ pub const Scraper = struct {
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         return parseSearchHtml(common.takeArena(&arena), response.body, trimmed);
     }
@@ -62,6 +63,7 @@ pub const Scraper = struct {
             .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = site ++ "/" }},
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         var parsed = try common.parseHtmlStable(a, response.body);
@@ -203,15 +205,15 @@ fn parseTitle(input: []const u8) ParsedTitle {
 }
 
 fn resolveSubclubHref(allocator: Allocator, href: []const u8) ![]const u8 {
-    if (std.mem.startsWith(u8, href, "https://") or std.mem.startsWith(u8, href, "http://"))
-        return allocator.dupe(u8, href);
-    if (std.mem.startsWith(u8, href, "../"))
-        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ site, href[3..] });
-    if (std.mem.startsWith(u8, href, "./"))
-        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ site, href[2..] });
-    if (std.mem.startsWith(u8, href, "/"))
-        return std.fmt.allocPrint(allocator, "{s}{s}", .{ site, href });
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ site, href });
+    const resolved = try common.resolveUrl(allocator, site ++ "/", href);
+    errdefer allocator.free(resolved);
+    try validateProviderEndpoint(resolved);
+    return resolved;
+}
+
+fn validateProviderEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
 }
 
 test "subclub parses movie and episode rows and archive files" {
@@ -244,6 +246,12 @@ test "subclub parses movie and episode rows and archive files" {
     );
 }
 
+test "subclub rejects unsafe provider links" {
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveSubclubHref(std.testing.allocator, "http://127.0.0.1/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveSubclubHref(std.testing.allocator, "https://user:pass@www.subclub.eu/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveSubclubHref(std.testing.allocator, "https://www.subclub.eu.evil.com/private"));
+}
+
 test "live subclub movie and tv direct downloads" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
     if (!common.providerMatchesLiveFilter(common.liveProviderFilter(), "subclub.eu")) return error.SkipZigTest;
@@ -261,6 +269,7 @@ test "live subclub movie and tv direct downloads" {
     const movie_download = try common.fetchBytes(&client, std.testing.allocator, movie_subtitles.subtitles[0].download_url, .{
         .accept = "text/plain,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(movie_download.body);
     try std.testing.expect(movie_download.body.len > 100);
@@ -275,6 +284,7 @@ test "live subclub movie and tv direct downloads" {
     const tv_download = try common.fetchBytes(&client, std.testing.allocator, tv_subtitles.subtitles[0].download_url, .{
         .accept = "text/plain,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(tv_download.body);
     try std.testing.expect(tv_download.body.len > 100);

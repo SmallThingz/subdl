@@ -34,6 +34,7 @@ pub const Scraper = struct {
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         return parseCatalog(common.takeArena(&arena), response.body, trimmed);
     }
@@ -43,11 +44,14 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        try validateProviderUrl(item.page_url);
+
         const response = try common.fetchBytes(self.client, a, item.page_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = catalog_url }},
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         const subtitles = try parseEpisodes(a, response.body, item.title, item.page_url);
@@ -60,11 +64,14 @@ pub const Scraper = struct {
 
     pub fn fetchDownloadByToken(self: *Scraper, allocator: Allocator, token: []const u8) !common.HttpResponse {
         const parts = parseDownloadToken(token) orelse return error.InvalidDownloadUrl;
+        try validateProviderUrl(parts.page_url);
+        try validateProviderUrl(parts.download_url);
         const response = try common.fetchBytes(self.client, allocator, parts.download_url, .{
             .accept = "application/zip,application/octet-stream,*/*",
             .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = parts.page_url }},
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         if (response.status != .ok) {
             allocator.free(response.body);
@@ -77,6 +84,12 @@ pub const Scraper = struct {
         return response;
     }
 };
+
+fn validateProviderUrl(url: []const u8) !void {
+    const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
+    if (uri.user != null or uri.password != null) return error.InvalidDownloadUrl;
+    if (!(common.sameOrigin(site, url) catch false)) return error.InvalidDownloadUrl;
+}
 
 fn parseCatalog(arena: std.heap.ArenaAllocator, body: []const u8, query: []const u8) !SearchResponse {
     var owned_arena = arena;
@@ -145,16 +158,16 @@ fn parseEpisodes(allocator: Allocator, body: []const u8, title: []const u8, page
         const number_start = pos + marker.len;
         const number_end = std.mem.indexOfPos(u8, body, number_start, "</td>") orelse break;
         const episode_text = std.mem.trim(u8, body[number_start..number_end], " \t\r\n");
-        cursor = number_end + "</td>".len;
+        const row_end = std.mem.indexOfPos(u8, body, number_end, "</tr>") orelse break;
+        const row_tail = body[number_end + "</td>".len .. row_end];
+        cursor = row_end + "</tr>".len;
 
         const parsed = parseSeasonEpisode(episode_text) orelse continue;
         const href_marker = "href=\"/napisy/pobierz/";
-        const href_pos = std.mem.indexOfPos(u8, body, cursor, href_marker) orelse continue;
-        if (href_pos - cursor > 1200) continue;
+        const href_pos = std.mem.indexOf(u8, row_tail, href_marker) orelse continue;
         const href_start = href_pos + "href=\"".len;
-        const href_end_rel = std.mem.indexOfScalar(u8, body[href_start..], '"') orelse continue;
-        const href = body[href_start .. href_start + href_end_rel];
-        cursor = href_start + href_end_rel + 1;
+        const href_end_rel = std.mem.indexOfScalar(u8, row_tail[href_start..], '"') orelse continue;
+        const href = row_tail[href_start .. href_start + href_end_rel];
         if (seen.contains(href)) continue;
         try seen.put(allocator, try allocator.dupe(u8, href), {});
 
@@ -232,6 +245,27 @@ test "grupahatak parses catalog and episode rows" {
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expectEqual(@as(i64, 1), rows[0].season);
     try std.testing.expectEqual(@as(i64, 1), rows[0].episode);
+}
+
+test "grupahatak does not borrow a download from the following episode row" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const rows = try parseEpisodes(arena.allocator(), "<tr><td class=\"num_released\">01x01</td><td>Pending</td></tr>" ++
+        "<tr><td class=\"num_released\">01x02</td><td><a href=\"/napisy/pobierz/2/\">Episode 2</a></td></tr>", "Show", "https://grupahatak.pl/napisy/1/Show/");
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqual(@as(i64, 2), rows[0].episode);
+    try std.testing.expect(std.mem.endsWith(u8, rows[0].download_url, "/napisy/pobierz/2/"));
+}
+
+test "grupahatak rejects non-provider token targets" {
+    try validateProviderUrl("https://grupahatak.pl/napisy/pobierz/1/");
+    for ([_][]const u8{
+        "http://127.0.0.1/napisy/pobierz/1/",
+        "https://grupahatak.pl.example/napisy/pobierz/1/",
+        "https://user@grupahatak.pl/napisy/pobierz/1/",
+    }) |url| {
+        try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl(url));
+    }
 }
 
 test "live grupahatak teen wolf listing and download" {

@@ -131,6 +131,7 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        try validateProviderEndpoint(item.subtitles_list_url);
         const list_body = try fetchPublic(self.client, a, item.subtitles_list_url, .{ .accept = "application/json" });
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, list_body, .{});
         const obj = switch (root) {
@@ -199,10 +200,12 @@ pub const Scraper = struct {
     }
 
     fn resolveAndVerifyDownloadPublic(self: *Scraper, allocator: Allocator, remote_endpoint: []const u8) !ResolvedDownload {
-        const remote_url = if (std.mem.startsWith(u8, remote_endpoint, "http"))
+        const remote_url = if (std.mem.startsWith(u8, remote_endpoint, "http://") or
+            std.mem.startsWith(u8, remote_endpoint, "https://"))
             remote_endpoint
         else
             try common.resolveUrl(allocator, site, remote_endpoint);
+        try validateProviderEndpoint(remote_url);
 
         const headers = [_]std.http.Header{
             .{ .name = "referer", .value = site ++ "/" },
@@ -218,7 +221,8 @@ pub const Scraper = struct {
         const parsed = parseFileDownload(body);
         if (parsed.url == null) return .{ .filename = null, .verified_url = null };
 
-        const url = parsed.url orelse return .{ .filename = parsed.filename, .verified_url = null };
+        const raw_url = parsed.url orelse return .{ .filename = parsed.filename, .verified_url = null };
+        const url = try normalizePublicDownloadUrl(allocator, raw_url);
         return .{ .filename = parsed.filename, .verified_url = url };
     }
 };
@@ -235,6 +239,7 @@ fn fetchPublic(client: *std.http.Client, allocator: Allocator, url: []const u8, 
         .extra_headers = options.extra_headers,
         .allow_non_ok = true,
         .max_attempts = 2,
+        .require_public_origin = true,
     });
 
     if (!options.allow_non_ok and response.status != .ok) {
@@ -243,6 +248,22 @@ fn fetchPublic(client: *std.http.Client, allocator: Allocator, url: []const u8, 
     }
 
     return response.body;
+}
+
+fn validateProviderEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+}
+
+fn normalizePublicDownloadUrl(allocator: Allocator, raw_url: []const u8) ![]const u8 {
+    const url = if (std.mem.startsWith(u8, raw_url, "http://") or
+        std.mem.startsWith(u8, raw_url, "https://"))
+        try allocator.dupe(u8, raw_url)
+    else
+        try common.resolveUrl(allocator, site, raw_url);
+    errdefer allocator.free(url);
+    try common.validatePublicHttpUrl(url);
+    return url;
 }
 
 fn parseLanguageFromCell(allocator: Allocator, cols: []const std.json.Value, idx: usize) !?[]const u8 {
@@ -299,7 +320,10 @@ fn parseRemoteEndpoint(allocator: Allocator, cols: []const std.json.Value) ![]co
     const tag_end = marker + tag_end_rel + 1;
     const href = (try htmlAttribute(allocator, fragment[tag_start..tag_end], "href")) orelse return error.MissingField;
     defer allocator.free(href);
-    return try common.resolveUrl(allocator, site, href);
+    const resolved = try common.resolveUrl(allocator, site, href);
+    errdefer allocator.free(resolved);
+    try validateProviderEndpoint(resolved);
+    return resolved;
 }
 
 fn firstHtmlAttribute(allocator: Allocator, fragment: []const u8, name: []const u8) !?[]const u8 {
@@ -435,7 +459,12 @@ fn replaceMediaWithFeatures(allocator: Allocator, input: []const u8) ![]const u8
 fn makeSubtitlesListUrl(allocator: Allocator, locale_path: []const u8) ![]const u8 {
     const feature_path = try replaceMediaWithFeatures(allocator, locale_path);
     defer allocator.free(feature_path);
-    return std.fmt.allocPrint(allocator, "{s}{s}/subtitles_list.json", .{ site, feature_path });
+    if (!std.mem.startsWith(u8, feature_path, "/") or std.mem.startsWith(u8, feature_path, "//"))
+        return error.InvalidDownloadUrl;
+    const url = try std.fmt.allocPrint(allocator, "{s}{s}/subtitles_list.json", .{ site, feature_path });
+    errdefer allocator.free(url);
+    try validateProviderEndpoint(url);
+    return url;
 }
 
 test "parse opensubtitles.com file_download" {
@@ -477,6 +506,37 @@ test "opensubtitles.com parses listing cells without reparsing html documents" {
     const remote = try parseRemoteEndpoint(allocator, &cols);
     defer allocator.free(remote);
     try std.testing.expectEqualStrings("https://rest.opensubtitles.com/nocache/download/1/subreq.js?direct_dl=true&locale=en", remote);
+}
+
+test "opensubtitles.com rejects untrusted provider endpoints before fetch" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        "http://127.0.0.1/private",
+        "https://user:pass@rest.opensubtitles.com/private",
+        "https://rest.opensubtitles.com.evil.test/private",
+        "https://evil.test/private",
+    };
+    for (cases) |url| try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint(url));
+
+    const cols = [_]std.json.Value{
+        .{ .string = "en" },
+        .{ .string = "<a data-remote=\"true\" href=\"http://127.0.0.1/private\">Direct</a>" },
+    };
+    try std.testing.expectError(error.UnsafeHttpTarget, parseRemoteEndpoint(allocator, &cols));
+
+    const scheme_relative_cols = [_]std.json.Value{
+        .{ .string = "en" },
+        .{ .string = "<a data-remote=\"true\" href=\"//169.254.169.254/latest/meta-data\">Direct</a>" },
+    };
+    try std.testing.expectError(error.UnsafeHttpTarget, parseRemoteEndpoint(allocator, &scheme_relative_cols));
+
+    try std.testing.expectError(error.InvalidDownloadUrl, makeSubtitlesListUrl(allocator, ".attacker.example/movies/x"));
+    try std.testing.expectError(error.InvalidDownloadUrl, makeSubtitlesListUrl(allocator, "@attacker.example/movies/x"));
+
+    try std.testing.expectError(error.InvalidDownloadUrl, normalizePublicDownloadUrl(allocator, "file:///tmp/subtitle.zip"));
+    try std.testing.expectError(error.UnsafeHttpTarget, normalizePublicDownloadUrl(allocator, "http://127.0.0.1/subtitle.zip"));
+    try std.testing.expectError(error.UnsafeHttpTarget, normalizePublicDownloadUrl(allocator, "http://169.254.169.254/latest/meta-data"));
+    try std.testing.expectError(error.UnsafeHttpTarget, normalizePublicDownloadUrl(allocator, "https://user:pass@cdn.opensubtitles.com/subtitle.zip"));
 }
 
 test "live opensubtitles.com search and resolve" {

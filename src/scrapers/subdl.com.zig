@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 const user_agent = "scrape-subdl.com/0.1 (+https://subdl.com)";
 const api_base = "https://api3.subdl.com";
 const site = "https://subdl.com";
+const download_site = "https://dl.subdl.com";
 
 pub const Error = error{
     UnexpectedHttpStatus,
@@ -270,7 +271,7 @@ pub const Scraper = struct {
             const entry_obj = try asObject(entry);
             const media_type_text = try getRequiredString(entry_obj, "type");
             const media_type = MediaType.fromString(media_type_text) orelse continue;
-            const link = try getRequiredString(entry_obj, "link");
+            const link = try resolveProviderLink(a, try getRequiredString(entry_obj, "link"));
 
             try items.append(a, .{
                 .media_type = media_type,
@@ -342,11 +343,11 @@ pub const Scraper = struct {
     };
 
     fn fetchSubtitlePage(self: *Scraper, link: []const u8, season_slug: ?[]const u8) !PageParseResult {
-        const parsed = try parseSubtitleLink(link);
-
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+        const normalized_link = try resolveProviderLink(a, link);
+        const parsed = try parseSubtitleLink(normalized_link);
 
         const path = if (season_slug) |season|
             try std.fmt.allocPrint(a, "/subtitle/{s}/{s}/{s}", .{ parsed.subdl_id, parsed.slug, season })
@@ -369,6 +370,7 @@ pub const Scraper = struct {
     }
 
     fn fetchBytes(self: *Scraper, allocator: Allocator, url: []const u8, accept: []const u8) ![]u8 {
+        try validateFetchEndpoint(url);
         const headers = [_]std.http.Header{
             .{ .name = "accept", .value = accept },
             .{ .name = "user-agent", .value = user_agent },
@@ -379,6 +381,7 @@ pub const Scraper = struct {
             .extra_headers = &headers,
             .max_attempts = 3,
             .retry_initial_backoff_ms = 400,
+            .require_public_origin = true,
         });
         if (response.status != .ok) {
             allocator.free(response.body);
@@ -387,6 +390,30 @@ pub const Scraper = struct {
         return response.body;
     }
 };
+
+fn resolveProviderLink(allocator: Allocator, href: []const u8) ![]const u8 {
+    const resolved = try common.resolveUrl(allocator, site, href);
+    errdefer allocator.free(resolved);
+    try validateProviderEndpoint(resolved);
+    return resolved;
+}
+
+fn validateProviderEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+}
+
+fn validateFetchEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (try common.sameOrigin(site, url)) return;
+    if (try common.sameOrigin(api_base, url)) return;
+    return error.UnsafeHttpTarget;
+}
+
+fn validateDownloadEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(download_site, url))) return error.UnsafeHttpTarget;
+}
 
 pub fn resolveProjectSearchLanguageCode(language_or_code: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, language_or_code, " \t\r\n");
@@ -446,7 +473,7 @@ fn parseHtmlTitleInfo(
     return .{
         .media_type = if (std.mem.indexOf(u8, body, "\"@type\":\"TVSeries\"") != null) .tv else .movie,
         .sd_id = std.fmt.parseInt(i64, path.subdl_id[2..], 10) catch 0,
-        .slug = path.slug,
+        .slug = try allocator.dupe(u8, path.slug),
         .name = parsed_name.name,
         .second_name = parsed_name.name,
         .poster_url = poster,
@@ -513,6 +540,7 @@ fn parseHtmlLanguages(
             const detail_path = if (detail_anchor) |node| common.getAttributeValueSafe(node, "href") orelse "" else "";
             const download_anchor = row.queryOne("a[href*='dl.subdl.com/subtitle/']");
             const download_url = if (download_anchor) |node| common.getAttributeValueSafe(node, "href") orelse "" else "";
+            if (download_url.len != 0) try validateDownloadEndpoint(download_url);
             const author_anchor = row.queryOne("a[href^='/u/']");
             const author = if (author_anchor) |node| try common.innerTextTrimmedOwned(allocator, node) else "";
             const download_prefix = "https://dl.subdl.com/subtitle/";
@@ -529,7 +557,7 @@ fn parseHtmlLanguages(
                 .season = common.parseAttrInt(row, "data-season", i64) orelse 0,
                 .episode = common.parseAttrInt(row, "data-episode-from", i64) orelse 0,
                 .title = title,
-                .extra = if (detail_path.len == 0) "" else try std.fmt.allocPrint(allocator, "{s}{s}", .{ site, detail_path }),
+                .extra = if (detail_path.len == 0) "" else try resolveProviderLink(allocator, detail_path),
                 .enabled = download_url.len != 0,
                 .n_id = downloadId(download_url),
                 .downloads = 0,
@@ -654,6 +682,14 @@ test "parse subtitle link" {
     try std.testing.expectEqualStrings("english", parsed.lang_slug.?);
 }
 
+test "subdl rejects unsafe provider, API, and download endpoints" {
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderLink(std.testing.allocator, "http://127.0.0.1/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderLink(std.testing.allocator, "https://user:pass@subdl.com/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderLink(std.testing.allocator, "https://subdl.com.evil.com/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateFetchEndpoint("https://api3.subdl.com.evil.com/search"));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateDownloadEndpoint("https://dl.subdl.com.evil.com/subtitle/1.zip"));
+}
+
 fn expectNonEmptySubtitles(languages: []const LanguageSubtitles) !void {
     try std.testing.expect(languages.len > 0);
 
@@ -765,6 +801,20 @@ test "current html page parsing extracts title seasons and rich subtitle rows" {
     try std.testing.expect(subtitle.hearing_impaired);
     try std.testing.expectEqualStrings("560930-2216904.zip", subtitle.link);
     try std.testing.expectEqualStrings("2216904", subtitle.n_id);
+}
+
+test "subdl title slug survives changes to the caller link" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fixture = "<html><body><h1>The Matrix (1999)</h1></body></html>";
+    var page = try common.parseHtmlStable(a, fixture);
+    defer page.deinit();
+    var caller_link = "/subtitle/sd21581/the-matrix".*;
+    const path = try Scraper.parseSubtitleLink(&caller_link);
+    const title = try parseHtmlTitleInfo(a, &page.doc, fixture, path, 0);
+    @memset(&caller_link, 'x');
+    try std.testing.expectEqualStrings("the-matrix", title.slug);
 }
 
 test "resolve project search language code accepts names and codes" {

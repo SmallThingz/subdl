@@ -52,6 +52,7 @@ pub const Scraper = struct {
             .accept = "text/html",
             .allow_non_ok = true,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         // This endpoint commonly returns 500 with usable HTML.
         _ = response.status;
@@ -69,7 +70,7 @@ pub const Scraper = struct {
             if (std.mem.indexOf(u8, href, "/movie-") == null or !std.mem.endsWith(u8, href, ".html")) continue;
             const text = try common.innerTextTrimmedOwned(a, anchor);
             if (text.len == 0) continue;
-            const link = try common.resolveUrl(a, site, href);
+            const link = try resolveProviderUrl(a, href);
             if (seen.contains(link)) continue;
             try seen.put(a, link, {});
             try items.append(a, .{ .title = text, .link = link });
@@ -104,7 +105,12 @@ pub const Scraper = struct {
         const started_ns = if (debug_timing) common.compatNanoTimestamp() else 0;
         if (debug_timing) std.debug.print("[moviesubtitles.org] subtitles start url={s}\n", .{movie_link});
 
-        const response = try common.fetchBytes(self.client, a, movie_link, .{ .accept = "text/html", .max_attempts = 2 });
+        try validateProviderEndpoint(movie_link);
+        const response = try common.fetchBytes(self.client, a, movie_link, .{
+            .accept = "text/html",
+            .max_attempts = 2,
+            .require_public_origin = true,
+        });
         var parsed = try common.parseHtmlStable(a, response.body);
 
         const title = blk: {
@@ -121,7 +127,7 @@ pub const Scraper = struct {
             total_detail_anchors += 1;
             const detail_href = common.getAttributeValueSafe(detail_anchor, "href") orelse continue;
             if (std.mem.indexOf(u8, detail_href, "subtitle-") == null) continue;
-            const details_url = try common.resolveUrl(a, site, detail_href);
+            const details_url = try resolveProviderUrl(a, detail_href);
             if (seen_details.contains(details_url)) continue;
             try seen_details.put(a, details_url, {});
 
@@ -198,7 +204,7 @@ fn appendSearchItemsFromRawHtml(allocator: Allocator, html_body: []const u8, ite
         const text_end = std.mem.indexOfScalarPos(u8, html_body, text_start, '<') orelse break;
         const title = std.mem.trim(u8, html_body[text_start..text_end], " \t\r\n");
 
-        const link = try common.resolveUrl(allocator, site, href);
+        const link = try resolveProviderUrl(allocator, href);
         if (seen.contains(link)) {
             pos = text_end;
             continue;
@@ -208,6 +214,18 @@ fn appendSearchItemsFromRawHtml(allocator: Allocator, html_body: []const u8, ite
 
         pos = text_end;
     }
+}
+
+fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+    const resolved = try common.resolveUrl(allocator, site, href);
+    errdefer allocator.free(resolved);
+    try validateProviderEndpoint(resolved);
+    return resolved;
+}
+
+fn validateProviderEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
 }
 
 fn findAncestorWithStyleFragment(node: HtmlNode, style_fragment: []const u8) ?HtmlNode {
@@ -245,6 +263,12 @@ test "moviesubtitles.org detail url rewrite" {
     const out = detailToDownloadUrl(allocator, src) orelse return error.TestUnexpectedResult;
     defer allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "/download-") != null);
+}
+
+test "moviesubtitles.org rejects unsafe provider links before fetch" {
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "http://127.0.0.1/movie-1.html"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://user:pass@www.moviesubtitles.org/movie-1.html"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://www.google.com/movie-1.html"));
 }
 
 test "live moviesubtitles.org search and subtitles" {

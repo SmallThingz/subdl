@@ -45,6 +45,7 @@ pub const Scraper = struct {
         const response = try common.fetchBytes(self.client, a, url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         var parsed = try common.parseHtmlStable(a, response.body);
@@ -65,11 +66,13 @@ pub const Scraper = struct {
                 parseOptionalInt(try common.innerTextTrimmedOwned(a, node))
             else
                 null;
+            const page_url = try common.resolveUrl(a, site, href);
+            common.validatePublicHttpUrl(page_url) catch continue;
 
             try items.append(a, .{
                 .title = title,
                 .language_code = language_code,
-                .page_url = try common.resolveUrl(a, site, href),
+                .page_url = page_url,
                 .download_url = try std.fmt.allocPrint(a, "{s}/getp.php?id={s}", .{ download_site, subtitle_id }),
                 .downloads = downloads,
             });
@@ -83,6 +86,9 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        try common.validatePublicHttpUrl(item.page_url);
+        try validateDownloadUrl(item.download_url);
+
         const filename = try a.dupe(u8, item.title);
         const subtitles = try a.alloc(SubtitleItem, 1);
         subtitles[0] = .{
@@ -94,6 +100,12 @@ pub const Scraper = struct {
         return .{ .arena = arena, .subtitles = subtitles };
     }
 };
+
+fn validateDownloadUrl(url: []const u8) !void {
+    const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
+    if (uri.user != null or uri.password != null) return error.InvalidDownloadUrl;
+    if (!(common.sameOrigin(download_site, url) catch false)) return error.InvalidDownloadUrl;
+}
 
 fn languageFromFlag(allocator: Allocator, src: []const u8) !?[]const u8 {
     const slash = std.mem.lastIndexOfScalar(u8, src, '/') orelse return null;
@@ -137,10 +149,12 @@ fn parseSearchFixture(allocator: Allocator, body: []const u8) ![]const SearchIte
             try languageFromFlag(allocator, common.getAttributeValueSafe(img, "src") orelse "")
         else
             null;
+        const page_url = try common.resolveUrl(allocator, site, href);
+        common.validatePublicHttpUrl(page_url) catch continue;
         try items.append(allocator, .{
             .title = title,
             .language_code = language_code,
-            .page_url = try common.resolveUrl(allocator, site, href),
+            .page_url = page_url,
             .download_url = try std.fmt.allocPrint(allocator, "{s}/getp.php?id={s}", .{ download_site, subtitle_id }),
             .downloads = null,
         });
@@ -170,6 +184,17 @@ test "greeksubtitles parses result rows" {
     try std.testing.expectEqual(@as(usize, 1), items.len);
     try std.testing.expectEqualStrings("el", items[0].language_code.?);
     try std.testing.expectEqualStrings("https://www.greeksubtitles.info/getp.php?id=196900", items[0].download_url);
+}
+
+test "greeksubtitles restricts generated download targets" {
+    try validateDownloadUrl("https://www.greeksubtitles.info/getp.php?id=1");
+    for ([_][]const u8{
+        "http://127.0.0.1/getp.php?id=1",
+        "https://www.greeksubtitles.info.example/getp.php?id=1",
+        "https://user@www.greeksubtitles.info/getp.php?id=1",
+    }) |url| {
+        try std.testing.expectError(error.InvalidDownloadUrl, validateDownloadUrl(url));
+    }
 }
 
 test "live greeksubtitles movie search" {

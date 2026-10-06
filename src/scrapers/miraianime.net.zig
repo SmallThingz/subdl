@@ -47,6 +47,7 @@ pub const Scraper = struct {
             .accept = "application/json",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
@@ -72,6 +73,7 @@ pub const Scraper = struct {
             const search_title = common.jsonString(obj, "title") orelse continue;
             const page_url = common.jsonString(obj, "url") orelse continue;
             if (anime_id <= 0 or search_title.len == 0 or page_url.len == 0) continue;
+            validateProviderEndpoint(page_url) catch continue;
             inspected += 1;
 
             const detail_url = try std.fmt.allocPrint(a, "{s}/anime/{d}", .{ api, anime_id });
@@ -79,6 +81,7 @@ pub const Scraper = struct {
                 .accept = "application/json",
                 .cache = false,
                 .max_attempts = 2,
+                .require_public_origin = true,
             }) catch continue;
             const detail = try std.json.parseFromSliceLeaky(std.json.Value, a, detail_response.body, .{});
             const detail_obj = switch (detail) {
@@ -130,11 +133,14 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        try validateProviderEndpoint(item.page_url);
+        try validateProviderEndpoint(item.subtitle_page_url);
         const response = try common.fetchBytes(self.client, a, item.subtitle_page_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = item.page_url }},
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         if (response.status != .ok) return error.UnexpectedHttpStatus;
 
@@ -150,6 +156,7 @@ pub const Scraper = struct {
             try seen.put(a, try a.dupe(u8, href), {});
 
             const download_url = try common.resolveUrl(a, site, href);
+            try common.validatePublicHttpUrl(download_url);
             try subtitles.append(a, .{
                 .language_code = "ar",
                 .filename = try filenameFromUrl(a, download_url, item.title),
@@ -164,6 +171,11 @@ pub const Scraper = struct {
         });
     }
 };
+
+fn validateProviderEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+}
 
 fn nestedValue(root: std.json.ObjectMap, path: []const []const u8) ?std.json.Value {
     if (path.len == 0) return null;
@@ -229,6 +241,12 @@ test "miraianime parses anime media kind metadata" {
     try std.testing.expectEqual(@as(?i64, 1), nestedInt(root, &.{ "acf", "basic_data", "episodes" }));
 }
 
+test "miraianime rejects unsafe provider URLs before fetch" {
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("http://127.0.0.1/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("https://user:pass@miraianime.net/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("https://www.google.com/private"));
+}
+
 test "live miraianime movie and tv subtitle packs" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
     if (!common.providerMatchesLiveFilter(common.liveProviderFilter(), "miraianime.net")) return error.SkipZigTest;
@@ -247,6 +265,7 @@ test "live miraianime movie and tv subtitle packs" {
     const movie_download = try common.fetchBytes(&client, std.testing.allocator, movie_subtitles.subtitles[0].download_url, .{
         .accept = "application/zip,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(movie_download.body);
     try std.testing.expect(movie_download.body.len > 4);
@@ -262,6 +281,7 @@ test "live miraianime movie and tv subtitle packs" {
     const tv_download = try common.fetchBytes(&client, std.testing.allocator, tv_subtitles.subtitles[0].download_url, .{
         .accept = "application/zip,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(tv_download.body);
     try std.testing.expect(tv_download.body.len > 4);

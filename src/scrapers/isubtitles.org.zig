@@ -114,6 +114,7 @@ pub const Scraper = struct {
     }
 
     pub fn fetchSubtitlesByMovieLinkWithOptions(self: *Scraper, details_url: []const u8, options: SubtitlesOptions) !SubtitlesResponse {
+        try validateProviderUrl(details_url);
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -157,6 +158,7 @@ pub const Scraper = struct {
                 const download_anchor = row.queryOne("td[data-title='Download'] a[href]") orelse continue;
                 const href = common.getAttributeValueSafe(download_anchor, "href") orelse continue;
                 const download_page_url = try common.resolveUrl(a, site, href);
+                if (!isProviderUrl(download_page_url)) continue;
                 if (seen.contains(download_page_url)) continue;
                 try seen.put(a, download_page_url, {});
 
@@ -202,6 +204,7 @@ pub const Scraper = struct {
     }
 
     fn fetchHtml(self: *Scraper, allocator: Allocator, url: []const u8) !common.HttpResponse {
+        try validateProviderUrl(url);
         const headers = [_]std.http.Header{
             .{ .name = "accept-encoding", .value = "identity" },
             .{ .name = "accept-language", .value = "en-US,en;q=0.8" },
@@ -211,9 +214,21 @@ pub const Scraper = struct {
             .extra_headers = &headers,
             .max_attempts = 2,
             .allow_non_ok = true,
+            .require_public_origin = true,
         });
     }
 };
+
+fn validateProviderUrl(url: []const u8) !void {
+    const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
+    if (uri.user != null or uri.password != null) return error.InvalidDownloadUrl;
+    if (!(common.sameOrigin(site, url) catch false)) return error.InvalidDownloadUrl;
+}
+
+fn isProviderUrl(url: []const u8) bool {
+    validateProviderUrl(url) catch return false;
+    return true;
+}
 
 fn collectSearchItemsFromSelector(
     allocator: Allocator,
@@ -226,6 +241,7 @@ fn collectSearchItemsFromSelector(
     while (anchors.next()) |anchor| {
         const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
         const details_url = try common.resolveUrl(allocator, site, href);
+        if (!isProviderUrl(details_url)) continue;
         if (seen.contains(details_url)) continue;
         try seen.put(allocator, details_url, {});
 
@@ -264,6 +280,7 @@ fn collectSearchItemsFromRawHtml(
         if (raw_title.len == 0) continue;
 
         const details_url = try common.resolveUrl(allocator, site, href);
+        if (!isProviderUrl(details_url)) continue;
         if (seen.contains(details_url)) continue;
         try seen.put(allocator, details_url, {});
 
@@ -366,7 +383,8 @@ fn extractNextPageUrl(allocator: Allocator, doc: *const HtmlDocument, current_ur
     if (doc.queryOne("a[rel='next'][href]")) |a| {
         if (common.getAttributeValueSafe(a, "href")) |href| {
             const resolved = try common.resolveUrl(temp, site, href);
-            if (!std.mem.eql(u8, resolved, current_url)) return try allocator.dupe(u8, resolved);
+            if (isProviderUrl(resolved) and !std.mem.eql(u8, resolved, current_url))
+                return try allocator.dupe(u8, resolved);
         }
     }
 
@@ -377,6 +395,7 @@ fn extractNextPageUrl(allocator: Allocator, doc: *const HtmlDocument, current_ur
     while (anchors.next()) |anchor| {
         const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
         const resolved = try common.resolveUrl(temp, site, href);
+        if (!isProviderUrl(resolved)) continue;
         if (std.mem.eql(u8, resolved, current_url)) continue;
 
         if (pageFromUrl(resolved)) |candidate_page| {
@@ -464,6 +483,18 @@ test "isubtitles split title/year" {
     const b = splitTitleAndYear("No Year Title");
     try std.testing.expectEqualStrings("No Year Title", b.title);
     try std.testing.expect(b.year == null);
+}
+
+test "isubtitles rejects non-provider navigation targets" {
+    try validateProviderUrl("https://isubtitles.org/the-matrix-subtitles");
+    for ([_][]const u8{
+        "http://127.0.0.1/the-matrix-subtitles",
+        "https://isubtitles.org.example/the-matrix-subtitles",
+        "https://user@isubtitles.org/the-matrix-subtitles",
+        "http://isubtitles.org/the-matrix-subtitles",
+    }) |url| {
+        try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl(url));
+    }
 }
 
 test "isubtitles next-link text" {

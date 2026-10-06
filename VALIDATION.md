@@ -1,6 +1,67 @@
 # Scrapers repair and validation
 
-Date: 2026-10-05 (UTC). Host: dc-box. Compiler: Zig 0.16.0.
+Date: 2026-10-06 (Australia/Brisbane). Host: dc-box. Compiler: Zig 0.16.0.
+
+## Current scraper qualification
+
+The final source snapshot passed these deterministic and build gates:
+
+- `zig build test test-http -j1`: 26/26 build steps; 602 tests passed and
+  125 network-gated tests skipped (727 total). All 18 transport cases and
+  28 isolated loopback requests passed; no credentials reached the
+  cross-origin fixture.
+- `zig build test -Doptimize=ReleaseSafe -j1`: 23/23 build steps and the same
+  602/727 test result under safety-enabled optimization.
+- `zig build -Denable-alldriver=true -j1`: 14/14 build steps for optional
+  browser-session support. This is compilation evidence, not CAPTCHA completion.
+- `zig build build-all-targets -j1`: 57/57 build steps for x86-64 and ARM64
+  Linux GNU, x86-64 Windows GNU, and x86-64 and ARM64 macOS. These are compile
+  checks, not foreign-platform runtime tests.
+
+All 45 active providers passed application search, subtitle listing, and real
+file downloads on the final unchanged source, including TV selection where
+advertised. This qualification combines the full sweep and isolated reruns:
+
+- `zig build test-live-active -Dtarget=aarch64-linux-gnu -Dlive-max-jobs=4
+  -j1` started and completed all 45 providers; 41 passed. Kitsunekko, Subsunacs,
+  and Subclub encountered `NameServerFailure`; Closed Caption Browser exceeded
+  its test deadline. The convenience target ignored the deliberately foreign
+  outer target and an ambient filter naming an inactive provider, as documented.
+- Each of those four providers then passed `zig build test-live -Dlive=all
+  -Dlive-providers=<provider> -Dlive-timeout-seconds=120 -j1` individually.
+  Source and HEAD hashes matched across the sweep and reruns. Normal resolver
+  and HTTP probes confirmed recovery; no resolver settings were changed.
+
+SubHD passed movie and TV downloads through its official prepare/temporary-page/
+download API sequence. Its inferred CDN shortcut was removed. Subtitri's public
+uCoz cookie redirect, SubCentral's legacy HTTP attachment link, and AnimeKalesi's
+public CDN redirect also completed. Critique findings were repaired and covered
+by regressions for session polling/reuse, cookie scope, bounded refresh, terminal
+rate limits, response ownership, body-size limits, and season-aware filenames.
+
+All 53 retained implementations were also probed earlier in this audit. The
+eight inactive providers remained unavailable because of upstream DNS failures, HTTP/access-block
+responses, or a stalled endpoint; they remain recovery probes rather than being
+advertised by the CLI/TUI. An earlier AnimeKalesi run reported
+`CloudflareChallenge` before its browser-session handoff was added. Deterministic
+tests cover handoff and bounded refresh; a browser-enabled live retry completed
+the normal public download path without presenting a challenge. Actual manual
+CAPTCHA completion was not verified. No CAPTCHA solver or access-block bypass
+was added. Passive Cloudflare background scripts are distinguished from actual
+challenge pages.
+
+Current logs are under `.tmp/audit-20261006/`: `qualification-final-r4-*` records
+the deterministic/build gates and full fanout; `live-recovery-final-*` records
+the four successful isolated reruns. Child exit codes and source hashes are
+preserved alongside both successful and failed attempts. Downloaded provider
+payloads are not committed.
+
+## Earlier qualification
+
+The remaining sections preserve evidence from the earlier repair snapshot.
+Their counts and provider availability are historical; consult the current
+registry and README for the active provider set and reproduce the current gates
+above when qualifying another snapshot.
 
 ## Scope
 
@@ -66,7 +127,7 @@ reviewed runtime/CLI/TUI/help and transport/cache/archive/ownership/build scopes
 This is bounded source review and executed-test evidence, not a claim that an
 arbitrary future input or changing third-party website cannot expose a bug.
 
-## Live provider results
+## Earlier live provider results
 
 Two full sweeps covered all 53 retained implementations, with bounded concurrency
 and subprocess deadlines. The second sweep had 41 zero-exit jobs. Follow-up runs
@@ -89,9 +150,10 @@ Eight external failures remain in this environment:
 | my-subs.co | DNS NameServerFailure |
 | subclub.eu | DNS NameServerFailure |
 
-These results establish conditions during this run, not permanent retirement.
-No provider was disabled merely to hide a failed qualification. No CAPTCHA was
-solved and no regional block was bypassed. Windows/macOS/ARM64 runtime execution
+These results establish conditions during that run, not permanent retirement.
+At that snapshot no provider was disabled merely to hide a failed qualification.
+The current registry keeps eight unavailable providers inactive with recovery probes.
+No CAPTCHA was solved and no regional block was bypassed. Windows/macOS/ARM64 runtime execution
 was not available on this Linux host; their binaries were cross-compiled.
 
 ## Evidence and limits

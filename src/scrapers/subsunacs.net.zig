@@ -44,6 +44,7 @@ pub const Scraper = struct {
             .extra_headers = &headers,
             .max_attempts = 2,
             .cache = false,
+            .require_public_origin = true,
         });
 
         return parseSearchHtml(common.takeArena(&arena), response.body);
@@ -53,6 +54,8 @@ pub const Scraper = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+        try validateProviderEndpoint(item.page_url);
+        try validateProviderEndpoint(item.download_page_url);
 
         const headers = [_]std.http.Header{.{ .name = "referer", .value = search_url }};
         const response = try common.fetchBytes(self.client, a, item.download_page_url, .{
@@ -60,6 +63,7 @@ pub const Scraper = struct {
             .extra_headers = &headers,
             .max_attempts = 2,
             .cache = false,
+            .require_public_origin = true,
         });
 
         var parsed = try common.parseHtmlStable(a, response.body);
@@ -71,7 +75,7 @@ pub const Scraper = struct {
             if (!isSubtitleFilename(filename)) continue;
             try subtitles.append(a, .{
                 .filename = filename,
-                .download_url = try common.resolveUrl(a, site, href),
+                .download_url = try resolveProviderUrl(a, href),
             });
         }
 
@@ -98,7 +102,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8) !SearchResp
         const title = try common.innerTextTrimmedOwned(a, anchor);
         if (title.len == 0) continue;
 
-        const page_url = try common.resolveUrl(a, site, href);
+        const page_url = try resolveProviderUrl(a, href);
         if (seen.contains(page_url)) continue;
         try seen.put(a, page_url, {});
 
@@ -156,6 +160,24 @@ fn isSubtitleFilename(filename: []const u8) bool {
     return false;
 }
 
+fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+    const resolved = try common.resolveUrl(allocator, site, href);
+    errdefer allocator.free(resolved);
+    try validateProviderEndpoint(resolved);
+    return resolved;
+}
+
+fn validateProviderEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+}
+
+test "subsunacs rejects unsafe provider links" {
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "http://127.0.0.1/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://user:pass@subsunacs.net/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://subsunacs.net.evil.com/private"));
+}
+
 test "subsunacs parses movie search and direct entries" {
     const search_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     var search = try parseSearchHtml(search_arena,
@@ -190,6 +212,7 @@ test "live subsunacs movie search, listing and download" {
     const response = try common.fetchBytes(&client, std.testing.allocator, subtitles.subtitles[0].download_url, .{
         .accept = "text/plain,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(response.body);
     try std.testing.expect(response.body.len > 32);

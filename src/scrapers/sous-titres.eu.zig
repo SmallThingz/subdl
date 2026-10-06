@@ -42,6 +42,7 @@ pub const Scraper = struct {
             .accept = "text/html,application/xhtml+xml,*/*",
             .extra_headers = &headers,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         return parseSearchHtml(common.takeArena(&arena), response.body, trimmed);
@@ -52,11 +53,13 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        try validateProviderEndpoint(item.page_url);
         const headers = [_]std.http.Header{.{ .name = "referer", .value = site ++ "/" }};
         const response = try common.fetchBytes(self.client, a, item.page_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .extra_headers = &headers,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         var parsed = try common.parseHtmlStable(a, response.body);
@@ -77,10 +80,11 @@ pub const Scraper = struct {
             else
                 null;
 
+            const download_url = try resolveProviderUrl(a, section, href);
             try subtitles.append(a, .{
                 .language_code = language_code,
                 .filename = filename,
-                .download_url = try common.resolveUrl(a, section, href),
+                .download_url = download_url,
             });
         }
 
@@ -123,7 +127,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
         const item: SearchItem = .{
             .title = title,
             .media_kind = media_kind,
-            .page_url = try common.resolveUrl(a, site, href),
+            .page_url = try resolveProviderUrl(a, site, href),
         };
         const normalized = try common.normalizeTitle(a, title);
         if (std.mem.eql(u8, normalized, wanted))
@@ -136,6 +140,18 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     try items.appendSlice(a, exact.items);
     try items.appendSlice(a, other.items);
     return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) });
+}
+
+fn resolveProviderUrl(allocator: Allocator, base: []const u8, href: []const u8) ![]const u8 {
+    const resolved = try common.resolveUrl(allocator, base, href);
+    errdefer allocator.free(resolved);
+    try validateProviderEndpoint(resolved);
+    return resolved;
+}
+
+fn validateProviderEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
 }
 
 fn hasClassToken(classes: []const u8, token: []const u8) bool {
@@ -163,6 +179,12 @@ test "sous-titres parses exact movie and series rows" {
     try std.testing.expectEqualStrings("https://www.sous-titres.eu/series/chernobyl.html", response.items[0].page_url);
 }
 
+test "sous-titres rejects unsafe provider links before fetch" {
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, site, "http://127.0.0.1/private.zip"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, site, "https://user:pass@www.sous-titres.eu/private.zip"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, site, "https://www.google.com/private.zip"));
+}
+
 test "live sous-titres movie and tv downloads" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
     if (!common.providerMatchesLiveFilter(common.liveProviderFilter(), "sous-titres.eu")) return error.SkipZigTest;
@@ -182,6 +204,7 @@ test "live sous-titres movie and tv downloads" {
     const movie_download = try common.fetchBytes(&client, std.testing.allocator, movie_subtitles.subtitles[0].download_url, .{
         .accept = "application/zip,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(movie_download.body);
     try std.testing.expect(movie_download.body.len > 4);

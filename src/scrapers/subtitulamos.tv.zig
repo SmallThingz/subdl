@@ -56,6 +56,7 @@ pub const Scraper = struct {
             .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = site ++ "/" }},
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         const hit = try chooseShow(a, search_response.body, trimmed) orelse
@@ -66,6 +67,7 @@ pub const Scraper = struct {
             .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = site ++ "/" }},
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         var items: std.ArrayListUnmanaged(SearchItem) = .empty;
@@ -83,12 +85,13 @@ pub const Scraper = struct {
             );
         } else {
             for (seasons[0..@min(seasons.len, max_seasons)]) |season_choice| {
-                const season_url = try common.resolveUrl(a, site, season_choice.href);
+                const season_url = try resolveProviderUrl(a, season_choice.href);
                 const season_page = try common.fetchBytes(self.client, a, season_url, .{
                     .accept = "text/html,application/xhtml+xml,*/*",
                     .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = show_url }},
                     .cache = false,
                     .max_attempts = 2,
+                    .require_public_origin = true,
                 });
                 try appendEpisodesFromPage(
                     a,
@@ -112,11 +115,14 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        try validateProviderUrl(item.page_url);
+
         const response = try common.fetchBytes(self.client, a, item.page_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = site ++ "/" }},
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         const subtitles = try parseEpisodeSubtitles(a, response.body, item);
@@ -203,7 +209,7 @@ fn appendEpisodesFromPage(
     const episodes = try parseChoices(allocator, body, "episode-choices");
     for (episodes) |choice| {
         if (out.items.len >= max_episodes) break;
-        const page_url = try common.resolveUrl(allocator, site, choice.href);
+        const page_url = try resolveProviderUrl(allocator, choice.href);
         if (seen.contains(page_url)) continue;
         try seen.put(allocator, page_url, {});
         try out.append(allocator, .{
@@ -249,7 +255,7 @@ fn parseEpisodeSubtitles(allocator: Allocator, body: []const u8, item: SearchIte
         if (seen.contains(href)) continue;
         try seen.put(allocator, try allocator.dupe(u8, href), {});
 
-        const download_url = try common.resolveUrl(allocator, site, href);
+        const download_url = try resolveProviderUrl(allocator, href);
         const id = subtitleIdFromHref(href) orelse "subtitle";
         const slugged = try common.asciiSlug(allocator, item.title);
         try out.append(allocator, .{
@@ -336,6 +342,18 @@ fn jsonInt(value: std.json.Value) ?i64 {
     };
 }
 
+fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+    const resolved = try common.resolveUrl(allocator, site, href);
+    errdefer allocator.free(resolved);
+    try validateProviderUrl(resolved);
+    return resolved;
+}
+
+fn validateProviderUrl(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+}
+
 test "subtitulamos parses search hit and direct subtitle href" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -350,6 +368,16 @@ test "subtitulamos parses search hit and direct subtitle href" {
     try std.testing.expectEqualStrings("/subtitles/11767/download", findDownloadHref(
         "<div class=\"version-container\"><a rel=\"nofollow\" href=\"/subtitles/11767/download\"><div class=\"download-button\"></div></a></div>",
     ).?);
+}
+
+test "subtitulamos rejects unsafe provider urls before fetch" {
+    for ([_][]const u8{
+        "http://127.0.0.1/subtitles/1/download",
+        "https://user@www.subtitulamos.tv/subtitles/1/download",
+        "https://www.subtitulamos.tv.attacker.example/subtitles/1/download",
+    }) |url| {
+        try std.testing.expectError(error.UnsafeHttpTarget, validateProviderUrl(url));
+    }
 }
 
 test "live subtitulamos tv search and direct download" {
@@ -374,6 +402,7 @@ test "live subtitulamos tv search and direct download" {
         .accept = "text/plain,text/srt,*/*",
         .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = search.items[0].page_url }},
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(download.body);
     try std.testing.expect(download.body.len > 32);

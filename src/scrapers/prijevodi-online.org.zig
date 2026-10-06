@@ -44,6 +44,7 @@ pub const Scraper = struct {
             .accept = "application/json",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
@@ -114,6 +115,7 @@ pub const Scraper = struct {
             .accept = "application/json",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
@@ -208,6 +210,7 @@ test "live prijevodi online tv search listing and download" {
     const download = try common.fetchBytes(&client, std.testing.allocator, subtitles.subtitles[0].download_url, .{
         .accept = "application/zip,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(download.body);
     try std.testing.expect(download.body.len > 4);

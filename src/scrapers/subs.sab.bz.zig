@@ -69,6 +69,7 @@ pub const Scraper = struct {
                 .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = site ++ "/" }},
                 .cache = false,
                 .max_attempts = 3,
+                .require_public_origin = true,
             });
             try appendSearchRows(a, response.body, trimmed, language.language_code, &seen, &exact, &partial);
         }
@@ -108,6 +109,7 @@ pub const Scraper = struct {
             .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = search_url }},
             .cache = false,
             .max_attempts = 3,
+            .require_public_origin = true,
         });
         if (response.status != .ok) {
             allocator.free(response.body);
@@ -131,6 +133,12 @@ pub fn parseDownloadToken(value: []const u8) ?[]const u8 {
     if (attach_id.len == 0) return null;
     for (attach_id) |c| if (!std.ascii.isDigit(c)) return null;
     return attach_id;
+}
+
+test "subs sab download tokens reject URL injection" {
+    try std.testing.expect(parseDownloadToken(download_token_prefix ++ "http://127.0.0.1/private") == null);
+    try std.testing.expect(parseDownloadToken(download_token_prefix ++ "https://user:pass@subs.sab.bz/private") == null);
+    try std.testing.expect(parseDownloadToken(download_token_prefix ++ "https://subs.sab.bz.evil.com/private") == null);
 }
 
 fn appendSearchRows(

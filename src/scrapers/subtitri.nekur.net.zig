@@ -52,6 +52,7 @@ pub const Scraper = struct {
             .allow_non_ok = true,
             .cache = false,
             .max_attempts = 3,
+            .require_public_origin = true,
         });
 
         // Nekur currently emits a complete search table with HTTP 500. Keep
@@ -69,6 +70,9 @@ pub const Scraper = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+
+        try validateProviderUrl(item.page_url);
+        try validateProviderUrl(item.download_url);
 
         const subtitles = try a.alloc(SubtitleItem, 1);
         subtitles[0] = .{
@@ -103,7 +107,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
 
         const split = common.splitTrailingYear(raw_title);
         const title = try a.dupe(u8, split.title);
-        const page_url = try common.resolveUrl(a, site, href);
+        const page_url = try resolveProviderUrl(a, href);
 
         const imdb_id = blk: {
             var cells = row.queryAll("td");
@@ -162,6 +166,18 @@ fn hasSearchTable(body: []const u8) bool {
         std.mem.indexOf(u8, body, "<tbody") != null;
 }
 
+fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+    const resolved = try common.resolveUrl(allocator, site, href);
+    errdefer allocator.free(resolved);
+    try validateProviderUrl(resolved);
+    return resolved;
+}
+
+fn validateProviderUrl(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+}
+
 test "nekur parses exact movie result" {
     const arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     var response = try parseSearchHtml(
@@ -192,6 +208,16 @@ test "nekur recognizes valid search table on upstream error response" {
     try std.testing.expect(!hasSearchTable("<html><h1>Internal Server Error</h1></html>"));
 }
 
+test "nekur rejects unsafe provider urls before fetch" {
+    for ([_][]const u8{
+        "http://127.0.0.1/file.zip",
+        "https://user@subtitri.nekur.net/file.zip",
+        "https://subtitri.nekur.net.attacker.example/file.zip",
+    }) |url| {
+        try std.testing.expectError(error.UnsafeHttpTarget, validateProviderUrl(url));
+    }
+}
+
 test "live nekur movie download" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
     if (!common.providerMatchesLiveFilter(common.liveProviderFilter(), "subtitri.nekur.net")) return error.SkipZigTest;
@@ -209,6 +235,7 @@ test "live nekur movie download" {
     const download = try common.fetchBytes(&client, std.testing.allocator, subtitles.subtitles[0].download_url, .{
         .accept = "application/zip,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(download.body);
     try std.testing.expect(download.body.len > 4);

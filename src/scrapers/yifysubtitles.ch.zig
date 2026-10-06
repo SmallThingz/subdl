@@ -43,6 +43,7 @@ pub const Scraper = struct {
         const response = try common.fetchBytes(self.client, a, url, .{
             .accept = "application/json",
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
@@ -77,10 +78,13 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        try validateProviderUrl(movie_page_url);
+
         const response = try common.fetchBytes(self.client, a, movie_page_url, .{
             .accept = "text/html",
             .max_attempts = 2,
             .cache = false,
+            .require_public_origin = true,
         });
         if (response.body.len == 0) return error.UnexpectedHttpStatus;
         var parsed = try common.parseHtmlStable(a, response.body);
@@ -93,9 +97,7 @@ pub const Scraper = struct {
 
         var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
         var rows = parsed.doc.queryAll("table tbody tr");
-        var had_rows = false;
         while (rows.next()) |row| {
-            had_rows = true;
             const lang = if (row.queryOne("span.sub-lang")) |lang_node|
                 try common.innerTextTrimmedOwned(a, lang_node)
             else
@@ -106,7 +108,7 @@ pub const Scraper = struct {
             else
                 continue;
 
-            const details_url = try common.resolveUrl(a, site, details_href);
+            const details_url = try resolveProviderUrl(a, details_href);
             const zip_url = try subtitleToZipUrl(a, details_url);
 
             const release_text = if (row.queryOne("a > span.text-muted")) |release_node|
@@ -134,14 +136,14 @@ pub const Scraper = struct {
             });
         }
 
-        if (!had_rows) {
+        if (subtitles.items.len == 0) {
             var fallback_rows = parsed.doc.queryAll("table tr");
             while (fallback_rows.next()) |row| {
                 const details_href = if (row.queryOne("a[href*='/subtitles/']")) |details_anchor|
                     details_anchor.getAttributeValue("href") orelse continue
                 else
                     continue;
-                const details_url = try common.resolveUrl(a, site, details_href);
+                const details_url = try resolveProviderUrl(a, details_href);
                 const zip_url = try subtitleToZipUrl(a, details_url);
                 try subtitles.append(a, .{
                     .language = "",
@@ -162,23 +164,60 @@ pub const Scraper = struct {
     }
 
     fn subtitleToZipUrl(allocator: Allocator, details_url: []const u8) ![]const u8 {
+        try validateProviderUrl(details_url);
+        const suffix_start = std.mem.indexOfAny(u8, details_url, "?#") orelse details_url.len;
+        const path = std.mem.trimEnd(u8, details_url[0..suffix_start], "/");
         const marker = "/subtitles/";
-        const idx = std.mem.indexOf(u8, details_url, marker) orelse return error.InvalidDownloadUrl;
+        const idx = std.mem.indexOf(u8, path, marker) orelse return error.InvalidDownloadUrl;
+        if (idx + marker.len >= path.len) return error.InvalidDownloadUrl;
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
         try buf.appendSlice(allocator, details_url[0..idx]);
         try buf.appendSlice(allocator, "/subtitle/");
-        try buf.appendSlice(allocator, details_url[idx + marker.len ..]);
+        try buf.appendSlice(allocator, path[idx + marker.len ..]);
         try buf.appendSlice(allocator, ".zip");
-        return try buf.toOwnedSlice(allocator);
+        try buf.appendSlice(allocator, details_url[suffix_start..]);
+        const url = try buf.toOwnedSlice(allocator);
+        errdefer allocator.free(url);
+        try validateProviderUrl(url);
+        return url;
     }
 };
+
+fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+    const resolved = try common.resolveUrl(allocator, site, href);
+    errdefer allocator.free(resolved);
+    try validateProviderUrl(resolved);
+    return resolved;
+}
+
+fn validateProviderUrl(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+}
 
 test "yify zip url" {
     const allocator = std.testing.allocator;
     const url = try Scraper.subtitleToZipUrl(allocator, "https://yifysubtitles.ch/subtitles/the-matrix-english-yify-100");
     defer allocator.free(url);
     try std.testing.expectEqualStrings("https://yifysubtitles.ch/subtitle/the-matrix-english-yify-100.zip", url);
+}
+
+test "yify zip URL preserves query and fragment after extension" {
+    const url = try Scraper.subtitleToZipUrl(std.testing.allocator, "https://yifysubtitles.ch/subtitles/title/?download=1#file");
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings("https://yifysubtitles.ch/subtitle/title.zip?download=1#file", url);
+    try std.testing.expectError(error.InvalidDownloadUrl, Scraper.subtitleToZipUrl(std.testing.allocator, "https://yifysubtitles.ch/subtitles/?download=1"));
+}
+
+test "yify rejects unsafe provider urls before fetch" {
+    for ([_][]const u8{
+        "http://127.0.0.1/subtitles/x",
+        "https://user@yifysubtitles.ch/subtitles/x",
+        "https://yifysubtitles.ch.attacker.example/subtitles/x",
+    }) |url| {
+        try std.testing.expectError(error.UnsafeHttpTarget, validateProviderUrl(url));
+    }
 }
 
 test "live yify search and subtitle extraction" {

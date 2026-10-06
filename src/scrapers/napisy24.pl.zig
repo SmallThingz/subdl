@@ -113,6 +113,7 @@ fn fetchSearch(client: *std.http.Client, allocator: Allocator, query: []const u8
     return common.fetchBytes(client, allocator, url, .{
         .accept = "application/xml,text/xml,text/plain,*/*",
         .max_attempts = 2,
+        .require_public_origin = true,
     });
 }
 
@@ -427,6 +428,7 @@ test "live napisy24 movie and tv search plus downloads" {
             .extra_headers = &.{.{ .name = "referer", .value = "https://napisy24.pl/" }},
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         defer std.testing.allocator.free(download.body);
         try std.testing.expect(download.body.len > 32);

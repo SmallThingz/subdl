@@ -42,6 +42,7 @@ pub const Scraper = struct {
         const response = try common.fetchBytes(self.client, a, catalog_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         return parseCatalog(common.takeArena(&arena), response.body, trimmed);
     }
@@ -51,10 +52,13 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        try validateProviderUrl(item.page_url);
+
         const response = try common.fetchBytes(self.client, a, item.page_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = catalog_url }},
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         var parsed = try common.parseHtmlStable(a, response.body);
@@ -84,6 +88,12 @@ pub const Scraper = struct {
         });
     }
 };
+
+fn validateProviderUrl(url: []const u8) !void {
+    const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
+    if (uri.user != null or uri.password != null) return error.InvalidDownloadUrl;
+    if (!(common.sameOrigin(site, url) catch false)) return error.InvalidDownloadUrl;
+}
 
 fn parseCatalog(arena: std.heap.ArenaAllocator, body: []const u8, query: []const u8) !SearchResponse {
     var owned_arena = arena;
@@ -228,6 +238,17 @@ fn isSupportedFile(filename: []const u8) bool {
         std.ascii.endsWithIgnoreCase(filename, ".7z");
 }
 
+test "jimaku rejects non-provider entry targets" {
+    try validateProviderUrl("https://jimaku.cc/entry/440");
+    for ([_][]const u8{
+        "http://127.0.0.1/entry/440",
+        "https://jimaku.cc.example/entry/440",
+        "https://user@jimaku.cc/entry/440",
+    }) |url| {
+        try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl(url));
+    }
+}
+
 test "jimaku parses movie and tv catalog entries" {
     const movie_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     var movie = try parseCatalog(
@@ -269,6 +290,7 @@ test "live jimaku movie and tv direct downloads" {
     const movie_download = try common.fetchBytes(&client, std.testing.allocator, movie_subs.subtitles[0].download_url, .{
         .accept = "text/plain,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(movie_download.body);
     try std.testing.expect(movie_download.body.len > 32);
@@ -283,6 +305,7 @@ test "live jimaku movie and tv direct downloads" {
     const tv_download = try common.fetchBytes(&client, std.testing.allocator, tv_subs.subtitles[0].download_url, .{
         .accept = "text/plain,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(tv_download.body);
     try std.testing.expect(tv_download.body.len > 32);

@@ -2130,6 +2130,7 @@ pub fn fetchSubtitles(allocator: Allocator, client: *std.http.Client, ref: Searc
                 .include_seasons = true,
                 .max_pages = 1,
                 .resolve_download_tokens = false,
+                .auto_cloudflare_session = true,
             });
             defer subtitles.deinit();
             if (subtitles.title.len > 0) title = try a.dupe(u8, subtitles.title);
@@ -3106,6 +3107,7 @@ pub fn downloadSubtitleWithProgressAndOptions(
     defer allocator.free(response.body);
     if (response.status != .ok) return error.UnexpectedHttpStatus;
     const body = response.body;
+    try validateSubtitleDownloadBody(allocator, body);
     const bytes_written = body.len;
 
     const preferred_name = try preferredSubtitleDownloadName(allocator, subtitle, url);
@@ -3308,9 +3310,11 @@ fn downloadSubtitlecatTranslated(
         .accept = "text/plain,*/*",
         .allow_non_ok = true,
         .max_attempts = 2,
+        .require_public_origin = true,
     });
     defer allocator.free(source_response.body);
     if (source_response.status != .ok) return error.UnexpectedHttpStatus;
+    try validateSubtitleDownloadBody(allocator, source_response.body);
 
     const target_lang = languageToGoogleCode(token.target_lang) orelse "";
 
@@ -3625,7 +3629,9 @@ fn resolveDownloadUrlIfNeeded(allocator: Allocator, client: *std.http.Client, do
 
     if (parseSubsourceRemoteToken(download_url)) |details_path| {
         var scraper = subdl.subsource_net.Scraper.init(allocator, client);
-        return try scraper.resolveDownloadUrl(allocator, details_path) orelse error.InvalidDownloadUrl;
+        return try scraper.resolveDownloadUrlWithOptions(allocator, details_path, .{
+            .auto_cloudflare_session = true,
+        }) orelse error.InvalidDownloadUrl;
     }
 
     if (std.mem.indexOf(u8, download_url, "my-subs.co/downloads/") != null) {
@@ -3656,18 +3662,27 @@ fn fetchDownloadBytes(client: *std.http.Client, allocator: Allocator, url: []con
         .extra_headers = provider_headers,
         .allow_non_ok = true,
         .max_attempts = max_attempts,
+        .require_public_origin = true,
     });
 
-    if (primary.status == .ok) return primary;
-    const was_forbidden = primary.status == .forbidden;
+    const was_challenge = cf.isChallengeBody(primary.body);
+    const was_rate_limited = primary.status == .too_many_requests;
+    if (primary.status == .ok and !was_challenge) return primary;
     allocator.free(primary.body);
 
-    if (was_forbidden) {
+    if (was_rate_limited) return error.RateLimited;
+    if (was_challenge) {
         if (cloudflareTargetForUrl(url)) |target| {
             const with_cf = try fetchBytesWithCloudflareSession(client, allocator, url, target.domain, target.challenge_url, "*/*", download_referer);
-            if (with_cf.status == .ok) return with_cf;
+            const still_challenged = cf.isChallengeBody(with_cf.body);
+            if (with_cf.status == .ok and !still_challenged) return with_cf;
+            const retry_rate_limited = with_cf.status == .too_many_requests;
             allocator.free(with_cf.body);
+            if (retry_rate_limited) return error.RateLimited;
+            if (still_challenged) return error.CloudflareChallenge;
+            return error.UnexpectedHttpStatus;
         }
+        return error.CloudflareChallenge;
     }
 
     return error.UnexpectedHttpStatus;
@@ -3687,14 +3702,26 @@ const CloudflareTarget = struct {
 };
 
 fn cloudflareTargetForUrl(url: []const u8) ?CloudflareTarget {
-    if (std.mem.indexOf(u8, url, "opensubtitles.com/") != null) {
+    if (isOpenSubtitlesSessionUrl(url)) {
         return .{
             .domain = "www.opensubtitles.com",
-            .challenge_url = "https://www.opensubtitles.com/",
+            .challenge_url = url,
         };
     }
 
     return null;
+}
+
+fn isOpenSubtitlesSessionUrl(url: []const u8) bool {
+    const uri = std.Uri.parse(url) catch return false;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return false;
+    if (uri.user != null or uri.password != null) return false;
+    if (uri.port) |port| if (port != 443) return false;
+    const host = uri.host orelse return false;
+    const host_bytes = switch (host) {
+        .raw, .percent_encoded => |bytes| bytes,
+    };
+    return std.ascii.eqlIgnoreCase(host_bytes, "www.opensubtitles.com");
 }
 
 fn yifyRefererForUrl(url: []const u8) ?[]const u8 {
@@ -3713,6 +3740,7 @@ fn fetchBytesWithCloudflareSession(
     accept: []const u8,
     referer: ?[]const u8,
 ) !common.HttpResponse {
+    if (!isOpenSubtitlesSessionUrl(url) or !std.ascii.eqlIgnoreCase(domain, "www.opensubtitles.com") or !isOpenSubtitlesSessionUrl(challenge_url)) return error.InvalidDownloadUrl;
     var session = try cf.ensureDomainSession(allocator, .{
         .domain = domain,
         .challenge_url = challenge_url,
@@ -3720,13 +3748,14 @@ fn fetchBytesWithCloudflareSession(
     defer session.deinit(allocator);
 
     const first = try fetchBytesUsingSession(client, allocator, url, accept, referer, session);
-    if (first.status != .forbidden) return first;
+    if (first.status == .too_many_requests or !cf.isChallengeBody(first.body)) return first;
     allocator.free(first.body);
 
     var refreshed = try cf.ensureDomainSession(allocator, .{
         .domain = domain,
         .challenge_url = challenge_url,
         .force_refresh = true,
+        .rejected_generation = session.generation,
     });
     defer refreshed.deinit(allocator);
     return fetchBytesUsingSession(client, allocator, url, accept, referer, refreshed);
@@ -3740,10 +3769,14 @@ fn fetchBytesUsingSession(
     referer: ?[]const u8,
     session: cf.Session,
 ) !common.HttpResponse {
+    // Recheck the destination at the boundary that attaches private cookies.
+    if (!isOpenSubtitlesSessionUrl(url)) return error.InvalidDownloadUrl;
     var headers = std.ArrayList(std.http.Header).empty;
     defer headers.deinit(allocator);
 
-    try headers.append(allocator, .{ .name = "cookie", .value = session.cookie_header });
+    const cookie_header = try session.cookieHeaderForUrl(allocator, url);
+    defer if (cookie_header) |value| allocator.free(value);
+    if (cookie_header) |value| try headers.append(allocator, .{ .name = "cookie", .value = value });
     try headers.append(allocator, .{ .name = "user-agent", .value = session.user_agent });
     if (referer) |value| {
         try headers.append(allocator, .{ .name = "referer", .value = value });
@@ -3754,6 +3787,8 @@ fn fetchBytesUsingSession(
         .extra_headers = headers.items,
         .allow_non_ok = true,
         .max_attempts = 2,
+        .cache = false,
+        .require_public_origin = true,
     });
 }
 
@@ -3763,6 +3798,143 @@ const ArchiveKind = enum {
     rar,
     seven_z,
 };
+
+fn validateSubtitleDownloadBody(allocator: Allocator, body: []const u8) !void {
+    if (cf.isChallengeBody(body)) return error.CloudflareChallenge;
+    if (body.len >= 2 and (std.mem.eql(u8, body[0..2], "\xFF\xFE") or std.mem.eql(u8, body[0..2], "\xFE\xFF"))) {
+        if (body.len % 2 != 0) return error.InvalidDownloadPayload;
+        // Only ASCII structural markers are needed for the UTF-16 probe. Its
+        // allocation is bounded by the HTTP body limit; original bytes are saved.
+        const probe = try allocator.alloc(u8, (body.len - 2) / 2);
+        defer allocator.free(probe);
+        const little_endian = body[0] == 0xFF;
+        for (probe, 0..) |*byte, i| {
+            const pair = body[2 + i * 2 ..][0..2];
+            const low = pair[if (little_endian) 0 else 1];
+            const high = pair[if (little_endian) 1 else 0];
+            byte.* = if (high == 0 and low < 128) low else '?';
+        }
+        return validateSubtitleDownloadBody(allocator, probe);
+    }
+    var text = std.mem.trim(u8, body, " \t\r\n");
+    if (std.mem.startsWith(u8, text, "\xEF\xBB\xBF")) text = std.mem.trim(u8, text[3..], " \t\r\n");
+    if (text.len == 0) return error.InvalidDownloadPayload;
+    if (detectArchiveKind("", "", body) != .none) return;
+    // Binary subtitle formats supported by the file picker.
+    if (body.len >= 13 and std.mem.eql(u8, body[0..2], "PG")) return;
+    if (body.len >= 4 and std.mem.eql(u8, body[0..4], "\x00\x00\x01\xBA")) return;
+    if (common.isAustralianWebsiteBlockPage(text)) return error.ProviderAccessBlocked;
+    var head = text[0..@min(text.len, 4096)];
+    while (std.mem.startsWith(u8, head, "<!--")) {
+        const end = std.mem.indexOf(u8, head, "-->") orelse return error.InvalidDownloadPayload;
+        head = std.mem.trimStart(u8, head[end + 3 ..], " \t\r\n");
+    }
+    if (head.len == 0) return error.InvalidDownloadPayload;
+    const sami = std.ascii.indexOfIgnoreCase(head, "<sami") != null and
+        std.ascii.indexOfIgnoreCase(text, "<sync") != null;
+    const ttml = std.ascii.indexOfIgnoreCase(head, "<tt") != null and
+        std.ascii.indexOfIgnoreCase(text, "<p") != null and
+        std.ascii.indexOfIgnoreCase(text, "begin=") != null;
+    const vobsub_index = std.ascii.indexOfIgnoreCase(head, "vobsub index file") != null and
+        std.ascii.indexOfIgnoreCase(text, "timestamp:") != null and
+        std.ascii.indexOfIgnoreCase(text, "filepos:") != null;
+    if (sami or ttml or vobsub_index) return;
+    for ([_][]const u8{ "<!doctype html", "<html", "<head", "<body", "<title", "<script", "<form", "<div", "<meta" }) |tag| {
+        if (std.ascii.startsWithIgnoreCase(head, tag)) return error.InvalidDownloadPayload;
+    }
+    // JSON objects and object/string arrays are API responses, not subtitles.
+    // Keep bracketed ASS sections and frame-based SUB cues valid.
+    if (text[0] == '{' or text[0] == '[') {
+        const following = std.mem.trimStart(u8, text[1..], " \t\r\n");
+        if (following.len > 0 and (following[0] == '"' or following[0] == '}' or following[0] == ']' or (text[0] == '[' and following[0] == '{'))) return error.InvalidDownloadPayload;
+    }
+    if (tmPlayerSubtitleBody(text)) return;
+    var ass_events = false;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (std.ascii.eqlIgnoreCase(line, "[Events]")) ass_events = true;
+        if (ass_events and std.ascii.startsWithIgnoreCase(line, "Dialogue:") and std.mem.count(u8, line, ",") >= 8) {
+            var fields = std.mem.splitScalar(u8, line["Dialogue:".len..], ',');
+            _ = fields.next() orelse continue;
+            const start = std.mem.trim(u8, fields.next() orelse continue, " \t");
+            const end = std.mem.trim(u8, fields.next() orelse continue, " \t");
+            if (subtitleTimestamp(start) and subtitleTimestamp(end)) return;
+        }
+        if (subtitleTimingLine(line, "-->")) return;
+        if (subtitleTimingLine(line, ",")) return;
+        if (subtitleFrameLine(line, '{', '}') or subtitleFrameLine(line, '[', ']')) return;
+    }
+    return error.InvalidDownloadPayload;
+}
+
+fn tmPlayerSubtitleBody(text: []const u8) bool {
+    const max_body_bytes = 1024 * 1024;
+    const max_body_lines = 20_000;
+    if (text.len > max_body_bytes) return false;
+
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var cue_count: usize = 0;
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) continue;
+        if (cue_count == max_body_lines) return false;
+        if (!tmPlayerCueLine(line)) return false;
+        cue_count += 1;
+    }
+    return cue_count != 0;
+}
+
+fn tmPlayerCueLine(line: []const u8) bool {
+    if (line.len <= 9 or line[2] != ':' or line[5] != ':' or line[8] != ':') return false;
+    if (!subtitleDigits(line[0..2]) or !subtitleDigits(line[3..5]) or !subtitleDigits(line[6..8])) return false;
+    const minutes = std.fmt.parseUnsigned(u8, line[3..5], 10) catch return false;
+    const seconds = std.fmt.parseUnsigned(u8, line[6..8], 10) catch return false;
+    if (minutes >= 60 or seconds >= 60) return false;
+    return std.mem.trim(u8, line[9..], " \t\r").len != 0;
+}
+
+fn subtitleDigits(text: []const u8) bool {
+    if (text.len == 0) return false;
+    for (text) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
+}
+
+fn subtitleTimestamp(text: []const u8) bool {
+    var parts: [3][]const u8 = undefined;
+    var count: usize = 0;
+    var split = std.mem.splitScalar(u8, text, ':');
+    while (split.next()) |part| {
+        if (count == parts.len) return false;
+        parts[count] = part;
+        count += 1;
+    }
+    if (count < 2 or !subtitleDigits(parts[0])) return false;
+    if (count == 3 and (parts[1].len != 2 or !subtitleDigits(parts[1]) or (std.fmt.parseUnsigned(u8, parts[1], 10) catch return false) >= 60)) return false;
+    const seconds = parts[count - 1];
+    const decimal = std.mem.indexOfAny(u8, seconds, ".,") orelse return false;
+    if (decimal != 2 or !subtitleDigits(seconds[0..decimal]) or (std.fmt.parseUnsigned(u8, seconds[0..decimal], 10) catch return false) >= 60) return false;
+    return subtitleDigits(seconds[decimal + 1 ..]);
+}
+
+fn subtitleTimingLine(line: []const u8, separator: []const u8) bool {
+    const divider = std.mem.indexOf(u8, line, separator) orelse return false;
+    const left = std.mem.trim(u8, line[0..divider], " \t");
+    const remaining = std.mem.trimStart(u8, line[divider + separator.len ..], " \t");
+    const right = remaining[0 .. std.mem.indexOfAny(u8, remaining, " \t") orelse remaining.len];
+    return subtitleTimestamp(left) and subtitleTimestamp(right);
+}
+
+fn subtitleFrameLine(line: []const u8, open: u8, close: u8) bool {
+    var remaining = line;
+    for (0..2) |_| {
+        if (remaining.len == 0 or remaining[0] != open) return false;
+        const end = std.mem.indexOfScalar(u8, remaining, close) orelse return false;
+        if (!subtitleDigits(remaining[1..end])) return false;
+        remaining = remaining[end + 1 ..];
+    }
+    return std.mem.trim(u8, remaining, " \t\r").len != 0;
+}
 
 /// Prefer bytes over provider labels; many download endpoints have no extension.
 fn detectArchiveKind(file_name: []const u8, url: []const u8, body: []const u8) ArchiveKind {
@@ -4429,6 +4601,7 @@ test "active provider registry excludes retired providers" {
         "indexsubtitle_cc",
         "sous_titres_eu",
         "cc_edatribe_com",
+        "subtitrari_noi_ro",
         "subclub_eu",
         "subs_ro",
         "subs4free_info",
@@ -4449,6 +4622,7 @@ test "active provider registry excludes retired providers" {
         "thesubtitledb_org",
         "napisy24_pl",
         "nyasub_cz",
+        "subhd_tv",
         "fansubs_ru",
         "legendei_net",
         "zoom_lk",
@@ -4497,7 +4671,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("indexsubtitle.cc") == .indexsubtitle_cc);
     try std.testing.expect(parseProvider("sous-titres.eu") == .sous_titres_eu);
     try std.testing.expect(parseProvider("cc.edatribe.com") == .cc_edatribe_com);
-    try std.testing.expect(parseProvider("subtitrari-noi.ro") == null);
+    try std.testing.expect(parseProvider("subtitrari-noi.ro") == .subtitrari_noi_ro);
     try std.testing.expect(parseProvider("subclub.eu") == .subclub_eu);
     try std.testing.expect(parseProvider("subs.ro") == .subs_ro);
     try std.testing.expect(parseProvider("subs4free.info") == .subs4free_info);
@@ -4518,7 +4692,7 @@ test "parseProvider accepts active dotted/hyphenated provider names" {
     try std.testing.expect(parseProvider("thesubtitledb.org") == .thesubtitledb_org);
     try std.testing.expect(parseProvider("napisy24.pl") == .napisy24_pl);
     try std.testing.expect(parseProvider("nyasub.cz") == .nyasub_cz);
-    try std.testing.expect(parseProvider("subhd.tv") == null);
+    try std.testing.expect(parseProvider("subhd.tv") == .subhd_tv);
     try std.testing.expect(parseProvider("fansubs.ru") == .fansubs_ru);
     try std.testing.expect(parseProvider("legendei.net") == .legendei_net);
     try std.testing.expect(parseProvider("zoom.lk") == .zoom_lk);
@@ -4546,6 +4720,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("indexsubtitle") == .indexsubtitle_cc);
     try std.testing.expect(try resolveProvider("sous_titres") == .sous_titres_eu);
     try std.testing.expect(try resolveProvider("cc_edatribe") == .cc_edatribe_com);
+    try std.testing.expect(try resolveProvider("subtitrari_noi") == .subtitrari_noi_ro);
     try std.testing.expect(try resolveProvider("subclub") == .subclub_eu);
     try std.testing.expect(try resolveProvider("subs_ro") == .subs_ro);
     try std.testing.expect(try resolveProvider("subs4free") == .subs4free_info);
@@ -4568,7 +4743,7 @@ test "resolveProvider accepts unique prefixes and rejects ambiguous prefixes" {
     try std.testing.expect(try resolveProvider("napisy24") == .napisy24_pl);
     try std.testing.expect(try resolveProvider("nyasub") == .nyasub_cz);
     try std.testing.expectError(error.AmbiguousProvider, resolveProvider("sub"));
-    try std.testing.expectError(error.UnknownProvider, resolveProvider("subhd"));
+    try std.testing.expect(try resolveProvider("subhd") == .subhd_tv);
     try std.testing.expect(try resolveProvider("fansubs") == .fansubs_ru);
     try std.testing.expect(try resolveProvider("legendei") == .legendei_net);
     try std.testing.expect(try resolveProvider("zoom") == .zoom_lk);
@@ -4713,6 +4888,113 @@ test "download referer is scoped to providers that require it" {
 test "cloudflare target excludes yify downloads" {
     try std.testing.expect(cloudflareTargetForUrl("https://yifysubtitles.ch/subtitle/test.zip") == null);
     try std.testing.expect(cloudflareTargetForUrl("https://www.opensubtitles.com/nocache/download/123") != null);
+}
+
+test "OpenSubtitles session cookies require the exact HTTPS origin" {
+    for ([_][]const u8{
+        "https://www.opensubtitles.com/",
+        "https://www.opensubtitles.com/download/1?format=srt",
+        "https://WWW.OPENSUBTITLES.COM:443/download/1",
+    }) |url| {
+        const target = cloudflareTargetForUrl(url).?;
+        try std.testing.expectEqualStrings(url, target.challenge_url);
+        try std.testing.expectEqualStrings("www.opensubtitles.com", target.domain);
+    }
+
+    const foreign_urls = [_][]const u8{
+        "https://example.test/opensubtitles.com/download/1",
+        "https://example.test/?next=https://www.opensubtitles.com/",
+        "https://www.opensubtitles.com.example.test/download/1",
+        "https://fakewww.opensubtitles.com/download/1",
+        "https://rest.opensubtitles.com/download/1",
+        "https://www.opensubtitles.com@other.test/download/1",
+        "https://user@www.opensubtitles.com/download/1",
+        "https://user:password@www.opensubtitles.com/download/1",
+        "https://www.opensubtitles.com:444/download/1",
+        "http://www.opensubtitles.com/download/1",
+        "https://www.opensubtitles.com./download/1",
+        "https://www.%6fpensubtitles.com/download/1",
+        "/www.opensubtitles.com/download/1",
+    };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    const cookies = [_]cf.Cookie{.{
+        .name = "fixture",
+        .value = "session",
+        .domain = "www.opensubtitles.com",
+        .path = "/",
+        .secure = true,
+        .host_only = true,
+        .expires_unix_seconds = null,
+    }};
+    const session: cf.Session = .{
+        .cookies = &cookies,
+        .cf_clearance = "fixture",
+        .user_agent = "fixture",
+        .csrf_token = null,
+        .acquired_at_unix = 0,
+        .generation = 1,
+    };
+    for (foreign_urls) |url| {
+        try std.testing.expect(cloudflareTargetForUrl(url) == null);
+        try std.testing.expectError(error.InvalidDownloadUrl, fetchBytesUsingSession(&client, std.testing.allocator, url, "*/*", null, session));
+        try std.testing.expectError(error.InvalidDownloadUrl, fetchBytesWithCloudflareSession(&client, std.testing.allocator, url, "www.opensubtitles.com", "https://www.opensubtitles.com/", "*/*", null));
+    }
+    try std.testing.expectError(error.InvalidDownloadUrl, fetchBytesWithCloudflareSession(&client, std.testing.allocator, "https://www.opensubtitles.com/file", "other.test", "https://www.opensubtitles.com/", "*/*", null));
+    try std.testing.expectError(error.InvalidDownloadUrl, fetchBytesWithCloudflareSession(&client, std.testing.allocator, "https://www.opensubtitles.com/file", "www.opensubtitles.com", "https://other.test/", "*/*", null));
+}
+
+test "subtitle downloads reject response pages and preserve subtitle formats" {
+    try std.testing.expectError(
+        error.CloudflareChallenge,
+        validateSubtitleDownloadBody(std.testing.allocator, "<!doctype html><script src='/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1'></script>"),
+    );
+    for ([_][]const u8{
+        "",                                                 " \t\r\n",                                                                    "\xEF\xBB\xBF \n",
+        "<!doctype html><html><body>Sign in</body></html>", "\xEF\xBB\xBF<!-- gateway --><HTML><BODY>Verify you are human</BODY></HTML>", "<head><title>Error</title></head>",
+        "{\"error\":\"expired\"}",                          " { \"message\":\"login required\" } ",                                       "[{\"error\":\"rate limited\"}]",
+        "{}",                                               "[]",                                                                         "error",
+        "Access denied",                                    "WEBVTT\n\nerror",                                                            "[Events]\nerror",
+        "{25}{50}",                                         "[25][50]",                                                                   "00:00:99,000 --> 00:00:02,000\nerror",
+        "00:61:01:invalid minute",                          "00:00:01:service started\nnot a subtitle cue",                               "prefix 00:00:01:embedded timestamp",
+    }) |body| try std.testing.expectError(error.InvalidDownloadPayload, validateSubtitleDownloadBody(std.testing.allocator, body));
+    try std.testing.expectError(error.ProviderAccessBlocked, validateSubtitleDownloadBody(std.testing.allocator, "Access to Website Disabled by the Federal Court of Australia"));
+
+    for ([_][]const u8{
+        "1\n00:00:01,000 --> 00:00:02,000\nHello <i>world</i>\n",
+        "1\n00:00:01,000 --> 00:00:02,000\nThe <html> and <body> tags.\n",
+        "\xEF\xBB\xBF1\r\n00:00:01,000 --> 00:00:02,000\r\nCaf\xC3\xA9\r\n",
+        "[Script Info]\nScriptType: v4.00+\n[Events]\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hello\n",
+        "[Script Info]\nScriptType: v4.00\n[Events]\nDialogue: Marked=0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hello\n",
+        "WEBVTT\n\n00:01.000 --> 00:02.000\nHello\n",
+        "0:00:01.000,0:00:02.000\nHello\n",
+        "<SAMI><BODY><SYNC Start=1000><P Class=ENCC>Hello</P></SYNC></BODY></SAMI>",
+        "<?xml version=\"1.0\"?><tt xmlns=\"http://www.w3.org/ns/ttml\"><body><p begin=\"00:00:01.000\" end=\"00:00:02.000\">Hello</p></body></tt>",
+        "# VobSub index file, v7\ntimestamp: 00:00:01:000, filepos: 000000000\n",
+        "{25}{50}Hello|world\n",
+        "[25][50]Hello\n",
+        "[INFORMATION]\n[TITLE]Example\n[SUBTITLE]\n00:00:01.00,00:00:02.00\nHello\n",
+        "00:00:01:Subtitle text",
+        "00:00:01:First subtitle|continued\n00:00:03:Second subtitle\n",
+        "\xFF\xFE{\x002\x005\x00}\x00{\x005\x000\x00}\x00H\x00i\x00",
+        "\xFE\xFF\x00{\x002\x005\x00}\x00{\x005\x000\x00}\x00H\x00i",
+        "PK\x05\x06\x00\x00\x00\x00",
+        "Rar!\x1A\x07\x00",
+        "\x37\x7A\xBC\xAF\x27\x1C",
+        "PG\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+        "\x00\x00\x01\xBA\x00",
+    }) |body| try validateSubtitleDownloadBody(std.testing.allocator, body);
+
+    const long_ass = "[Script Info]\n;" ++ "x" ** 9000 ++ "\n[Events]\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hello\n";
+    const utf16 = try std.testing.allocator.alloc(u8, 2 + long_ass.len * 2);
+    defer std.testing.allocator.free(utf16);
+    utf16[0] = 0xFF;
+    utf16[1] = 0xFE;
+    for (long_ass, 0..) |byte, i| {
+        utf16[2 + i * 2] = byte;
+        utf16[3 + i * 2] = 0;
+    }
+    try validateSubtitleDownloadBody(std.testing.allocator, utf16);
 }
 
 test "subtitleLabel uses Without release fallback for missing filename" {
@@ -5156,23 +5438,30 @@ test "download filename normalization has no partial ownership on failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkFilenameAllocationFailures, .{});
 }
 
+const LiveMediaClassification = enum { unknown, movie, series };
+
 fn liveSeriesCandidateMatches(allocator: Allocator, ref: SearchRef, query: []const u8) !bool {
-    const movie = switch (ref) {
+    var classification: LiveMediaClassification = switch (ref) {
         inline else => |item| blk: {
             if (@hasField(@TypeOf(item), "media_kind")) {
                 const tag = @tagName(item.media_kind);
-                if (std.ascii.eqlIgnoreCase(tag, "movie") or std.ascii.eqlIgnoreCase(tag, "film")) break :blk true;
+                if (std.ascii.eqlIgnoreCase(tag, "movie") or std.ascii.eqlIgnoreCase(tag, "film")) break :blk .movie;
+                if (std.ascii.eqlIgnoreCase(tag, "tv") or std.ascii.eqlIgnoreCase(tag, "series") or std.ascii.eqlIgnoreCase(tag, "show") or std.ascii.eqlIgnoreCase(tag, "episode")) break :blk .series;
             }
-            break :blk false;
+            break :blk .unknown;
         },
     };
-    if (movie) return false;
+    if (classification == .movie) return false;
     switch (ref) {
         .opensubtitles_com => |item| if (item.item_type) |kind| {
             if (std.ascii.eqlIgnoreCase(kind, "movie")) return false;
+            if (std.ascii.eqlIgnoreCase(kind, "tv") or std.ascii.eqlIgnoreCase(kind, "series") or std.ascii.eqlIgnoreCase(kind, "episode")) classification = .series;
         },
         .subdl_com => |item| if (std.ascii.eqlIgnoreCase(@tagName(item.media_type), "movie")) return false,
-        .subsource_net => |item| if (std.ascii.eqlIgnoreCase(item.media_type, "movie")) return false,
+        .subsource_net => |item| {
+            if (std.ascii.eqlIgnoreCase(item.media_type, "movie")) return false;
+            if (std.ascii.eqlIgnoreCase(item.media_type, "tv") or std.ascii.eqlIgnoreCase(item.media_type, "series")) classification = .series;
+        },
         else => {},
     }
     const title = try common.normalizeTitle(allocator, common.splitTrailingYear(common.parseEpisodeQuery(titleFromRef(ref)).title).title);
@@ -5183,7 +5472,7 @@ fn liveSeriesCandidateMatches(allocator: Allocator, ref: SearchRef, query: []con
     if (std.mem.indexOf(u8, title, expected) == null) return false;
     // Ambiguous plain-title endpoints otherwise mistake the 2012 movie for
     // the requested miniseries, giving false positive TV coverage.
-    if (std.mem.eql(u8, expected, "chernobyl") and !std.mem.eql(u8, title, expected)) return false;
+    if (classification != .series and std.mem.eql(u8, expected, "chernobyl") and !std.mem.eql(u8, title, expected)) return false;
     return true;
 }
 
@@ -5194,6 +5483,15 @@ test "series live selection rejects unrelated and movie-only search hits" {
     try std.testing.expect(!try liveSeriesCandidateMatches(allocator, .{ .isubtitles_org = .{ .title = "The Battle of Chernobyl", .details_url = "" } }, "Chernobyl"));
     try std.testing.expect(try liveSeriesCandidateMatches(allocator, .{ .isubtitles_org = .{ .title = "Chernobyl (2019)", .details_url = "" } }, "Chernobyl"));
     try std.testing.expect(try liveSeriesCandidateMatches(allocator, .{ .isubtitles_org = .{ .title = "Chernobyl\u{a0}", .details_url = "" } }, "Chernobyl"));
+    try std.testing.expect(try liveSeriesCandidateMatches(allocator, .{ .subs_ro = .{
+        .title = "Chernobyl - Sezonul 1",
+        .year = 2019,
+        .media_kind = .tv,
+        .language_code = "ro",
+        .release = "Chernobyl - Sezonul 1",
+        .page_url = "https://subs.ro/subtitrare/chernobyl-sezonul-1-2019/129054",
+        .download_url = "https://subs.ro/subtitrare/descarca/chernobyl-sezonul-1-2019/129054",
+    } }, "Chernobyl"));
 }
 
 test "ZIP download template whitespace preserves exact decoder boundary" {

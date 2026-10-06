@@ -3,6 +3,7 @@ const common = @import("common.zig");
 const html = @import("htmlparser");
 
 const Allocator = std.mem.Allocator;
+const max_raw_response_bytes = (common.FetchOptions{}).max_response_bytes;
 const HtmlParseOptions: html.ParseOptions = .{};
 const site = "https://greeksubs.net";
 const search_url = site ++ "/en/search";
@@ -53,6 +54,7 @@ pub const Scraper = struct {
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         return parseSearchHtml(common.takeArena(&arena), response.body, trimmed);
     }
@@ -62,10 +64,13 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        try validateProviderUrl(item.page_url);
+
         const response = try common.fetchBytes(self.client, a, item.page_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
         var seen = std.StringHashMapUnmanaged(void).empty;
@@ -82,6 +87,7 @@ pub const Scraper = struct {
                 const text = try common.innerTextTrimmedOwned(a, link);
                 if (std.ascii.findIgnoreCase(text, "Season") == null) continue;
                 const page_url = try common.resolveUrl(a, site, href);
+                validateProviderUrl(page_url) catch continue;
                 if (seen_pages.contains(page_url)) continue;
                 try seen_pages.put(a, page_url, {});
                 followed += 1;
@@ -90,6 +96,7 @@ pub const Scraper = struct {
                     .accept = "text/html,application/xhtml+xml,*/*",
                     .cache = false,
                     .max_attempts = 2,
+                    .require_public_origin = true,
                 }) catch continue;
                 try collectSubtitleRows(a, child.body, page_url, &subtitles, &seen);
             }
@@ -104,6 +111,7 @@ pub const Scraper = struct {
 
     pub fn fetchDownloadByToken(self: *Scraper, allocator: Allocator, token: []const u8) !common.HttpResponse {
         const parts = parseDownloadToken(token) orelse return error.InvalidDownloadUrl;
+        try validateProviderUrl(parts.page_url);
         var page = try fetchRaw(self.client, allocator, parts.page_url, &.{});
         defer page.deinit(allocator);
         if (page.status != .ok) return error.UnexpectedHttpStatus;
@@ -168,6 +176,7 @@ fn collectSubtitleRows(
 const RawResponse = common.RawResponse;
 
 fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, extra_headers: []const std.http.Header) !RawResponse {
+    try validateProviderUrl(url);
     try common.ensureClientTlsReady(client);
     const normalized = try common.normalizeUrlForFetch(allocator, url);
     defer allocator.free(normalized);
@@ -182,6 +191,7 @@ fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, ext
         .extra_headers = extra_headers,
     });
     defer req.deinit();
+    errdefer req.connection.?.closing = true;
     try req.sendBodiless();
 
     var head_buffer: [16 * 1024]u8 = undefined;
@@ -192,15 +202,31 @@ fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, ext
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
-    var writer = std.Io.Writer.Allocating.init(allocator);
-    defer writer.deinit();
-    _ = try reader.streamRemaining(&writer.writer);
+    const body = readBoundedBody(allocator, reader, max_raw_response_bytes) catch |err| {
+        if (err == error.ReadFailed) {
+            if (response.bodyErr()) |body_err| return body_err;
+            if (req.connection.?.stream_reader.err) |stream_err| return stream_err;
+        }
+        return err;
+    };
+    errdefer allocator.free(body);
+    switch (req.reader.state) {
+        .body_remaining_content_length => |left| if (left != 0) return error.HttpBodyTruncated,
+        .body_remaining_chunk_len => return error.HttpChunkTruncated,
+        else => {},
+    }
 
     return .{
         .status = status,
-        .body = try allocator.dupe(u8, writer.writer.buffered()),
+        .body = body,
         .cookie = cookie,
     };
+}
+
+fn validateProviderUrl(url: []const u8) !void {
+    const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
+    if (uri.user != null or uri.password != null) return error.InvalidDownloadUrl;
+    if (!(common.sameOrigin(site, url) catch false)) return error.InvalidDownloadUrl;
 }
 
 fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []const u8) !SearchResponse {
@@ -224,11 +250,13 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
         if (std.mem.indexOf(u8, normalized_title, normalized_query) == null and
             std.mem.indexOf(u8, normalized_query, normalized_title) == null) continue;
 
+        const page_url = try common.resolveUrl(a, site, href);
+        validateProviderUrl(page_url) catch continue;
         const item: SearchItem = .{
             .title = title,
             .year = parseYear(try common.innerTextTrimmedOwned(a, anchor)),
             .media_kind = media_kind,
-            .page_url = try common.resolveUrl(a, site, href),
+            .page_url = page_url,
         };
         if (std.mem.eql(u8, normalized_title, normalized_query)) {
             try exact.append(a, item);
@@ -324,6 +352,45 @@ fn parseYear(value: []const u8) ?i64 {
     return null;
 }
 
+fn readBoundedBody(allocator: Allocator, reader: *std.Io.Reader, max_bytes: usize) ![]u8 {
+    var writer = std.Io.Writer.Allocating.init(allocator);
+    defer writer.deinit();
+    var received: usize = 0;
+    while (true) {
+        if (received == max_bytes) {
+            _ = reader.takeByte() catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            return error.ResponseTooLarge;
+        }
+        const count = reader.stream(&writer.writer, .limited(max_bytes - received)) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        received += count;
+    }
+    var body = writer.toArrayList();
+    errdefer body.deinit(allocator);
+    return body.toOwnedSlice(allocator);
+}
+
+test "raw response body limit accepts exact bounds and rejects excess" {
+    const a = std.testing.allocator;
+    var exact: std.Io.Reader = .fixed("1234");
+    const body = try readBoundedBody(a, &exact, 4);
+    defer a.free(body);
+    try std.testing.expectEqualStrings("1234", body);
+    var oversized: std.Io.Reader = .fixed("12345");
+    try std.testing.expectError(error.ResponseTooLarge, readBoundedBody(a, &oversized, 4));
+    var empty: std.Io.Reader = .fixed("");
+    const empty_body = try readBoundedBody(a, &empty, 0);
+    defer a.free(empty_body);
+    try std.testing.expectEqual(@as(usize, 0), empty_body.len);
+    var zero_limit: std.Io.Reader = .fixed("1");
+    try std.testing.expectError(error.ResponseTooLarge, readBoundedBody(a, &zero_limit, 0));
+}
+
 test "greeksubs token and download id parsing" {
     try std.testing.expectEqualStrings("abc-123", parseDownloadId("downloadMe('abc-123')").?);
     const allocator = std.testing.allocator;
@@ -335,6 +402,18 @@ test "greeksubs token and download id parsing" {
     try std.testing.expect(!hasKnownDownloadExtension("Interstellar.2014.1080p.BluRay.x264-YIFY"));
     try std.testing.expect(hasKnownDownloadExtension("Interstellar.2014.srt"));
     try std.testing.expect(hasKnownDownloadExtension("Game of Thrones Season 1.zip"));
+}
+
+test "greeksubs rejects non-provider session targets" {
+    try validateProviderUrl("https://greeksubs.net/en/view/interstellar");
+    for ([_][]const u8{
+        "http://127.0.0.1/en/view/interstellar",
+        "https://greeksubs.net.example/en/view/interstellar",
+        "https://user@greeksubs.net/en/view/interstellar",
+        "http://greeksubs.net/en/view/interstellar",
+    }) |url| {
+        try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl(url));
+    }
 }
 
 test "live greeksubs movie search, listing and session download" {

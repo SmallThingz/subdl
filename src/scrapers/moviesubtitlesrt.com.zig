@@ -68,7 +68,11 @@ pub const Scraper = struct {
             if (has_next_page) page += 1;
         }) {
             const url = try buildSearchUrl(a, encoded_query, page);
-            const html_resp = try common.fetchBytes(self.client, a, url, .{ .accept = "text/html", .max_attempts = 2 });
+            const html_resp = try common.fetchBytes(self.client, a, url, .{
+                .accept = "text/html",
+                .max_attempts = 2,
+                .require_public_origin = true,
+            });
             var parsed = try common.parseHtmlStable(a, html_resp.body);
 
             const len_before = items.items.len;
@@ -76,7 +80,7 @@ pub const Scraper = struct {
             while (links.next()) |link| {
                 const href = common.getAttributeValueSafe(link, "href") orelse continue;
                 const text = try common.innerTextTrimmedOwned(a, link);
-                const page_url = try common.resolveUrl(a, site, href);
+                const page_url = try resolveProviderUrl(a, href);
                 try items.append(a, .{ .title = text, .page_url = page_url });
             }
 
@@ -85,7 +89,7 @@ pub const Scraper = struct {
                 while (fallback.next()) |link| {
                     const href = common.getAttributeValueSafe(link, "href") orelse continue;
                     const text = try common.innerTextTrimmedOwned(a, link);
-                    const page_url = try common.resolveUrl(a, site, href);
+                    const page_url = try resolveProviderUrl(a, href);
                     try items.append(a, .{ .title = text, .page_url = page_url });
                 }
             }
@@ -106,7 +110,12 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        const html_resp = try common.fetchBytes(self.client, a, page_url, .{ .accept = "text/html", .max_attempts = 2 });
+        try validateProviderEndpoint(page_url);
+        const html_resp = try common.fetchBytes(self.client, a, page_url, .{
+            .accept = "text/html",
+            .max_attempts = 2,
+            .require_public_origin = true,
+        });
         var parsed = try common.parseHtmlStable(a, html_resp.body);
 
         const title_node = parsed.doc.queryOne("h1") orelse parsed.doc.queryOne("title") orelse return error.MissingField;
@@ -139,11 +148,11 @@ pub const Scraper = struct {
         const download_url = try blk: {
             if (findFirstLinkByPredicate(&parsed.doc, hasZipHref)) |zip_link| {
                 const href = common.getAttributeValueSafe(zip_link, "href") orelse break :blk error.MissingField;
-                break :blk try common.resolveUrl(a, site, href);
+                break :blk try resolveProviderUrl(a, href);
             }
             if (findFirstLinkByPredicate(&parsed.doc, hasDownloadHref)) |download_link| {
                 const href = common.getAttributeValueSafe(download_link, "href") orelse break :blk error.MissingField;
-                break :blk try common.resolveUrl(a, site, href);
+                break :blk try resolveProviderUrl(a, href);
             }
             break :blk error.MissingField;
         };
@@ -164,6 +173,18 @@ pub const Scraper = struct {
         };
     }
 };
+
+fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+    const resolved = try common.resolveUrl(allocator, site, href);
+    errdefer allocator.free(resolved);
+    try validateProviderEndpoint(resolved);
+    return resolved;
+}
+
+fn validateProviderEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+}
 
 fn firstAndLastTd(row: HtmlNode) ?struct { first: HtmlNode, last: HtmlNode } {
     var children = row.children();
@@ -252,6 +273,12 @@ test "moviesubtitlesrt has next page detection" {
     var parsed = try common.parseHtmlStable(allocator, html_text);
     defer parsed.deinit();
     try std.testing.expect(hasNextSearchPage(&parsed.doc, 2));
+}
+
+test "moviesubtitlesrt rejects unsafe provider links before fetch" {
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "http://127.0.0.1/subtitle.zip"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://user:pass@moviesubtitlesrt.com/subtitle.zip"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://www.google.com/subtitle.zip"));
 }
 
 test "live moviesubtitlesrt search and details" {

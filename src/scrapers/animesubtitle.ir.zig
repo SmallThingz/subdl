@@ -46,6 +46,7 @@ pub const Scraper = struct {
             .accept = "application/json",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
@@ -102,6 +103,7 @@ pub const Scraper = struct {
             .accept = "application/json",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
         const obj = switch (root) {
@@ -123,7 +125,7 @@ pub const Scraper = struct {
             if (seen.contains(href)) continue;
             try seen.put(a, try a.dupe(u8, href), {});
 
-            const download_url = try htmlUnescapeUrl(a, href);
+            const download_url = resolvePublicDownloadUrl(a, href) catch continue;
             const filename = filenameNearHref(a, content, pos, item.title) catch
                 try std.fmt.allocPrint(a, "{s}.zip", .{item.title});
             try subtitles.append(a, .{
@@ -185,6 +187,15 @@ fn htmlUnescapeUrl(allocator: Allocator, input: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+fn resolvePublicDownloadUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+    const unescaped = try htmlUnescapeUrl(allocator, href);
+    defer allocator.free(unescaped);
+    const resolved = try common.resolveUrl(allocator, site, unescaped);
+    errdefer allocator.free(resolved);
+    try common.validatePublicHttpUrl(resolved);
+    return resolved;
+}
+
 fn nestedString(root: std.json.ObjectMap, path: []const []const u8) ?[]const u8 {
     if (path.len == 0) return null;
     var value = root.get(path[0]) orelse return null;
@@ -209,6 +220,20 @@ test "animesubtitle ir extracts latin titles and media kind hints" {
     try std.testing.expect(std.mem.indexOf(u8, "زیرنویس فارسی فیلم انیمه ای Given: Umi e", "فیلم") != null);
 }
 
+test "animesubtitle rejects unsafe provider download URLs" {
+    const allocator = std.testing.allocator;
+    const valid = try resolvePublicDownloadUrl(allocator, "/download/subtitle.zip?x=1&amp;y=2");
+    defer allocator.free(valid);
+    try std.testing.expectEqualStrings("https://animesubtitle.ir/download/subtitle.zip?x=1&y=2", valid);
+
+    for ([_][]const u8{
+        "http://127.0.0.1/download/subtitle.zip",
+        "https://user@example.com/download/subtitle.zip",
+    }) |url| {
+        try std.testing.expectError(error.UnsafeHttpTarget, resolvePublicDownloadUrl(allocator, url));
+    }
+}
+
 test "live animesubtitle ir movie and tv downloads" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
     if (!common.providerMatchesLiveFilter(common.liveProviderFilter(), "animesubtitle.ir")) return error.SkipZigTest;
@@ -227,6 +252,7 @@ test "live animesubtitle ir movie and tv downloads" {
     const movie_download = try common.fetchBytes(&client, std.testing.allocator, movie_subs.subtitles[0].download_url, .{
         .accept = "application/zip,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(movie_download.body);
     try std.testing.expect(movie_download.body.len > 4);
@@ -242,6 +268,7 @@ test "live animesubtitle ir movie and tv downloads" {
     const tv_download = try common.fetchBytes(&client, std.testing.allocator, tv_subs.subtitles[0].download_url, .{
         .accept = "application/zip,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(tv_download.body);
     try std.testing.expect(tv_download.body.len > 4);

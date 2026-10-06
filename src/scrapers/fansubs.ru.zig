@@ -2,6 +2,7 @@ const std = @import("std");
 const common = @import("common.zig");
 
 const Allocator = std.mem.Allocator;
+const max_raw_response_bytes = (common.FetchOptions{}).max_response_bytes;
 const site = "http://fansubs.ru";
 const search_url = site ++ "/search.php";
 const download_url = site ++ "/base.php";
@@ -47,6 +48,7 @@ pub const Scraper = struct {
             },
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         if (isRateLimited(response.body)) {
@@ -61,6 +63,7 @@ pub const Scraper = struct {
                 },
                 .cache = false,
                 .max_attempts = 2,
+                .require_public_origin = true,
             });
         }
 
@@ -72,6 +75,8 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        try validateProviderUrl(item.page_url);
+
         const response = try common.fetchBytes(self.client, a, item.page_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .extra_headers = &[_]std.http.Header{
@@ -79,6 +84,7 @@ pub const Scraper = struct {
             },
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         const subtitles = try parseSubtitleRows(a, response.body);
@@ -99,6 +105,7 @@ pub const Scraper = struct {
         var attempt: usize = 0;
         while (attempt < 3) : (attempt += 1) {
             const response = fetchDownloadOnce(self.client, allocator, payload) catch |err| {
+                if (err == error.Canceled or err == error.OutOfMemory or err == error.ResponseTooLarge) return err;
                 if (attempt + 1 < 3) {
                     common.sleepMilliseconds(250 * (attempt + 1));
                     continue;
@@ -120,12 +127,14 @@ pub const Scraper = struct {
 };
 
 fn fetchDownloadOnce(client: *std.http.Client, allocator: Allocator, payload: []const u8) !common.HttpResponse {
+    try validateProviderUrl(download_url);
     try common.ensureClientTlsReady(client);
     const normalized = try common.normalizeUrlForFetch(allocator, download_url);
     defer allocator.free(normalized);
     const uri = try std.Uri.parse(normalized);
 
     var req = try client.request(.POST, uri, .{
+        .redirect_behavior = .unhandled,
         .headers = .{
             .user_agent = .{ .override = common.default_user_agent },
             .accept_encoding = .{ .override = "identity" },
@@ -137,6 +146,7 @@ fn fetchDownloadOnce(client: *std.http.Client, allocator: Allocator, payload: []
         },
     });
     defer req.deinit();
+    errdefer req.connection.?.closing = true;
 
     const mutable_payload = try allocator.dupe(u8, payload);
     defer allocator.free(mutable_payload);
@@ -149,18 +159,31 @@ fn fetchDownloadOnce(client: *std.http.Client, allocator: Allocator, payload: []
 
     var transfer_buffer: [16 * 1024]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
-    var writer = std.Io.Writer.Allocating.init(allocator);
-    defer writer.deinit();
-    _ = try reader.streamRemaining(&writer.writer);
-
-    const body = try allocator.dupe(u8, writer.writer.buffered());
+    const body = readBoundedBody(allocator, reader, max_raw_response_bytes) catch |err| {
+        if (err == error.ReadFailed) {
+            if (response.bodyErr()) |body_err| return body_err;
+            if (req.connection.?.stream_reader.err) |stream_err| return stream_err;
+        }
+        return err;
+    };
+    errdefer allocator.free(body);
+    switch (req.reader.state) {
+        .body_remaining_content_length => |left| if (left != 0) return error.HttpBodyTruncated,
+        .body_remaining_chunk_len => return error.HttpChunkTruncated,
+        else => {},
+    }
     if (expected_length) |expected| {
         if (body.len != expected) {
-            allocator.free(body);
             return error.TruncatedResponse;
         }
     }
     return .{ .status = status, .body = body };
+}
+
+fn validateProviderUrl(url: []const u8) !void {
+    const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
+    if (uri.user != null or uri.password != null) return error.InvalidDownloadUrl;
+    if (!(common.sameOrigin(site, url) catch false)) return error.InvalidDownloadUrl;
 }
 
 fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []const u8) !SearchResponse {
@@ -297,6 +320,57 @@ fn isRateLimited(body: []const u8) bool {
     if (std.mem.indexOf(u8, body, "repeat the search in 5 seconds") != null) return true;
     // CP1251 bytes for "Повторите запрос через 5 секунд".
     return std.mem.indexOf(u8, body, "\xCF\xEE\xE2\xF2\xEE\xF0\xE8\xF2\xE5 \xE7\xE0\xEF\xF0\xEE\xF1 \xF7\xE5\xF0\xE5\xE7 5 \xF1\xE5\xEA\xF3\xED\xE4") != null;
+}
+
+fn readBoundedBody(allocator: Allocator, reader: *std.Io.Reader, max_bytes: usize) ![]u8 {
+    var writer = std.Io.Writer.Allocating.init(allocator);
+    defer writer.deinit();
+    var received: usize = 0;
+    while (true) {
+        if (received == max_bytes) {
+            _ = reader.takeByte() catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            return error.ResponseTooLarge;
+        }
+        const count = reader.stream(&writer.writer, .limited(max_bytes - received)) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        received += count;
+    }
+    var body = writer.toArrayList();
+    errdefer body.deinit(allocator);
+    return body.toOwnedSlice(allocator);
+}
+
+test "raw response body limit accepts exact bounds and rejects excess" {
+    const a = std.testing.allocator;
+    var exact: std.Io.Reader = .fixed("1234");
+    const body = try readBoundedBody(a, &exact, 4);
+    defer a.free(body);
+    try std.testing.expectEqualStrings("1234", body);
+    var oversized: std.Io.Reader = .fixed("12345");
+    try std.testing.expectError(error.ResponseTooLarge, readBoundedBody(a, &oversized, 4));
+    var empty: std.Io.Reader = .fixed("");
+    const empty_body = try readBoundedBody(a, &empty, 0);
+    defer a.free(empty_body);
+    try std.testing.expectEqual(@as(usize, 0), empty_body.len);
+    var zero_limit: std.Io.Reader = .fixed("1");
+    try std.testing.expectError(error.ResponseTooLarge, readBoundedBody(a, &zero_limit, 0));
+}
+
+test "fansubs rejects non-provider page targets" {
+    try validateProviderUrl("http://fansubs.ru/base.php?id=368");
+    for ([_][]const u8{
+        "http://127.0.0.1/base.php?id=368",
+        "http://fansubs.ru.example/base.php?id=368",
+        "http://user@fansubs.ru/base.php?id=368",
+        "https://fansubs.ru/base.php?id=368",
+    }) |url| {
+        try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl(url));
+    }
 }
 
 test "fansubs parses search and subtitle rows" {

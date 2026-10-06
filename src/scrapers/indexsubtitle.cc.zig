@@ -59,9 +59,11 @@ pub const Scraper = struct {
             const title = common.jsonString(obj, "title") orelse continue;
             const url = common.jsonString(obj, "url") orelse continue;
             if (url.len == 0 or std.mem.eql(u8, url, "#")) continue;
+            const page_url = try common.resolveUrl(a, site, url);
+            validateProviderUrl(page_url) catch continue;
             const item: SearchItem = .{
                 .title = try a.dupe(u8, title),
-                .page_url = try common.resolveUrl(a, site, url),
+                .page_url = page_url,
             };
             const base_title = titleWithoutYear(title);
             const normalized = try normalizeSearchTitle(a, base_title);
@@ -82,10 +84,13 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        try validateProviderUrl(item.page_url);
+
         const response = try common.fetchBytes(self.client, a, item.page_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         const rows_json = extractRowsJson(response.body) orelse return error.MissingField;
@@ -125,11 +130,13 @@ pub const Scraper = struct {
 
     pub fn fetchDownloadByToken(self: *Scraper, allocator: Allocator, token: []const u8) !common.HttpResponse {
         const parts = parseDownloadToken(token) orelse return error.InvalidDownloadUrl;
+        try validateProviderUrl(parts.page_url);
 
         const page = try common.fetchBytes(self.client, allocator, parts.page_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         defer allocator.free(page.body);
         if (page.status != .ok) return error.UnexpectedHttpStatus;
@@ -178,9 +185,16 @@ pub const Scraper = struct {
             .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = parts.page_url }},
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
     }
 };
+
+fn validateProviderUrl(url: []const u8) !void {
+    const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
+    if (uri.user != null or uri.password != null) return error.InvalidDownloadUrl;
+    if (!(common.sameOrigin(site, url) catch false)) return error.InvalidDownloadUrl;
+}
 
 fn fetchPostWithStatusRetry(
     client: *std.http.Client,
@@ -201,6 +215,7 @@ fn fetchPostWithStatusRetry(
             .cache = false,
             .allow_non_ok = true,
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         if (response.status == .ok) return response;
 
@@ -343,6 +358,17 @@ test "indexsubtitle extracts embedded rows and ttl" {
     try std.testing.expect(std.mem.startsWith(u8, rows, "[{"));
     try std.testing.expectEqual(@as(?i64, 1790576999), parsePageTtl(body));
     try std.testing.expectEqualStrings("657711", rowId("the-matrix-1999/english/657711").?);
+}
+
+test "indexsubtitle rejects non-provider page targets" {
+    try validateProviderUrl("https://indexsubtitle.cc/movie/the-matrix");
+    for ([_][]const u8{
+        "http://127.0.0.1/movie/the-matrix",
+        "https://indexsubtitle.cc.example/movie/the-matrix",
+        "https://user@indexsubtitle.cc/movie/the-matrix",
+    }) |url| {
+        try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl(url));
+    }
 }
 
 test "indexsubtitle retries transient search statuses" {

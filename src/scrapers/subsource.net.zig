@@ -4,6 +4,7 @@ const cf_shared = @import("opensubtitles_com_cf.zig");
 
 const Allocator = std.mem.Allocator;
 const api_base = "https://api.subsource.net/v1";
+const api_host = "api.subsource.net";
 const site = "https://subsource.net";
 const default_subsource_user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 
@@ -75,6 +76,7 @@ pub const SubtitlesResponse = common.PagedTitledSubtitlesResponse(SubtitleItem);
 const Auth = struct {
     cf_clearance: ?[]const u8,
     user_agent: []const u8,
+    browser_session: ?cf_shared.Session = null,
 };
 
 pub const Scraper = struct {
@@ -95,7 +97,7 @@ pub const Scraper = struct {
         const a = arena.allocator();
 
         const query_trimmed = std.mem.trim(u8, query, " \t\r\n");
-        var auth = try resolveAuth(a, options.cf_clearance, options.user_agent, false, options.auto_cloudflare_session);
+        var auth = resolveAuth(options.cf_clearance, options.user_agent);
 
         var out: std.ArrayListUnmanaged(SearchItem) = .empty;
         var seen = std.AutoHashMapUnmanaged(i64, void).empty;
@@ -136,7 +138,7 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        var auth = try resolveAuth(a, options.cf_clearance, options.user_agent, false, options.auto_cloudflare_session);
+        var auth = resolveAuth(options.cf_clearance, options.user_agent);
 
         var endpoints: std.ArrayListUnmanaged([]const u8) = .empty;
         if (try pathToSubtitles(a, item.link)) |path| {
@@ -168,24 +170,18 @@ pub const Scraper = struct {
                 else
                     try std.fmt.allocPrint(a, "{s}{s}?page={d}", .{ api_base, endpoint, page });
 
-                var response = try getJson(self.client, a, endpoint_url, auth, true);
-                if ((response.status == .forbidden or response.status == .too_many_requests) and options.auto_cloudflare_session) {
-                    auth = try resolveAuth(a, options.cf_clearance, options.user_agent, true, options.auto_cloudflare_session);
-                    response = try getJson(self.client, a, endpoint_url, auth, true);
-                }
-                if (response.status == .too_many_requests) return error.RateLimited;
-                if (response.status != .ok) break;
+                const response = try fetchApiJsonWith(fetchApiJsonRequest, acquireBrowserAuth, self.client, a, endpoint_url, null, &auth, options);
 
                 const parsed = try std.json.parseFromSlice(std.json.Value, a, response.body, .{});
 
                 const root = switch (parsed.value) {
                     .object => |o| o,
-                    else => break,
+                    else => return error.InvalidFieldType,
                 };
-                const subtitles_v = root.get("subtitles") orelse break;
+                const subtitles_v = root.get("subtitles") orelse return error.MissingField;
                 const subtitles_arr = switch (subtitles_v) {
                     .array => |arr| arr,
-                    else => break,
+                    else => return error.InvalidFieldType,
                 };
 
                 var new_count: usize = 0;
@@ -211,11 +207,9 @@ pub const Scraper = struct {
                     var download_token: ?[]const u8 = null;
                     var download_url: ?[]const u8 = null;
                     if (options.resolve_download_tokens) {
-                        const details = self.fetchSubtitleDetails(a, details_path, auth) catch null;
-                        if (details) |d| {
-                            download_token = d.download_token;
-                            download_url = d.download_url;
-                        }
+                        const details = try self.fetchSubtitleDetails(a, details_path, &auth, options);
+                        download_token = details.download_token;
+                        download_url = details.download_url;
                     }
 
                     try out.append(a, .{
@@ -252,18 +246,17 @@ pub const Scraper = struct {
         download_url: ?[]const u8,
     };
 
-    fn fetchSubtitleDetails(self: *Scraper, allocator: Allocator, details_path: []const u8, auth: Auth) !SubtitleDetails {
+    fn fetchSubtitleDetails(self: *Scraper, allocator: Allocator, details_path: []const u8, auth: *Auth, options: SubtitlesOptions) !SubtitleDetails {
         const trimmed = std.mem.trimStart(u8, details_path, "/");
         const url = try std.fmt.allocPrint(allocator, "{s}/subtitle/{s}", .{ api_base, trimmed });
 
-        const response = try getJson(self.client, allocator, url, auth, true);
-        if (response.status != .ok) return .{ .download_token = null, .download_url = null };
+        const response = try fetchApiJsonWith(fetchApiJsonRequest, acquireBrowserAuth, self.client, allocator, url, null, auth, options);
 
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
 
         const root = switch (parsed.value) {
             .object => |o| o,
-            else => return .{ .download_token = null, .download_url = null },
+            else => return error.InvalidFieldType,
         };
 
         const subtitle_obj = blk: {
@@ -286,10 +279,15 @@ pub const Scraper = struct {
     }
 
     pub fn resolveDownloadUrl(self: *Scraper, allocator: Allocator, details_path: []const u8) !?[]u8 {
+        return self.resolveDownloadUrlWithOptions(allocator, details_path, .{});
+    }
+
+    pub fn resolveDownloadUrlWithOptions(self: *Scraper, allocator: Allocator, details_path: []const u8, options: SubtitlesOptions) !?[]u8 {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const details = try self.fetchSubtitleDetails(a, details_path, try resolveAuth(a, null, null, false, false));
+        var auth = resolveAuth(options.cf_clearance, options.user_agent);
+        const details = try self.fetchSubtitleDetails(a, details_path, &auth, options);
         return if (details.download_url) |url| try allocator.dupe(u8, url) else null;
     }
 };
@@ -407,24 +405,18 @@ fn appendSearchResults(
 ) !void {
     const payload = try buildSearchPayload(allocator, query, options.include_seasons, options.limit_per_page);
 
-    var response = try postJson(client, allocator, api_base ++ "/movie/search", payload, auth.*, true);
-    if ((response.status == .forbidden or response.status == .too_many_requests) and options.auto_cloudflare_session) {
-        auth.* = try resolveAuth(allocator, options.cf_clearance, options.user_agent, true, options.auto_cloudflare_session);
-        response = try postJson(client, allocator, api_base ++ "/movie/search", payload, auth.*, true);
-    }
-    if (response.status == .too_many_requests) return error.RateLimited;
-    if (response.status != .ok) return;
+    const response = try fetchApiJsonWith(fetchApiJsonRequest, acquireBrowserAuth, client, allocator, api_base ++ "/movie/search", payload, auth, options);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
 
     const root = switch (parsed.value) {
         .object => |o| o,
-        else => return,
+        else => return error.InvalidFieldType,
     };
-    const results_v = root.get("results") orelse return;
+    const results_v = root.get("results") orelse return error.MissingField;
     const results = switch (results_v) {
         .array => |arr| arr,
-        else => return,
+        else => return error.InvalidFieldType,
     };
 
     for (results.items) |entry| {
@@ -489,33 +481,76 @@ fn buildSearchPayload(allocator: Allocator, query: []const u8, include_seasons: 
     );
 }
 
-fn resolveAuth(allocator: Allocator, cf_clearance_opt: ?[]const u8, user_agent_opt: ?[]const u8, force_refresh: bool, auto_cloudflare_session: bool) !Auth {
-    var cf_clearance = cf_clearance_opt;
-    if (cf_clearance == null) {
-        cf_clearance = common.getenv("SUBSOURCE_CF_CLEARANCE");
+fn requireApiResponse(response: common.HttpResponse) !void {
+    if (response.status == .too_many_requests) return error.RateLimited;
+    if (cf_shared.isChallengeBody(response.body)) return error.CloudflareChallenge;
+    if (response.status != .ok) return error.UnexpectedHttpStatus;
+}
+
+fn fetchApiJsonRequest(client: *std.http.Client, allocator: Allocator, url: []const u8, payload: ?[]const u8, auth: Auth) !common.HttpResponse {
+    return if (payload) |body| postJson(client, allocator, url, body, auth, true) else getJson(client, allocator, url, auth, true);
+}
+
+fn fetchApiJsonWith(comptime fetch: anytype, comptime acquire: anytype, client: *std.http.Client, allocator: Allocator, url: []const u8, payload: ?[]const u8, auth: *Auth, options: anytype) !common.HttpResponse {
+    var response = try fetch(client, allocator, url, payload, auth.*);
+    errdefer allocator.free(response.body);
+    // Try a cached browser session before replacing it. A session that was
+    // actually rejected may be refreshed once for this request.
+    const max_recoveries: usize = if (auth.browser_session == null) 2 else 1;
+    var recoveries: usize = 0;
+    while (cf_shared.isChallengeBody(response.body) and options.auto_cloudflare_session and recoveries < max_recoveries) : (recoveries += 1) {
+        // A rate limit is terminal even when it contains challenge markup.
+        if (response.status == .too_many_requests) return error.RateLimited;
+        const rejected_generation = if (auth.browser_session) |session| session.generation else null;
+        const refreshed = try acquire(allocator, url, rejected_generation, rejected_generation != null);
+        const retry = try fetch(client, allocator, url, payload, refreshed);
+        allocator.free(response.body);
+        response = retry;
+        auth.* = refreshed;
     }
+    try requireApiResponse(response);
+    return response;
+}
 
-    var user_agent = user_agent_opt orelse common.getenv("SUBSOURCE_USER_AGENT") orelse default_subsource_user_agent;
+fn resolveAuth(cf_clearance_opt: ?[]const u8, user_agent_opt: ?[]const u8) Auth {
+    return resolveAuthWith(common.getenv, cf_clearance_opt, user_agent_opt);
+}
 
-    if (cf_clearance == null and auto_cloudflare_session and force_refresh) {
-        const session = try cf_shared.ensureDomainSession(allocator, .{
-            .domain = "subsource.net",
-            .challenge_url = site,
-            .force_refresh = force_refresh,
-        });
-        cf_clearance = session.cf_clearance;
-        user_agent = session.user_agent;
-    }
+fn resolveAuthWith(comptime get_env: anytype, cf_clearance_opt: ?[]const u8, user_agent_opt: ?[]const u8) Auth {
+    return .{
+        .cf_clearance = cf_clearance_opt orelse get_env("SUBSOURCE_CF_CLEARANCE"),
+        .user_agent = user_agent_opt orelse get_env("SUBSOURCE_USER_AGENT") orelse default_subsource_user_agent,
+    };
+}
 
-    return .{ .cf_clearance = cf_clearance, .user_agent = user_agent };
+fn acquireBrowserAuth(allocator: Allocator, request_url: []const u8, rejected_generation: ?u64, force_refresh: bool) !Auth {
+    return acquireBrowserAuthWith(cf_shared.ensureDomainSession, allocator, request_url, rejected_generation, force_refresh);
+}
+
+fn acquireBrowserAuthWith(comptime ensure_session: anytype, allocator: Allocator, request_url: []const u8, rejected_generation: ?u64, force_refresh: bool) !Auth {
+    // Recovery replaces any challenged configured cookie with a coherent
+    // browser session, preserving the session's matching user agent.
+    const session = try ensure_session(allocator, .{
+        .domain = api_host,
+        .challenge_url = request_url,
+        .force_refresh = force_refresh,
+        .rejected_generation = rejected_generation,
+    });
+    return .{ .cf_clearance = null, .user_agent = session.user_agent, .browser_session = session };
 }
 
 fn getJson(client: *std.http.Client, allocator: Allocator, url: []const u8, auth: Auth, allow_non_ok: bool) !common.HttpResponse {
     var headers_buf: [2]std.http.Header = undefined;
     var headers_len: usize = 0;
+    var owned_cookie: ?[]u8 = null;
+    defer if (owned_cookie) |cookie| allocator.free(cookie);
 
-    if (auth.cf_clearance) |token| {
-        const cookie = try std.fmt.allocPrint(allocator, "cf_clearance={s}", .{token});
+    if (auth.browser_session) |session| {
+        owned_cookie = try session.cookieHeaderForUrl(allocator, url);
+    } else if (auth.cf_clearance) |token| {
+        owned_cookie = try std.fmt.allocPrint(allocator, "cf_clearance={s}", .{token});
+    }
+    if (owned_cookie) |cookie| {
         headers_buf[headers_len] = .{ .name = "cookie", .value = cookie };
         headers_len += 1;
     }
@@ -528,15 +563,23 @@ fn getJson(client: *std.http.Client, allocator: Allocator, url: []const u8, auth
         .extra_headers = headers_buf[0..headers_len],
         .allow_non_ok = allow_non_ok,
         .max_attempts = 2,
+        .retry_on_429 = false,
+        .cache = false,
     });
 }
 
 fn postJson(client: *std.http.Client, allocator: Allocator, url: []const u8, payload: []const u8, auth: Auth, allow_non_ok: bool) !common.HttpResponse {
     var headers_buf: [3]std.http.Header = undefined;
     var headers_len: usize = 0;
+    var owned_cookie: ?[]u8 = null;
+    defer if (owned_cookie) |cookie| allocator.free(cookie);
 
-    if (auth.cf_clearance) |token| {
-        const cookie = try std.fmt.allocPrint(allocator, "cf_clearance={s}", .{token});
+    if (auth.browser_session) |session| {
+        owned_cookie = try session.cookieHeaderForUrl(allocator, url);
+    } else if (auth.cf_clearance) |token| {
+        owned_cookie = try std.fmt.allocPrint(allocator, "cf_clearance={s}", .{token});
+    }
+    if (owned_cookie) |cookie| {
         headers_buf[headers_len] = .{ .name = "cookie", .value = cookie };
         headers_len += 1;
     }
@@ -555,6 +598,8 @@ fn postJson(client: *std.http.Client, allocator: Allocator, url: []const u8, pay
         .extra_headers = headers_buf[0..headers_len],
         .allow_non_ok = allow_non_ok,
         .max_attempts = 2,
+        .retry_on_429 = false,
+        .cache = false,
     });
 }
 
@@ -706,6 +751,260 @@ test "subsource path to subtitles" {
 test "subsource language normalization" {
     try std.testing.expectEqualStrings("fa", normalizeSubsourceLanguage("farsi/persian").?);
     try std.testing.expectEqualStrings("zh-tw", normalizeSubsourceLanguage("chinese traditional").?);
+}
+
+test "subsource API recovery distinguishes rate limits challenges and failed pages" {
+    const Mock = struct {
+        var fetch_calls: usize = 0;
+        var acquire_calls: usize = 0;
+        var initial_status: std.http.Status = .ok;
+        var retry_status: std.http.Status = .ok;
+        var refreshed_status: std.http.Status = .ok;
+        var initial_body: []const u8 = "";
+        var retry_body: []const u8 = "";
+        var refreshed_body: []const u8 = "";
+        var initial_browser_session: bool = false;
+        var acquire_error: bool = false;
+        var retry_fetch_error: bool = false;
+
+        fn browserAuth(generation: u64) Auth {
+            return .{
+                .cf_clearance = null,
+                .user_agent = "fixture-browser-agent",
+                .browser_session = .{
+                    .cookies = &.{},
+                    .cf_clearance = "fixture-clearance",
+                    .user_agent = "fixture-browser-agent",
+                    .csrf_token = null,
+                    .acquired_at_unix = 0,
+                    .generation = generation,
+                },
+            };
+        }
+
+        fn fetch(_: *std.http.Client, allocator: Allocator, _: []const u8, _: ?[]const u8, auth: Auth) !common.HttpResponse {
+            fetch_calls += 1;
+            if (acquire_calls > 0) {
+                try std.testing.expect(auth.cf_clearance == null);
+                try std.testing.expectEqualStrings("fixture-browser-agent", auth.user_agent);
+                const expected_generation: u64 = if (initial_browser_session or acquire_calls == 2) 42 else 41;
+                try std.testing.expectEqual(expected_generation, auth.browser_session.?.generation);
+            }
+            if (retry_fetch_error and fetch_calls > 1) return error.ConnectionRefused;
+            return .{
+                .status = switch (fetch_calls) {
+                    1 => initial_status,
+                    2 => retry_status,
+                    else => refreshed_status,
+                },
+                .body = try allocator.dupe(u8, switch (fetch_calls) {
+                    1 => initial_body,
+                    2 => retry_body,
+                    else => refreshed_body,
+                }),
+            };
+        }
+
+        fn acquire(_: Allocator, request_url: []const u8, rejected_generation: ?u64, force_refresh: bool) !Auth {
+            try std.testing.expect(std.mem.startsWith(u8, request_url, "https://fixture.invalid/"));
+            const expected_force = initial_browser_session or acquire_calls > 0;
+            try std.testing.expectEqual(expected_force, force_refresh);
+            try std.testing.expectEqual(if (expected_force) @as(?u64, 41) else null, rejected_generation);
+            acquire_calls += 1;
+            if (acquire_error) return error.CloudflareSessionUnavailable;
+            return browserAuth(if (expected_force) 42 else 41);
+        }
+    };
+    const challenge = "<html><body><script>window._cf_chl_opt = {};</script></body></html>";
+    const valid = "{\"results\":[],\"subtitles\":[]}";
+    const Case = struct {
+        initial_status: std.http.Status,
+        initial_body: []const u8,
+        retry_status: std.http.Status = .ok,
+        retry_body: []const u8 = valid,
+        refreshed_status: std.http.Status = .ok,
+        refreshed_body: []const u8 = valid,
+        initial_browser_session: bool = false,
+        acquire_error: bool = false,
+        retry_fetch_error: bool = false,
+        automatic: bool = true,
+        expected_error: ?anyerror = null,
+        expected_fetches: usize = 1,
+        expected_acquisitions: usize = 0,
+    };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    for ([_]Case{
+        .{ .initial_status = .too_many_requests, .initial_body = challenge, .expected_error = error.RateLimited },
+        .{ .initial_status = .forbidden, .initial_body = "{\"error\":\"permission denied\"}", .expected_error = error.UnexpectedHttpStatus },
+        .{ .initial_status = .internal_server_error, .initial_body = valid, .expected_error = error.UnexpectedHttpStatus },
+        .{ .initial_status = .ok, .initial_body = challenge, .automatic = false, .expected_error = error.CloudflareChallenge },
+        .{ .initial_status = .forbidden, .initial_body = challenge, .automatic = false, .expected_error = error.CloudflareChallenge },
+        .{ .initial_status = .ok, .initial_body = valid },
+        .{ .initial_status = .ok, .initial_body = challenge, .expected_fetches = 2, .expected_acquisitions = 1 },
+        .{ .initial_status = .forbidden, .initial_body = challenge, .retry_status = .forbidden, .retry_body = challenge, .expected_fetches = 3, .expected_acquisitions = 2 },
+        .{ .initial_status = .forbidden, .initial_body = challenge, .retry_status = .forbidden, .retry_body = challenge, .refreshed_status = .forbidden, .refreshed_body = challenge, .expected_error = error.CloudflareChallenge, .expected_fetches = 3, .expected_acquisitions = 2 },
+        .{ .initial_status = .forbidden, .initial_body = challenge, .retry_status = .too_many_requests, .retry_body = challenge, .expected_error = error.RateLimited, .expected_fetches = 2, .expected_acquisitions = 1 },
+        .{ .initial_status = .forbidden, .initial_body = challenge, .retry_status = .forbidden, .retry_body = challenge, .refreshed_status = .too_many_requests, .refreshed_body = challenge, .expected_error = error.RateLimited, .expected_fetches = 3, .expected_acquisitions = 2 },
+        .{ .initial_status = .forbidden, .initial_body = challenge, .initial_browser_session = true, .expected_fetches = 2, .expected_acquisitions = 1 },
+        .{ .initial_status = .forbidden, .initial_body = challenge, .initial_browser_session = true, .retry_status = .forbidden, .retry_body = challenge, .expected_error = error.CloudflareChallenge, .expected_fetches = 2, .expected_acquisitions = 1 },
+        .{ .initial_status = .forbidden, .initial_body = challenge, .acquire_error = true, .expected_error = error.CloudflareSessionUnavailable, .expected_acquisitions = 1 },
+        .{ .initial_status = .forbidden, .initial_body = challenge, .retry_fetch_error = true, .expected_error = error.ConnectionRefused, .expected_fetches = 2, .expected_acquisitions = 1 },
+    }) |case| {
+        Mock.fetch_calls = 0;
+        Mock.acquire_calls = 0;
+        Mock.initial_status = case.initial_status;
+        Mock.initial_body = case.initial_body;
+        Mock.retry_status = case.retry_status;
+        Mock.retry_body = case.retry_body;
+        Mock.refreshed_status = case.refreshed_status;
+        Mock.refreshed_body = case.refreshed_body;
+        Mock.initial_browser_session = case.initial_browser_session;
+        Mock.acquire_error = case.acquire_error;
+        Mock.retry_fetch_error = case.retry_fetch_error;
+        var auth: Auth = if (case.initial_browser_session) Mock.browserAuth(41) else .{ .cf_clearance = "configured-clearance", .user_agent = "fixture-agent" };
+        const result = fetchApiJsonWith(Mock.fetch, Mock.acquire, &client, std.testing.allocator, "https://fixture.invalid/search", null, &auth, SearchOptions{ .auto_cloudflare_session = case.automatic });
+        if (case.expected_error) |err| {
+            try std.testing.expectError(err, result);
+        } else {
+            const response = try result;
+            defer std.testing.allocator.free(response.body);
+            try std.testing.expectEqualStrings(valid, response.body);
+        }
+        try std.testing.expectEqual(case.expected_fetches, Mock.fetch_calls);
+        try std.testing.expectEqual(case.expected_acquisitions, Mock.acquire_calls);
+    }
+
+    // A successful first page cannot make a later unavailable page successful.
+    Mock.fetch_calls = 0;
+    Mock.acquire_calls = 0;
+    Mock.initial_status = .ok;
+    Mock.initial_body = valid;
+    Mock.retry_status = .service_unavailable;
+    Mock.retry_body = "unavailable";
+    Mock.initial_browser_session = false;
+    Mock.acquire_error = false;
+    Mock.retry_fetch_error = false;
+    var auth: Auth = .{ .cf_clearance = null, .user_agent = "fixture-agent" };
+    const first_page = try fetchApiJsonWith(Mock.fetch, Mock.acquire, &client, std.testing.allocator, "https://fixture.invalid/subtitles", null, &auth, SubtitlesOptions{});
+    defer std.testing.allocator.free(first_page.body);
+    try std.testing.expectError(error.UnexpectedHttpStatus, fetchApiJsonWith(Mock.fetch, Mock.acquire, &client, std.testing.allocator, "https://fixture.invalid/subtitles?page=2", null, &auth, SubtitlesOptions{}));
+    try std.testing.expectEqual(@as(usize, 2), Mock.fetch_calls);
+    try std.testing.expectEqual(@as(usize, 0), Mock.acquire_calls);
+
+    // Detail requests use the same recovery contract with subtitle options.
+    Mock.fetch_calls = 0;
+    Mock.acquire_calls = 0;
+    Mock.initial_status = .forbidden;
+    Mock.initial_body = challenge;
+    Mock.retry_status = .ok;
+    Mock.retry_body = "{\"subtitle\":{\"download_token\":\"fixture-download\"}}";
+    const detail = try fetchApiJsonWith(Mock.fetch, Mock.acquire, &client, std.testing.allocator, "https://fixture.invalid/subtitle/fixture", null, &auth, SubtitlesOptions{ .auto_cloudflare_session = true });
+    defer std.testing.allocator.free(detail.body);
+    try std.testing.expectEqualStrings(Mock.retry_body, detail.body);
+    try std.testing.expect(auth.cf_clearance == null);
+    try std.testing.expectEqualStrings("fixture-clearance", auth.browser_session.?.cf_clearance);
+    try std.testing.expectEqual(@as(usize, 2), Mock.fetch_calls);
+    try std.testing.expectEqual(@as(usize, 1), Mock.acquire_calls);
+}
+
+test "subsource initial auth resolution does not acquire a browser session" {
+    const Mock = struct {
+        var env_reads: usize = 0;
+        var has_environment: bool = true;
+
+        fn getEnv(name: []const u8) ?[]const u8 {
+            env_reads += 1;
+            if (!has_environment) return null;
+            if (std.mem.eql(u8, name, "SUBSOURCE_CF_CLEARANCE")) return "environment-token";
+            if (std.mem.eql(u8, name, "SUBSOURCE_USER_AGENT")) return "environment-agent";
+            return null;
+        }
+    };
+    const configured = resolveAuthWith(Mock.getEnv, "explicit-token", "explicit-agent");
+    try std.testing.expectEqualStrings("explicit-token", configured.cf_clearance.?);
+    try std.testing.expectEqualStrings("explicit-agent", configured.user_agent);
+    try std.testing.expect(configured.browser_session == null);
+    try std.testing.expectEqual(@as(usize, 0), Mock.env_reads);
+
+    const environment = resolveAuthWith(Mock.getEnv, null, null);
+    try std.testing.expectEqualStrings("environment-token", environment.cf_clearance.?);
+    try std.testing.expectEqualStrings("environment-agent", environment.user_agent);
+    try std.testing.expect(environment.browser_session == null);
+    try std.testing.expectEqual(@as(usize, 2), Mock.env_reads);
+
+    Mock.has_environment = false;
+    const defaults = resolveAuthWith(Mock.getEnv, null, null);
+    try std.testing.expect(defaults.cf_clearance == null);
+    try std.testing.expectEqualStrings(default_subsource_user_agent, defaults.user_agent);
+    try std.testing.expect(defaults.browser_session == null);
+}
+
+test "subsource browser acquisition reuses cache before generation aware refresh" {
+    const Mock = struct {
+        var session_calls: usize = 0;
+        var session_error: bool = false;
+        var expected_force: bool = false;
+        const session_cookies = [_]cf_shared.Cookie{.{
+            .name = "cf_clearance",
+            .value = "fresh-fixture-token",
+            .domain = api_host,
+            .path = "/",
+            .secure = true,
+            .host_only = true,
+            .expires_unix_seconds = null,
+        }};
+
+        fn ensureSession(_: Allocator, options: cf_shared.EnsureDomainOptions) !cf_shared.Session {
+            session_calls += 1;
+            try std.testing.expectEqual(expected_force, options.force_refresh);
+            try std.testing.expectEqualStrings(api_host, options.domain);
+            try std.testing.expectEqualStrings(api_base ++ "/movie/search", options.challenge_url.?);
+            try std.testing.expectEqual(if (expected_force) @as(?u64, 41) else null, options.rejected_generation);
+            if (session_error) return error.CloudflareSessionUnavailable;
+            return .{
+                .cookies = &session_cookies,
+                .cf_clearance = "fresh-fixture-token",
+                .user_agent = "fresh-fixture-agent",
+                .csrf_token = null,
+                .acquired_at_unix = 0,
+                .generation = 42,
+            };
+        }
+    };
+    for ([_]bool{ false, true }) |force_refresh| {
+        Mock.session_calls = 0;
+        Mock.expected_force = force_refresh;
+        const refreshed = try acquireBrowserAuthWith(Mock.ensureSession, std.testing.allocator, api_base ++ "/movie/search", if (force_refresh) 41 else null, force_refresh);
+        try std.testing.expect(refreshed.cf_clearance == null);
+        try std.testing.expectEqualStrings("fresh-fixture-token", refreshed.browser_session.?.cf_clearance);
+        try std.testing.expectEqualStrings("fresh-fixture-agent", refreshed.user_agent);
+        try std.testing.expectEqual(@as(usize, 1), Mock.session_calls);
+    }
+
+    Mock.session_error = true;
+    try std.testing.expectError(error.CloudflareSessionUnavailable, acquireBrowserAuthWith(Mock.ensureSession, std.testing.allocator, api_base ++ "/movie/search", 41, true));
+}
+
+test "subsource does not replay an apex host-only browser cookie to the API" {
+    const cookies = [_]cf_shared.Cookie{.{
+        .name = "cf_clearance",
+        .value = "apex-only",
+        .domain = "subsource.net",
+        .path = "/",
+        .secure = true,
+        .host_only = true,
+        .expires_unix_seconds = null,
+    }};
+    const session: cf_shared.Session = .{
+        .cookies = &cookies,
+        .cf_clearance = "apex-only",
+        .user_agent = "fixture",
+        .csrf_token = null,
+        .acquired_at_unix = 0,
+        .generation = 1,
+    };
+    try std.testing.expect((try session.cookieHeaderForUrl(std.testing.allocator, api_base ++ "/movie/search")) == null);
 }
 
 test "subsource absolute site link normalization" {

@@ -5,6 +5,7 @@ const html = @import("htmlparser");
 const Allocator = std.mem.Allocator;
 const HtmlParseOptions: html.ParseOptions = .{};
 const site = "https://subtitles.ajatt.top";
+const raw_site = "https://raw.githubusercontent.com";
 
 pub const MediaKind = common.MediaKind;
 
@@ -38,6 +39,7 @@ pub const Scraper = struct {
         const response = try common.fetchBytes(self.client, a, site ++ "/", .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .max_attempts = 2,
+            .require_public_origin = true,
         });
         return parseIndex(common.takeArena(&arena), response.body, query);
     }
@@ -46,10 +48,12 @@ pub const Scraper = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+        try validateProviderEndpoint(item.page_url);
 
         const response = try common.fetchBytes(self.client, a, item.page_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         var parsed = try common.parseHtmlStable(a, response.body);
@@ -58,6 +62,7 @@ pub const Scraper = struct {
         var anchors = parsed.doc.queryAll("a[href^='https://raw.githubusercontent.com/Ajatt-Tools/kitsunekko-mirror/']");
         while (anchors.next()) |anchor| {
             const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
+            try validateRawEndpoint(href);
             const filename = if (common.getAttributeValueSafe(anchor, "download")) |download|
                 try a.dupe(u8, download)
             else
@@ -112,7 +117,7 @@ fn parseIndex(arena: std.heap.ArenaAllocator, body: []const u8, query: []const u
             .english_name = english_name,
             .japanese_name = japanese_name,
             .media_kind = media_kind,
-            .page_url = try common.resolveUrl(a, site, href),
+            .page_url = try resolveProviderUrl(a, href),
         });
     }
 
@@ -164,6 +169,30 @@ fn normalizeForSearch(allocator: Allocator, input: []const u8) ![]const u8 {
         pending_space = out.items.len > 0;
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+    const resolved = try common.resolveUrl(allocator, site, href);
+    errdefer allocator.free(resolved);
+    try validateProviderEndpoint(resolved);
+    return resolved;
+}
+
+fn validateProviderEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+}
+
+fn validateRawEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(raw_site, url))) return error.UnsafeHttpTarget;
+}
+
+test "ajatt rejects unsafe provider and raw download endpoints" {
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "http://127.0.0.1/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://user:pass@subtitles.ajatt.top/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://subtitles.ajatt.top.evil.com/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateRawEndpoint("https://raw.githubusercontent.com.evil.com/repo/file.srt"));
 }
 
 test "ajatt parses movie and tv catalog rows" {

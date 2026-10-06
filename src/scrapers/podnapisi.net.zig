@@ -106,6 +106,7 @@ pub const Scraper = struct {
             .retry_initial_backoff_ms = 1500,
             .retry_on_429 = true,
             .allow_non_ok = true,
+            .require_public_origin = true,
         }) catch return;
 
         if (response.status != .ok) return;
@@ -183,6 +184,7 @@ pub const Scraper = struct {
             .retry_initial_backoff_ms = 1500,
             .allow_non_ok = true,
             .retry_on_429 = true,
+            .require_public_origin = true,
         });
         if (response.status == .too_many_requests) return error.RateLimited;
         if (response.status != .ok) return error.UnexpectedHttpStatus;
@@ -196,7 +198,7 @@ pub const Scraper = struct {
             if (std.mem.endsWith(u8, href, "/subtitles/search/")) continue;
             if (std.mem.indexOf(u8, href, "/advanced") != null) continue;
 
-            const absolute = try common.resolveUrl(allocator, site, href);
+            const absolute = try resolveProviderUrl(allocator, href);
             const id = parseIdFromSubtitlesSearchUrl(absolute) orelse continue;
             if (std.ascii.eqlIgnoreCase(id, "advanced")) continue;
 
@@ -214,6 +216,10 @@ pub const Scraper = struct {
     }
 
     pub fn fetchSubtitlesBySearchLink(self: *Scraper, subtitles_page_url: []const u8) !SubtitlesResponse {
+        return self.fetchSubtitlesBySearchLinkUsing(common.fetchBytes, subtitles_page_url);
+    }
+
+    fn fetchSubtitlesBySearchLinkUsing(self: *Scraper, comptime fetch: anytype, subtitles_page_url: []const u8) !SubtitlesResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -221,15 +227,19 @@ pub const Scraper = struct {
         const started_ns = if (debug_timing) common.compatNanoTimestamp() else 0;
         if (debug_timing) std.debug.print("[podnapisi.net] subtitles start url={s}\n", .{subtitles_page_url});
 
-        const response = try common.fetchBytes(self.client, a, subtitles_page_url, .{
+        try validateProviderEndpoint(subtitles_page_url);
+        const response = try fetch(self.client, a, subtitles_page_url, .{
             .accept = "text/html",
             .max_attempts = 3,
             .retry_initial_backoff_ms = 1500,
             .allow_non_ok = true,
             .retry_on_429 = true,
+            .require_public_origin = true,
         });
 
         if (response.status == .too_many_requests) return error.RateLimited;
+
+        if (response.status != .ok) return error.UnexpectedHttpStatus;
 
         var parsed = try common.parseHtmlStable(a, response.body);
 
@@ -249,7 +259,7 @@ pub const Scraper = struct {
             row_count += 1;
             const download_anchor = findDescendantAnchorByRelNoFollow(row) orelse continue;
             const href = common.getAttributeValueSafe(download_anchor, "href") orelse continue;
-            const download_url = try common.resolveUrl(a, site, href);
+            const download_url = try resolveProviderUrl(a, href);
 
             const language = if (common.findDescendantByTag(row, "abbr")) |node|
                 try common.innerTextTrimmedOwned(a, node)
@@ -292,6 +302,18 @@ pub const Scraper = struct {
         return common.finishResponse(SubtitlesResponse, &arena, .{ .arena = arena, .subtitles = try out.toOwnedSlice(a) });
     }
 };
+
+fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+    const resolved = try common.resolveUrl(allocator, site, href);
+    errdefer allocator.free(resolved);
+    try validateProviderEndpoint(resolved);
+    return resolved;
+}
+
+fn validateProviderEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+}
 
 fn parseIdFromSubtitlesSearchUrl(url: []const u8) ?[]const u8 {
     const marker = "/subtitles/search/";
@@ -470,6 +492,42 @@ fn findDescendantSpanWithClass(node: HtmlNode, class_fragment: []const u8) ?Html
         if (findDescendantSpanWithClass(child, class_fragment)) |nested| return nested;
     }
     return null;
+}
+
+fn SubtitlesStatusFixture(comptime status: std.http.Status) type {
+    return struct {
+        fn fetch(_: *std.http.Client, allocator: Allocator, _: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+            return .{ .status = status, .body = try allocator.dupe(u8, "<html><body>No subtitles found</body></html>") };
+        }
+    };
+}
+
+test "podnapisi rejects non-ok subtitle pages before empty parsing" {
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &client);
+    inline for (.{ std.http.Status.forbidden, std.http.Status.internal_server_error, std.http.Status.bad_gateway, std.http.Status.service_unavailable }) |status| {
+        try std.testing.expectError(error.UnexpectedHttpStatus, scraper.fetchSubtitlesBySearchLinkUsing(
+            SubtitlesStatusFixture(status).fetch,
+            "https://www.podnapisi.net/subtitles/search/12345",
+        ));
+    }
+    try std.testing.expectError(error.RateLimited, scraper.fetchSubtitlesBySearchLinkUsing(
+        SubtitlesStatusFixture(.too_many_requests).fetch,
+        "https://www.podnapisi.net/subtitles/search/12345",
+    ));
+    var response = try scraper.fetchSubtitlesBySearchLinkUsing(
+        SubtitlesStatusFixture(.ok).fetch,
+        "https://www.podnapisi.net/subtitles/search/12345",
+    );
+    defer response.deinit();
+    try std.testing.expectEqual(@as(usize, 0), response.subtitles.len);
+}
+
+test "podnapisi rejects unsafe provider links before fetch" {
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "http://127.0.0.1/subtitles/search/1"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://user:pass@www.podnapisi.net/subtitles/search/1"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://www.google.com/subtitles/search/1"));
 }
 
 test "parse podnapisi id" {

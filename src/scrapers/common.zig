@@ -43,6 +43,9 @@ pub const FetchOptions = struct {
     retry_on_429: bool = true,
     cache: bool = true,
     max_response_bytes: usize = 128 * 1024 * 1024,
+    /// Reject credentials, local/private hosts, and unsafe redirect targets.
+    /// Enable this for URLs originating in provider-controlled response data.
+    require_public_origin: bool = false,
 };
 
 pub const FetchCacheConfig = struct {
@@ -283,6 +286,7 @@ pub fn fetchBytes(client: *std.http.Client, allocator: Allocator, url: []const u
 }
 
 fn fetchBytesWith(comptime fetch: anytype, comptime backoff: anytype, client: *std.http.Client, allocator: Allocator, url: []const u8, opts: FetchOptions) !HttpResponse {
+    if (opts.require_public_origin) try validatePublicHttpUrl(url);
     if (try loadFetchCache(allocator, url, opts)) |cached| return cached;
 
     var attempts: usize = 0;
@@ -396,9 +400,13 @@ fn storeFetchCache(allocator: Allocator, url: []const u8, opts: FetchOptions, re
 fn writeFetchCacheAtomically(path: []const u8, bytes: []const u8) !void {
     try ensureParentDir(path);
     const io = runtime_io.get();
-    var atomic = try std.Io.Dir.cwd().createFileAtomic(io, path, .{ .replace = true });
+    var atomic = try std.Io.Dir.cwd().createFileAtomic(io, path, .{
+        .replace = true,
+        .permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o600) else .default_file,
+    });
     defer atomic.deinit(io);
     try atomic.file.writeStreamingAll(io, bytes);
+    try atomic.file.sync(io);
     try atomic.replace(io);
 }
 
@@ -412,6 +420,7 @@ fn fetchCachePath(allocator: Allocator, root: []const u8, url: []const u8, opts:
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(@tagName(opts.method));
     hasher.update("\n");
+    hasher.update(if (opts.require_public_origin) "public-origin\n" else "unrestricted-origin\n");
     hasher.update(url);
     hasher.update("\n");
     if (opts.accept) |accept| hasher.update(accept);
@@ -444,7 +453,59 @@ pub fn ensureParentDir(path: []const u8) !void {
 }
 
 fn fetchBytesViaHttp(client: *std.http.Client, allocator: Allocator, url: []const u8, opts: FetchOptions) !HttpResponse {
+    if (opts.require_public_origin) {
+        // A proxy resolves or connects to the origin outside this process, so
+        // the validated address cannot be bound to the actual socket. Check
+        // both proxy kinds because a redirect may switch protocols.
+        if (client.http_proxy != null or client.https_proxy != null) {
+            return error.PublicOriginProxyUnsupported;
+        }
+
+        // Public-origin requests use a short-lived client with an empty pool
+        // and no proxy. Each hop is connected to one validated DNS answer, so
+        // a connection opened by an unrestricted request cannot redirect this
+        // request into a private network.
+        try ensureClientTlsReady(client);
+        var public_client: std.http.Client = .{
+            .allocator = client.allocator,
+            .io = client.io,
+            .tls_buffer_size = client.tls_buffer_size,
+            .ssl_key_log = client.ssl_key_log,
+            .read_buffer_size = client.read_buffer_size,
+            .write_buffer_size = client.write_buffer_size,
+        };
+        defer public_client.deinit();
+        // Preserve caller-supplied roots and validation time. Rescanning the
+        // system store here could silently discard a custom trust policy.
+        try copyClientTrust(client, &public_client);
+        return fetchBytesViaReadyClient(&public_client, allocator, url, opts);
+    }
+
     try ensureClientTlsReady(client);
+    return fetchBytesViaReadyClient(client, allocator, url, opts);
+}
+
+fn copyClientTrust(source: *std.http.Client, destination: *std.http.Client) !void {
+    if (!std.http.Client.disable_tls) {
+        try source.ca_bundle_lock.lockShared(source.io);
+        defer source.ca_bundle_lock.unlockShared(source.io);
+
+        var bundle: std.crypto.Certificate.Bundle = .empty;
+        errdefer bundle.deinit(destination.allocator);
+        bundle.bytes = try source.ca_bundle.bytes.clone(destination.allocator);
+        const Map = @TypeOf(source.ca_bundle.map);
+        const MapContext = @typeInfo(@TypeOf(Map.promoteContext)).@"fn".params[2].type.?;
+        bundle.map = try source.ca_bundle.map.cloneContext(
+            destination.allocator,
+            MapContext{ .cb = &bundle },
+        );
+
+        destination.ca_bundle = bundle;
+        destination.now = source.now;
+    }
+}
+
+fn fetchBytesViaReadyClient(client: *std.http.Client, allocator: Allocator, url: []const u8, opts: FetchOptions) !HttpResponse {
     var phase = LivePhase.init("http.fetch", url);
     phase.start();
     defer phase.finish();
@@ -514,9 +575,11 @@ fn fetchWithRedirects(client: *std.http.Client, allocator: Allocator, start_url:
     var private_allowed = true;
     var redirects: usize = 0;
     while (true) {
+        if (opts.require_public_origin) try validatePublicHttpUrl(current);
         var headers = initial_headers;
         var selected: std.ArrayList(std.http.Header) = .empty;
         defer selected.deinit(allocator);
+        if (opts.require_public_origin) headers.host = .default;
         if (!private_allowed) {
             headers.authorization = .omit;
             headers.host = .default;
@@ -526,7 +589,23 @@ fn fetchWithRedirects(client: *std.http.Client, allocator: Allocator, start_url:
             if (!private_allowed and (std.ascii.eqlIgnoreCase(header.name, "cookie") or std.ascii.eqlIgnoreCase(header.name, "authorization") or std.ascii.eqlIgnoreCase(header.name, "proxy-authorization") or std.ascii.eqlIgnoreCase(header.name, "referer"))) continue;
             try selected.append(allocator, header);
         }
-        var request = try client.request(method, try std.Uri.parse(current), .{ .redirect_behavior = .unhandled, .handle_continue = false, .headers = headers, .extra_headers = selected.items });
+        const pinned_connection = if (opts.require_public_origin)
+            try connectPinnedPublicHttpUrl(client, allocator, current)
+        else
+            null;
+        if (pinned_connection) |connection| connection.closing = true;
+        const request_options: std.http.Client.RequestOptions = .{
+            .redirect_behavior = .unhandled,
+            .handle_continue = false,
+            .keep_alive = !opts.require_public_origin,
+            .connection = pinned_connection,
+            .headers = headers,
+            .extra_headers = selected.items,
+        };
+        var request = client.request(method, try std.Uri.parse(current), request_options) catch |err| {
+            if (pinned_connection) |connection| client.connection_pool.release(connection, client.io);
+            return err;
+        };
         defer request.deinit();
         errdefer request.connection.?.closing = true;
         if (payload) |body| {
@@ -551,6 +630,7 @@ fn fetchWithRedirects(client: *std.http.Client, allocator: Allocator, start_url:
             if (redirects == 5) return error.TooManyHttpRedirects;
             const next = try resolveUrl(allocator, current, response.head.location orelse return error.HttpRedirectLocationMissing);
             errdefer allocator.free(next);
+            if (opts.require_public_origin) try validatePublicHttpUrl(next);
             if (!try sameOrigin(current, next)) private_allowed = false;
             if (response.head.status == .see_other or ((response.head.status == .moved_permanently or response.head.status == .found) and method == .POST)) {
                 if (method != .HEAD) method = .GET;
@@ -682,6 +762,208 @@ pub fn normalizeUrlForFetch(allocator: Allocator, url: []const u8) ![]u8 {
     }
 
     return try out.toOwnedSlice(allocator);
+}
+
+/// Validate an untrusted network target before a request is sent. Provider
+/// download URLs never need embedded credentials, local names, or literal
+/// private/reserved addresses. Redirects are checked through the same path.
+pub fn validatePublicHttpUrl(url: []const u8) !void {
+    const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and
+        !std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.InvalidDownloadUrl;
+    if (uri.user != null or uri.password != null) return error.UnsafeHttpTarget;
+
+    const component = uri.host orelse return error.InvalidDownloadUrl;
+    const raw_host = switch (component) {
+        .raw, .percent_encoded => |host| host,
+    };
+    // Escaped host bytes can obscure separators and address syntax. Parsed
+    // ordinary hosts may still use the percent_encoded component tag, so
+    // inspect the actual bytes rather than the union tag.
+    if (std.mem.indexOfScalar(u8, raw_host, '%') != null) return error.UnsafeHttpTarget;
+    if (isUnsafePublicHost(raw_host)) return error.UnsafeHttpTarget;
+}
+
+fn isUnsafePublicHost(raw_host: []const u8) bool {
+    var host = std.mem.trim(u8, raw_host, " \t\r\n");
+    while (host.len > 0 and host[host.len - 1] == '.') host = host[0 .. host.len - 1];
+    if (host.len == 0) return true;
+
+    if (std.ascii.eqlIgnoreCase(host, "localhost") or
+        std.ascii.endsWithIgnoreCase(host, ".localhost") or
+        std.ascii.eqlIgnoreCase(host, "local") or
+        std.ascii.endsWithIgnoreCase(host, ".local") or
+        std.ascii.eqlIgnoreCase(host, "internal") or
+        std.ascii.endsWithIgnoreCase(host, ".internal") or
+        std.ascii.eqlIgnoreCase(host, "invalid") or
+        std.ascii.endsWithIgnoreCase(host, ".invalid") or
+        std.ascii.eqlIgnoreCase(host, "test") or
+        std.ascii.endsWithIgnoreCase(host, ".test") or
+        std.ascii.eqlIgnoreCase(host, "example") or
+        std.ascii.endsWithIgnoreCase(host, ".example") or
+        std.ascii.eqlIgnoreCase(host, "home.arpa") or
+        std.ascii.endsWithIgnoreCase(host, ".home.arpa")) return true;
+
+    // Literal IPv6 targets are unnecessary for provider downloads. Rejecting
+    // them also covers IPv4-mapped and alternate loopback spellings.
+    if (std.mem.indexOfScalar(u8, host, ':') != null or
+        host[0] == '[' or host[host.len - 1] == ']') return true;
+
+    // Dotless names are subject to local resolver search paths and can target
+    // an intranet host even when the literal spelling appears harmless.
+    if (std.mem.indexOfScalar(u8, host, '.') == null) return true;
+
+    if (parseIpv4Address(host)) |ip| return isUnsafeIpv4(ip);
+
+    // Reject non-canonical integer/hex/octal address spellings that URL
+    // stacks may normalize to an IP address after this check.
+    if (host[0] >= '0' and host[0] <= '9') {
+        var address_like = true;
+        for (host) |c| {
+            if (!((c >= '0' and c <= '9') or c == '.' or c == 'x' or c == 'X' or
+                (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F')))
+            {
+                address_like = false;
+                break;
+            }
+        }
+        if (address_like) return true;
+    }
+    return false;
+}
+
+fn isUnsafeIpv4(ip: [4]u8) bool {
+    const a = ip[0];
+    const b = ip[1];
+    if (a == 0 or a == 10 or a == 127 or a >= 224) return true;
+    if (a == 100 and b >= 64 and b <= 127) return true;
+    if (a == 169 and b == 254) return true;
+    if (a == 172 and b >= 16 and b <= 31) return true;
+    if (a == 192 and (b == 0 or b == 168)) return true;
+    if (a == 198 and (b == 18 or b == 19)) return true;
+    if (a == 198 and b == 51 and ip[2] == 100) return true;
+    if (a == 203 and b == 0 and ip[2] == 113) return true;
+    return false;
+}
+
+fn isUnsafeResolvedAddress(address: std.Io.net.IpAddress) bool {
+    return switch (address) {
+        .ip4 => |ip4| isUnsafeIpv4(ip4.bytes),
+        .ip6 => |ip6| blk: {
+            const bytes = ip6.bytes;
+            const mapped_prefix = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+            if (std.mem.eql(u8, bytes[0..12], &mapped_prefix)) {
+                break :blk isUnsafeIpv4(.{ bytes[12], bytes[13], bytes[14], bytes[15] });
+            }
+            // Only globally routed unicast space (2000::/3) is suitable for
+            // provider downloads. Exclude documentation and benchmarking.
+            if ((bytes[0] & 0xe0) != 0x20) break :blk true;
+            if (std.mem.eql(u8, bytes[0..4], &[_]u8{ 0x20, 0x01, 0x0d, 0xb8 })) break :blk true;
+            if (std.mem.eql(u8, bytes[0..6], &[_]u8{ 0x20, 0x01, 0x00, 0x02, 0, 0 })) break :blk true;
+            break :blk false;
+        },
+    };
+}
+
+/// Resolve once, reject the complete answer set if any address is unsafe, and
+/// return the exact addresses that the caller is allowed to connect to.
+fn resolvePublicHttpAddresses(allocator: Allocator, io: std.Io, url: []const u8) ![]std.Io.net.IpAddress {
+    const uri = try std.Uri.parse(url);
+    var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = try uri.getHost(&host_buffer);
+    const port: u16 = uri.port orelse if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
+
+    var addresses: std.ArrayListUnmanaged(std.Io.net.IpAddress) = .empty;
+    errdefer addresses.deinit(allocator);
+
+    var lookup_buffer: [32]std.Io.net.HostName.LookupResult = undefined;
+    var lookup_queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&lookup_buffer);
+    var lookup = io.async(std.Io.net.HostName.lookup, .{ host, io, &lookup_queue, .{ .port = port } });
+    defer lookup.cancel(io) catch {};
+
+    while (lookup_queue.getOne(io)) |result| switch (result) {
+        .address => |address| {
+            if (isUnsafeResolvedAddress(address)) return error.UnsafeHttpTarget;
+            try addresses.append(allocator, address);
+        },
+        .canonical_name => |canonical| if (isUnsafePublicHost(canonical.bytes)) return error.UnsafeHttpTarget,
+    } else |err| switch (err) {
+        error.Canceled => |e| return e,
+        error.Closed => {
+            try lookup.await(io);
+            if (addresses.items.len == 0) return error.NoAddressReturned;
+            return addresses.toOwnedSlice(allocator);
+        },
+    }
+}
+
+/// Format a resolver result as a numeric host without its port. Zig's resolver
+/// recognizes these strings as literals before consulting hosts files or DNS.
+fn formatNumericHost(address: std.Io.net.IpAddress, buffer: []u8) ![]u8 {
+    return switch (address) {
+        .ip4 => |ip4| std.fmt.bufPrint(buffer, "{d}.{d}.{d}.{d}", .{
+            ip4.bytes[0], ip4.bytes[1], ip4.bytes[2], ip4.bytes[3],
+        }),
+        .ip6 => |ip6| std.fmt.bufPrint(buffer, "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}", .{
+            std.mem.readInt(u16, ip6.bytes[0..2], .big),
+            std.mem.readInt(u16, ip6.bytes[2..4], .big),
+            std.mem.readInt(u16, ip6.bytes[4..6], .big),
+            std.mem.readInt(u16, ip6.bytes[6..8], .big),
+            std.mem.readInt(u16, ip6.bytes[8..10], .big),
+            std.mem.readInt(u16, ip6.bytes[10..12], .big),
+            std.mem.readInt(u16, ip6.bytes[12..14], .big),
+            std.mem.readInt(u16, ip6.bytes[14..16], .big),
+        }),
+    };
+}
+
+/// Connect to one of the validated resolver results while retaining the
+/// original hostname for the HTTP Host field and TLS certificate/SNI checks.
+fn connectPinnedPublicHttpUrl(client: *std.http.Client, allocator: Allocator, url: []const u8) !*std.http.Client.Connection {
+    const uri = try std.Uri.parse(url);
+    const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.InvalidDownloadUrl;
+    var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    const origin_host = try uri.getHost(&host_buffer);
+    const port: u16 = uri.port orelse if (protocol == .tls) 443 else 80;
+
+    const addresses = try resolvePublicHttpAddresses(allocator, client.io, url);
+    defer allocator.free(addresses);
+
+    var last_error: anyerror = error.NoAddressReturned;
+    for (addresses) |address| {
+        var numeric_buffer: [64]u8 = undefined;
+        const numeric_bytes = try formatNumericHost(address, &numeric_buffer);
+        // Deliberately bypass HostName.init: IPv6 literals contain colons, but
+        // the resolver accepts and parses them before any name lookup.
+        const numeric_host: std.Io.net.HostName = .{ .bytes = numeric_bytes };
+        const connection = client.connectTcpOptions(.{
+            .host = numeric_host,
+            .port = port,
+            .protocol = protocol,
+            .proxied_host = origin_host,
+            .proxied_port = port,
+        }) catch |err| {
+            last_error = err;
+            continue;
+        };
+        return connection;
+    }
+    return last_error;
+}
+
+fn parseIpv4Address(host: []const u8) ?[4]u8 {
+    var result: [4]u8 = undefined;
+    var parts = std.mem.splitScalar(u8, host, '.');
+    var index: usize = 0;
+    while (parts.next()) |part| {
+        if (index == result.len or part.len == 0) return null;
+        if (part.len > 1 and part[0] == '0') return null;
+        for (part) |c| if (c < '0' or c > '9') return null;
+        result[index] = std.fmt.parseInt(u8, part, 10) catch return null;
+        index += 1;
+    }
+    if (index != result.len) return null;
+    return result;
 }
 
 fn isHex(c: u8) bool {
@@ -1217,6 +1499,59 @@ test "URL resolution follows document relative and origin semantics" {
     try std.testing.expect(!try sameOrigin("http://localhost:8080/a", "http://localhost:8081/b"));
 }
 
+test "untrusted HTTP targets reject credentials and local address spellings" {
+    for ([_][]const u8{
+        "https://subdl.com/download/1",
+        "http://93.184.216.34/subtitle.srt",
+        "https://cdn.example.com/subtitle.zip",
+    }) |url| try validatePublicHttpUrl(url);
+
+    try std.testing.expectError(error.InvalidDownloadUrl, validatePublicHttpUrl("file:///etc/passwd"));
+
+    for ([_][]const u8{
+        "https://user@example.com/subtitle.srt",
+        "https://localhost/subtitle.srt",
+        "https://worker.local/subtitle.srt",
+        "https://service.internal/subtitle.srt",
+        "https://fixture.invalid/subtitle.srt",
+        "https://fixture.test/subtitle.srt",
+        "https://host.example/subtitle.srt",
+        "https://127.0.0.1/subtitle.srt",
+        "https://10.2.3.4/subtitle.srt",
+        "https://100.64.0.1/subtitle.srt",
+        "https://169.254.1.1/subtitle.srt",
+        "https://172.16.2.3/subtitle.srt",
+        "https://192.168.2.3/subtitle.srt",
+        "https://198.18.0.1/subtitle.srt",
+        "https://[::1]/subtitle.srt",
+        "https://[::ffff:127.0.0.1]/subtitle.srt",
+        "https://2130706433/subtitle.srt",
+        "https://0x7f000001/subtitle.srt",
+        "https://0177.0.0.1/subtitle.srt",
+        "https://%6cocalhost/subtitle.srt",
+        "https://metadata/subtitle.srt",
+    }) |url| try std.testing.expectError(error.UnsafeHttpTarget, validatePublicHttpUrl(url));
+}
+
+test "resolved public address classification rejects private and special networks" {
+    for ([_][]const u8{ "8.8.8.8", "93.184.216.34", "2606:4700:4700::1111" }) |text| {
+        const address = try std.Io.net.IpAddress.parse(text, 443);
+        try std.testing.expect(!isUnsafeResolvedAddress(address));
+    }
+    for ([_][]const u8{ "127.0.0.1", "10.0.0.1", "169.254.169.254", "::1", "fc00::1", "fe80::1", "::ffff:127.0.0.1", "2001:db8::1" }) |text| {
+        const address = try std.Io.net.IpAddress.parse(text, 443);
+        try std.testing.expect(isUnsafeResolvedAddress(address));
+    }
+}
+
+test "resolver addresses become canonical numeric connection hosts" {
+    var buffer: [64]u8 = undefined;
+    const ip4 = try std.Io.net.IpAddress.parse("93.184.216.34", 443);
+    try std.testing.expectEqualStrings("93.184.216.34", try formatNumericHost(ip4, &buffer));
+    const ip6 = try std.Io.net.IpAddress.parse("2606:4700:4700::1111", 443);
+    try std.testing.expectEqualStrings("2606:4700:4700:0:0:0:0:1111", try formatNumericHost(ip6, &buffer));
+}
+
 pub fn shouldRunLiveTests(allocator: Allocator) bool {
     _ = allocator;
     return build_options.live_tests_enabled;
@@ -1276,8 +1611,20 @@ pub fn providerMatchesLiveFilter(filter: ?[]const u8, provider_name: []const u8)
         if (entry.len == 0) continue;
         if (std.mem.eql(u8, entry, "*")) return true;
         if (std.ascii.eqlIgnoreCase(entry, "all")) return true;
+        if (std.ascii.eqlIgnoreCase(entry, "active")) {
+            if (isActiveLiveProvider(provider_name)) return true;
+            continue;
+        }
         if (providerNameEq(entry, provider_name)) return true;
         if (providerNameContains(provider_name, entry)) return true;
+    }
+    return false;
+}
+
+fn isActiveLiveProvider(provider_name: []const u8) bool {
+    var active = std.mem.splitScalar(u8, build_options.active_live_provider_filter, ',');
+    while (active.next()) |name| {
+        if (providerNameEq(provider_name, name)) return true;
     }
     return false;
 }
@@ -1729,6 +2076,14 @@ test "provider filter matching" {
     try std.testing.expect(!providerMatchesLiveFilter("podnapisi.net", "tvsubtitles.net"));
 }
 
+test "active provider filter expands only registry active entries" {
+    try std.testing.expect(providerMatchesLiveFilter("active", "subsource.net"));
+    try std.testing.expect(providerMatchesLiveFilter("ACTIVE", "subsource_net"));
+    try std.testing.expect(providerMatchesLiveFilter("active", "subhd.tv"));
+    try std.testing.expect(!providerMatchesLiveFilter("active", "tvsubtitles.net"));
+    try std.testing.expect(providerMatchesLiveFilter("active,tvsubtitles.net", "tvsubtitles.net"));
+}
+
 test "JSON integer conversion rejects nonfinite and out of range provider numbers" {
     const t = std.testing;
     for ([_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64), 1e100, -1e100, 0x1p63 }) |number|
@@ -1897,8 +2252,14 @@ test "HTTP cache rejects legacy status and impossible timestamps" {
     const path = try fetchCachePath(allocator, root, url, .{});
     defer allocator.free(path);
     try ensureParentDir(path);
+    try std.Io.Dir.cwd().writeFile(runtime_io.get(), .{ .sub_path = path, .data = "old cache bytes" });
     var body = [_]u8{'x'};
     try storeFetchCache(allocator, url, .{}, .{ .status = .ok, .body = &body });
+    if (@hasDecl(std.Io.File.Permissions, "toMode")) {
+        const file = try std.Io.Dir.cwd().openFile(runtime_io.get(), path, .{});
+        defer file.close(runtime_io.get());
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), (try file.stat(runtime_io.get())).permissions.toMode() & 0o777);
+    }
     const valid = (try loadFetchCache(allocator, url, .{})).?;
     allocator.free(valid.body);
     const now = compatUnixTimestamp();

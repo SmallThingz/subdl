@@ -55,6 +55,7 @@ pub const Scraper = struct {
             .extra_headers = &headers,
             .cache = false,
             .max_attempts = 3,
+            .require_public_origin = true,
         });
 
         return parseSearchHtml(common.takeArena(&arena), response.body, trimmed);
@@ -64,6 +65,9 @@ pub const Scraper = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+
+        try validateProviderUrl(item.page_url);
+        try validateProviderUrl(item.download_url);
 
         const filename = try filenameFromDownloadUrl(a, item.download_url, item.title);
         const subtitles = try a.alloc(SubtitleItem, 1);
@@ -105,7 +109,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
         const item: SearchItem = .{
             .title = title,
             .year = split.year,
-            .page_url = try common.resolveUrl(a, site, page_href),
+            .page_url = try resolveProviderUrl(a, page_href),
             .download_url = try normalizeDownloadUrl(a, download_href),
         };
 
@@ -122,9 +126,31 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
 }
 
 fn normalizeDownloadUrl(allocator: Allocator, href: []const u8) ![]const u8 {
-    if (std.mem.indexOf(u8, href, "https://")) |idx| return allocator.dupe(u8, href[idx..]);
-    if (std.mem.indexOf(u8, href, "http://")) |idx| return allocator.dupe(u8, href[idx..]);
-    return common.resolveUrl(allocator, site, href);
+    const resolved = if (std.mem.indexOf(u8, href, "https://")) |idx|
+        try allocator.dupe(u8, href[idx..])
+    else if (std.mem.indexOf(u8, href, "http://")) |idx|
+        try allocator.dupe(u8, href[idx..])
+    else
+        try common.resolveUrl(allocator, site, href);
+    errdefer allocator.free(resolved);
+    try validateProviderUrl(resolved);
+    return resolved;
+}
+
+fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+    const resolved = try common.resolveUrl(allocator, site, href);
+    errdefer allocator.free(resolved);
+    try validateProviderUrl(resolved);
+    return resolved;
+}
+
+fn validateProviderUrl(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url)) and
+        !(try common.sameOrigin("https://subtitrari-noi.ro", url)))
+    {
+        return error.UnsafeHttpTarget;
+    }
 }
 
 fn filenameFromDownloadUrl(allocator: Allocator, url: []const u8, title: []const u8) ![]u8 {
@@ -157,6 +183,16 @@ test "subtitrari-noi parses exact result and prefixed absolute archive url" {
     try std.testing.expectEqualStrings("https://subtitrari-noi.ro/Arhive/Reacher.zip", response.items[0].download_url);
 }
 
+test "subtitrari-noi rejects unsafe provider urls before fetch" {
+    for ([_][]const u8{
+        "http://127.0.0.1/archive.zip",
+        "https://user@subtitrari-noi.ro/archive.zip",
+        "https://subtitrari-noi.ro.attacker.example/archive.zip",
+    }) |url| {
+        try std.testing.expectError(error.UnsafeHttpTarget, validateProviderUrl(url));
+    }
+}
+
 test "live subtitrari-noi movie and tv downloads" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
     if (!common.providerMatchesLiveFilter(common.liveProviderFilter(), "subtitrari-noi.ro")) return error.SkipZigTest;
@@ -173,6 +209,7 @@ test "live subtitrari-noi movie and tv downloads" {
     const movie_download = try common.fetchBytes(&client, std.testing.allocator, movie_subtitles.subtitles[0].download_url, .{
         .accept = "application/zip,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(movie_download.body);
     try std.testing.expect(movie_download.body.len > 4);
@@ -186,6 +223,7 @@ test "live subtitrari-noi movie and tv downloads" {
     const tv_download = try common.fetchBytes(&client, std.testing.allocator, tv_subtitles.subtitles[0].download_url, .{
         .accept = "application/zip,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(tv_download.body);
     try std.testing.expect(tv_download.body.len > 4);

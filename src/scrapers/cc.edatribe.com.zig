@@ -50,6 +50,7 @@ pub const Scraper = struct {
             const response = try common.fetchBytes(self.client, a, catalog_url, .{
                 .accept = "application/json",
                 .max_attempts = 2,
+                .require_public_origin = true,
             });
             try appendCatalogMatches(a, response.body, wanted, catalog_url, catalog.media_kind, &seen, &exact, &partial);
         }
@@ -65,9 +66,12 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        try validateProviderUrl(item.page_url);
+
         const response = try common.fetchBytes(self.client, a, item.page_url, .{
             .accept = "application/json",
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
@@ -103,6 +107,12 @@ pub const Scraper = struct {
         });
     }
 };
+
+fn validateProviderUrl(url: []const u8) !void {
+    const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
+    if (uri.user != null or uri.password != null) return error.InvalidDownloadUrl;
+    if (!(common.sameOrigin(site, url) catch false)) return error.InvalidDownloadUrl;
+}
 
 fn appendCatalogMatches(
     allocator: Allocator,
@@ -206,6 +216,17 @@ test "closed caption browser parses catalog prefixes and exact matches" {
     try std.testing.expectEqualStrings("Attack on Titan", exact.items[0].title);
 }
 
+test "closed caption browser rejects non-provider catalog targets" {
+    try validateProviderUrl("https://cc.edatribe.com/files/Movie/");
+    for ([_][]const u8{
+        "http://127.0.0.1/files/Movie/",
+        "https://cc.edatribe.com.example/files/Movie/",
+        "https://user@cc.edatribe.com/files/Movie/",
+    }) |url| {
+        try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl(url));
+    }
+}
+
 test "live closed caption browser movie and tv downloads" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
     if (!common.providerMatchesLiveFilter(common.liveProviderFilter(), "cc.edatribe.com")) return error.SkipZigTest;
@@ -224,6 +245,7 @@ test "live closed caption browser movie and tv downloads" {
     const movie_download = try common.fetchBytes(&client, std.testing.allocator, movie_subtitles.subtitles[0].download_url, .{
         .accept = "text/plain,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(movie_download.body);
     try std.testing.expect(movie_download.body.len > 32);
@@ -239,6 +261,7 @@ test "live closed caption browser movie and tv downloads" {
     const tv_download = try common.fetchBytes(&client, std.testing.allocator, tv_subtitles.subtitles[0].download_url, .{
         .accept = "text/plain,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(tv_download.body);
     try std.testing.expect(tv_download.body.len > 32);

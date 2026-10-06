@@ -51,14 +51,11 @@ pub const Scraper = struct {
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 3,
+            .require_public_origin = true,
         });
         const antispam = try parseAntispamToken(a, page.body);
 
-        const payload = try std.fmt.allocPrint(
-            a,
-            "termen-general={s}&type=subtitrari&antispam={s}",
-            .{ encoded, antispam },
-        );
+        const payload = try buildSearchPayload(a, encoded, antispam);
         const headers = [_]std.http.Header{
             .{ .name = "origin", .value = site },
             .{ .name = "referer", .value = search_page_url },
@@ -73,6 +70,7 @@ pub const Scraper = struct {
             .extra_headers = &headers,
             .cache = false,
             .max_attempts = 3,
+            .require_public_origin = true,
         });
 
         return parseSearchHtml(common.takeArena(&arena), response.body, trimmed);
@@ -82,6 +80,8 @@ pub const Scraper = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+        try validateProviderEndpoint(item.page_url);
+        try validateProviderEndpoint(item.download_url);
 
         const subtitles = try a.alloc(SubtitleItem, 1);
         subtitles[0] = .{
@@ -97,6 +97,12 @@ pub const Scraper = struct {
     }
 };
 
+fn buildSearchPayload(allocator: Allocator, encoded_query: []const u8, antispam: []const u8) ![]const u8 {
+    const encoded_token = try common.encodeUriComponent(allocator, antispam);
+    defer allocator.free(encoded_token);
+    return std.fmt.allocPrint(allocator, "termen-general={s}&type=subtitrari&antispam={s}", .{ encoded_query, encoded_token });
+}
+
 fn parseAntispamToken(allocator: Allocator, body: []const u8) ![]const u8 {
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
@@ -106,6 +112,15 @@ fn parseAntispamToken(allocator: Allocator, body: []const u8) ![]const u8 {
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
     if (trimmed.len < 16 or trimmed.len > 128) return error.UnexpectedResponseType;
     return allocator.dupe(u8, trimmed);
+}
+
+test "subs.ro encodes form token without adding fields or decoding plus" {
+    const payload = try buildSearchPayload(std.testing.allocator, "The%20Matrix%26", "a+b/c=d&e?f%g");
+    defer std.testing.allocator.free(payload);
+    try std.testing.expectEqualStrings(
+        "termen-general=The%20Matrix%26&type=subtitrari&antispam=a%2Bb%2Fc%3Dd%26e%3Ff%25g",
+        payload,
+    );
 }
 
 fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []const u8) !SearchResponse {
@@ -126,8 +141,10 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
 
         const page_href = common.getAttributeValueSafe(title_anchor, "href") orelse continue;
         const download_href = common.getAttributeValueSafe(download_anchor, "href") orelse continue;
-        if (seen.contains(download_href)) continue;
-        try seen.put(a, try a.dupe(u8, download_href), {});
+        const page_url = try resolveProviderUrl(a, page_href);
+        const download_url = try resolveProviderUrl(a, download_href);
+        if (seen.contains(download_url)) continue;
+        try seen.put(a, download_url, {});
 
         const title_attr = common.getAttributeValueSafe(title_anchor, "data-movie-name");
         const raw_title = if (title_attr) |value|
@@ -152,8 +169,8 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
             .media_kind = inferMediaKind(raw_title, page_href),
             .language_code = language_code,
             .release = release,
-            .page_url = try common.resolveUrl(a, site, page_href),
-            .download_url = try common.resolveUrl(a, site, download_href),
+            .page_url = page_url,
+            .download_url = download_url,
         };
 
         const normalized = try common.normalizeTitle(a, raw_title);
@@ -219,6 +236,24 @@ fn pathBaseName(path: []const u8) []const u8 {
     return trimmed[slash + 1 ..];
 }
 
+fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+    const resolved = try common.resolveUrl(allocator, site, href);
+    errdefer allocator.free(resolved);
+    try validateProviderEndpoint(resolved);
+    return resolved;
+}
+
+fn validateProviderEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+}
+
+test "subs.ro rejects unsafe provider links" {
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "http://127.0.0.1/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://user:pass@subs.ro/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://subs.ro.evil.com/private"));
+}
+
 test "subs ro parses antispam token" {
     const allocator = std.testing.allocator;
     const token = try parseAntispamToken(
@@ -282,6 +317,7 @@ test "live subs ro movie and tv downloads" {
     const movie_download = try common.fetchBytes(&client, std.testing.allocator, movie_subtitles.subtitles[0].download_url, .{
         .accept = "application/zip,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(movie_download.body);
     try std.testing.expect(movie_download.body.len > 4);
@@ -296,6 +332,7 @@ test "live subs ro movie and tv downloads" {
     const tv_download = try common.fetchBytes(&client, std.testing.allocator, tv_subtitles.subtitles[0].download_url, .{
         .accept = "application/zip,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
     });
     defer std.testing.allocator.free(tv_download.body);
     try std.testing.expect(tv_download.body.len > 4);

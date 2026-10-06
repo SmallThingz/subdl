@@ -40,6 +40,7 @@ pub const Scraper = struct {
         const response = try common.fetchBytes(self.client, a, url, .{
             .accept = "application/json",
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         return parseSearchJson(common.takeArena(&arena), response.body);
@@ -49,10 +50,12 @@ pub const Scraper = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+        try validateWebEndpoint(item.page_url);
 
         const response = try common.fetchBytes(self.client, a, item.page_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .max_attempts = 2,
+            .require_public_origin = true,
         });
 
         var parsed = try common.parseHtmlStable(a, response.body);
@@ -61,6 +64,7 @@ pub const Scraper = struct {
         var anchors = parsed.doc.queryAll("a[href^='https://api.subt.is/v1/subtitle/link/']");
         while (anchors.next()) |anchor| {
             const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
+            try validateApiEndpoint(href);
             if (seen.contains(href)) continue;
             try seen.put(a, href, {});
             const id = trailingPathSegment(href) orelse "subtitle";
@@ -106,11 +110,13 @@ fn parseSearchJson(arena: std.heap.ArenaAllocator, body: []const u8) !SearchResp
         const slug = common.jsonString(entry_obj, "slug") orelse continue;
         const year = if (entry_obj.get("year")) |value| common.jsonInt(value) else null;
 
+        const page_url = try std.fmt.allocPrint(a, "{s}/subtitles/movie/{s}", .{ web_site, slug });
+        try validateWebEndpoint(page_url);
         try items.append(a, .{
             .title = try a.dupe(u8, title),
             .year = year,
             .slug = try a.dupe(u8, slug),
-            .page_url = try std.fmt.allocPrint(a, "{s}/subtitles/movie/{s}", .{ web_site, slug }),
+            .page_url = page_url,
         });
     }
 
@@ -124,6 +130,23 @@ fn trailingPathSegment(url: []const u8) ?[]const u8 {
     const slash = std.mem.lastIndexOfScalar(u8, url[0..end], '/') orelse return url[0..end];
     if (slash + 1 >= end) return null;
     return url[slash + 1 .. end];
+}
+
+fn validateWebEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(web_site, url))) return error.UnsafeHttpTarget;
+}
+
+fn validateApiEndpoint(url: []const u8) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(api_site, url))) return error.UnsafeHttpTarget;
+}
+
+test "subtis rejects unsafe web and API endpoints" {
+    try std.testing.expectError(error.UnsafeHttpTarget, validateWebEndpoint("http://127.0.0.1/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateWebEndpoint("https://user:pass@subtis.io/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateWebEndpoint("https://subtis.io.evil.com/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateApiEndpoint("https://api.subt.is.evil.com/v1/subtitle/link/1"));
 }
 
 test "subtis parses movie search payload" {
