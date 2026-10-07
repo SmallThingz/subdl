@@ -157,9 +157,12 @@ const PngWriter = struct {
     writer: *std.Io.Writer = undefined,
 
     pub fn init(allocator: std.mem.Allocator, writer: *std.Io.Writer, chunk_buffer_size: usize, compression_buffer_size: usize) !PngWriter {
+        const chunk_buffer = try allocator.alloc(u8, chunk_buffer_size);
+        errdefer allocator.free(chunk_buffer);
+
         return .{
             .writer = writer,
-            .chunk_buffer = try allocator.alloc(u8, chunk_buffer_size),
+            .chunk_buffer = chunk_buffer,
             .compression_buffer = try allocator.alloc(u8, compression_buffer_size),
         };
     }
@@ -181,10 +184,10 @@ const PngWriter = struct {
         try writer.writeInt(u32, header.width, .big);
         try writer.writeInt(u32, header.height, .big);
         try writer.writeInt(u8, header.bit_depth, .big);
-        try writer.writeInt(u8, @intFromEnum(header.color_type), .big);
-        try writer.writeInt(u8, @intFromEnum(header.compression_method), .big);
-        try writer.writeInt(u8, @intFromEnum(header.filter_method), .big);
-        try writer.writeInt(u8, @intFromEnum(header.interlace_method), .big);
+        try writer.writeInt(u8, @backingInt(header.color_type), .big);
+        try writer.writeInt(u8, @backingInt(header.compression_method), .big);
+        try writer.writeInt(u8, @backingInt(header.filter_method), .big);
+        try writer.writeInt(u8, @backingInt(header.interlace_method), .big);
 
         try writer.flush();
     }

@@ -27,6 +27,10 @@ else
             return null;
         }
 
+        pub fn read(_: Entry, _: []u8) !void {
+            return error.UnarrUnavailable;
+        }
+
         pub fn readAlloc(_: Entry, _: anytype, _: usize) ![]u8 {
             return error.UnarrUnavailable;
         }

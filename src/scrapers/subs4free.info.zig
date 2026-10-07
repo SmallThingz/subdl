@@ -37,6 +37,8 @@ pub const Scraper = struct {
 
         const trimmed = std.mem.trim(u8, query, " \t\r\n");
         if (trimmed.len == 0) return .{ .arena = arena, .items = &.{} };
+        const wanted = try common.normalizeTitle(a, trimmed);
+        if (wanted.len == 0) return .{ .arena = arena, .items = &.{} };
 
         const encoded = try common.encodeUriComponent(a, trimmed);
         const url = try std.fmt.allocPrint(a, "{s}/search_report.php?search={s}&searchType=1", .{ site, encoded });
@@ -46,6 +48,8 @@ pub const Scraper = struct {
             .cache = false,
             .max_attempts = 2,
             .require_public_origin = true,
+            .require_https = true,
+            .require_same_origin = true,
         });
         return parseSearchHtml(common.takeArena(&arena), response.body, trimmed);
     }
@@ -58,7 +62,7 @@ pub const Scraper = struct {
         const subtitles = try a.alloc(SubtitleItem, 1);
         subtitles[0] = .{
             .language_code = try a.dupe(u8, item.language_code),
-            .filename = try std.fmt.allocPrint(a, "{s}.zip", .{item.release}),
+            .filename = try subtitleFilename(a, item.release),
             .download_url = try makeDownloadToken(a, item.page_url),
         };
         return common.finishResponse(SubtitlesResponse, &arena, .{
@@ -70,7 +74,8 @@ pub const Scraper = struct {
 
     pub fn fetchDownloadByToken(self: *Scraper, allocator: Allocator, token: []const u8) !common.HttpResponse {
         const page_url = parseDownloadToken(token) orelse return error.InvalidDownloadUrl;
-        var page = try fetchDetailPage(self.client, allocator, page_url);
+        const deadline_ms = common.compatMilliTimestamp() +| common.default_fetch_timeout_ms;
+        var page = try fetchDetailPage(self.client, allocator, page_url, deadline_ms);
         defer page.deinit(allocator);
         try requireDetailStatus(page.status);
         const cookie = page.cookie orelse return error.SessionExpired;
@@ -94,14 +99,33 @@ pub const Scraper = struct {
             .cache = false,
             .max_attempts = 2,
             .require_public_origin = true,
+            .require_https = true,
+            .require_same_origin = true,
+            .deadline_ms = deadline_ms,
         });
-        if (response.status != .ok or response.body.len < 4 or !std.mem.eql(u8, response.body[0..2], "PK")) {
+        if (response.status == .too_many_requests) {
             allocator.free(response.body);
-            return error.UnexpectedResponseType;
+            return error.RateLimited;
         }
+        if (response.status != .ok) {
+            allocator.free(response.body);
+            return error.UnexpectedHttpStatus;
+        }
+        validateZipDownloadBody(response.body) catch |err| {
+            allocator.free(response.body);
+            return err;
+        };
         return response;
     }
 };
+
+fn subtitleFilename(allocator: Allocator, release: []const u8) ![]u8 {
+    const bounded = release[0..@min(release.len, 160)];
+    const slug = try common.asciiSlug(allocator, bounded);
+    defer allocator.free(slug);
+    if (slug.len == 0) return allocator.dupe(u8, "subs4free-subtitle.zip");
+    return std.fmt.allocPrint(allocator, "{s}.zip", .{slug});
+}
 
 const DetailPage = struct {
     status: std.http.Status,
@@ -120,8 +144,53 @@ fn requireDetailStatus(status: std.http.Status) !void {
     if (status != .ok) return error.UnexpectedHttpStatus;
 }
 
-fn fetchDetailPage(client: *std.http.Client, allocator: Allocator, url: []const u8) !DetailPage {
-    try validateProviderEndpoint(url);
+fn fetchDetailPage(client: *std.http.Client, allocator: Allocator, url: []const u8, deadline_ms: i64) !DetailPage {
+    const now_ms = common.compatMilliTimestamp();
+    if (now_ms >= deadline_ms) return error.Timeout;
+
+    const FetchTask = struct {
+        fn run(result: *?DetailPage, task_client: *std.http.Client, task_allocator: Allocator, task_url: []const u8) !void {
+            result.* = try fetchDetailPageUnbounded(task_client, task_allocator, task_url);
+        }
+    };
+    const FetchResult = @typeInfo(@TypeOf(FetchTask.run)).@"fn".return_type.?;
+    const TimeoutResult = @typeInfo(@TypeOf(std.Io.Timeout.sleep)).@"fn".return_type.?;
+    const Selection = union(enum) {
+        fetch: FetchResult,
+        timeout: TimeoutResult,
+    };
+    var selection_buffer: [2]Selection = undefined;
+    var selection = std.Io.Select(Selection).init(client.io, &selection_buffer);
+    var owned_page: ?DetailPage = null;
+    defer {
+        selection.cancelDiscard();
+        if (owned_page) |*page| page.deinit(allocator);
+    }
+
+    const remaining_ms: i64 = deadline_ms -| now_ms;
+    const timeout: std.Io.Timeout = .{ .deadline = std.Io.Clock.Timestamp.fromNow(client.io, .{
+        .raw = std.Io.Duration.fromMilliseconds(remaining_ms),
+        .clock = .awake,
+    }) };
+    try selection.concurrent(.fetch, FetchTask.run, .{ &owned_page, client, allocator, url });
+    try selection.concurrent(.timeout, std.Io.Timeout.sleep, .{ timeout, client.io });
+
+    switch (try selection.await()) {
+        .fetch => |result| {
+            try result;
+            const page = owned_page orelse return error.MissingHttpResponse;
+            owned_page = null;
+            return page;
+        },
+        .timeout => |result| {
+            try result;
+            return error.Timeout;
+        },
+    }
+}
+
+fn fetchDetailPageUnbounded(client: *std.http.Client, allocator: Allocator, url: []const u8) !DetailPage {
+    try validateProviderDetailUrl(url);
     const normalized = try common.normalizeUrlForFetch(allocator, url);
     defer allocator.free(normalized);
     const uri = try std.Uri.parse(normalized);
@@ -159,33 +228,26 @@ fn fetchDetailPage(client: *std.http.Client, allocator: Allocator, url: []const 
     var interim_count: usize = 0;
     while (response.head.status.class() == .informational) {
         if (response.head.status == .switching_protocols) return error.UnsupportedProtocolUpgrade;
+        try validateRawDetailResponseHead(response.head);
         interim_count += 1;
         if (interim_count > 16) return error.TooManyInformationalResponses;
         response = req.receiveHead(&head_buffer) catch |err| return common.normalizeRequestReadError(&req, err);
     }
+    try validateRawDetailResponseHead(response.head);
     const cookie = try common.extractPhpSessionCookie(allocator, response.head.bytes);
     errdefer if (cookie) |value| allocator.free(value);
 
-    var transfer_buffer: [16 * 1024]u8 = undefined;
-    const reader = response.reader(&transfer_buffer);
-    const body = readBoundedBody(allocator, reader, max_raw_response_bytes) catch |err| {
-        if (err == error.ReadFailed) {
-            if (response.bodyErr()) |body_err| return body_err;
-            return common.normalizeRequestReadError(&req, err);
-        }
-        return err;
-    };
+    const body = try common.readStrictResponseBody(&req, &response, allocator, max_raw_response_bytes);
     errdefer allocator.free(body);
-    switch (req.reader.state) {
-        .body_remaining_content_length => |left| if (left != 0) return error.HttpBodyTruncated,
-        .body_remaining_chunk_len => return error.HttpChunkTruncated,
-        else => {},
-    }
     return .{
         .status = response.head.status,
         .body = body,
         .cookie = cookie,
     };
+}
+
+fn validateRawDetailResponseHead(head: std.http.Client.Response.Head) !void {
+    try common.validateResponseFraming(head);
 }
 
 fn readBoundedBody(allocator: Allocator, reader: *std.Io.Reader, max_bytes: usize) ![]u8 {
@@ -227,19 +289,71 @@ test "raw response body limit accepts exact bounds and rejects excess" {
     try std.testing.expectError(error.ResponseTooLarge, readBoundedBody(a, &zero_limit, 0));
 }
 
-fn validateProviderEndpoint(url: []const u8) !void {
+fn validateProviderDetailUrl(url: []const u8) !void {
     try common.validatePublicHttpUrl(url);
     if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+
+    const uri = std.Uri.parse(url) catch return error.UnsafeHttpTarget;
+    if (uri.fragment != null) return error.UnsafeHttpTarget;
+    if (std.mem.indexOfScalar(u8, url, '?') != null) return error.UnsafeHttpTarget;
+    var path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    if (path.len > 1 and path[path.len - 1] == '/') path = path[0 .. path.len - 1];
+    if (path.len > 1 and path[path.len - 1] == '/') return error.UnsafeHttpTarget;
+
+    const greek_prefix = "/greek-subtitles/";
+    const english_prefix = "/english-subtitles/";
+    const remainder = if (std.mem.startsWith(u8, path, greek_prefix))
+        path[greek_prefix.len..]
+    else if (std.mem.startsWith(u8, path, english_prefix))
+        path[english_prefix.len..]
+    else
+        return error.UnsafeHttpTarget;
+
+    var segments = std.mem.splitScalar(u8, remainder, '/');
+    const detail_id = segments.next() orelse return error.UnsafeHttpTarget;
+    const slug = segments.next() orelse return error.UnsafeHttpTarget;
+    if (segments.next() != null or !isDetailId(detail_id) or !isDetailSlug(slug))
+        return error.UnsafeHttpTarget;
+}
+
+fn isDetailId(value: []const u8) bool {
+    if (value.len != 11 or value[0] != 's') return false;
+    for (value[1..]) |c| {
+        if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return false;
+    }
+    return true;
+}
+
+fn isDetailSlug(value: []const u8) bool {
+    if (value.len == 0 or value[0] == '-' or value[value.len - 1] == '-') return false;
+    for (value) |c| {
+        if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'z') and c != '-') return false;
+    }
+    return true;
+}
+
+fn validateZipDownloadBody(body: []const u8) !void {
+    if (body.len < 4) return error.UnexpectedResponseType;
+    const signature = body[0..4];
+    if (!std.mem.eql(u8, signature, "PK\x03\x04") and
+        !std.mem.eql(u8, signature, "PK\x05\x06") and
+        !std.mem.eql(u8, signature, "PK\x07\x08"))
+    {
+        return error.UnexpectedResponseType;
+    }
 }
 
 pub fn makeDownloadToken(allocator: Allocator, page_url: []const u8) ![]u8 {
+    try validateProviderDetailUrl(page_url);
     return std.fmt.allocPrint(allocator, "{s}{s}", .{ download_token_prefix, page_url });
 }
 
 pub fn parseDownloadToken(value: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, value, download_token_prefix)) return null;
     const page_url = value[download_token_prefix.len..];
-    if (!std.mem.startsWith(u8, page_url, site ++ "/")) return null;
+    validateProviderDetailUrl(page_url) catch return null;
     return page_url;
 }
 
@@ -247,9 +361,9 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     var owned_arena = arena;
     errdefer owned_arena.deinit();
     const a = owned_arena.allocator();
-    var parsed = try common.parseHtmlStable(a, body);
-
     const wanted = try common.normalizeTitle(a, query);
+    if (wanted.len == 0) return .{ .arena = owned_arena, .items = &.{} };
+    var parsed = try common.parseHtmlStable(a, body);
     var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
     var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
     var seen = std.StringHashMapUnmanaged(void).empty;
@@ -264,11 +378,11 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
         const split = splitTitleYear(release) orelse continue;
         const normalized = try common.normalizeTitle(a, split.title);
         const exact_match = std.mem.eql(u8, normalized, wanted);
-        const partial_match = std.mem.indexOf(u8, normalized, wanted) != null or
-            std.mem.indexOf(u8, wanted, normalized) != null;
+        const partial_match = normalizedTitlesRelated(normalized, wanted);
         if (!exact_match and !partial_match) continue;
 
         const page_url = try common.resolveUrl(a, site, href);
+        validateProviderDetailUrl(page_url) catch continue;
         if (seen.contains(page_url)) continue;
         try seen.put(a, page_url, {});
         const item: SearchItem = .{
@@ -288,6 +402,23 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     try items.appendSlice(a, exact.items);
     try items.appendSlice(a, partial.items);
     return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) });
+}
+
+fn normalizedTitlesRelated(lhs: []const u8, rhs: []const u8) bool {
+    return containsNormalizedPhrase(lhs, rhs) or containsNormalizedPhrase(rhs, lhs);
+}
+
+fn containsNormalizedPhrase(haystack: []const u8, needle: []const u8) bool {
+    if (haystack.len == 0 or needle.len == 0 or needle.len > haystack.len) return false;
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, start, needle)) |index| {
+        const end = index + needle.len;
+        const starts_at_boundary = index == 0 or haystack[index - 1] == ' ';
+        const ends_at_boundary = end == haystack.len or haystack[end] == ' ';
+        if (starts_at_boundary and ends_at_boundary) return true;
+        start = index + 1;
+    }
+    return false;
 }
 
 const TitleYear = common.RequiredTitleYear;
@@ -335,17 +466,49 @@ fn allDigits(input: []const u8) bool {
 fn parseDownloadId(allocator: Allocator, body: []const u8) !?[]u8 {
     var parsed = try common.parseHtmlStable(allocator, body);
     defer parsed.deinit();
-    const node = parsed.doc.queryOne("input[name=\"id\"][value]") orelse return null;
-    const value = common.getAttributeValueSafe(node, "value") orelse return null;
-    if (value.len == 0) return null;
-    return try allocator.dupe(u8, value);
+    var forms = parsed.doc.queryAll("form[action]");
+    while (forms.next()) |form| {
+        const action = common.getAttributeValueSafe(form, "action") orelse continue;
+        if (!(try formTargetsDownloadEndpoint(allocator, action))) continue;
+
+        var nodes = form.queryAll("input[name=\"id\"][value]");
+        while (nodes.next()) |node| {
+            const value = common.getAttributeValueSafe(node, "value") orelse continue;
+            if (!isCanonicalPositiveDownloadId(value)) continue;
+            return try allocator.dupe(u8, value);
+        }
+    }
+    return null;
+}
+
+fn formTargetsDownloadEndpoint(allocator: Allocator, action: []const u8) !bool {
+    const resolved = common.resolveUrl(allocator, site ++ "/", action) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return false,
+    };
+    defer allocator.free(resolved);
+
+    common.validatePublicHttpUrl(resolved) catch return false;
+    if (!(common.sameOrigin(site, resolved) catch false)) return false;
+    const uri = std.Uri.parse(resolved) catch return false;
+    if (uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return false;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    return std.mem.eql(u8, path, "/getSub.php");
+}
+
+fn isCanonicalPositiveDownloadId(value: []const u8) bool {
+    if (value.len == 0 or value.len > 19 or value[0] == '0') return false;
+    for (value) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
 }
 
 test "subs4free preserves numeric titles and ignores resolution numbers" {
     const fixture =
-        "<div class='movie-details'><a class='movie-heading' href='/greek-subtitles/a'>Blade Runner 2049 2017 1920x1080 BluRay</a></div>" ++
-        "<div class='movie-details'><a class='movie-heading' href='/english-subtitles/b'>Blade Runner 2049 (2017) 1080p</a></div>" ++
-        "<div class='movie-details'><a class='movie-heading' href='/greek-subtitles/c'>Blade Runner 2049 2017 1920 x 1080 BluRay</a></div>";
+        "<div class='movie-details'><a class='movie-heading' href='/greek-subtitles/s0000000001/a'>Blade Runner 2049 2017 1920x1080 BluRay</a></div>" ++
+        "<div class='movie-details'><a class='movie-heading' href='/english-subtitles/s0000000002/b'>Blade Runner 2049 (2017) 1080p</a></div>" ++
+        "<div class='movie-details'><a class='movie-heading' href='/greek-subtitles/s0000000003/c'>Blade Runner 2049 2017 1920 x 1080 BluRay</a></div>";
     var response = try parseSearchHtml(std.heap.ArenaAllocator.init(std.testing.allocator), fixture, "Blade Runner 2049");
     defer response.deinit();
     try std.testing.expectEqual(@as(usize, 3), response.items.len);
@@ -374,9 +537,9 @@ test "subs4free preserves numeric titles and ignores resolution numbers" {
 
 test "subs4free parses exact movie rows before partial matches" {
     const fixture =
-        "<div class=\"movie-details\"><a class=\"movie-heading\" href=\"/greek-subtitles/a\">The Matrix Revolutions 2003 1080p</a></div>" ++
-        "<div class=\"movie-details\"><a class=\"movie-heading\" href=\"/greek-subtitles/b\">The Matrix 1999 1080p BrRip x264 YIFY</a></div>" ++
-        "<div class=\"movie-details\"><a class=\"movie-heading\" href=\"/english-subtitles/c\">The Matrix 1999 BluRay</a></div>";
+        "<div class=\"movie-details\"><a class=\"movie-heading\" href=\"/greek-subtitles/s0000000001/a\">The Matrix Revolutions 2003 1080p</a></div>" ++
+        "<div class=\"movie-details\"><a class=\"movie-heading\" href=\"/greek-subtitles/s0000000002/b\">The Matrix 1999 1080p BrRip x264 YIFY</a></div>" ++
+        "<div class=\"movie-details\"><a class=\"movie-heading\" href=\"/english-subtitles/s0000000003/c\">The Matrix 1999 BluRay</a></div>";
     const arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     var response = try parseSearchHtml(arena, fixture, "The Matrix");
     defer response.deinit();
@@ -390,10 +553,51 @@ test "subs4free parses exact movie rows before partial matches" {
     try std.testing.expectEqualStrings("The Matrix Revolutions", response.items[2].title);
 }
 
-test "subs4free parses download id" {
-    const id = (try parseDownloadId(std.testing.allocator, "<form><input type=\"hidden\" name=\"id\" value=\"abc123\"></form>")).?;
+test "subs4free selects a canonical positive download id" {
+    const body =
+        "<form action=\"/profile\"><input type=\"hidden\" name=\"id\" value=\"999\"></form>" ++
+        "<form action=\"/getSub.php\"><input type=\"hidden\" name=\"id\" value=\"0\"></form>" ++
+        "<form action=\"https://example.com/getSub.php\"><input type=\"hidden\" name=\"id\" value=\"998\"></form>" ++
+        "<form action=\"/getSub.php?next=/admin\"><input type=\"hidden\" name=\"id\" value=\"997\"></form>" ++
+        "<form action=\"getSub.php\"><input type=\"hidden\" name=\"id\" value=\"abc123\"></form>" ++
+        "<form action=\"/getSub.php\"><input type=\"hidden\" name=\"id\" value=\"01\"></form>" ++
+        "<form action=\"/getSub.php\"><input type=\"hidden\" name=\"id\" value=\"123\"></form>";
+    const id = (try parseDownloadId(std.testing.allocator, body)).?;
     defer std.testing.allocator.free(id);
-    try std.testing.expectEqualStrings("abc123", id);
+    try std.testing.expectEqualStrings("123", id);
+    try std.testing.expect((try parseDownloadId(
+        std.testing.allocator,
+        "<form action=\"/unrelated\"><input name=\"id\" value=\"1\"></form>" ++
+            "<form action=\"/getSub.php\"><input name=\"id\" value=\"0\"><input name=\"id\" value=\"0001\"></form>",
+    )) == null);
+}
+
+test "subs4free output names and title relevance are filesystem safe" {
+    const filename = try subtitleFilename(std.testing.allocator, "../The Matrix\\Release: 1080p");
+    defer std.testing.allocator.free(filename);
+    try std.testing.expectEqualStrings("the-matrix-release-1080p.zip", filename);
+    const fallback = try subtitleFilename(std.testing.allocator, "../...");
+    defer std.testing.allocator.free(fallback);
+    try std.testing.expectEqualStrings("subs4free-subtitle.zip", fallback);
+    try std.testing.expect(normalizedTitlesRelated("jack reacher", "reacher"));
+    try std.testing.expect(!normalizedTitlesRelated("preacher", "reacher"));
+    try std.testing.expect(!normalizedTitlesRelated("reacher", ""));
+}
+
+test "subs4free accepts only complete ZIP signatures" {
+    for ([_][]const u8{
+        "PK\x03\x04payload",
+        "PK\x05\x06",
+        "PK\x07\x08payload",
+    }) |body| try validateZipDownloadBody(body);
+
+    for ([_][]const u8{
+        "",
+        "PK",
+        "PKxx",
+        "PK<html>",
+        "Rar!",
+    }) |body| try std.testing.expectError(error.UnexpectedResponseType, validateZipDownloadBody(body));
 }
 
 test "subs4free raw detail page classifies rate limits" {
@@ -402,8 +606,93 @@ test "subs4free raw detail page classifies rate limits" {
     try std.testing.expectError(error.UnexpectedHttpStatus, requireDetailStatus(.service_unavailable));
 }
 
-test "subs4free rejects unsafe detail targets before fetch" {
-    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("http://127.0.0.1/private"));
-    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("https://user:pass@www.subs4free.info/private"));
-    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("https://www.google.com/private"));
+test "subs4free detail fetch rejects an expired deadline before I/O" {
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    try std.testing.expectError(
+        error.Timeout,
+        fetchDetailPage(
+            &client,
+            std.testing.allocator,
+            site ++ "/greek-subtitles/s0000000001/title",
+            common.compatMilliTimestamp(),
+        ),
+    );
+}
+
+test "subs4free accepts only provider detail routes" {
+    inline for (.{
+        "https://www.subs4free.info/greek-subtitles/sc8643a5496/the-matrix-revolutions-2003",
+        "https://www.subs4free.info/english-subtitles/s0cc253fd68/the-matrix-resurrections-2021",
+        "https://www.subs4free.info/english-subtitles/s0cc253fd68/the-matrix-resurrections-2021/",
+    }) |url| {
+        try validateProviderDetailUrl(url);
+        const token = try makeDownloadToken(std.testing.allocator, url);
+        defer std.testing.allocator.free(token);
+        try std.testing.expectEqualStrings(url, parseDownloadToken(token).?);
+    }
+
+    inline for (.{
+        "http://127.0.0.1/greek-subtitles/s0000000001/title",
+        "https://user:pass@www.subs4free.info/greek-subtitles/s0000000001/title",
+        "https://www.google.com/greek-subtitles/s0000000001/title",
+        "https://www.subs4free.info/admin",
+        "https://www.subs4free.info/greek-subtitles/s0000000001",
+        "https://www.subs4free.info/greek-subtitles/s0000000001/title/extra",
+        "https://www.subs4free.info/greek-subtitles/not-an-id/title",
+        "https://www.subs4free.info/greek-subtitles/s000000000g/title",
+        "https://www.subs4free.info/greek-subtitles/s0000000001/not_a_slug",
+        "https://www.subs4free.info/greek-subtitles/s0000000001/title//",
+        "https://www.subs4free.info/greek-subtitles/../admin/title",
+        "https://www.subs4free.info/greek-subtitles/s0000000001/%2e%2e",
+        "https://www.subs4free.info/greek-subtitles/s0000000001/title?from=search",
+        "https://www.subs4free.info/greek-subtitles/s0000000001/title#fragment",
+    }) |url| {
+        try std.testing.expectError(error.UnsafeHttpTarget, validateProviderDetailUrl(url));
+        try std.testing.expect(parseDownloadToken(download_token_prefix ++ url) == null);
+    }
+}
+
+test "subs4free raw detail transport rejects ambiguous response framing" {
+    for ([_][]const u8{
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n",
+    }) |raw_head| {
+        const head = try std.http.Client.Response.Head.parse(raw_head);
+        try std.testing.expectError(error.AmbiguousHttpFraming, validateRawDetailResponseHead(head));
+    }
+}
+
+test "live subs4free search session and download" {
+    if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
+    if (!common.providerMatchesLiveFilter(common.liveProviderFilter(), "subs4free.info")) return error.SkipZigTest;
+
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &client);
+
+    var search = try scraper.search("The Matrix");
+    defer search.deinit();
+    const item = blk: {
+        for (search.items) |candidate| {
+            if (candidate.year == 1999 and std.ascii.eqlIgnoreCase(candidate.title, "The Matrix"))
+                break :blk candidate;
+        }
+        return error.TestUnexpectedResult;
+    };
+    std.debug.print("[live][subs4free.info][search]\n", .{});
+    try common.livePrintField(std.testing.allocator, "title", item.title);
+    try common.livePrintField(std.testing.allocator, "release", item.release);
+    try common.livePrintField(std.testing.allocator, "page_url", item.page_url);
+
+    var subtitles = try scraper.fetchSubtitlesBySearchItem(item);
+    defer subtitles.deinit();
+    if (subtitles.subtitles.len != 1) return error.TestUnexpectedResult;
+    const subtitle = subtitles.subtitles[0];
+    try common.livePrintField(std.testing.allocator, "filename", subtitle.filename);
+
+    const download = try scraper.fetchDownloadByToken(std.testing.allocator, subtitle.download_url);
+    defer std.testing.allocator.free(download.body);
+    if (download.status != .ok or download.body.len < 4) return error.TestUnexpectedResult;
+    std.debug.print("[live][subs4free.info][download] bytes={d}\n", .{download.body.len});
 }

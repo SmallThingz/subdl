@@ -100,7 +100,7 @@ state: struct {
     mouse: bool = false,
     pixel_mouse: bool = false,
     color_scheme_updates: bool = false,
-    in_band_resize: bool = false,
+    in_band_resize: std.atomic.Value(bool) = .init(false),
     changed_default_fg: bool = false,
     changed_default_bg: bool = false,
     changed_cursor_color: bool = false,
@@ -129,9 +129,7 @@ pub fn deinit(self: *Vaxis, alloc: ?std.mem.Allocator, tty: *std.Io.Writer) void
     self.resetState(tty) catch {};
 
     if (alloc) |a| {
-        if (self.state.prev_cursor_secondary.ptr != self.screen.cursor_secondary.ptr)
-            a.free(self.state.prev_cursor_secondary);
-        a.free(self.screen.cursor_secondary);
+        self.freeSecondaryCursors(a);
         self.screen.deinit(a);
         self.screen_last.deinit(a);
     }
@@ -142,6 +140,8 @@ pub fn resetState(self: *Vaxis, tty: *std.Io.Writer) !void {
     // always show the cursor on state reset
     tty.writeAll(ctlseqs.show_cursor) catch {};
     tty.writeAll(ctlseqs.sgr_reset) catch {};
+    if (self.caps.multi_cursor)
+        tty.print(ctlseqs.reset_secondary_cursors, .{}) catch {};
     if (self.screen.cursor_shape != .default) {
         // In many terminals, `.default` will set to the configured cursor shape. Others, it will
         // change to a blinking block.
@@ -173,9 +173,9 @@ pub fn resetState(self: *Vaxis, tty: *std.Io.Writer) !void {
         try tty.writeAll(ctlseqs.color_scheme_reset);
         self.state.color_scheme_updates = false;
     }
-    if (self.state.in_band_resize) {
+    if (self.state.in_band_resize.load(.acquire)) {
         try tty.writeAll(ctlseqs.in_band_resize_reset);
-        self.state.in_band_resize = false;
+        self.state.in_band_resize.store(false, .release);
     }
     if (self.state.changed_default_fg) {
         try tty.writeAll(ctlseqs.osc10_reset);
@@ -204,7 +204,7 @@ pub fn resize(
     winsize: Winsize,
 ) !void {
     log.debug("resizing screen: width={d} height={d}", .{ winsize.cols, winsize.rows });
-    const replacements = blk: {
+    var replacements = blk: {
         var screen = try Screen.init(alloc, winsize);
         errdefer screen.deinit(alloc);
         screen.width_method = self.caps.unicode;
@@ -212,14 +212,13 @@ pub fn resize(
         errdefer screen_last.deinit(alloc);
         break :blk .{ .screen = screen, .screen_last = screen_last };
     };
+    errdefer {
+        replacements.screen.deinit(alloc);
+        replacements.screen_last.deinit(alloc);
+    }
 
-    self.screen.deinit(alloc);
-    self.screen_last.deinit(alloc);
-    self.screen = replacements.screen;
-    self.screen_last = replacements.screen_last;
-    // try self.screen.int(alloc, winsize.cols, winsize.rows);
-    // we only init our current screen. This has the effect of redrawing
-    // every cell
+    if (self.caps.multi_cursor)
+        try tty.print(ctlseqs.reset_secondary_cursors, .{});
     if (self.state.alt_screen)
         try tty.writeAll(ctlseqs.home)
     else {
@@ -228,10 +227,32 @@ pub fn resize(
         }
         try tty.writeByte('\r');
     }
-    self.state.cursor.row = 0;
-    self.state.cursor.col = 0;
     try tty.writeAll(ctlseqs.sgr_reset ++ ctlseqs.erase_below_cursor);
     try tty.flush();
+
+    self.freeSecondaryCursors(alloc);
+    self.screen.deinit(alloc);
+    self.screen_last.deinit(alloc);
+    self.screen = replacements.screen;
+    self.screen_last = replacements.screen_last;
+    // We only initialize the current screen. This redraws every cell.
+    self.state.cursor.row = 0;
+    self.state.cursor.col = 0;
+}
+
+fn freeSecondaryCursors(self: *Vaxis, alloc: std.mem.Allocator) void {
+    const previous = self.state.prev_cursor_secondary;
+    const current = self.state.cursor_secondary;
+    const pending = self.screen.cursor_secondary;
+    if (previous.len > 0 and previous.ptr != current.ptr and previous.ptr != pending.ptr)
+        alloc.free(previous);
+    if (current.len > 0 and current.ptr != pending.ptr)
+        alloc.free(current);
+    if (pending.len > 0)
+        alloc.free(pending);
+    self.state.prev_cursor_secondary = &.{};
+    self.state.cursor_secondary = &.{};
+    self.screen.cursor_secondary = &.{};
 }
 
 /// returns a Window comprising of the entire terminal screen
@@ -411,7 +432,8 @@ pub fn render(self: *Vaxis, tty: *std.Io.Writer) !void {
         (self.screen.cursor.row != self.state.cursor.row or
             self.screen.cursor.col != self.state.cursor.col);
     const cursor_secondary_changed = self.screen.cursor_vis and
-        std.meta.eql(self.screen.cursor_secondary, self.state.cursor_secondary);
+        self.caps.multi_cursor and
+        !std.meta.eql(self.screen.cursor_secondary, self.state.cursor_secondary);
     const needs_render = self.refresh or
         cursor_vis_changed or
         cursor_shape_changed or
@@ -836,14 +858,12 @@ pub fn render(self: *Vaxis, tty: *std.Io.Writer) !void {
         self.state.cursor.row = cursor_pos.row;
         self.state.cursor.col = cursor_pos.col;
     }
-    if (self.screen.cursor_vis and self.caps.multi_cursor) {
+    if (cursor_secondary_changed) {
         try tty.print(ctlseqs.reset_secondary_cursors, .{});
         for (self.screen.cursor_secondary) |cur|
             try tty.print(ctlseqs.show_secondary_cursor, .{ cur.row + 1, cur.col + 1 });
-        if (cursor_secondary_changed) {
-            self.state.prev_cursor_secondary = self.state.cursor_secondary;
-            self.state.cursor_secondary = self.screen.cursor_secondary;
-        }
+        self.state.prev_cursor_secondary = self.state.cursor_secondary;
+        self.state.cursor_secondary = self.screen.cursor_secondary;
     }
     self.screen_last.cursor_vis = self.screen.cursor_vis;
     if (self.screen.mouse_shape != self.screen_last.mouse_shape) {
@@ -909,10 +929,8 @@ pub fn setMouseShape(self: *Vaxis, shape: Shape) void {
 /// Change the mouse reporting mode
 pub fn setMouseMode(self: *Vaxis, tty: *std.Io.Writer, enable: bool) !void {
     if (enable) {
-        self.state.mouse = true;
         if (self.caps.sgr_pixels) {
             log.debug("enabling mouse mode: pixel coordinates", .{});
-            self.state.pixel_mouse = true;
             try tty.writeAll(ctlseqs.mouse_set_pixels);
         } else {
             log.debug("enabling mouse mode: cell coordinates", .{});
@@ -923,6 +941,8 @@ pub fn setMouseMode(self: *Vaxis, tty: *std.Io.Writer, enable: bool) !void {
     }
 
     try tty.flush();
+    self.state.mouse = enable;
+    self.state.pixel_mouse = enable and self.caps.sgr_pixels;
 }
 
 /// Translate pixel mouse coordinates to cell + offset
@@ -1195,13 +1215,15 @@ pub fn addTerminalSecondaryCursor(self: *Vaxis, alloc: std.mem.Allocator, y: u16
         alloc.free(self.state.prev_cursor_secondary);
         self.state.prev_cursor_secondary = &.{};
     }
-    var cursors: std.ArrayList(Screen.Cursor) = if (self.screen.cursor_secondary.ptr == self.state.cursor_secondary.ptr)
-        .fromOwnedSlice(try alloc.dupe(Cursor, self.screen.cursor_secondary))
-    else
-        .fromOwnedSlice(self.screen.cursor_secondary);
-
-    (try cursors.addOne(alloc)).* = .{ .row = y, .col = x };
-    self.screen.cursor_secondary = try cursors.toOwnedSlice(alloc);
+    const old = self.screen.cursor_secondary;
+    var cursors: std.ArrayList(Screen.Cursor) = try .initCapacity(alloc, old.len + 1);
+    errdefer cursors.deinit(alloc);
+    try cursors.appendSlice(alloc, old);
+    try cursors.append(alloc, .{ .row = y, .col = x });
+    const replacement = try cursors.toOwnedSlice(alloc);
+    if (old.ptr != self.state.cursor_secondary.ptr)
+        alloc.free(old);
+    self.screen.cursor_secondary = replacement;
 }
 
 /// Request the terminal cursor position. Add `cursor_position: vaxis.Screen.Cursor`
@@ -1564,6 +1586,30 @@ test "queryCursorPosition: failed write does not leave a pending request" {
     try std.testing.expectEqual(@as(usize, 1), vx.cursor_position_requests.pending());
 }
 
+test "mouse mode state is transactional and disable clears pixel mode" {
+    var env = try std.testing.environ.createMap(std.testing.allocator);
+    defer env.deinit();
+    var vx = try Vaxis.init(std.testing.io, std.testing.allocator, &env, .{});
+    var deinit_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer deinit_writer.deinit();
+    defer vx.deinit(std.testing.allocator, &deinit_writer.writer);
+
+    vx.caps.sgr_pixels = true;
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+    try vx.setMouseMode(&writer.writer, true);
+    try std.testing.expect(vx.state.mouse);
+    try std.testing.expect(vx.state.pixel_mouse);
+    try vx.setMouseMode(&writer.writer, false);
+    try std.testing.expect(!vx.state.mouse);
+    try std.testing.expect(!vx.state.pixel_mouse);
+
+    var failing: std.Io.Writer = .failing;
+    try std.testing.expectError(error.WriteFailed, vx.setMouseMode(&failing, true));
+    try std.testing.expect(!vx.state.mouse);
+    try std.testing.expect(!vx.state.pixel_mouse);
+}
+
 test "render: no output when no changes" {
     const io = std.testing.io;
     var env_map = try std.testing.environ.createMap(std.testing.allocator);
@@ -1581,6 +1627,58 @@ test "render: no output when no changes" {
     try std.testing.expectEqual(@as(usize, 0), output.len);
 }
 
+test "render: secondary cursor changes are committed once" {
+    const io = std.testing.io;
+    var env_map = try std.testing.environ.createMap(std.testing.allocator);
+    defer env_map.deinit();
+    var vx = try Vaxis.init(io, std.testing.allocator, &env_map, .{});
+    var deinit_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer deinit_writer.deinit();
+    defer vx.deinit(std.testing.allocator, &deinit_writer.writer);
+
+    vx.caps.multi_cursor = true;
+    vx.screen.cursor_vis = true;
+    try vx.addTerminalSecondaryCursor(std.testing.allocator, 2, 3);
+
+    var render_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer render_writer.deinit();
+    try vx.render(&render_writer.writer);
+    const output = try render_writer.toOwnedSlice();
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(output.len > 0);
+    try std.testing.expectEqual(@as(usize, 1), vx.state.cursor_secondary.len);
+    try std.testing.expectEqual(@as(u16, 2), vx.state.cursor_secondary[0].row);
+    try std.testing.expectEqual(@as(u16, 3), vx.state.cursor_secondary[0].col);
+
+    try vx.render(&render_writer.writer);
+    try std.testing.expectEqual(@as(usize, 0), render_writer.written().len);
+}
+
+fn testSecondaryCursorAllocationFailures(allocator: std.mem.Allocator) !void {
+    var env_map = try std.testing.environ.createMap(allocator);
+    defer env_map.deinit();
+    var vx = try Vaxis.init(std.testing.io, allocator, &env_map, .{});
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+    defer vx.deinit(allocator, &writer.writer);
+
+    vx.caps.multi_cursor = true;
+    vx.screen.cursor_vis = true;
+    try vx.addTerminalSecondaryCursor(allocator, 1, 2);
+    try vx.render(&writer.writer);
+    try vx.addTerminalSecondaryCursor(allocator, 3, 4);
+    try vx.render(&writer.writer);
+    try vx.resetAllTerminalSecondaryCursors(allocator);
+}
+
+test "secondary cursor updates preserve ownership on allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        testSecondaryCursorAllocationFailures,
+        .{},
+    );
+}
+
 fn testResizeAllocationFailures(allocator: std.mem.Allocator) !void {
     var env_map = try std.testing.environ.createMap(allocator);
     defer env_map.deinit();
@@ -1589,7 +1687,17 @@ fn testResizeAllocationFailures(allocator: std.mem.Allocator) !void {
     defer writer.deinit();
     defer vx.deinit(allocator, &writer.writer);
 
+    vx.caps.multi_cursor = true;
+    vx.screen.cursor_vis = true;
+    try vx.addTerminalSecondaryCursor(allocator, 1, 1);
+    try vx.render(&writer.writer);
+    try vx.addTerminalSecondaryCursor(allocator, 2, 2);
+    try vx.render(&writer.writer);
+    try vx.addTerminalSecondaryCursor(allocator, 3, 3);
     try vx.resize(allocator, &writer.writer, .{ .rows = 2, .cols = 2, .x_pixel = 0, .y_pixel = 0 });
+    try std.testing.expectEqual(@as(usize, 0), vx.state.prev_cursor_secondary.len);
+    try std.testing.expectEqual(@as(usize, 0), vx.state.cursor_secondary.len);
+    try std.testing.expectEqual(@as(usize, 0), vx.screen.cursor_secondary.len);
     try vx.resize(allocator, &writer.writer, .{ .rows = 3, .cols = 3, .x_pixel = 0, .y_pixel = 0 });
 }
 

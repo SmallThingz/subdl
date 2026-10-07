@@ -1,10 +1,10 @@
 const std = @import("std");
 const common = @import("common.zig");
+const cf = @import("opensubtitles_com_cf.zig");
 const html = @import("htmlparser");
 const HtmlParseOptions: html.ParseOptions = .{};
 const HtmlDocument = HtmlParseOptions.GetDocument();
 const HtmlNode = HtmlParseOptions.GetNode();
-const suite = @import("test_suite.zig");
 
 const Allocator = std.mem.Allocator;
 const site = "https://www.podnapisi.net";
@@ -56,6 +56,9 @@ pub const Scraper = struct {
         const a = arena.allocator();
 
         var items: std.ArrayListUnmanaged(SearchItem) = .empty;
+        const trimmed = std.mem.trim(u8, query, " \t\r\n");
+        if (trimmed.len == 0) return .{ .arena = arena, .items = &.{} };
+
         const page_start = if (options.page_start == 0) 1 else options.page_start;
         const max_pages = if (options.max_pages == 0) 1 else options.max_pages;
 
@@ -63,10 +66,7 @@ pub const Scraper = struct {
         var fetched_pages: usize = 0;
         var has_next_page = false;
 
-        while (fetched_pages < max_pages) : ({
-            fetched_pages += 1;
-            if (has_next_page) page += 1;
-        }) {
+        while (fetched_pages < max_pages) {
             var page_items: std.ArrayListUnmanaged(SearchItem) = .empty;
             defer page_items.deinit(a);
 
@@ -74,15 +74,17 @@ pub const Scraper = struct {
 
             // JSON endpoint (better metadata) only supports first-page suggestions.
             if (page == 1) {
-                try self.appendJsonSearchItemsUsing(fetch, a, query, &page_items);
+                try self.appendJsonSearchItemsUsing(fetch, a, trimmed, &page_items);
             }
 
-            try self.appendHtmlSearchItemsUsing(fetch, a, query, page, &page_items, &page_has_next);
+            try self.appendHtmlSearchItemsUsing(fetch, a, trimmed, page, &page_items, &page_has_next);
             dedupeSearchItemsById(&page_items);
 
             try items.appendSlice(a, page_items.items);
             has_next_page = page_has_next;
-            if (!has_next_page) break;
+            fetched_pages += 1;
+            if (!has_next_page or fetched_pages >= max_pages) break;
+            page = try std.math.add(usize, page, 1);
         }
 
         dedupeSearchItemsById(&items);
@@ -113,12 +115,14 @@ pub const Scraper = struct {
             .retry_on_429 = false,
             .allow_non_ok = true,
             .require_public_origin = true,
+            .require_https = true,
+            .require_same_origin = true,
         }) catch |err| {
             if (common.mustPropagateOptionalFailure(err)) return err;
             return;
         };
 
-        if (response.status == .too_many_requests) return error.RateLimited;
+        try requireAccessibleResponse(response);
         if (response.status != .ok) return;
 
         const root = std.json.parseFromSliceLeaky(std.json.Value, allocator, response.body, .{}) catch |err| switch (err) {
@@ -148,6 +152,7 @@ pub const Scraper = struct {
             const id_val = item.get("id") orelse continue;
             if (id_val != .string or id_val.string.len == 0) continue;
             const id = id_val.string;
+            if (!isSafeProviderSegment(id)) continue;
 
             const year = blk: {
                 const year_val = item.get("year") orelse break :blk null;
@@ -166,6 +171,7 @@ pub const Scraper = struct {
 
             const title = try deriveJsonItemTitle(allocator, item, id);
             const subtitles_page_url = try std.fmt.allocPrint(allocator, "{s}/subtitles/search/{s}", .{ site, id });
+            validateProviderEndpoint(subtitles_page_url, .search_result) catch continue;
 
             try out.append(allocator, .{
                 .id = id,
@@ -199,8 +205,10 @@ pub const Scraper = struct {
             .allow_non_ok = true,
             .retry_on_429 = false,
             .require_public_origin = true,
+            .require_https = true,
+            .require_same_origin = true,
         });
-        if (response.status == .too_many_requests) return error.RateLimited;
+        try requireAccessibleResponse(response);
         if (response.status != .ok) return error.UnexpectedHttpStatus;
 
         var parsed = try common.parseHtmlStable(allocator, response.body);
@@ -212,7 +220,10 @@ pub const Scraper = struct {
             if (std.mem.endsWith(u8, href, "/subtitles/search/")) continue;
             if (std.mem.indexOf(u8, href, "/advanced") != null) continue;
 
-            const absolute = try resolveProviderUrl(allocator, href);
+            const absolute = resolveProviderUrl(allocator, href, .search_result) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => continue,
+            };
             const id = parseIdFromSubtitlesSearchUrl(absolute) orelse continue;
             if (std.ascii.eqlIgnoreCase(id, "advanced")) continue;
 
@@ -239,9 +250,12 @@ pub const Scraper = struct {
         const a = arena.allocator();
         const debug_timing = common.debugTimingEnabled();
         const started_ns = if (debug_timing) common.compatNanoTimestamp() else 0;
-        if (debug_timing) std.debug.print("[podnapisi.net] subtitles start url={s}\n", .{subtitles_page_url});
+        if (debug_timing) {
+            const safe_url: []const u8 = common.redactUrlForLog(a, subtitles_page_url) catch "<redacted-url>";
+            std.debug.print("[podnapisi.net] subtitles start url={s}\n", .{safe_url});
+        }
 
-        try validateProviderEndpoint(subtitles_page_url);
+        try validateProviderEndpoint(subtitles_page_url, .search_result);
         const response = try fetch(self.client, a, subtitles_page_url, .{
             .accept = "text/html",
             .max_attempts = 3,
@@ -249,10 +263,11 @@ pub const Scraper = struct {
             .allow_non_ok = true,
             .retry_on_429 = false,
             .require_public_origin = true,
+            .require_https = true,
+            .require_same_origin = true,
         });
 
-        if (response.status == .too_many_requests) return error.RateLimited;
-
+        try requireAccessibleResponse(response);
         if (response.status != .ok) return error.UnexpectedHttpStatus;
 
         var parsed = try common.parseHtmlStable(a, response.body);
@@ -271,9 +286,7 @@ pub const Scraper = struct {
         var rows = parsed.doc.queryAll("tbody tr");
         while (rows.next()) |row| {
             row_count += 1;
-            const download_anchor = findDescendantAnchorByRelNoFollow(row) orelse continue;
-            const href = common.getAttributeValueSafe(download_anchor, "href") orelse continue;
-            const download_url = try resolveProviderUrl(a, href);
+            const download_url = (try resolveFirstNoFollowDownload(a, row)) orelse continue;
 
             const language = if (common.findDescendantByTag(row, "abbr")) |node|
                 try common.innerTextTrimmedOwned(a, node)
@@ -317,26 +330,118 @@ pub const Scraper = struct {
     }
 };
 
-fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+const ProviderRoute = enum { search_result, download };
+
+fn resolveProviderUrl(allocator: Allocator, href: []const u8, route: ProviderRoute) ![]const u8 {
     const resolved = try common.resolveUrl(allocator, site, href);
     errdefer allocator.free(resolved);
-    try validateProviderEndpoint(resolved);
+    try validateProviderEndpoint(resolved, route);
     return resolved;
 }
 
-fn validateProviderEndpoint(url: []const u8) !void {
+fn validateProviderEndpoint(url: []const u8, route: ProviderRoute) !void {
     try common.validatePublicHttpUrl(url);
     if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+
+    const uri = std.Uri.parse(url) catch return error.UnsafeHttpTarget;
+    if (uri.fragment != null) return error.UnsafeHttpTarget;
+    var path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    if (path.len > 1 and path[path.len - 1] == '/') path = path[0 .. path.len - 1];
+    if (std.mem.indexOf(u8, path, "//") != null) return error.UnsafeHttpTarget;
+
+    var parts: [5][]const u8 = undefined;
+    const part_count = splitProviderPath(path, &parts) orelse return error.UnsafeHttpTarget;
+    const valid = switch (route) {
+        .search_result => (part_count == 3 or part_count == 4) and
+            std.mem.eql(u8, parts[0], "subtitles") and
+            std.mem.eql(u8, parts[1], "search") and
+            isSafeProviderSegment(parts[2]) and
+            (part_count == 3 or isSafeProviderSegment(parts[3])) and
+            rawQuery(url) == null,
+        .download => (part_count == 3 and
+            std.mem.eql(u8, parts[0], "subtitles") and
+            isSubtitleId(parts[1]) and
+            std.mem.eql(u8, parts[2], "download")) or
+            (part_count == 5 and
+                isProviderLocale(parts[0]) and
+                std.mem.eql(u8, parts[1], "subtitles") and
+                isSafeProviderSegment(parts[2]) and
+                isSubtitleId(parts[3]) and
+                std.mem.eql(u8, parts[4], "download")),
+    };
+    if (!valid) return error.UnsafeHttpTarget;
+
+    if (route == .download) {
+        if (rawQuery(url)) |query| {
+            if (!std.mem.eql(u8, query, "container=zip")) return error.UnsafeHttpTarget;
+        }
+    }
+}
+
+fn splitProviderPath(path: []const u8, out: *[5][]const u8) ?usize {
+    if (path.len < 2 or path[0] != '/') return null;
+    var count: usize = 0;
+    var segments = std.mem.splitScalar(u8, path[1..], '/');
+    while (segments.next()) |segment| {
+        if (segment.len == 0 or count == out.len) return null;
+        out[count] = segment;
+        count += 1;
+    }
+    return count;
+}
+
+fn isSafeProviderSegment(value: []const u8) bool {
+    if (value.len == 0 or std.mem.eql(u8, value, ".") or std.mem.eql(u8, value, "..")) return false;
+    for (value) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.' and c != '~') return false;
+    }
+    return true;
+}
+
+fn isSubtitleId(value: []const u8) bool {
+    if (value.len != 4) return false;
+    for (value) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') return false;
+    }
+    return true;
+}
+
+fn isProviderLocale(value: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, value, '-');
+    const language = parts.next() orelse return false;
+    if (language.len < 2 or language.len > 3) return false;
+    for (language) |c| if (c < 'a' or c > 'z') return false;
+
+    if (parts.next()) |region| {
+        if (region.len < 2 or region.len > 4 or parts.next() != null) return false;
+        for (region) |c| if (c < 'a' or c > 'z') return false;
+    }
+    return true;
+}
+
+fn rawQuery(url: []const u8) ?[]const u8 {
+    const start = std.mem.indexOfScalar(u8, url, '?') orelse return null;
+    if (start + 1 == url.len) return "";
+    return url[start + 1 ..];
 }
 
 fn parseIdFromSubtitlesSearchUrl(url: []const u8) ?[]const u8 {
     const marker = "/subtitles/search/";
+    const uri = std.Uri.parse(url) catch return null;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    if (!std.mem.startsWith(u8, path, marker)) return null;
     const start = std.mem.indexOf(u8, url, marker) orelse return null;
     const remainder_raw = url[start + marker.len ..];
     const remainder = std.mem.trimStart(u8, remainder_raw, "/");
     const end = std.mem.indexOfAny(u8, remainder, "?#/") orelse remainder.len;
     if (end == 0) return null;
-    return remainder[0..end];
+    const id = remainder[0..end];
+    if (!isSafeProviderSegment(id)) return null;
+    return id;
 }
 
 fn parseTitleFromSubtitlesSearchUrl(allocator: Allocator, url: []const u8) !?[]const u8 {
@@ -450,18 +555,28 @@ fn hasNextHtmlSearchPage(doc: *const HtmlDocument, current_page: usize) bool {
 }
 
 fn parsePageNumberFromHref(href: []const u8) ?usize {
-    if (std.mem.indexOf(u8, href, "page=")) |idx| {
-        const from = href[idx + "page=".len ..];
-        var end: usize = 0;
-        while (end < from.len and std.ascii.isDigit(from[end])) : (end += 1) {}
-        if (end > 0) return std.fmt.parseInt(usize, from[0..end], 10) catch null;
+    const fragment_start = std.mem.indexOfScalar(u8, href, '#') orelse href.len;
+    const before_fragment = href[0..fragment_start];
+    if (std.mem.indexOfScalar(u8, before_fragment, '?')) |query_start| {
+        var fields = std.mem.splitScalar(u8, before_fragment[query_start + 1 ..], '&');
+        while (fields.next()) |field| {
+            const equals = std.mem.indexOfScalar(u8, field, '=') orelse continue;
+            if (!std.mem.eql(u8, field[0..equals], "page")) continue;
+            const value = field[equals + 1 ..];
+            if (value.len == 0) return null;
+            for (value) |c| if (!std.ascii.isDigit(c)) return null;
+            return std.fmt.parseInt(usize, value, 10) catch null;
+        }
     }
 
-    if (std.mem.indexOf(u8, href, "/page/")) |idx| {
-        const from = href[idx + "/page/".len ..];
+    const path_end = std.mem.indexOfAny(u8, href, "?#") orelse href.len;
+    const path = href[0..path_end];
+    if (std.mem.lastIndexOf(u8, path, "/page/")) |idx| {
+        const from = path[idx + "/page/".len ..];
         var end: usize = 0;
         while (end < from.len and std.ascii.isDigit(from[end])) : (end += 1) {}
-        if (end > 0) return std.fmt.parseInt(usize, from[0..end], 10) catch null;
+        if (end > 0 and (end == from.len or from[end] == '/'))
+            return std.fmt.parseInt(usize, from[0..end], 10) catch null;
     }
     return null;
 }
@@ -484,41 +599,106 @@ fn dedupeSearchItemsById(items: *std.ArrayListUnmanaged(SearchItem)) void {
     items.items.len = write_idx;
 }
 
-fn findDescendantAnchorByRelNoFollow(node: HtmlNode) ?HtmlNode {
-    var children = node.children();
-    while (children.next()) |child| {
-        if (std.mem.eql(u8, child.tagName(), "a")) {
-            const rel = common.getAttributeValueSafe(child, "rel") orelse "";
-            if (std.mem.indexOf(u8, rel, "nofollow") != null) return child;
-        }
-        if (findDescendantAnchorByRelNoFollow(child)) |nested| return nested;
+fn resolveFirstNoFollowDownload(allocator: Allocator, node: HtmlNode) !?[]const u8 {
+    var descendants = common.boundedHtmlDescendants(node);
+    while (descendants.next()) |child| {
+        if (!std.mem.eql(u8, child.tagName(), "a")) continue;
+        const rel = common.getAttributeValueSafe(child, "rel") orelse "";
+        if (std.mem.indexOf(u8, rel, "nofollow") == null) continue;
+        const href = common.getAttributeValueSafe(child, "href") orelse continue;
+        const resolved = resolveProviderUrl(allocator, href, .download) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => continue,
+        };
+        return resolved;
     }
     return null;
 }
 
 fn findDescendantSpanWithClass(node: HtmlNode, class_fragment: []const u8) ?HtmlNode {
-    var children = node.children();
-    while (children.next()) |child| {
+    var descendants = common.boundedHtmlDescendants(node);
+    while (descendants.next()) |child| {
         if (std.mem.eql(u8, child.tagName(), "span")) {
             const class = common.getAttributeValueSafe(child, "class") orelse "";
             if (std.mem.indexOf(u8, class, class_fragment) != null) return child;
         }
-        if (findDescendantSpanWithClass(child, class_fragment)) |nested| return nested;
     }
     return null;
+}
+
+fn requireAccessibleResponse(response: common.HttpResponse) !void {
+    if (response.status == .too_many_requests) return error.RateLimited;
+    if (cf.isChallengeBody(response.body)) return error.CloudflareChallenge;
+    if (response.status == .unauthorized or response.status == .forbidden or
+        common.isAustralianWebsiteBlockPage(response.body)) return error.ProviderAccessBlocked;
 }
 
 fn SubtitlesStatusFixture(comptime status: std.http.Status) type {
     return struct {
         fn fetch(_: *std.http.Client, allocator: Allocator, _: []const u8, options: common.FetchOptions) anyerror!common.HttpResponse {
             try std.testing.expect(!options.retry_on_429);
+            try expectSecureFetchPolicy(options);
             return .{ .status = status, .body = try allocator.dupe(u8, "<html><body>No subtitles found</body></html>") };
         }
     };
 }
 
-test "podnapisi rate limits stop before the HTML search fallback" {
-    const Scenario = enum { limited, canceled, out_of_memory };
+fn expectSecureFetchPolicy(options: common.FetchOptions) !void {
+    try std.testing.expect(options.require_public_origin);
+    try std.testing.expect(options.require_https);
+    try std.testing.expect(options.require_same_origin);
+}
+
+test "podnapisi whitespace search does not fetch" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, _: Allocator, _: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            return error.TestUnexpectedFetch;
+        }
+    };
+
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+    var response = try scraper.searchWithOptionsUsing(Fixture.fetch, " \t\r\n ", .{});
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), response.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+}
+
+test "podnapisi pagination rejects page overflow before another fetch" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, _: []const u8, options: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            try expectSecureFetchPolicy(options);
+            return .{
+                .status = .ok,
+                .body = try allocator.dupe(u8, "<html><head><link rel='next' href='?page=2'></head></html>"),
+            };
+        }
+    };
+
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+    try std.testing.expectError(error.Overflow, scraper.searchWithOptionsUsing(Fixture.fetch, "Matrix", .{
+        .page_start = std.math.maxInt(usize),
+        .max_pages = 2,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+}
+
+test "podnapisi terminal suggestion failures stop before the HTML search fallback" {
+    const Scenario = enum { limited, canceled, out_of_memory, forbidden, unauthorized, challenge_ok, challenge_forbidden, challenge_limited };
     const Case = struct { scenario: Scenario, expected_error: anyerror };
     const Fixture = struct {
         client: std.http.Client,
@@ -530,10 +710,21 @@ test "podnapisi rate limits stop before the HTML search fallback" {
             self.calls += 1;
             try std.testing.expectEqual(@as(usize, 1), self.calls);
             try std.testing.expect(!options.retry_on_429);
+            try expectSecureFetchPolicy(options);
             return switch (self.scenario) {
                 .limited => .{ .status = .too_many_requests, .body = try allocator.dupe(u8, "limited") },
                 .canceled => error.Canceled,
                 .out_of_memory => error.OutOfMemory,
+                .forbidden => .{ .status = .forbidden, .body = try allocator.dupe(u8, "Forbidden") },
+                .unauthorized => .{ .status = .unauthorized, .body = try allocator.dupe(u8, "Unauthorized") },
+                .challenge_ok, .challenge_forbidden, .challenge_limited => .{
+                    .status = switch (self.scenario) {
+                        .challenge_ok => .ok,
+                        .challenge_forbidden => .forbidden,
+                        else => .too_many_requests,
+                    },
+                    .body = try allocator.dupe(u8, "<html><title>Just a moment...</title><script src='/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1'></script></html>"),
+                },
             };
         }
     };
@@ -542,6 +733,11 @@ test "podnapisi rate limits stop before the HTML search fallback" {
         .{ .scenario = .limited, .expected_error = error.RateLimited },
         .{ .scenario = .canceled, .expected_error = error.Canceled },
         .{ .scenario = .out_of_memory, .expected_error = error.OutOfMemory },
+        .{ .scenario = .forbidden, .expected_error = error.ProviderAccessBlocked },
+        .{ .scenario = .unauthorized, .expected_error = error.ProviderAccessBlocked },
+        .{ .scenario = .challenge_ok, .expected_error = error.CloudflareChallenge },
+        .{ .scenario = .challenge_forbidden, .expected_error = error.CloudflareChallenge },
+        .{ .scenario = .challenge_limited, .expected_error = error.RateLimited },
     }) |case| {
         var fixture: Fixture = .{
             .client = .{ .allocator = std.testing.allocator, .io = std.testing.io },
@@ -562,6 +758,7 @@ test "podnapisi uses HTML fallback after an ordinary suggestion failure" {
         fn fetch(client: *std.http.Client, allocator: Allocator, url: []const u8, options: common.FetchOptions) anyerror!common.HttpResponse {
             const self: *@This() = @fieldParentPtr("client", client);
             self.calls += 1;
+            try expectSecureFetchPolicy(options);
             if (self.calls == 1) {
                 try std.testing.expect(std.mem.indexOf(u8, url, "/moviedb/search/") != null);
                 try std.testing.expect(!options.cache);
@@ -585,8 +782,14 @@ test "podnapisi rejects non-ok subtitle pages before empty parsing" {
     var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer client.deinit();
     var scraper = Scraper.init(std.testing.allocator, &client);
-    inline for (.{ std.http.Status.forbidden, std.http.Status.internal_server_error, std.http.Status.bad_gateway, std.http.Status.service_unavailable }) |status| {
+    inline for (.{ std.http.Status.internal_server_error, std.http.Status.bad_gateway, std.http.Status.service_unavailable }) |status| {
         try std.testing.expectError(error.UnexpectedHttpStatus, scraper.fetchSubtitlesBySearchLinkUsing(
+            SubtitlesStatusFixture(status).fetch,
+            "https://www.podnapisi.net/subtitles/search/12345",
+        ));
+    }
+    inline for (.{ std.http.Status.unauthorized, std.http.Status.forbidden }) |status| {
+        try std.testing.expectError(error.ProviderAccessBlocked, scraper.fetchSubtitlesBySearchLinkUsing(
             SubtitlesStatusFixture(status).fetch,
             "https://www.podnapisi.net/subtitles/search/12345",
         ));
@@ -603,10 +806,81 @@ test "podnapisi rejects non-ok subtitle pages before empty parsing" {
     try std.testing.expectEqual(@as(usize, 0), response.subtitles.len);
 }
 
+test "podnapisi HTML challenges do not become empty search or subtitle results" {
+    const Fixture = struct {
+        fn fetch(_: *std.http.Client, allocator: Allocator, _: []const u8, _: common.FetchOptions) !common.HttpResponse {
+            return .{
+                .status = .ok,
+                .body = try allocator.dupe(u8, "<html><title>Just a moment...</title><script src='/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1'></script></html>"),
+            };
+        }
+    };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &client);
+    try std.testing.expectError(error.CloudflareChallenge, scraper.searchWithOptionsUsing(Fixture.fetch, "Matrix", .{ .page_start = 2 }));
+    try std.testing.expectError(error.CloudflareChallenge, scraper.fetchSubtitlesBySearchLinkUsing(
+        Fixture.fetch,
+        "https://www.podnapisi.net/subtitles/search/12345",
+    ));
+}
+
 test "podnapisi rejects unsafe provider links before fetch" {
-    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "http://127.0.0.1/subtitles/search/1"));
-    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://user:pass@www.podnapisi.net/subtitles/search/1"));
-    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://www.google.com/subtitles/search/1"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "http://127.0.0.1/subtitles/search/1", .search_result));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://user:pass@www.podnapisi.net/subtitles/search/1", .search_result));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://www.google.com/subtitles/search/1", .search_result));
+}
+
+test "podnapisi accepts only exact search and download routes" {
+    inline for (.{
+        "https://www.podnapisi.net/subtitles/search/12345",
+        "https://www.podnapisi.net/subtitles/search/tt0133093/the-matrix",
+    }) |url| try validateProviderEndpoint(url, .search_result);
+
+    inline for (.{
+        "https://www.podnapisi.net/subtitles/GMso/download",
+        "https://www.podnapisi.net/subtitles/d_Im/download?container=zip",
+        "https://www.podnapisi.net/subtitles/GMso/download?container=zip",
+        "https://www.podnapisi.net/en/subtitles/en-man-of-steel-2013/WMgp/download",
+        "https://www.podnapisi.net/pt-br/subtitles/man-of-steel-2013/WMgp/download?container=zip",
+    }) |url| try validateProviderEndpoint(url, .download);
+
+    const cases = [_]struct { url: []const u8, route: ProviderRoute }{
+        .{ .url = "https://www.podnapisi.net/admin", .route = .search_result },
+        .{ .url = "https://www.podnapisi.net/subtitles/search/../../admin", .route = .search_result },
+        .{ .url = "https://www.podnapisi.net/subtitles/search/%2e%2e/admin", .route = .search_result },
+        .{ .url = "https://www.podnapisi.net/subtitles/search/12345?next=/admin", .route = .search_result },
+        .{ .url = "https://www.podnapisi.net/admin?next=download", .route = .download },
+        .{ .url = "https://www.podnapisi.net/subtitles/too-long/download", .route = .download },
+        .{ .url = "https://www.podnapisi.net/subtitles/a%2fb/download", .route = .download },
+        .{ .url = "https://www.podnapisi.net/subtitles/GMso/download?next=/admin", .route = .download },
+        .{ .url = "https://www.podnapisi.net/admin/subtitles/title/WMgp/download", .route = .download },
+        .{ .url = "https://www.podnapisi.net/EN/subtitles/title/WMgp/download", .route = .download },
+        .{ .url = "https://www.podnapisi.net/en/subtitles/title/../admin/download", .route = .download },
+        .{ .url = "https://www.podnapisi.net/en/subtitles/title/WMgp/download#fragment", .route = .download },
+    };
+    for (cases) |case| try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint(case.url, case.route));
+
+    try std.testing.expect(isSafeProviderSegment("WMgp"));
+    try std.testing.expect(isSafeProviderSegment("d_Im"));
+    inline for (.{ "", ".", "..", "a/b", "a?b", "%2e%2e" }) |id|
+        try std.testing.expect(!isSafeProviderSegment(id));
+}
+
+test "podnapisi malformed first nofollow link does not shadow a valid download" {
+    const allocator = std.testing.allocator;
+    var parsed = try common.parseHtmlStable(
+        allocator,
+        "<table><tbody><tr>" ++
+            "<td><a rel='nofollow' href='/subtitles/too-long/download'>bad</a></td>" ++
+            "<td><a rel='nofollow' href='/subtitles/GMso/download?container=zip'>valid</a></td>" ++
+            "</tr></tbody></table>",
+    );
+    defer parsed.deinit();
+    const row = parsed.doc.queryOne("tr") orelse return error.TestUnexpectedResult;
+    const url = (try resolveFirstNoFollowDownload(allocator, row)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(url);
+    try std.testing.expectEqualStrings(site ++ "/subtitles/GMso/download?container=zip", url);
 }
 
 test "parse podnapisi id" {
@@ -621,11 +895,19 @@ test "parse podnapisi title slug from url" {
     try std.testing.expectEqualStrings("the matrix reloaded", parsed.?);
 }
 
+test "podnapisi page parser requires the exact query key" {
+    try std.testing.expectEqual(@as(?usize, 2), parsePageNumberFromHref("?notpage=9&page=2"));
+    try std.testing.expectEqual(@as(?usize, 3), parsePageNumberFromHref("?page_size=9&page=3#page=99"));
+    try std.testing.expectEqual(@as(?usize, 4), parsePageNumberFromHref("/subtitles/page/4/?notpage=8"));
+    try std.testing.expect(parsePageNumberFromHref("?notpage=9") == null);
+    try std.testing.expect(parsePageNumberFromHref("?page_size=9") == null);
+    try std.testing.expect(parsePageNumberFromHref("?page=2x") == null);
+    try std.testing.expect(parsePageNumberFromHref("/subtitles#page=99") == null);
+}
+
 test "live podnapisi search and subtitles" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
     if (!common.shouldRunNamedLiveTest(std.testing.allocator, "PODNAPISI")) return error.SkipZigTest;
-    if (suite.shouldRunExtensiveLiveSuite(std.testing.allocator)) return error.SkipZigTest;
-
     var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer client.deinit();
 

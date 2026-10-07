@@ -9,6 +9,7 @@ const HtmlParseOptions: html.ParseOptions = .{};
 const site = "https://animekalesi.com";
 const browser_cookie_scope_url = site ++ "/";
 const series_index_url = site ++ "/tum-anime-serileri.html";
+const max_token_route_segment_bytes = 240;
 pub const download_token_prefix = "animekalesi-session:";
 
 pub const SearchItem = common.SearchLink;
@@ -34,6 +35,8 @@ pub const Scraper = struct {
 
         const trimmed = std.mem.trim(u8, query, " \t\r\n");
         if (trimmed.len == 0) return .{ .arena = arena, .items = &.{} };
+        const normalized_query = try common.normalizeTitle(a, trimmed);
+        if (normalized_query.len == 0) return .{ .arena = arena, .items = &.{} };
 
         const response = try fetchProviderHtml(self.client, a, series_index_url, null);
         return parseSeriesIndex(common.takeArena(&arena), response.body, trimmed);
@@ -44,35 +47,10 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        try validateProviderUrl(item.page_url);
+        try validateListingUrl(item.page_url);
 
         const response = try fetchProviderHtml(self.client, a, item.page_url, series_index_url);
-        var parsed = try common.parseHtmlStable(a, response.body);
-
-        var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
-        var seen = std.StringHashMapUnmanaged(void).empty;
-        var anchors = parsed.doc.queryAll("td#ayazi_indir a[href^='indir_bolum-']");
-        while (anchors.next()) |anchor| {
-            const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
-            if (seen.contains(href)) continue;
-            try seen.put(a, try a.dupe(u8, href), {});
-
-            const title_attr = common.getAttributeValueSafe(anchor, "title") orelse "";
-            const episode = parseLastPositiveInt(title_attr) orelse continue;
-            const season: i64 = parseSeason(title_attr) orelse 1;
-            const episode_url = try common.resolveUrl(a, site, href);
-            const slugged = try common.asciiSlug(a, item.title);
-
-            try subtitles.append(a, .{
-                .language_code = "tr",
-                .filename = try std.fmt.allocPrint(a, "animekalesi-{s}-s{d}e{d}.zip", .{ slugged, season, episode }),
-                .download_url = try makeDownloadToken(a, item.page_url, episode_url),
-                .season = season,
-                .episode = episode,
-            });
-        }
-
-        const owned = try subtitles.toOwnedSlice(a);
+        const owned = try parseSubtitleListing(a, response.body, item);
         std.mem.sort(SubtitleItem, owned, {}, common.seasonEpisodeLessThan(SubtitleItem));
         return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
@@ -83,7 +61,8 @@ pub const Scraper = struct {
 
     pub fn fetchDownloadByToken(self: *Scraper, allocator: Allocator, token: []const u8) !common.HttpResponse {
         const parts = parseDownloadToken(token) orelse return error.InvalidDownloadUrl;
-        if (!try isProviderOrigin(parts.listing_url) or !try isProviderOrigin(parts.episode_url)) return error.InvalidDownloadUrl;
+        try validateListingUrl(parts.listing_url);
+        try validateEpisodeUrl(parts.episode_url);
 
         var asp_cookies: AspSessionCookies = .empty;
         defer asp_cookies.deinit(allocator);
@@ -114,6 +93,9 @@ pub const Scraper = struct {
         );
         defer listing.deinit(allocator);
 
+        if (!try listingContainsEpisodeUrl(allocator, listing.body, parts.episode_url))
+            return error.InvalidDownloadUrl;
+
         var episode = try fetchRawProviderStep(
             self.client,
             allocator,
@@ -139,6 +121,47 @@ pub const Scraper = struct {
     }
 };
 
+fn parseSubtitleListing(allocator: Allocator, body: []const u8, item: SearchItem) ![]SubtitleItem {
+    var parsed = try common.parseHtmlStable(allocator, body);
+    var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    var anchors = parsed.doc.queryAll("td#ayazi_indir a[href^='indir_bolum-']");
+    while (anchors.next()) |anchor| {
+        const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
+        const title_attr = common.getAttributeValueSafe(anchor, "title") orelse "";
+        const episode = parseLastPositiveInt(title_attr) orelse continue;
+        const season: i64 = parseSeason(title_attr) orelse 1;
+        if (seen.contains(href)) continue;
+
+        try subtitles.ensureUnusedCapacity(allocator, 1);
+        try seen.ensureUnusedCapacity(allocator, 1);
+
+        const episode_url = common.resolveUrl(allocator, site, href) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => continue,
+        };
+        defer allocator.free(episode_url);
+        validateEpisodeUrl(episode_url) catch continue;
+        const slugged = try common.asciiSlug(allocator, item.title);
+        defer allocator.free(slugged);
+        const filename = try std.fmt.allocPrint(allocator, "animekalesi-{s}-s{d}e{d}.zip", .{ slugged, season, episode });
+        errdefer allocator.free(filename);
+        const download_url = try makeDownloadToken(allocator, item.page_url, episode_url);
+        errdefer allocator.free(download_url);
+        const subtitle: SubtitleItem = .{
+            .language_code = "tr",
+            .filename = filename,
+            .download_url = download_url,
+            .season = season,
+            .episode = episode,
+        };
+
+        seen.putAssumeCapacityNoClobber(href, {});
+        subtitles.appendAssumeCapacity(subtitle);
+    }
+    return subtitles.toOwnedSlice(allocator);
+}
+
 fn parseSeriesIndex(arena: std.heap.ArenaAllocator, body: []const u8, query: []const u8) !SearchResponse {
     var owned_arena = arena;
     errdefer owned_arena.deinit();
@@ -146,9 +169,9 @@ fn parseSeriesIndex(arena: std.heap.ArenaAllocator, body: []const u8, query: []c
     var parsed = try common.parseHtmlStable(a, body);
 
     const wanted = try common.normalizeTitle(a, query);
+    if (wanted.len == 0) return .{ .arena = owned_arena, .items = &.{} };
     var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
     var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
-    var seen = std.StringHashMapUnmanaged(void).empty;
 
     var anchors = parsed.doc.queryAll("td#bolumler a[href^='bolumler-']");
     while (anchors.next()) |anchor| {
@@ -162,25 +185,44 @@ fn parseSeriesIndex(arena: std.heap.ArenaAllocator, body: []const u8, query: []c
         if (std.mem.indexOf(u8, normalized, wanted) == null and
             std.mem.indexOf(u8, wanted, normalized) == null) continue;
 
-        const series_url = try common.resolveUrl(a, site, href);
-        const listing_url = try subtitleListingUrl(a, series_url);
-        if (seen.contains(listing_url)) continue;
-        try seen.put(a, listing_url, {});
+        const series_url = common.resolveUrl(a, site, href) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => continue,
+        };
+        const listing_url = subtitleListingUrl(a, series_url) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => continue,
+        };
+        validateListingUrl(listing_url) catch continue;
 
         const item: SearchItem = .{
             .title = title,
             .page_url = listing_url,
         };
-        if (std.mem.eql(u8, normalized, wanted))
-            try exact.append(a, item)
-        else
+        if (std.mem.eql(u8, normalized, wanted)) {
+            if (searchLinkIndex(exact.items, listing_url) != null) continue;
+            if (searchLinkIndex(partial.items, listing_url)) |index| {
+                _ = partial.orderedRemove(index);
+            }
+            try exact.append(a, item);
+        } else {
+            if (searchLinkIndex(exact.items, listing_url) != null or
+                searchLinkIndex(partial.items, listing_url) != null) continue;
             try partial.append(a, item);
+        }
     }
 
     var out: std.ArrayListUnmanaged(SearchItem) = .empty;
     try out.appendSlice(a, exact.items);
     try out.appendSlice(a, partial.items);
     return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try out.toOwnedSlice(a) });
+}
+
+fn searchLinkIndex(items: []const SearchItem, page_url: []const u8) ?usize {
+    for (items, 0..) |item, index| {
+        if (std.mem.eql(u8, item.page_url, page_url)) return index;
+    }
+    return null;
 }
 
 fn subtitleListingUrl(allocator: Allocator, series_url: []const u8) ![]u8 {
@@ -226,6 +268,8 @@ fn parseSeason(value: []const u8) ?i64 {
 }
 
 pub fn makeDownloadToken(allocator: Allocator, listing_url: []const u8, episode_url: []const u8) ![]u8 {
+    try validateListingUrl(listing_url);
+    try validateEpisodeUrl(episode_url);
     return std.fmt.allocPrint(allocator, "{s}{s}|{s}", .{ download_token_prefix, listing_url, episode_url });
 }
 
@@ -239,7 +283,29 @@ pub fn parseDownloadToken(value: []const u8) ?DownloadToken {
     const payload = value[download_token_prefix.len..];
     const sep = std.mem.indexOfScalar(u8, payload, '|') orelse return null;
     if (sep == 0 or sep + 1 >= payload.len) return null;
-    return .{ .listing_url = payload[0..sep], .episode_url = payload[sep + 1 ..] };
+    const result: DownloadToken = .{ .listing_url = payload[0..sep], .episode_url = payload[sep + 1 ..] };
+    validateListingUrl(result.listing_url) catch return null;
+    validateEpisodeUrl(result.episode_url) catch return null;
+    return result;
+}
+
+fn listingContainsEpisodeUrl(allocator: Allocator, body: []const u8, expected_url: []const u8) !bool {
+    try validateEpisodeUrl(expected_url);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var parsed = try common.parseHtmlStable(a, body);
+    var anchors = parsed.doc.queryAll("td#ayazi_indir a[href^='indir_bolum-']");
+    while (anchors.next()) |anchor| {
+        const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
+        const resolved = common.resolveUrl(a, site, href) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => continue,
+        };
+        validateEpisodeUrl(resolved) catch continue;
+        if (std.mem.eql(u8, resolved, expected_url)) return true;
+    }
+    return false;
 }
 
 fn parseEpisodeDownloadUrl(allocator: Allocator, body: []const u8) ![]const u8 {
@@ -247,10 +313,17 @@ fn parseEpisodeDownloadUrl(allocator: Allocator, body: []const u8) ![]const u8 {
     defer arena.deinit();
     const a = arena.allocator();
     var parsed = try common.parseHtmlStable(a, body);
-    const anchor = parsed.doc.queryOne("div#altyazi_indir a[href]") orelse return error.MissingField;
-    const href = common.getAttributeValueSafe(anchor, "href") orelse return error.MissingField;
-    const resolved = try common.resolveUrl(a, site, href);
-    return allocator.dupe(u8, resolved);
+    var anchors = parsed.doc.queryAll("div#altyazi_indir a[href]");
+    while (anchors.next()) |anchor| {
+        const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
+        const resolved = common.resolveUrl(a, site, href) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        validateInitialDownloadUrl(resolved) catch continue;
+        return allocator.dupe(u8, resolved);
+    }
+    return error.MissingField;
 }
 
 fn trimDisplaySpace(value: []const u8) []const u8 {
@@ -297,6 +370,105 @@ const RawResponse = struct {
 };
 
 fn fetchRaw(
+    client: *std.http.Client,
+    allocator: Allocator,
+    url: []const u8,
+    cookie: ?[]const u8,
+    referer: ?[]const u8,
+    user_agent: ?[]const u8,
+) !RawResponse {
+    // Each raw network attempt is bounded from DNS through body read. A retry
+    // after the separately bounded manual browser handoff receives a fresh
+    // transport budget instead of truncating the user's challenge window.
+    const now_ms = common.compatMilliTimestamp();
+    return fetchRawUntil(
+        client,
+        allocator,
+        url,
+        cookie,
+        referer,
+        user_agent,
+        now_ms +| common.default_fetch_timeout_ms,
+    );
+}
+
+fn fetchRawUntil(
+    client: *std.http.Client,
+    allocator: Allocator,
+    url: []const u8,
+    cookie: ?[]const u8,
+    referer: ?[]const u8,
+    user_agent: ?[]const u8,
+    deadline_ms: i64,
+) !RawResponse {
+    const now_ms = common.compatMilliTimestamp();
+    if (now_ms >= deadline_ms) return error.Timeout;
+
+    const FetchTask = struct {
+        fn run(
+            result: *?RawResponse,
+            task_client: *std.http.Client,
+            task_allocator: Allocator,
+            task_url: []const u8,
+            task_cookie: ?[]const u8,
+            task_referer: ?[]const u8,
+            task_user_agent: ?[]const u8,
+        ) !void {
+            result.* = try fetchRawUnbounded(
+                task_client,
+                task_allocator,
+                task_url,
+                task_cookie,
+                task_referer,
+                task_user_agent,
+            );
+        }
+    };
+    const FetchResult = @typeInfo(@TypeOf(FetchTask.run)).@"fn".return_type.?;
+    const TimeoutResult = @typeInfo(@TypeOf(std.Io.Timeout.sleep)).@"fn".return_type.?;
+    const Selection = union(enum) {
+        fetch: FetchResult,
+        timeout: TimeoutResult,
+    };
+    var selection_buffer: [2]Selection = undefined;
+    var selection = std.Io.Select(Selection).init(client.io, &selection_buffer);
+    var owned_response: ?RawResponse = null;
+    defer {
+        selection.cancelDiscard();
+        if (owned_response) |*response| response.deinit(allocator);
+    }
+
+    const remaining_ms: i64 = deadline_ms -| now_ms;
+    const timeout: std.Io.Timeout = .{ .deadline = std.Io.Clock.Timestamp.fromNow(client.io, .{
+        .raw = std.Io.Duration.fromMilliseconds(remaining_ms),
+        .clock = .awake,
+    }) };
+    try selection.concurrent(.fetch, FetchTask.run, .{
+        &owned_response,
+        client,
+        allocator,
+        url,
+        cookie,
+        referer,
+        user_agent,
+    });
+    try selection.concurrent(.timeout, std.Io.Timeout.sleep, .{ timeout, client.io });
+
+    switch (try selection.await()) {
+        .fetch => |result| {
+            try result;
+            const response = owned_response orelse return error.MissingHttpResponse;
+            owned_response = null;
+            return response;
+        },
+        .timeout => |result| {
+            try result;
+            return error.Timeout;
+        },
+    }
+}
+
+fn fetchRawUnbounded(
     client: *std.http.Client,
     allocator: Allocator,
     url: []const u8,
@@ -353,30 +525,19 @@ fn fetchRaw(
     var interim_count: usize = 0;
     while (response.head.status.class() == .informational) {
         if (response.head.status == .switching_protocols) return error.UnsupportedProtocolUpgrade;
+        try validateRawSessionResponseHead(response.head);
         interim_count += 1;
         if (interim_count > 16) return error.TooManyInformationalResponses;
         response = req.receiveHead(&head_buffer) catch |err| return common.normalizeRequestReadError(&req, err);
     }
+    try validateRawSessionResponseHead(response.head);
     const cookie_headers = try extractSessionCookieHeaders(allocator, response.head.bytes);
     errdefer if (cookie_headers) |value| allocator.free(value);
     const location = if (response.head.location) |value| try allocator.dupe(u8, value) else null;
     errdefer if (location) |value| allocator.free(value);
 
-    var transfer_buffer: [16 * 1024]u8 = undefined;
-    const reader = response.reader(&transfer_buffer);
-    const body = readBoundedBody(allocator, reader, max_raw_response_bytes) catch |err| {
-        if (err == error.ReadFailed) {
-            if (response.bodyErr()) |body_err| return body_err;
-            return common.normalizeRequestReadError(&req, err);
-        }
-        return err;
-    };
+    const body = try common.readStrictResponseBody(&req, &response, allocator, max_raw_response_bytes);
     errdefer allocator.free(body);
-    switch (req.reader.state) {
-        .body_remaining_content_length => |left| if (left != 0) return error.HttpBodyTruncated,
-        .body_remaining_chunk_len => return error.HttpChunkTruncated,
-        else => {},
-    }
 
     return .{
         .status = response.head.status,
@@ -384,6 +545,10 @@ fn fetchRaw(
         .cookie_headers = cookie_headers,
         .location = location,
     };
+}
+
+fn validateRawSessionResponseHead(head: std.http.Client.Response.Head) !void {
+    try common.validateResponseFraming(head);
 }
 
 fn extractSessionCookieHeaders(allocator: Allocator, headers: []const u8) !?[]u8 {
@@ -835,6 +1000,96 @@ fn isProviderOrigin(url: []const u8) !bool {
 
 fn validateProviderUrl(url: []const u8) !void {
     if (!(isProviderOrigin(url) catch false)) return error.InvalidDownloadUrl;
+}
+
+fn validateInitialDownloadUrl(url: []const u8) !void {
+    try validateProviderUrl(url);
+    const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
+    if (uri.fragment != null) return error.InvalidDownloadUrl;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    const prefix = "/download/";
+    if (!std.mem.startsWith(u8, path, prefix) or
+        !isSafeDownloadPathSegment(path[prefix.len..]))
+    {
+        return error.InvalidDownloadUrl;
+    }
+}
+
+fn isSafeDownloadPathSegment(segment: []const u8) bool {
+    if (segment.len == 0 or segment.len > 2048 or
+        std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, ".."))
+    {
+        return false;
+    }
+
+    var index: usize = 0;
+    while (index < segment.len) {
+        const byte = segment[index];
+        if (byte < 0x20 or byte == 0x7f or byte == '/' or byte == '\\' or byte == '?' or byte == '#')
+            return false;
+        if (byte != '%') {
+            index += 1;
+            continue;
+        }
+        if (segment.len - index < 3) return false;
+        const high = downloadHexNibble(segment[index + 1]) orelse return false;
+        const low = downloadHexNibble(segment[index + 2]) orelse return false;
+        const decoded = high * 16 + low;
+        if (decoded < 0x20 or decoded == 0x7f or decoded == '/' or decoded == '\\' or
+            decoded == '?' or decoded == '#' or decoded == '%' or decoded == '.')
+        {
+            return false;
+        }
+        index += 3;
+    }
+    return true;
+}
+
+fn downloadHexNibble(byte: u8) ?u8 {
+    if (byte >= '0' and byte <= '9') return byte - '0';
+    if (byte >= 'a' and byte <= 'f') return byte - 'a' + 10;
+    if (byte >= 'A' and byte <= 'F') return byte - 'A' + 10;
+    return null;
+}
+
+fn validateListingUrl(url: []const u8) !void {
+    try validateTokenRoute(url, "/altyazib-");
+}
+
+fn validateEpisodeUrl(url: []const u8) !void {
+    try validateTokenRoute(url, "/indir_bolum-");
+}
+
+fn validateTokenRoute(url: []const u8, prefix: []const u8) !void {
+    try validateProviderUrl(url);
+    if (url.len <= site.len or !std.mem.eql(u8, url[0..site.len], site) or url[site.len] != '/')
+        return error.InvalidDownloadUrl;
+    const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
+    if (uri.query != null or uri.fragment != null) return error.InvalidDownloadUrl;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    const suffix = ".html";
+    if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix))
+        return error.InvalidDownloadUrl;
+    const segment = path[prefix.len .. path.len - suffix.len];
+    if (segment.len == 0 or segment.len > max_token_route_segment_bytes)
+        return error.InvalidDownloadUrl;
+
+    var id_end: usize = 0;
+    while (id_end < segment.len and std.ascii.isDigit(segment[id_end])) : (id_end += 1) {}
+    if (id_end == 0 or segment[0] == '0' or
+        id_end + 1 >= segment.len or segment[id_end] != '-')
+    {
+        return error.InvalidDownloadUrl;
+    }
+    const slug = segment[id_end + 1 ..];
+    if (slug[0] == '-' or slug[slug.len - 1] == '-') return error.InvalidDownloadUrl;
+    for (slug) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-') return error.InvalidDownloadUrl;
+    }
 }
 
 const DownloadDisposition = enum {
@@ -1438,6 +1693,24 @@ test "raw response body limit accepts exact bounds and rejects excess" {
     try std.testing.expectEqual(@as(usize, 0), empty_body.len);
     var zero_limit: std.Io.Reader = .fixed("1");
     try std.testing.expectError(error.ResponseTooLarge, readBoundedBody(a, &zero_limit, 0));
+}
+
+test "animekalesi raw request rejects an expired deadline before I/O" {
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    const now_ms = common.compatMilliTimestamp();
+    try std.testing.expectError(
+        error.Timeout,
+        fetchRawUntil(
+            &client,
+            std.testing.allocator,
+            site ++ "/",
+            null,
+            null,
+            null,
+            now_ms,
+        ),
+    );
 }
 
 test "animekalesi response cookie extraction preserves every ASP attribute" {
@@ -2187,8 +2460,145 @@ test "animekalesi builds subtitle listing URL and token" {
 
     const tampered = download_token_prefix ++
         "https://animekalesi.com/listing\r\nx-injected: yes|https://animekalesi.com/episode";
-    const tampered_parts = parseDownloadToken(tampered).?;
-    try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl(tampered_parts.listing_url));
+    try std.testing.expect(parseDownloadToken(tampered) == null);
+}
+
+test "animekalesi punctuation-only normalized query yields no search results" {
+    var response = try parseSeriesIndex(
+        std.heap.ArenaAllocator.init(std.testing.allocator),
+        "<table><tr><td id=\"bolumler\"><a href=\"bolumler-82-death-note.html\">Death Note</a></td></tr></table>",
+        "... !!! ---",
+    );
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), response.items.len);
+}
+
+test "animekalesi series index skips malformed hrefs before a valid result" {
+    var response = try parseSeriesIndex(
+        std.heap.ArenaAllocator.init(std.testing.allocator),
+        "<table><tr><td id=\"bolumler\">" ++
+            "<a href=\"bolumler-%ZZ\">Death Note</a>" ++
+            "<a href=\"bolumler-82-death-note.html\">Death Note</a>" ++
+            "</td></tr></table>",
+        "Death Note",
+    );
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), response.items.len);
+    try std.testing.expectEqualStrings(site ++ "/altyazib-82-death-note.html", response.items[0].page_url);
+}
+
+test "animekalesi later exact representation replaces a partial duplicate" {
+    var response = try parseSeriesIndex(
+        std.heap.ArenaAllocator.init(std.testing.allocator),
+        "<table><tr><td id=\"bolumler\">" ++
+            "<a href=\"bolumler-82-death-note.html\">Death Note Extra</a>" ++
+            "<a href=\"bolumler-82-death-note.html\">Death Note</a>" ++
+            "</td></tr></table>",
+        "Death Note",
+    );
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), response.items.len);
+    try std.testing.expectEqualStrings("Death Note", response.items[0].title);
+}
+
+test "animekalesi token routes are exact canonical provider paths" {
+    const listing = "https://animekalesi.com/altyazib-82-death-note.html";
+    const episode = "https://animekalesi.com/indir_bolum-71-death-note-1-bolum.html";
+    try validateListingUrl(listing);
+    try validateEpisodeUrl(episode);
+
+    for ([_][]const u8{
+        download_token_prefix ++ "https://animekalesi.com/altyazib-82-death-note.html?next=/private|" ++ episode,
+        download_token_prefix ++ "https://animekalesi.com/altyazib-82-death-note.html#fragment|" ++ episode,
+        download_token_prefix ++ "https://animekalesi.com/altyazib-82/death-note.html|" ++ episode,
+        download_token_prefix ++ "https://animekalesi.com/altyazib-82-%2fadmin.html|" ++ episode,
+        download_token_prefix ++ "https://animekalesi.com/altyazib-death-note.html|" ++ episode,
+        download_token_prefix ++ "https://animekalesi.com/altyazib-0-death-note.html|" ++ episode,
+        download_token_prefix ++ "https://animekalesi.com/altyazib-082-death-note.html|" ++ episode,
+        download_token_prefix ++ "https://ANIMEKALESI.com/altyazib-82-death-note.html|" ++ episode,
+        download_token_prefix ++ "https://animekalesi.com:443/altyazib-82-death-note.html|" ++ episode,
+        download_token_prefix ++ listing ++ "|https://animekalesi.com/indir_bolum-71-death-note.html?x=1",
+        download_token_prefix ++ listing ++ "|https://animekalesi.com/indir_bolum-71-death-note.html#x",
+        download_token_prefix ++ listing ++ "|https://animekalesi.com/episode/indir_bolum-71-death-note.html",
+        download_token_prefix ++ listing ++ "|https://animekalesi.com/indir_bolum-71-..html",
+    }) |invalid| {
+        try std.testing.expect(parseDownloadToken(invalid) == null);
+    }
+    try std.testing.expectError(
+        error.InvalidDownloadUrl,
+        makeDownloadToken(std.testing.allocator, site ++ "/listing", episode),
+    );
+    const oversized_slug: [max_token_route_segment_bytes]u8 = @splat('a');
+    const oversized_url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/altyazib-1-{s}.html",
+        .{ site, &oversized_slug },
+    );
+    defer std.testing.allocator.free(oversized_url);
+    try std.testing.expectError(error.InvalidDownloadUrl, validateListingUrl(oversized_url));
+}
+
+test "animekalesi skips malformed download anchors before a valid route" {
+    const body =
+        "<div id=\"altyazi_indir\">" ++
+        "<a href=\"https://www.google.com/download/decoy.zip\">external</a>" ++
+        "<a href=\"/admin/archive.zip\">wrong route</a>" ++
+        "<a href=\"/download/archive.zip?token=public\">valid</a>" ++
+        "</div>";
+    const url = try parseEpisodeDownloadUrl(std.testing.allocator, body);
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings(site ++ "/download/archive.zip?token=public", url);
+
+    try std.testing.expectError(
+        error.MissingField,
+        parseEpisodeDownloadUrl(
+            std.testing.allocator,
+            "<div id=\"altyazi_indir\"><a href=\"/download-admin\">bad</a></div>",
+        ),
+    );
+}
+
+test "animekalesi listing must contain the token episode before handoff" {
+    const expected = site ++ "/indir_bolum-71-death-note-1-bolum.html";
+    const other = site ++ "/indir_bolum-72-death-note-2-bolum.html";
+    const body =
+        "<table><tr><td id=\"ayazi_indir\">" ++
+        "<a href=\"indir_bolum-71-death-note-1-bolum.html\">one</a>" ++
+        "<a href=\"indir_bolum-bad.html\">bad</a>" ++
+        "</td></tr></table>";
+    try std.testing.expect(try listingContainsEpisodeUrl(std.testing.allocator, body, expected));
+    try std.testing.expect(!try listingContainsEpisodeUrl(std.testing.allocator, body, other));
+}
+
+test "animekalesi malformed duplicate does not suppress a valid episode" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const subtitles = try parseSubtitleListing(
+        arena.allocator(),
+        "<table><tr><td id=\"ayazi_indir\">" ++
+            "<a href=\"indir_bolum-7-death-note.html\">missing title</a>" ++
+            "<a href=\"indir_bolum-7-death-note.html\" title=\"Death Note 2 Sezon 3 Bolum\">valid</a>" ++
+            "<a href=\"indir_bolum-7-death-note.html\" title=\"Death Note 9 Sezon 9 Bolum\">duplicate</a>" ++
+            "</td></tr></table>",
+        .{ .title = "Death Note", .page_url = "https://animekalesi.com/altyazib-82-death-note.html" },
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), subtitles.len);
+    try std.testing.expectEqual(@as(i64, 2), subtitles[0].season);
+    try std.testing.expectEqual(@as(i64, 3), subtitles[0].episode);
+}
+
+test "animekalesi raw session transport rejects ambiguous response framing" {
+    for ([_][]const u8{
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n",
+    }) |raw_head| {
+        const head = try std.http.Client.Response.Head.parse(raw_head);
+        try std.testing.expectError(error.AmbiguousHttpFraming, validateRawSessionResponseHead(head));
+    }
 }
 
 test "live animekalesi search listing and session download" {

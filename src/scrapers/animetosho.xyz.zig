@@ -47,6 +47,8 @@ pub const Scraper = struct {
 
         const parsed_query = parseQuery(query);
         if (parsed_query.title.len == 0) return .{ .arena = arena, .items = &.{} };
+        const normalized_query = try common.normalizeTitle(a, parsed_query.title);
+        if (normalized_query.len == 0) return .{ .arena = arena, .items = &.{} };
 
         const encoded = try common.encodeUriComponent(a, query);
         const search_url = try std.fmt.allocPrint(a, "{s}?q={s}", .{ feed, encoded });
@@ -54,6 +56,8 @@ pub const Scraper = struct {
             .accept = "application/json,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
+            .require_https = true,
         });
 
         return parseSearchBody(common.takeArena(&arena), response.body, parsed_query);
@@ -69,46 +73,15 @@ pub const Scraper = struct {
             .accept = "application/json,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
+            .require_https = true,
         });
-
-        const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
-        const obj = common.jsonObject(root) orelse return error.InvalidFieldType;
-
-        var normal: std.ArrayListUnmanaged(SubtitleItem) = .empty;
-        var forced: std.ArrayListUnmanaged(SubtitleItem) = .empty;
-        var seen = std.AutoHashMapUnmanaged(i64, void).empty;
-
-        if (common.jsonArray(obj.get("attachments") orelse .null)) |attachments| {
-            try appendRootAttachments(a, &normal, &forced, &seen, item, attachments);
-        }
-
-        if (common.jsonArray(obj.get("files") orelse .null)) |files| {
-            for (files.items) |file_value| {
-                if (normal.items.len + forced.items.len >= max_subtitle_items) break;
-                const file_obj = common.jsonObject(file_value) orelse continue;
-                const filename = common.jsonString(file_obj, "filename") orelse "";
-                if (item.episode != null and !fileMatchesEpisode(filename, item.season orelse 1, item.episode.?)) continue;
-
-                const attachments = common.jsonArray(file_obj.get("attachments") orelse .null) orelse continue;
-                try appendAttachments(a, &normal, &forced, &seen, item, attachments, filename);
-
-                // For a TV season/batch search without a requested episode, avoid
-                // exploding the UI with every track from every episode.
-                if (item.media_kind == .tv and item.episode == null and normal.items.len + forced.items.len > 0) break;
-            }
-        }
-
-        var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
-        try subtitles.appendSlice(a, normal.items);
-        if (subtitles.items.len < max_subtitle_items) {
-            const remaining = max_subtitle_items - subtitles.items.len;
-            try subtitles.appendSlice(a, forced.items[0..@min(remaining, forced.items.len)]);
-        }
+        const subtitles = try parseSubtitleItems(a, response.body, item);
 
         return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
-            .subtitles = try subtitles.toOwnedSlice(a),
+            .subtitles = subtitles,
         });
     }
 
@@ -125,6 +98,8 @@ pub const Scraper = struct {
             .accept = "application/x-xz,application/octet-stream,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
+            .require_https = true,
         });
         defer allocator.free(response.body);
 
@@ -142,6 +117,45 @@ pub const Scraper = struct {
     }
 };
 
+fn parseSubtitleItems(allocator: Allocator, body: []const u8, item: SearchItem) ![]const SubtitleItem {
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, allocator, body, .{});
+    const obj = common.jsonObject(root) orelse return error.InvalidFieldType;
+
+    var normal: std.ArrayListUnmanaged(SubtitleItem) = .empty;
+    var forced: std.ArrayListUnmanaged(SubtitleItem) = .empty;
+    var seen = std.AutoHashMapUnmanaged(i64, void).empty;
+
+    if (common.jsonArray(obj.get("attachments") orelse .null)) |attachments| {
+        try appendRootAttachments(allocator, &normal, &forced, &seen, item, attachments);
+    }
+
+    if (common.jsonArray(obj.get("files") orelse .null)) |files| {
+        for (files.items) |file_value| {
+            if (normal.items.len >= max_subtitle_items and forced.items.len >= max_subtitle_items) break;
+            const file_obj = common.jsonObject(file_value) orelse continue;
+            const filename = common.jsonString(file_obj, "filename") orelse "";
+            if (item.episode != null and !fileMatchesEpisode(filename, item.season orelse 1, item.episode.?)) continue;
+
+            const attachments = common.jsonArray(file_obj.get("attachments") orelse .null) orelse continue;
+            const retained_before = normal.items.len + forced.items.len;
+            try appendAttachments(allocator, &normal, &forced, &seen, item, attachments, filename);
+
+            // For a TV season/batch search without a requested episode, avoid
+            // exploding the UI with every track from every episode.
+            if (item.media_kind == .tv and item.episode == null and
+                normal.items.len + forced.items.len > retained_before) break;
+        }
+    }
+
+    var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
+    try subtitles.appendSlice(allocator, normal.items);
+    if (subtitles.items.len < max_subtitle_items) {
+        const remaining = max_subtitle_items - subtitles.items.len;
+        try subtitles.appendSlice(allocator, forced.items[0..@min(remaining, forced.items.len)]);
+    }
+    return subtitles.toOwnedSlice(allocator);
+}
+
 fn parseSearchBody(arena: std.heap.ArenaAllocator, body: []const u8, parsed_query: ParsedQuery) !SearchResponse {
     var owned_arena = arena;
     errdefer owned_arena.deinit();
@@ -150,6 +164,7 @@ fn parseSearchBody(arena: std.heap.ArenaAllocator, body: []const u8, parsed_quer
     const root = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
     const values = common.jsonArray(root) orelse return error.InvalidFieldType;
     const wanted = try common.normalizeTitle(a, parsed_query.title);
+    if (wanted.len == 0) return .{ .arena = owned_arena, .items = &.{} };
 
     var items: std.ArrayListUnmanaged(SearchItem) = .empty;
     var seen = std.AutoHashMapUnmanaged(i64, void).empty;
@@ -221,7 +236,7 @@ fn appendAttachments(
     media_filename: ?[]const u8,
 ) !void {
     for (attachments.items) |attachment_value| {
-        if (normal.items.len + forced.items.len >= max_subtitle_items) break;
+        if (normal.items.len >= max_subtitle_items and forced.items.len >= max_subtitle_items) break;
         const attachment = common.jsonObject(attachment_value) orelse continue;
         if (!isSubtitleAttachment(attachment)) continue;
 
@@ -235,6 +250,8 @@ fn appendAttachments(
         const language_name = common.jsonString(info, "language") orelse "";
         const language_code = normalizeLanguage(raw_code, language_name);
         const is_forced = jsonTruthy(info.get("forced"));
+        const target = if (is_forced) forced else normal;
+        if (target.items.len >= max_subtitle_items) continue;
 
         try seen.put(allocator, attachment_id, {});
 
@@ -248,7 +265,6 @@ fn appendAttachments(
             );
 
         const download_url = try makeDownloadToken(allocator, item.release_id, attachment_id, extension);
-        const target = if (is_forced) forced else normal;
         try target.append(allocator, .{
             .language_code = try allocator.dupe(u8, language_code),
             .filename = filename,
@@ -295,10 +311,12 @@ const DownloadToken = struct {
 };
 
 pub fn makeDownloadToken(allocator: Allocator, release_id: i64, attachment_id: i64, extension: []const u8) ![]u8 {
+    if (release_id <= 0 or attachment_id <= 0) return error.InvalidDownloadUrl;
+    const canonical_extension = supportedTextFormat(extension) orelse return error.InvalidDownloadUrl;
     return std.fmt.allocPrint(
         allocator,
         "{s}{d}|{d}|{s}",
-        .{ download_token_prefix, release_id, attachment_id, extension },
+        .{ download_token_prefix, release_id, attachment_id, canonical_extension },
     );
 }
 
@@ -310,13 +328,20 @@ pub fn parseDownloadToken(value: []const u8) ?DownloadToken {
     const second = first + 1 + second_rel;
     if (first == 0 or second <= first + 1 or second + 1 >= payload.len) return null;
 
-    const release_id = std.fmt.parseInt(i64, payload[0..first], 10) catch return null;
-    const attachment_id = std.fmt.parseInt(i64, payload[first + 1 .. second], 10) catch return null;
-    if (release_id <= 0 or attachment_id <= 0) return null;
+    const release_id = parsePositiveDecimal(payload[0..first]) orelse return null;
+    const attachment_id = parsePositiveDecimal(payload[first + 1 .. second]) orelse return null;
 
     const extension = payload[second + 1 ..];
-    if (supportedTextFormat(extension) == null) return null;
+    const canonical_extension = supportedTextFormat(extension) orelse return null;
+    if (!std.mem.eql(u8, extension, canonical_extension)) return null;
     return .{ .release_id = release_id, .attachment_id = attachment_id, .extension = extension };
+}
+
+fn parsePositiveDecimal(value: []const u8) ?i64 {
+    if (value.len == 0 or value[0] == '0') return null;
+    for (value) |c| if (!std.ascii.isDigit(c)) return null;
+    const parsed = std.fmt.parseInt(i64, value, 10) catch return null;
+    return if (parsed > 0) parsed else null;
 }
 
 fn supportedTextFormat(value: []const u8) ?[]const u8 {
@@ -377,8 +402,8 @@ fn seasonMarkerIndex(title: []const u8) ?usize {
 }
 
 fn isBatchRelease(value: []const u8) bool {
-    if (std.ascii.indexOfIgnoreCase(value, "batch") != null or
-        std.ascii.indexOfIgnoreCase(value, "complete") != null) return true;
+    if (std.ascii.findIgnoreCase(value, "batch") != null or
+        std.ascii.findIgnoreCase(value, "complete") != null) return true;
     for (value, 0..) |c, separator| {
         if ((c == '-' or c == '~') and isEpisodeRangeAt(value, separator)) return true;
     }
@@ -516,16 +541,29 @@ fn episodeOnlySeasonMatches(value: []const u8, season: u16) bool {
 }
 
 fn releaseEpisodeMarkerMatches(value: []const u8, episode: u16) ?bool {
+    var bracket_depth: usize = 0;
+    var found = false;
     for (value, 0..) |c, i| {
-        if (c != '-') continue;
+        if (c == '[') {
+            bracket_depth += 1;
+            continue;
+        }
+        if (c == ']') {
+            if (bracket_depth > 0) bracket_depth -= 1;
+            continue;
+        }
+        // Release-group tags commonly contain numeric suffixes such as
+        // `[Group-2]`. They are metadata, not episode markers.
+        if (c != '-' or bracket_depth != 0) continue;
         var start = i + 1;
         while (start < value.len and std.ascii.isWhitespace(value[start])) : (start += 1) {}
         const parsed = parseEpisodeNumber(value, start) orelse continue;
         if (parsed.end - start > 3 or isDecimalNumber(value, start, parsed.end)) continue;
         _ = episodeTokenEnd(value, parsed.end) orelse continue;
-        return parsed.value == episode;
+        found = true;
+        if (parsed.value == episode) return true;
     }
-    return null;
+    return if (found) false else null;
 }
 
 fn isDecimalNumber(value: []const u8, start: usize, end: usize) bool {
@@ -617,6 +655,26 @@ test "animetosho parses query and download token" {
     try std.testing.expectEqual(@as(i64, 692954), decoded.release_id);
     try std.testing.expectEqual(@as(i64, 3637452), decoded.attachment_id);
     try std.testing.expectEqualStrings("srt", decoded.extension);
+
+    const canonical = try makeDownloadToken(std.testing.allocator, 1, 2, "WEBVTT");
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expectEqualStrings("vtt", parseDownloadToken(canonical).?.extension);
+    for ([_]i64{ -1, 0 }) |invalid_id| {
+        try std.testing.expectError(
+            error.InvalidDownloadUrl,
+            makeDownloadToken(std.testing.allocator, invalid_id, 2, "srt"),
+        );
+        try std.testing.expectError(
+            error.InvalidDownloadUrl,
+            makeDownloadToken(std.testing.allocator, 1, invalid_id, "srt"),
+        );
+    }
+    try std.testing.expectError(
+        error.InvalidDownloadUrl,
+        makeDownloadToken(std.testing.allocator, 1, 2, "exe"),
+    );
+    try std.testing.expect(parseDownloadToken(download_token_prefix ++ "01|2|srt") == null);
+    try std.testing.expect(parseDownloadToken(download_token_prefix ++ "1|2|SRT") == null);
 }
 
 test "animetosho root attachments require the requested release episode" {
@@ -661,6 +719,46 @@ test "animetosho root attachments require the requested release episode" {
     try std.testing.expectEqual(@as(usize, 1), normal.items.len);
 }
 
+test "animetosho detail selection preserves a later normal track" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var body: std.Io.Writer.Allocating = .init(allocator);
+    defer body.deinit();
+    try body.writer.writeAll("{\"attachments\":[");
+    for (0..max_subtitle_items) |index| {
+        if (index != 0) try body.writer.writeAll(",");
+        try body.writer.print(
+            "{{\"id\":{d},\"type\":\"subtitle\",\"info\":{{\"format\":\"srt\",\"language_code\":\"eng\",\"forced\":true}}}}",
+            .{index + 1},
+        );
+    }
+    try body.writer.print(
+        "],\"files\":[{{\"filename\":\"Show.mkv\",\"attachments\":[{{\"id\":{d},\"type\":\"subtitle\",\"info\":{{\"format\":\"srt\",\"language_code\":\"eng\"}}}}]}}]}}",
+        .{max_subtitle_items + 1},
+    );
+    const item: SearchItem = .{
+        .title = "Show",
+        .year = null,
+        .media_kind = .movie,
+        .season = null,
+        .episode = null,
+        .release_id = 1,
+        .release = "Show",
+        .page_url = "https://fixture.invalid/1",
+    };
+    const subtitles = try parseSubtitleItems(allocator, body.written(), item);
+
+    try std.testing.expectEqual(@as(usize, max_subtitle_items), subtitles.len);
+    const normal_token = parseDownloadToken(subtitles[0].download_url).?;
+    try std.testing.expectEqual(@as(i64, max_subtitle_items + 1), normal_token.attachment_id);
+    try std.testing.expectEqual(@as(i64, 1), parseDownloadToken(subtitles[1].download_url).?.attachment_id);
+    try std.testing.expectEqual(
+        @as(i64, max_subtitle_items - 1),
+        parseDownloadToken(subtitles[subtitles.len - 1].download_url).?.attachment_id,
+    );
+}
+
 test "animetosho episode markers reject unrelated release and audio numbers" {
     for ([_][]const u8{
         "Show - 03 [FLAC 2.0]",
@@ -672,6 +770,8 @@ test "animetosho episode markers reject unrelated release and audio numbers" {
         "Show [FLAC 2.0]",
     }) |release| try std.testing.expect(!fileMatchesEpisode(release, 1, 2));
     for ([_][]const u8{ "Show S1E2", "Show 1x2", "Show Episode 02", "Show - 02 [FLAC 2.0]" }) |release| try std.testing.expect(fileMatchesEpisode(release, 1, 2));
+    try std.testing.expect(fileMatchesEpisode("[Group-1] Show - 02", 1, 2));
+    try std.testing.expect(!fileMatchesEpisode("[Group-2] Show - 01", 1, 2));
 }
 
 test "animetosho later-season selection requires a season-qualified episode" {
@@ -727,6 +827,17 @@ test "animetosho parses completed title search results" {
     try std.testing.expectEqual(@as(i64, 1), response.items[0].release_id);
     try std.testing.expectEqual(@as(?i64, 2001), response.items[0].year);
     try std.testing.expect(response.items[0].media_kind == .movie);
+}
+
+test "animetosho punctuation-only normalized query yields no search results" {
+    var response = try parseSearchBody(
+        std.heap.ArenaAllocator.init(std.testing.allocator),
+        "[{\"id\":1,\"status\":\"complete\",\"title\":\"Spirited Away (2001)\"}]",
+        .{ .title = "... !!! ---", .season = null, .episode = null },
+    );
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), response.items.len);
 }
 
 test "live animetosho movie and tv attachment downloads" {

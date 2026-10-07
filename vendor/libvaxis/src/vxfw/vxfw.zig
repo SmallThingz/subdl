@@ -98,6 +98,17 @@ pub const Command = union(enum) {
     },
 
     query_color: vaxis.Cell.Color.Kind,
+
+    pub fn deinit(self: Command, allocator: Allocator) void {
+        switch (self) {
+            .copy_to_clipboard, .set_title => |text| allocator.free(text),
+            .notify => |notification| {
+                if (notification.title) |title| allocator.free(title);
+                allocator.free(notification.body);
+            },
+            else => {},
+        }
+    }
 };
 
 pub const EventContext = struct {
@@ -149,14 +160,18 @@ pub const EventContext = struct {
     /// content is duplicated using self.alloc.
     /// Caller retains ownership of their copy of content.
     pub fn copyToClipboard(self: *EventContext, content: []const u8) Allocator.Error!void {
-        try self.addCmd(.{ .copy_to_clipboard = try self.alloc.dupe(u8, content) });
+        const owned = try self.alloc.dupe(u8, content);
+        errdefer self.alloc.free(owned);
+        try self.addCmd(.{ .copy_to_clipboard = owned });
     }
 
     /// Set window title.
     /// title is duplicated using self.alloc.
     /// Caller retains ownership of their copy of title.
     pub fn setTitle(self: *EventContext, title: []const u8) Allocator.Error!void {
-        try self.addCmd(.{ .set_title = try self.alloc.dupe(u8, title) });
+        const owned = try self.alloc.dupe(u8, title);
+        errdefer self.alloc.free(owned);
+        try self.addCmd(.{ .set_title = owned });
     }
 
     pub fn queueRefresh(self: *EventContext) Allocator.Error!void {
@@ -172,15 +187,13 @@ pub const EventContext = struct {
         body: []const u8,
     ) Allocator.Error!void {
         const alloc = self.alloc;
-        if (maybe_title) |title| {
-            return self.addCmd(.{ .notify = .{
-                .title = try alloc.dupe(u8, title),
-                .body = try alloc.dupe(u8, body),
-            } });
-        }
-        return self.addCmd(.{ .notify = .{
-            .title = null,
-            .body = try alloc.dupe(u8, body),
+        const owned_title = if (maybe_title) |title| try alloc.dupe(u8, title) else null;
+        errdefer if (owned_title) |title| alloc.free(title);
+        const owned_body = try alloc.dupe(u8, body);
+        errdefer alloc.free(owned_body);
+        try self.addCmd(.{ .notify = .{
+            .title = owned_title,
+            .body = owned_body,
         } });
     }
 
@@ -536,6 +549,31 @@ test "Surface: satisfiesConstraints" {
     try testing.expect(surf.satisfiesConstraints(.{ .width = 1, .height = 1 }, .{ .width = 20, .height = 20 }));
     try testing.expect(!surf.satisfiesConstraints(.{ .width = 10, .height = 10 }, .{ .width = 20, .height = 20 }));
     try testing.expect(!surf.satisfiesConstraints(.{ .width = 1, .height = 1 }, .{ .width = 10, .height = 10 }));
+}
+
+fn testOwnedCommandAllocationFailures(allocator: Allocator) !void {
+    var ctx: EventContext = .{
+        .io = testing.io,
+        .alloc = allocator,
+        .cmds = .empty,
+    };
+    defer {
+        for (ctx.cmds.items) |cmd| cmd.deinit(allocator);
+        ctx.cmds.deinit(allocator);
+    }
+
+    try ctx.copyToClipboard("copy");
+    try ctx.setTitle("title");
+    try ctx.sendNotification("subject", "body");
+    try ctx.sendNotification(null, "body only");
+}
+
+test "owned commands clean up after allocation failure" {
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        testOwnedCommandAllocationFailures,
+        .{},
+    );
 }
 
 test "All widgets have a doctest and refAllDecls test" {

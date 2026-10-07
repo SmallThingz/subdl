@@ -39,12 +39,16 @@ pub const Scraper = struct {
 
         const trimmed = std.mem.trim(u8, query, " \t\r\n");
         if (trimmed.len == 0) return .{ .arena = arena, .items = &.{} };
+        const wanted = try common.normalizeTitle(a, trimmed);
+        if (wanted.len == 0) return .{ .arena = arena, .items = &.{} };
 
         const home = try common.fetchBytes(self.client, a, home_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
             .require_public_origin = true,
+            .require_https = true,
+            .require_same_origin = true,
         });
         const board = try findBoard(a, home.body, trimmed) orelse return .{ .arena = arena, .items = &.{} };
 
@@ -54,6 +58,8 @@ pub const Scraper = struct {
             .cache = false,
             .max_attempts = 2,
             .require_public_origin = true,
+            .require_https = true,
+            .require_same_origin = true,
         });
 
         const items = try parseBoardThreads(a, board_page.body, board.title, board.url);
@@ -61,11 +67,19 @@ pub const Scraper = struct {
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
+        return self.fetchSubtitlesBySearchItemUsing(item, fetchRaw);
+    }
+
+    fn fetchSubtitlesBySearchItemUsing(self: *Scraper, item: SearchItem, comptime fetch: anytype) !SubtitlesResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+        const deadline_ms = common.compatMilliTimestamp() +| common.default_fetch_timeout_ms;
 
-        var thread = try fetchRaw(self.client, a, item.thread_url, null, item.board_url);
+        try validateItemRoute(item.board_url, .board);
+        try validateItemRoute(item.thread_url, .thread);
+
+        var thread = try fetch(self.client, a, item.thread_url, null, item.board_url, deadline_ms);
         defer thread.deinit(a);
         try requireOkResponseStatus(thread.status);
 
@@ -79,19 +93,16 @@ pub const Scraper = struct {
         }
 
         const gate = try parseGate(a, thread.body);
-        const thank_url = try std.fmt.allocPrint(
-            a,
-            "{s}/index.php?action=Thank&output=xml&postID={s}&t={s}",
-            .{ site, gate.post_id, gate.token },
-        );
+        const thank_url = try buildThankUrl(a, gate);
 
-        var revealed = try fetchRaw(self.client, a, thank_url, thread.cookie, item.thread_url);
+        var revealed = try fetch(self.client, a, thank_url, thread.cookie, item.thread_url, deadline_ms);
         defer revealed.deinit(a);
         try requireOkResponseStatus(revealed.status);
 
         var subtitles = try parseRevealedAttachments(a, revealed.body, item.title, item.season);
         if (subtitles.len == 0) {
-            var refreshed = try fetchRaw(self.client, a, item.thread_url, thread.cookie, item.board_url);
+            const refresh_cookie = revealed.cookie orelse thread.cookie;
+            var refreshed = try fetch(self.client, a, item.thread_url, refresh_cookie, item.board_url, deadline_ms);
             defer refreshed.deinit(a);
             try requireOkResponseStatus(refreshed.status);
             subtitles = try parseRevealedAttachments(a, refreshed.body, item.title, item.season);
@@ -118,17 +129,37 @@ fn requireOkResponseStatus(status: std.http.Status) !void {
 fn findBoard(allocator: Allocator, body: []const u8, query: []const u8) !?Board {
     const wanted = try common.normalizeTitle(allocator, query);
     defer allocator.free(wanted);
+    if (wanted.len == 0) return null;
 
     var partial: ?Board = null;
     var cursor: usize = 0;
     while (std.mem.indexOfPos(u8, body, cursor, "<option")) |start| {
-        const tag_end = std.mem.indexOfPos(u8, body, start, ">") orelse break;
-        const close = std.mem.indexOfPos(u8, body, tag_end + 1, "</option>") orelse break;
+        const next_option = std.mem.indexOfPos(u8, body, start + "<option".len, "<option");
+        const tag_end = std.mem.indexOfPos(u8, body, start, ">") orelse {
+            cursor = next_option orelse break;
+            continue;
+        };
+        if (next_option) |next| {
+            if (next < tag_end) {
+                cursor = next;
+                continue;
+            }
+        }
+        const close = std.mem.indexOfPos(u8, body, tag_end + 1, "</option>") orelse {
+            cursor = next_option orelse break;
+            continue;
+        };
+        if (next_option) |next| {
+            if (next < close) {
+                cursor = next;
+                continue;
+            }
+        }
         cursor = close + "</option>".len;
 
         const tag = body[start .. tag_end + 1];
         const value = attributeValue(tag, "value") orelse continue;
-        if (value.len == 0 or !allDigits(value)) continue;
+        if (!isCanonicalPositiveId(value)) continue;
         const raw_title = body[tag_end + 1 .. close];
         const title = std.mem.trim(u8, stripSimpleTags(raw_title), " \t\r\n");
         if (title.len == 0) continue;
@@ -142,13 +173,28 @@ fn findBoard(allocator: Allocator, body: []const u8, query: []const u8) !?Board 
             .url = try std.fmt.allocPrint(allocator, "{s}/index.php?page=Board&boardID={s}", .{ site, value }),
         };
         if (std.mem.eql(u8, normalized, wanted)) return board;
-        if (partial == null and
-            (std.mem.indexOf(u8, normalized, wanted) != null or std.mem.indexOf(u8, wanted, normalized) != null))
-        {
+        if (partial == null and normalizedTitlesRelated(normalized, wanted)) {
             partial = board;
         }
     }
     return partial;
+}
+
+fn normalizedTitlesRelated(lhs: []const u8, rhs: []const u8) bool {
+    return containsNormalizedPhrase(lhs, rhs) or containsNormalizedPhrase(rhs, lhs);
+}
+
+fn containsNormalizedPhrase(haystack: []const u8, needle: []const u8) bool {
+    if (haystack.len == 0 or needle.len == 0 or needle.len > haystack.len) return false;
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, start, needle)) |index| {
+        const end = index + needle.len;
+        const starts_at_boundary = index == 0 or haystack[index - 1] == ' ';
+        const ends_at_boundary = end == haystack.len or haystack[end] == ' ';
+        if (starts_at_boundary and ends_at_boundary) return true;
+        start = index + 1;
+    }
+    return false;
 }
 
 fn parseBoardThreads(allocator: Allocator, body: []const u8, series_title: []const u8, board_url: []const u8) ![]const SearchItem {
@@ -167,6 +213,7 @@ fn parseBoardThreads(allocator: Allocator, body: []const u8, series_title: []con
         }
         const thread_id = body[id_start..id_end];
         cursor = id_end;
+        if (!isCanonicalPositiveId(thread_id) or !hasQuotedIdTerminator(body, id_end)) continue;
         if (seen.contains(thread_id)) continue;
 
         const gt = std.mem.indexOfPos(u8, body, id_end, ">") orelse continue;
@@ -201,23 +248,66 @@ const Gate = struct {
     token: []const u8,
 };
 
-fn parseGate(allocator: Allocator, body: []const u8) !Gate {
-    const token_marker = "SECURITY_TOKEN = '";
-    const token_start = std.mem.indexOf(u8, body, token_marker) orelse return error.MissingField;
-    const token_tail = body[token_start + token_marker.len ..];
-    const token_end = std.mem.indexOfScalar(u8, token_tail, '\'') orelse return error.MissingField;
+fn buildThankUrl(allocator: Allocator, gate: Gate) ![]u8 {
+    if (!isCanonicalPositiveId(gate.post_id) or gate.token.len == 0) return error.MissingField;
+    const encoded_token = try common.encodeUriComponent(allocator, gate.token);
+    defer allocator.free(encoded_token);
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/index.php?action=Thank&output=xml&postID={s}&t={s}",
+        .{ site, gate.post_id, encoded_token },
+    );
+}
 
-    const post_marker = "thankPostButton";
-    const post_start = std.mem.indexOf(u8, body, post_marker) orelse return error.MissingField;
-    const post_tail = body[post_start + post_marker.len ..];
-    var post_end: usize = 0;
-    while (post_end < post_tail.len and std.ascii.isDigit(post_tail[post_end])) : (post_end += 1) {}
-    if (post_end == 0) return error.MissingField;
+fn parseGate(allocator: Allocator, body: []const u8) !Gate {
+    const token = findGateToken(body) orelse return error.MissingField;
+    const post_id = findGatePostId(body) orelse return error.MissingField;
 
     return .{
-        .post_id = try allocator.dupe(u8, post_tail[0..post_end]),
-        .token = try allocator.dupe(u8, token_tail[0..token_end]),
+        .post_id = try allocator.dupe(u8, post_id),
+        .token = try allocator.dupe(u8, token),
     };
+}
+
+fn findGateToken(body: []const u8) ?[]const u8 {
+    const marker = "SECURITY_TOKEN = '";
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, body, cursor, marker)) |marker_pos| {
+        const token_start = marker_pos + marker.len;
+        const token_end_offset = std.mem.indexOfScalar(u8, body[token_start..], '\'') orelse {
+            cursor = token_start;
+            continue;
+        };
+        const token_end = token_start + token_end_offset;
+        if (std.mem.indexOfPos(u8, body, token_start, marker)) |next_marker| {
+            if (next_marker < token_end) {
+                cursor = next_marker;
+                continue;
+            }
+        }
+        if (token_end > token_start) return body[token_start..token_end];
+        cursor = token_end + 1;
+    }
+    return null;
+}
+
+fn findGatePostId(body: []const u8) ?[]const u8 {
+    const marker = "thankPostButton";
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, body, cursor, marker)) |marker_pos| {
+        const id_start = marker_pos + marker.len;
+        var id_end = id_start;
+        while (id_end < body.len and std.ascii.isDigit(body[id_end])) : (id_end += 1) {}
+        cursor = id_start;
+        const post_id = body[id_start..id_end];
+        if (!isCanonicalPositiveId(post_id) or !hasQuotedIdTerminator(body, id_end)) continue;
+        return post_id;
+    }
+    return null;
+}
+
+fn hasQuotedIdTerminator(body: []const u8, id_end: usize) bool {
+    return id_end == body.len or body[id_end] == '"' or body[id_end] == '\'';
 }
 
 fn parseRevealedAttachments(allocator: Allocator, body: []const u8, series_title: []const u8, season: i64) ![]const SubtitleItem {
@@ -228,8 +318,15 @@ fn parseRevealedAttachments(allocator: Allocator, body: []const u8, series_title
 
     while (cursor < body.len) {
         const de_pos = std.mem.indexOfPos(u8, body, cursor, "flags/de.png");
-        const en_pos = std.mem.indexOfPos(u8, body, cursor, "flags/uk.png");
-        const row_pos = std.mem.indexOfPos(u8, body, cursor, "<tr class=\"aktiv\">");
+        const en_uk_pos = std.mem.indexOfPos(u8, body, cursor, "flags/uk.png");
+        const en_usa_pos = std.mem.indexOfPos(u8, body, cursor, "flags/usa.png");
+        var en_pos = en_uk_pos;
+        if (en_usa_pos) |p| {
+            if (en_pos == null or p < en_pos.?) en_pos = p;
+        }
+        // Current pages put the alternating `aktiv` class on only one episode
+        // row. The release cell is the stable row discriminator.
+        const row_pos = std.mem.indexOfPos(u8, body, cursor, "class=\"release\"");
 
         var next_pos: ?usize = null;
         var event: enum { de, en, row } = .row;
@@ -258,7 +355,9 @@ fn parseRevealedAttachments(allocator: Allocator, body: []const u8, series_title
             },
             .en => {
                 current_language = "en";
-                cursor = pos + "flags/uk.png".len;
+                // Both supported flag names start here; advancing one byte is
+                // enough to prevent rediscovering the same marker.
+                cursor = pos + 1;
             },
             .row => {
                 const row_end = std.mem.indexOfPos(u8, body, pos, "</tr>") orelse break;
@@ -287,14 +386,21 @@ fn parseRevealedAttachments(allocator: Allocator, body: []const u8, series_title
 
                     const attachment_id = queryParam(href_raw, "attachmentID") orelse continue;
                     if (seen.contains(attachment_id)) continue;
-                    try seen.put(allocator, try allocator.dupe(u8, attachment_id), {});
-
                     const decoded_href = try htmlUnescapeUrl(allocator, href_raw);
-                    const download_url = try resolveAttachmentUrl(allocator, decoded_href);
+                    const download_url = resolveAttachmentUrl(allocator, decoded_href) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => continue,
+                    };
                     const slugged = try common.asciiSlug(allocator, series_title);
-                    try out.append(allocator, .{
-                        .language_code = try allocator.dupe(u8, language),
-                        .filename = try std.fmt.allocPrint(allocator, "subcentral-{s}-s{d}e{d}-{s}", .{ slugged, season, episode, language }),
+                    const language_code = try allocator.dupe(u8, language);
+                    const filename = try std.fmt.allocPrint(allocator, "subcentral-{s}-s{d}e{d}-{s}", .{ slugged, season, episode, language });
+                    const seen_id = try allocator.dupe(u8, attachment_id);
+                    try seen.ensureUnusedCapacity(allocator, 1);
+                    try out.ensureUnusedCapacity(allocator, 1);
+                    seen.putAssumeCapacityNoClobber(seen_id, {});
+                    out.appendAssumeCapacity(.{
+                        .language_code = language_code,
+                        .filename = filename,
                         .download_url = download_url,
                         .episode = episode,
                     });
@@ -422,15 +528,73 @@ fn stripSimpleTags(input: []const u8) []const u8 {
     return best;
 }
 
-fn allDigits(value: []const u8) bool {
-    if (value.len == 0) return false;
+fn isCanonicalPositiveId(value: []const u8) bool {
+    if (value.len == 0 or value.len > 19 or value[0] == '0') return false;
     for (value) |c| if (!std.ascii.isDigit(c)) return false;
     return true;
 }
 
 const RawResponse = common.RawResponse;
 
-fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, cookie: ?[]const u8, referer: ?[]const u8) !RawResponse {
+fn fetchRaw(
+    client: *std.http.Client,
+    allocator: Allocator,
+    url: []const u8,
+    cookie: ?[]const u8,
+    referer: ?[]const u8,
+    deadline_ms: i64,
+) !RawResponse {
+    const now_ms = common.compatMilliTimestamp();
+    if (now_ms >= deadline_ms) return error.Timeout;
+
+    const FetchTask = struct {
+        fn run(
+            result: *?RawResponse,
+            task_client: *std.http.Client,
+            task_allocator: Allocator,
+            task_url: []const u8,
+            task_cookie: ?[]const u8,
+            task_referer: ?[]const u8,
+        ) !void {
+            result.* = try fetchRawUnbounded(task_client, task_allocator, task_url, task_cookie, task_referer);
+        }
+    };
+    const FetchResult = @typeInfo(@TypeOf(FetchTask.run)).@"fn".return_type.?;
+    const TimeoutResult = @typeInfo(@TypeOf(std.Io.Timeout.sleep)).@"fn".return_type.?;
+    const Selection = union(enum) {
+        fetch: FetchResult,
+        timeout: TimeoutResult,
+    };
+    var selection_buffer: [2]Selection = undefined;
+    var selection = std.Io.Select(Selection).init(client.io, &selection_buffer);
+    var owned_response: ?RawResponse = null;
+    defer {
+        selection.cancelDiscard();
+        if (owned_response) |*response| response.deinit(allocator);
+    }
+
+    const timeout: std.Io.Timeout = .{ .deadline = std.Io.Clock.Timestamp.fromNow(client.io, .{
+        .raw = std.Io.Duration.fromMilliseconds(deadline_ms -| now_ms),
+        .clock = .awake,
+    }) };
+    try selection.concurrent(.fetch, FetchTask.run, .{ &owned_response, client, allocator, url, cookie, referer });
+    try selection.concurrent(.timeout, std.Io.Timeout.sleep, .{ timeout, client.io });
+
+    switch (try selection.await()) {
+        .fetch => |result| {
+            try result;
+            const response = owned_response orelse return error.MissingHttpResponse;
+            owned_response = null;
+            return response;
+        },
+        .timeout => |result| {
+            try result;
+            return error.Timeout;
+        },
+    }
+}
+
+fn fetchRawUnbounded(client: *std.http.Client, allocator: Allocator, url: []const u8, cookie: ?[]const u8, referer: ?[]const u8) !RawResponse {
     try validateProviderEndpoint(url);
     if (referer) |value| try validateProviderEndpoint(value);
     const normalized = try common.normalizeUrlForFetch(allocator, url);
@@ -480,34 +644,27 @@ fn fetchRaw(client: *std.http.Client, allocator: Allocator, url: []const u8, coo
     var interim_count: usize = 0;
     while (response.head.status.class() == .informational) {
         if (response.head.status == .switching_protocols) return error.UnsupportedProtocolUpgrade;
+        try validateRawBoardResponseHead(response.head);
         interim_count += 1;
         if (interim_count > 16) return error.TooManyInformationalResponses;
         response = req.receiveHead(&head_buffer) catch |err| return common.normalizeRequestReadError(&req, err);
     }
+    try validateRawBoardResponseHead(response.head);
     const cookie_value = try extractCookie(allocator, response.head.bytes);
     errdefer if (cookie_value) |value| allocator.free(value);
 
-    var transfer_buffer: [16 * 1024]u8 = undefined;
-    const reader = response.reader(&transfer_buffer);
-    const body = readBoundedBody(allocator, reader, max_raw_response_bytes) catch |err| {
-        if (err == error.ReadFailed) {
-            if (response.bodyErr()) |body_err| return body_err;
-            return common.normalizeRequestReadError(&req, err);
-        }
-        return err;
-    };
+    const body = try common.readStrictResponseBody(&req, &response, allocator, max_raw_response_bytes);
     errdefer allocator.free(body);
-    switch (req.reader.state) {
-        .body_remaining_content_length => |left| if (left != 0) return error.HttpBodyTruncated,
-        .body_remaining_chunk_len => return error.HttpChunkTruncated,
-        else => {},
-    }
 
     return .{
         .status = response.head.status,
         .body = body,
         .cookie = cookie_value,
     };
+}
+
+fn validateRawBoardResponseHead(head: std.http.Client.Response.Head) !void {
+    try common.validateResponseFraming(head);
 }
 
 fn readBoundedBody(allocator: Allocator, reader: *std.Io.Reader, max_bytes: usize) ![]u8 {
@@ -554,6 +711,30 @@ fn validateProviderEndpoint(url: []const u8) !void {
     if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
 }
 
+const ItemRoute = enum { board, thread };
+
+fn validateItemRoute(url: []const u8, route: ItemRoute) !void {
+    try validateProviderEndpoint(url);
+    const uri = std.Uri.parse(url) catch return error.UnsafeHttpTarget;
+    if (uri.fragment != null) return error.UnsafeHttpTarget;
+
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    if (!std.mem.eql(u8, path, "/index.php")) return error.UnsafeHttpTarget;
+
+    const query_component = uri.query orelse return error.UnsafeHttpTarget;
+    const query = switch (query_component) {
+        .raw, .percent_encoded => |value| value,
+    };
+    const prefix = switch (route) {
+        .board => "page=Board&boardID=",
+        .thread => "page=Thread&threadID=",
+    };
+    if (!std.mem.startsWith(u8, query, prefix)) return error.UnsafeHttpTarget;
+    if (!isCanonicalPositiveId(query[prefix.len..])) return error.UnsafeHttpTarget;
+}
+
 fn resolveAttachmentUrl(allocator: Allocator, href: []const u8) ![]const u8 {
     const legacy_prefix = "http://www.subcentral.de/index.php?page=Attachment";
     const has_exact_legacy_prefix = std.mem.startsWith(u8, href, legacy_prefix) and
@@ -564,8 +745,44 @@ fn resolveAttachmentUrl(allocator: Allocator, href: []const u8) ![]const u8 {
     else
         try common.resolveUrl(allocator, site, href);
     errdefer allocator.free(resolved);
-    try validateProviderEndpoint(resolved);
+    try validateAttachmentRoute(resolved);
     return resolved;
+}
+
+fn validateAttachmentRoute(url: []const u8) !void {
+    try validateProviderEndpoint(url);
+    const uri = std.Uri.parse(url) catch return error.UnsafeHttpTarget;
+    if (uri.user != null or uri.password != null or uri.fragment != null) return error.UnsafeHttpTarget;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    if (!std.mem.eql(u8, path, "/index.php")) return error.UnsafeHttpTarget;
+    const query_component = uri.query orelse return error.UnsafeHttpTarget;
+    const query = switch (query_component) {
+        .raw, .percent_encoded => |value| value,
+    };
+    const prefix = "page=Attachment&attachmentID=";
+    if (!std.mem.startsWith(u8, query, prefix)) return error.UnsafeHttpTarget;
+    const tail = query[prefix.len..];
+    const separator = std.mem.indexOfScalar(u8, tail, '&');
+    const id = if (separator) |pos| tail[0..pos] else tail;
+    if (!isCanonicalPositiveId(id)) return error.UnsafeHttpTarget;
+
+    if (separator) |pos| {
+        const suffix = tail[pos + 1 ..];
+        const hash_prefix = "h=";
+        if (!std.mem.startsWith(u8, suffix, hash_prefix)) return error.UnsafeHttpTarget;
+        const hash = suffix[hash_prefix.len..];
+        if (hash.len != 40 or !allLowerHex(hash)) return error.UnsafeHttpTarget;
+    }
+}
+
+fn allLowerHex(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |c| {
+        if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return false;
+    }
+    return true;
 }
 
 fn extractCookie(allocator: Allocator, headers: []const u8) !?[]u8 {
@@ -582,6 +799,19 @@ fn extractCookie(allocator: Allocator, headers: []const u8) !?[]u8 {
     return null;
 }
 
+const cookie_flow_gate_fixture = "SECURITY_TOKEN = 'fixture-token'; thankPostButton42";
+const cookie_flow_attachment_fixture =
+    "<img src=\"flags/de.png\">" ++
+    "<tr><td class=\"release\">S01E01 - Pilot</td>" ++
+    "<td><a href=\"http://www.subcentral.de/index.php?page=Attachment&amp;attachmentID=42\">Download</a></td></tr>";
+
+fn makeFixtureRawResponse(allocator: Allocator, body: []const u8, cookie: ?[]const u8) !RawResponse {
+    const owned_body = try allocator.dupe(u8, body);
+    errdefer allocator.free(owned_body);
+    const owned_cookie = if (cookie) |value| try allocator.dupe(u8, value) else null;
+    return .{ .status = .ok, .body = owned_body, .cookie = owned_cookie };
+}
+
 test "subcentral parses season and episode" {
     try std.testing.expectEqual(@as(?i64, 1), parseSeason("Breaking Bad - Staffel 1 - [DE-Subs]"));
     try std.testing.expectEqual(@as(?i64, 1), parseEpisode("E01 - Pilot"));
@@ -595,10 +825,179 @@ test "subcentral classifies raw response failures" {
     try std.testing.expectError(error.UnexpectedHttpStatus, requireOkResponseStatus(.internal_server_error));
 }
 
+test "subcentral refresh prefers a cookie rotated by the Thank response" {
+    const board_url = site ++ "/index.php?page=Board&boardID=12";
+    const thread_url = site ++ "/index.php?page=Thread&threadID=34";
+    const Mock = struct {
+        var calls: usize = 0;
+
+        fn fetch(
+            _: *std.http.Client,
+            allocator: Allocator,
+            url: []const u8,
+            cookie: ?[]const u8,
+            referer: ?[]const u8,
+            _: i64,
+        ) !RawResponse {
+            calls += 1;
+            return switch (calls) {
+                1 => blk: {
+                    try std.testing.expectEqualStrings(site ++ "/index.php?page=Thread&threadID=34", url);
+                    try std.testing.expect(cookie == null);
+                    try std.testing.expectEqualStrings(site ++ "/index.php?page=Board&boardID=12", referer.?);
+                    break :blk makeFixtureRawResponse(allocator, cookie_flow_gate_fixture, "wcf_cookieHash=old");
+                },
+                2 => blk: {
+                    try std.testing.expect(std.mem.indexOf(u8, url, "action=Thank") != null);
+                    try std.testing.expectEqualStrings("wcf_cookieHash=old", cookie.?);
+                    try std.testing.expectEqualStrings(site ++ "/index.php?page=Thread&threadID=34", referer.?);
+                    break :blk makeFixtureRawResponse(allocator, "<xml>ok</xml>", "wcf_cookieHash=rotated");
+                },
+                3 => blk: {
+                    try std.testing.expectEqualStrings(site ++ "/index.php?page=Thread&threadID=34", url);
+                    try std.testing.expectEqualStrings("wcf_cookieHash=rotated", cookie.?);
+                    try std.testing.expectEqualStrings(site ++ "/index.php?page=Board&boardID=12", referer.?);
+                    break :blk makeFixtureRawResponse(allocator, cookie_flow_attachment_fixture, null);
+                },
+                else => error.TestUnexpectedResult,
+            };
+        }
+    };
+    Mock.calls = 0;
+
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &client);
+    var response = try scraper.fetchSubtitlesBySearchItemUsing(.{
+        .title = "Example",
+        .season = 1,
+        .board_url = board_url,
+        .thread_url = thread_url,
+    }, Mock.fetch);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), Mock.calls);
+    try std.testing.expectEqual(@as(usize, 1), response.subtitles.len);
+}
+
+test "subcentral refresh retains the thread cookie when Thank sets none" {
+    const board_url = site ++ "/index.php?page=Board&boardID=12";
+    const thread_url = site ++ "/index.php?page=Thread&threadID=34";
+    const Mock = struct {
+        var calls: usize = 0;
+
+        fn fetch(
+            _: *std.http.Client,
+            allocator: Allocator,
+            url: []const u8,
+            cookie: ?[]const u8,
+            referer: ?[]const u8,
+            _: i64,
+        ) !RawResponse {
+            calls += 1;
+            return switch (calls) {
+                1 => blk: {
+                    try std.testing.expectEqualStrings(site ++ "/index.php?page=Thread&threadID=34", url);
+                    try std.testing.expect(cookie == null);
+                    try std.testing.expectEqualStrings(site ++ "/index.php?page=Board&boardID=12", referer.?);
+                    break :blk makeFixtureRawResponse(allocator, cookie_flow_gate_fixture, "wcf_cookieHash=old");
+                },
+                2 => blk: {
+                    try std.testing.expect(std.mem.indexOf(u8, url, "action=Thank") != null);
+                    try std.testing.expectEqualStrings("wcf_cookieHash=old", cookie.?);
+                    try std.testing.expectEqualStrings(site ++ "/index.php?page=Thread&threadID=34", referer.?);
+                    break :blk makeFixtureRawResponse(allocator, "<xml>ok</xml>", null);
+                },
+                3 => blk: {
+                    try std.testing.expectEqualStrings(site ++ "/index.php?page=Thread&threadID=34", url);
+                    try std.testing.expectEqualStrings("wcf_cookieHash=old", cookie.?);
+                    try std.testing.expectEqualStrings(site ++ "/index.php?page=Board&boardID=12", referer.?);
+                    break :blk makeFixtureRawResponse(allocator, cookie_flow_attachment_fixture, null);
+                },
+                else => error.TestUnexpectedResult,
+            };
+        }
+    };
+    Mock.calls = 0;
+
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &client);
+    var response = try scraper.fetchSubtitlesBySearchItemUsing(.{
+        .title = "Example",
+        .season = 1,
+        .board_url = board_url,
+        .thread_url = thread_url,
+    }, Mock.fetch);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), Mock.calls);
+    try std.testing.expectEqual(@as(usize, 1), response.subtitles.len);
+}
+
+test "subcentral raw fetch rejects an expired deadline before I/O" {
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    try std.testing.expectError(
+        error.Timeout,
+        fetchRaw(&client, std.testing.allocator, home_url, null, null, common.compatMilliTimestamp()),
+    );
+}
+
 test "subcentral rejects unsafe raw request targets before fetch" {
     try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("http://127.0.0.1/private"));
     try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("https://user:pass@www.subcentral.de/private"));
     try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("https://www.google.com/private"));
+}
+
+test "subcentral accepts only canonical board and thread item routes" {
+    try validateItemRoute(site ++ "/index.php?page=Board&boardID=12", .board);
+    try validateItemRoute(site ++ "/index.php?page=Thread&threadID=34", .thread);
+
+    for ([_]struct { url: []const u8, route: ItemRoute }{
+        .{ .url = site ++ "/admin?page=Board&boardID=12", .route = .board },
+        .{ .url = site ++ "/index.php/extra?page=Board&boardID=12", .route = .board },
+        .{ .url = site ++ "/index.php?page=Thread&threadID=12", .route = .board },
+        .{ .url = site ++ "/index.php?page=Board&boardID=", .route = .board },
+        .{ .url = site ++ "/index.php?page=Board&boardID=0", .route = .board },
+        .{ .url = site ++ "/index.php?page=Board&boardID=012", .route = .board },
+        .{ .url = site ++ "/index.php?page=Board&boardID=12x", .route = .board },
+        .{ .url = site ++ "/index.php?page=Board&boardID=12/3", .route = .board },
+        .{ .url = site ++ "/index.php?page=Board&boardID=12%2F3", .route = .board },
+        .{ .url = site ++ "/index.php?page=Board&boardID=12&action=Delete", .route = .board },
+        .{ .url = site ++ "/index.php?boardID=12&page=Board", .route = .board },
+        .{ .url = site ++ "/index.php?page=Thread&threadID=34#fragment", .route = .thread },
+    }) |invalid| {
+        try std.testing.expectError(error.UnsafeHttpTarget, validateItemRoute(invalid.url, invalid.route));
+    }
+}
+
+test "subcentral encodes the security token as one query value" {
+    const url = try buildThankUrl(std.testing.allocator, .{
+        .post_id = "42",
+        .token = "token&/?#%\\\r\n",
+    });
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings(
+        site ++ "/index.php?action=Thank&output=xml&postID=42&t=token%26%2F%3F%23%25%5C%0D%0A",
+        url,
+    );
+    try std.testing.expect(std.mem.indexOfAny(u8, url, "#\\\r\n") == null);
+    try std.testing.expectError(error.MissingField, buildThankUrl(std.testing.allocator, .{ .post_id = "0", .token = "token" }));
+    try std.testing.expectError(error.MissingField, buildThankUrl(std.testing.allocator, .{ .post_id = "042", .token = "token" }));
+}
+
+test "subcentral gate scanner recovers after malformed markers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body =
+        "SECURITY_TOKEN = 'unterminated " ++
+        "SECURITY_TOKEN = ''; " ++
+        "SECURITY_TOKEN = 'fixture-token'; " ++
+        "thankPostButton thankPostButton0\" thankPostButton12evil\" thankPostButton42\"";
+    const gate = try parseGate(arena.allocator(), body);
+    try std.testing.expectEqualStrings("fixture-token", gate.token);
+    try std.testing.expectEqualStrings("42", gate.post_id);
 }
 
 test "subcentral normalizes only the exact legacy HTTP attachment prefix" {
@@ -622,6 +1021,16 @@ test "subcentral normalizes only the exact legacy HTTP attachment prefix" {
         relative,
     );
 
+    const signed = try resolveAttachmentUrl(
+        std.testing.allocator,
+        "http://www.subcentral.de/index.php?page=Attachment&attachmentID=44&h=0123456789abcdef0123456789abcdef01234567",
+    );
+    defer std.testing.allocator.free(signed);
+    try std.testing.expectEqualStrings(
+        "https://www.subcentral.de/index.php?page=Attachment&attachmentID=44&h=0123456789abcdef0123456789abcdef01234567",
+        signed,
+    );
+
     for ([_][]const u8{
         "http://user:pass@www.subcentral.de/index.php?page=Attachment&attachmentID=1",
         "http://www.subcentral.de:80/index.php?page=Attachment&attachmentID=1",
@@ -629,9 +1038,54 @@ test "subcentral normalizes only the exact legacy HTTP attachment prefix" {
         "http://subcentral.de/index.php?page=Attachment&attachmentID=1",
         "http://www.subcentral.de/elsewhere?page=Attachment&attachmentID=1",
         "http://www.subcentral.de/index.php?page=AttachmentLookalike&attachmentID=1",
+        "https://www.subcentral.de/elsewhere?page=Attachment&attachmentID=1",
+        "https://www.subcentral.de/index.php?page=Attachment&attachmentID=1&action=Delete",
+        "https://www.subcentral.de/index.php?page=Attachment&attachmentID=1&h=0123456789abcdef0123456789abcdef0123456",
+        "https://www.subcentral.de/index.php?page=Attachment&attachmentID=1&h=0123456789abcdef0123456789abcdef0123456g",
+        "https://www.subcentral.de/index.php?page=Attachment&attachmentID=1&h=0123456789abcdef0123456789abcdef01234567&action=Delete",
+        "https://www.subcentral.de/index.php?page=Attachment&attachmentID=01",
+        "https://www.subcentral.de/index.php?page=Attachment&attachmentID=1#fragment",
     }) |unsafe| {
         try std.testing.expectError(error.UnsafeHttpTarget, resolveAttachmentUrl(std.testing.allocator, unsafe));
     }
+}
+
+test "subcentral board scanner recovers after malformed options" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const board = (try findBoard(
+        arena.allocator(),
+        "<option value=\"0\">Breaking Bad</option>" ++
+            "<option value=\"012\">Breaking Bad</option>" ++
+            "<option value=\"broken\" <option value=\"12\">Breaking Bad</option>",
+        "Breaking Bad",
+    )).?;
+    try std.testing.expectEqualStrings("Breaking Bad", board.title);
+    try std.testing.expectEqualStrings(site ++ "/index.php?page=Board&boardID=12", board.url);
+}
+
+test "subcentral invalid thread ids do not precede a later valid thread" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body =
+        "<a href=\"index.php?page=Thread&amp;threadID=0\">Example - Staffel 1 - [DE-Subs]</a>" ++
+        "<a href=\"index.php?page=Thread&amp;threadID=012\">Example - Staffel 1 - [DE-Subs]</a>" ++
+        "<a href=\"index.php?page=Thread&amp;threadID=13evil\">Example - Staffel 1 - [DE-Subs]</a>" ++
+        "<a href=\"index.php?page=Thread&amp;threadID=12\">Example - Staffel 1 - [DE-Subs]</a>";
+    const items = try parseBoardThreads(arena.allocator(), body, "Example", site ++ "/index.php?page=Board&boardID=1");
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expectEqualStrings(site ++ "/index.php?page=Thread&threadID=12", items[0].thread_url);
+}
+
+test "subcentral board relevance rejects empty and partial-word matches" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body =
+        "<option value=\"1\">Preacher</option>" ++
+        "<option value=\"2\">Jack Reacher</option>";
+    const board = (try findBoard(arena.allocator(), body, "Reacher")).?;
+    try std.testing.expectEqualStrings("Jack Reacher", board.title);
+    try std.testing.expect((try findBoard(arena.allocator(), body, "---")) == null);
 }
 
 test "subcentral parser normalizes legacy HTTP attachment links" {
@@ -647,6 +1101,51 @@ test "subcentral parser normalizes legacy HTTP attachment links" {
         "https://www.subcentral.de/index.php?page=Attachment&attachmentID=42",
         subtitles[0].download_url,
     );
+}
+
+test "subcentral parser accepts current plain rows, USA flag, and signed attachment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body =
+        "<img src=\"creative/bilder/flags/usa.png\">" ++
+        "<tr><td class=\"release\">E02 - Example</td>" ++
+        "<td><a href=\"http://www.subcentral.de/index.php?page=Attachment&amp;attachmentID=44&amp;h=0123456789abcdef0123456789abcdef01234567\">Download</a></td></tr>";
+    const subtitles = try parseRevealedAttachments(arena.allocator(), body, "Example", 1);
+
+    try std.testing.expectEqual(@as(usize, 1), subtitles.len);
+    try std.testing.expectEqualStrings("en", subtitles[0].language_code);
+    try std.testing.expectEqual(@as(i64, 2), subtitles[0].episode);
+    try std.testing.expectEqualStrings(
+        "https://www.subcentral.de/index.php?page=Attachment&attachmentID=44&h=0123456789abcdef0123456789abcdef01234567",
+        subtitles[0].download_url,
+    );
+}
+
+test "subcentral malformed attachment does not suppress a valid sibling id" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body =
+        "<img src=\"flags/de.png\">" ++
+        "<tr class=\"aktiv\"><td class=\"release\">S01E01 - Pilot</td>" ++
+        "<td><a href=\"https://evil.test/index.php?page=Attachment&amp;attachmentID=42\">bad</a>" ++
+        "<a href=\"http://www.subcentral.de/index.php?page=Attachment&amp;attachmentID=42\">good</a></td></tr>";
+    const subtitles = try parseRevealedAttachments(arena.allocator(), body, "Example", 1);
+
+    try std.testing.expectEqual(@as(usize, 1), subtitles.len);
+    try std.testing.expectEqualStrings(
+        "https://www.subcentral.de/index.php?page=Attachment&attachmentID=42",
+        subtitles[0].download_url,
+    );
+}
+
+test "subcentral raw board transport rejects ambiguous response framing" {
+    for ([_][]const u8{
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n",
+    }) |raw_head| {
+        const head = try std.http.Client.Response.Head.parse(raw_head);
+        try std.testing.expectError(error.AmbiguousHttpFraming, validateRawBoardResponseHead(head));
+    }
 }
 
 test "live subcentral breaking bad listing and download" {

@@ -5,6 +5,170 @@ const zigimg = @import("zigimg");
 
 const test_io = std.testing.io;
 
+test "TIFF inline tag values validate type and preserve both SHORT values" {
+    var read_stream = zigimg.io.ReadStream.initMemory(&.{0});
+
+    const little_tag = tiff.TagField{
+        .data_type = 3,
+        .data_count = 2,
+        .data_offset = 0x2222_1111,
+    };
+    const little_values = try little_tag.readTagData(std.testing.allocator, &read_stream, .little);
+    defer std.testing.allocator.free(little_values);
+    try std.testing.expectEqualSlices(u32, &.{ 0x1111, 0x2222 }, little_values);
+
+    const little_single_tag = tiff.TagField{
+        .data_type = 3,
+        .data_count = 1,
+        .data_offset = 0xAAAA_1234,
+    };
+    const little_single = try little_single_tag.readTagData(std.testing.allocator, &read_stream, .little);
+    defer std.testing.allocator.free(little_single);
+    try std.testing.expectEqualSlices(u32, &.{0x1234}, little_single);
+
+    const big_tag = tiff.TagField{
+        .data_type = 3,
+        .data_count = 2,
+        .data_offset = 0x1111_2222,
+    };
+    const big_values = try big_tag.readTagData(std.testing.allocator, &read_stream, .big);
+    defer std.testing.allocator.free(big_values);
+    try std.testing.expectEqualSlices(u32, &.{ 0x1111, 0x2222 }, big_values);
+
+    const big_single_tag = tiff.TagField{
+        .data_type = 3,
+        .data_count = 1,
+        .data_offset = 0x1234_AAAA,
+    };
+    const big_single = try big_single_tag.readTagData(std.testing.allocator, &read_stream, .big);
+    defer std.testing.allocator.free(big_single);
+    try std.testing.expectEqualSlices(u32, &.{0x1234}, big_single);
+
+    const invalid_tag = tiff.TagField{
+        .data_type = 99,
+        .data_count = 1,
+        .data_offset = 0,
+    };
+    try std.testing.expectError(error.InvalidData, invalid_tag.readTagData(std.testing.allocator, &read_stream, .little));
+}
+
+test "TIFF tag data rejects empty and truncated values" {
+    var read_stream = zigimg.io.ReadStream.initMemory(&.{ 0, 0, 0, 0 });
+
+    const empty_tag = tiff.TagField{
+        .data_type = 4,
+        .data_count = 0,
+        .data_offset = 0,
+    };
+    try std.testing.expectError(error.InvalidData, empty_tag.readTagData(std.testing.allocator, &read_stream, .little));
+
+    const truncated_tag = tiff.TagField{
+        .data_type = 4,
+        .data_count = 2,
+        .data_offset = 0,
+    };
+    if (truncated_tag.readTagData(std.testing.allocator, &read_stream, .little)) |values| {
+        defer std.testing.allocator.free(values);
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
+
+test "TIFF scalar tag readers validate type and count" {
+    const short_tag = tiff.TagField{
+        .data_type = 3,
+        .data_count = 1,
+        .data_offset = 0xCAFE_1234,
+    };
+    try std.testing.expectEqual(@as(u16, 0x1234), try short_tag.toShort(.little));
+    try std.testing.expectEqual(@as(u32, 0x1234), try short_tag.toLongOrShort(.little));
+
+    const long_tag = tiff.TagField{
+        .data_type = 4,
+        .data_count = 1,
+        .data_offset = 0xCAFE_1234,
+    };
+    try std.testing.expectEqual(@as(u32, 0xCAFE_1234), try long_tag.toLong());
+    try std.testing.expectEqual(@as(u32, 0xCAFE_1234), try long_tag.toLongOrShort(.little));
+    try std.testing.expectError(error.InvalidData, long_tag.toShort(.little));
+
+    const repeated_short = tiff.TagField{
+        .data_type = 3,
+        .data_count = 2,
+        .data_offset = 0,
+    };
+    try std.testing.expectError(error.InvalidData, repeated_short.toShort(.little));
+    try std.testing.expectError(error.InvalidData, repeated_short.toLongOrShort(.little));
+
+    var read_stream = zigimg.io.ReadStream.initMemory(&.{0});
+    try std.testing.expectError(error.InvalidData, short_tag.readRational(&read_stream, .little));
+}
+
+test "TIFF row and strip metadata rejects unsafe shapes" {
+    var pixels_buffer: [2]zigimg.color.Grayscale8 = undefined;
+    var pixels = zigimg.color.PixelStorage{ .grayscale8 = pixels_buffer[0..] };
+    var the_tiff = tiff.TIFF{ .bitmap = tiff.BitmapDescriptor{} };
+    the_tiff.bitmap.image_width = 2;
+    the_tiff.bitmap.image_height = 1;
+    the_tiff.bitmap.bits_per_sample.resize(1);
+    the_tiff.bitmap.bits_per_sample.data[0] = 8;
+
+    var read_stream = zigimg.io.ReadStream.initMemory(&.{0});
+    try std.testing.expectError(error.InvalidData, the_tiff.readStrips(std.testing.allocator, &read_stream, &pixels));
+
+    the_tiff.bitmap.rows_per_strip = 1;
+    try std.testing.expectError(error.InvalidData, the_tiff.readStrips(std.testing.allocator, &read_stream, &pixels));
+
+    var byte_counts = [_]u32{1};
+    var offsets = [_]u32{0};
+    the_tiff.bitmap.strip_byte_counts = byte_counts[0..];
+    the_tiff.bitmap.strip_offsets = offsets[0..];
+    try std.testing.expectError(error.InvalidData, the_tiff.readStrips(std.testing.allocator, &read_stream, &pixels));
+
+    the_tiff.bitmap.image_width = 1;
+    the_tiff.bitmap.image_height = 2;
+    try std.testing.expectError(error.InvalidData, the_tiff.readStrips(std.testing.allocator, &read_stream, &pixels));
+
+    the_tiff.bitmap.image_width = 9;
+    the_tiff.bitmap.image_height = 1;
+    the_tiff.bitmap.bits_per_sample.data[0] = 1;
+    try std.testing.expectEqual(@as(usize, 2), try the_tiff.calRowByteSize());
+
+    the_tiff.bitmap.samples_per_pixel = 2;
+    try std.testing.expectError(error.InvalidData, the_tiff.calRowByteSize());
+}
+
+test "TIFF 1-bit strips ignore padding at each row boundary" {
+    const encoded = [_]u8{
+        0b1010_1010, 0b1111_1111,
+        0b0101_0101, 0b0000_0000,
+    };
+    var byte_counts = [_]u32{encoded.len};
+    var offsets = [_]u32{0};
+    var the_tiff = tiff.TIFF{ .bitmap = tiff.BitmapDescriptor{
+        .image_width = 9,
+        .image_height = 2,
+        .photometric_interpretation = 1,
+        .rows_per_strip = 2,
+        .strip_offsets = offsets[0..],
+        .strip_byte_counts = byte_counts[0..],
+    } };
+    the_tiff.bitmap.bits_per_sample.resize(1);
+    the_tiff.bitmap.bits_per_sample.data[0] = 1;
+
+    var pixel_buffer: [18]zigimg.color.Grayscale1 = undefined;
+    var pixels = zigimg.color.PixelStorage{ .grayscale1 = pixel_buffer[0..] };
+    var read_stream = zigimg.io.ReadStream.initMemory(&encoded);
+    try the_tiff.readStrips(std.testing.allocator, &read_stream, &pixels);
+
+    const expected = [_]u1{
+        1, 0, 1, 0, 1, 0, 1, 0, 1,
+        0, 1, 0, 1, 0, 1, 0, 1, 0,
+    };
+    for (pixel_buffer, expected) |actual, wanted| {
+        try std.testing.expectEqual(wanted, actual.value);
+    }
+}
+
 test "Should error on non TIFF images" {
     const file = try helpers.testOpenFile(test_io, helpers.fixtures_path ++ "bmp/simple_v4.bmp");
     defer file.close(test_io);

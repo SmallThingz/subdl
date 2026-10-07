@@ -25,6 +25,17 @@ const catalogs = [_]Catalog{
     .{ .path = "/files/TV%20series(Incomplete)/", .media_kind = .tv },
 };
 
+fn providerMetadataFetchOptions() common.FetchOptions {
+    return .{
+        .accept = "application/json",
+        .cache = false,
+        .max_attempts = 2,
+        .require_public_origin = true,
+        .require_https = true,
+        .require_same_origin = true,
+    };
+}
+
 pub const Scraper = struct {
     allocator: Allocator,
     client: *std.http.Client,
@@ -47,11 +58,7 @@ pub const Scraper = struct {
 
         for (catalogs) |catalog| {
             const catalog_url = try std.fmt.allocPrint(a, "{s}{s}", .{ site, catalog.path });
-            const response = try common.fetchBytes(self.client, a, catalog_url, .{
-                .accept = "application/json",
-                .max_attempts = 2,
-                .require_public_origin = true,
-            });
+            const response = try common.fetchBytes(self.client, a, catalog_url, providerMetadataFetchOptions());
             try appendCatalogMatches(a, response.body, wanted, catalog_url, catalog.media_kind, &seen, &exact, &partial);
         }
 
@@ -68,11 +75,7 @@ pub const Scraper = struct {
 
         try validateProviderUrl(item.page_url);
 
-        const response = try common.fetchBytes(self.client, a, item.page_url, .{
-            .accept = "application/json",
-            .max_attempts = 2,
-            .require_public_origin = true,
-        });
+        const response = try common.fetchBytes(self.client, a, item.page_url, providerMetadataFetchOptions());
 
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
         const entries = switch (root) {
@@ -81,6 +84,7 @@ pub const Scraper = struct {
         };
 
         var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
+        var seen = std.StringHashMapUnmanaged(void).empty;
         for (entries.items) |entry| {
             const obj = switch (entry) {
                 .object => |value| value,
@@ -91,7 +95,10 @@ pub const Scraper = struct {
             const filename = common.jsonString(obj, "name") orelse continue;
             if (!common.isSubtitleFilename(filename)) continue;
             const encoded_filename = try common.encodeUriComponent(a, filename);
+            if (!isSafeEncodedSegment(encoded_filename)) continue;
             const download_url = try std.fmt.allocPrint(a, "{s}{s}", .{ item.page_url, encoded_filename });
+            if (seen.contains(download_url)) continue;
+            try seen.put(a, download_url, {});
 
             try subtitles.append(a, .{
                 .language_code = "en",
@@ -112,6 +119,40 @@ fn validateProviderUrl(url: []const u8) !void {
     const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
     if (uri.user != null or uri.password != null) return error.InvalidDownloadUrl;
     if (!(common.sameOrigin(site, url) catch false)) return error.InvalidDownloadUrl;
+    if (uri.query != null or uri.fragment != null) return error.InvalidDownloadUrl;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    for (catalogs) |catalog| {
+        if (path.len <= catalog.path.len or !std.mem.startsWith(u8, path, catalog.path) or !std.mem.endsWith(u8, path, "/")) continue;
+        const name = path[catalog.path.len .. path.len - 1];
+        if (isSafeEncodedSegment(name)) return;
+    }
+    return error.InvalidDownloadUrl;
+}
+
+fn isSafeEncodedSegment(value: []const u8) bool {
+    if (value.len == 0 or value.len > 1024) return false;
+    var decoded_len: usize = 0;
+    var decoded_all_dots = true;
+    var index: usize = 0;
+    while (index < value.len) {
+        var byte = value[index];
+        if (byte == '%') {
+            if (value.len - index < 3) return false;
+            const high = std.fmt.charToDigit(value[index + 1], 16) catch return false;
+            const low = std.fmt.charToDigit(value[index + 2], 16) catch return false;
+            byte = @intCast(high * 16 + low);
+            index += 3;
+        } else {
+            if (!(std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.' or byte == '~')) return false;
+            index += 1;
+        }
+        if (byte < 0x20 or byte == 0x7f or byte == '%' or byte == '/' or byte == '\\' or byte == '?' or byte == '#') return false;
+        decoded_len += 1;
+        if (byte != '.') decoded_all_dots = false;
+    }
+    return !(decoded_all_dots and (decoded_len == 1 or decoded_len == 2));
 }
 
 fn appendCatalogMatches(
@@ -149,7 +190,14 @@ fn appendCatalogMatches(
         const encoded_name = try common.encodeUriComponent(allocator, raw_name);
         defer allocator.free(encoded_name);
         const page_url = try std.fmt.allocPrint(allocator, "{s}{s}/", .{ catalog_url, encoded_name });
-        if (seen.contains(page_url)) continue;
+        validateProviderUrl(page_url) catch {
+            allocator.free(page_url);
+            continue;
+        };
+        if (seen.contains(page_url)) {
+            allocator.free(page_url);
+            continue;
+        }
         try seen.put(allocator, page_url, {});
 
         const item: SearchItem = .{
@@ -200,6 +248,8 @@ test "closed caption browser parses catalog prefixes and exact matches" {
     try appendCatalogMatches(
         allocator,
         \\[
+        \\{"name":"..","type":"directory"},
+        \\{"name":"bad/name","type":"directory"},
         \\{"name":"[0010]Attack on Titan","type":"directory"},
         \\{"name":"[0011]Attack on Titan S2","type":"directory"}
         \\]
@@ -217,14 +267,30 @@ test "closed caption browser parses catalog prefixes and exact matches" {
 }
 
 test "closed caption browser rejects non-provider catalog targets" {
-    try validateProviderUrl("https://cc.edatribe.com/files/Movie/");
+    try validateProviderUrl("https://cc.edatribe.com/files/Movie/%5BM008%5DSpirited%20Away/");
     for ([_][]const u8{
         "http://127.0.0.1/files/Movie/",
         "https://cc.edatribe.com.example/files/Movie/",
         "https://user@cc.edatribe.com/files/Movie/",
+        "https://cc.edatribe.com/admin/",
+        "https://cc.edatribe.com/files/Movie/title/?next=/admin",
+        "https://cc.edatribe.com/files/Movie/title/#fragment",
+        "https://cc.edatribe.com/files/Movie/../",
+        "https://cc.edatribe.com/files/Movie/%2e%2e/",
+        "https://cc.edatribe.com/files/Movie/a%2fb/",
+        "https://cc.edatribe.com/files/Movie/a%252fb/",
+        "https://cc.edatribe.com/files/Movie/a/b/",
     }) |url| {
         try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl(url));
     }
+}
+
+test "closed caption metadata fetches pin HTTPS provider redirects" {
+    const options = providerMetadataFetchOptions();
+    try std.testing.expect(options.require_public_origin);
+    try std.testing.expect(options.require_https);
+    try std.testing.expect(options.require_same_origin);
+    try std.testing.expect(!options.cache);
 }
 
 test "live closed caption browser movie and tv downloads" {
@@ -266,4 +332,19 @@ test "live closed caption browser movie and tv downloads" {
     defer std.testing.allocator.free(tv_download.body);
     try std.testing.expect(tv_download.body.len > 32);
     try std.testing.expect(std.mem.indexOf(u8, tv_download.body, "-->") != null);
+}
+
+test "closed caption browser rejects catalog roots before listing I/O" {
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &client);
+    for (catalogs) |catalog| {
+        const url = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}", .{ site, catalog.path });
+        defer std.testing.allocator.free(url);
+        try std.testing.expectError(error.InvalidDownloadUrl, scraper.fetchSubtitlesBySearchItem(.{
+            .title = "Catalog root",
+            .media_kind = catalog.media_kind,
+            .page_url = url,
+        }));
+    }
 }

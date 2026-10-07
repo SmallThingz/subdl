@@ -2,7 +2,6 @@ const std = @import("std");
 const math = @import("math.zig");
 const Allocator = std.mem.Allocator;
 const PixelFormat = @import("pixel_format.zig").PixelFormat;
-const TypeInfo = std.builtin.TypeInfo;
 
 fn isAll8BitColor(comptime red_type: type, comptime green_type: type, comptime blue_type: type, comptime alpha_type: type) bool {
     return red_type == u8 and green_type == u8 and blue_type == u8 and (alpha_type == u8 or alpha_type == void);
@@ -731,8 +730,11 @@ pub fn IndexedStorage(comptime T: type) type {
             std.debug.assert(palette_size <= PaletteSize);
 
             // Allocate the full capacity of the palette but reduce its length to the requested size
+            const indices = try allocator.alloc(T, pixel_count);
+            errdefer allocator.free(indices);
+
             var result = Self{
-                .indices = try allocator.alloc(T, pixel_count),
+                .indices = indices,
                 .palette = try allocator.alloc(Rgba32, PaletteSize),
             };
 
@@ -855,7 +857,7 @@ fn ToMethodsGrayscale(
             return .{
                 toF32(self.value),
                 toF32(self.value),
-                toF32(self.valuie),
+                toF32(self.value),
                 if (has_alpha)
                     toF32(self.alpha)
                 else
@@ -1099,120 +1101,47 @@ pub const PixelStorage = union(PixelFormat) {
         };
     }
 
-    pub fn initRawPixels(pixels: []const u8, pixel_format: PixelFormat) !PixelStorage {
+    /// Wrap mutable raw pixel bytes in owning storage. On success, the caller
+    /// transfers ownership and must later deinitialize the storage with the
+    /// allocator that created the complete, compatibly typed and aligned
+    /// allocation. On error, the caller retains ownership of `pixels`.
+    pub fn initRawPixels(pixels: []u8, pixel_format: PixelFormat) !PixelStorage {
         return switch (pixel_format) {
-            .grayscale1 => {
-                return .{
-                    .grayscale1 = @constCast(std.mem.bytesAsSlice(Grayscale1, pixels)),
-                };
-            },
-            .grayscale2 => {
-                return .{
-                    .grayscale2 = @constCast(std.mem.bytesAsSlice(Grayscale2, pixels)),
-                };
-            },
-            .grayscale4 => {
-                return .{
-                    .grayscale4 = @constCast(std.mem.bytesAsSlice(Grayscale4, pixels)),
-                };
-            },
-            .grayscale8 => {
-                return .{
-                    .grayscale8 = @constCast(std.mem.bytesAsSlice(Grayscale8, pixels)),
-                };
-            },
-            .grayscale8Alpha => {
-                return .{
-                    .grayscale8Alpha = @constCast(std.mem.bytesAsSlice(Grayscale8Alpha, pixels)),
-                };
-            },
-            .grayscale16 => {
-                return .{
-                    .grayscale16 = @alignCast(@constCast(std.mem.bytesAsSlice(Grayscale16, pixels))),
-                };
-            },
-            .grayscale16Alpha => {
-                return .{
-                    .grayscale16Alpha = @alignCast(@constCast(std.mem.bytesAsSlice(Grayscale16Alpha, pixels))),
-                };
-            },
-            .rgb332 => {
-                return .{
-                    .rgb332 = @constCast(std.mem.bytesAsSlice(Rgb332, pixels)),
-                };
-            },
-            .sega_grb333 => {
-                return .{
-                    .sega_grb333 = @alignCast(@constCast(std.mem.bytesAsSlice(SegaGrb333, pixels))),
-                };
-            },
-            .sega_bgr333 => {
-                return .{
-                    .sega_bgr333 = @alignCast(@constCast(std.mem.bytesAsSlice(SegaBgr333, pixels))),
-                };
-            },
-            .sega_bgr222 => {
-                return .{
-                    .sega_bgr222 = @alignCast(@constCast(std.mem.bytesAsSlice(SegaBgr222, pixels))),
-                };
-            },
-            .sega_bgr444 => {
-                return .{
-                    .sega_bgr444 = @alignCast(@constCast(std.mem.bytesAsSlice(SegaBgr444, pixels))),
-                };
-            },
-            .rgb555 => {
-                return .{
-                    .rgb555 = @alignCast(@constCast(std.mem.bytesAsSlice(Rgb555, pixels))),
-                };
-            },
-            .rgb565 => {
-                return .{
-                    .rgb565 = @alignCast(@constCast(std.mem.bytesAsSlice(Rgb565, pixels))),
-                };
-            },
-            .rgb24 => {
-                return .{
-                    .rgb24 = @constCast(std.mem.bytesAsSlice(Rgb24, pixels)),
-                };
-            },
-            .rgba32 => {
-                return .{
-                    .rgba32 = @constCast(std.mem.bytesAsSlice(Rgba32, pixels)),
-                };
-            },
-            .bgr555 => {
-                return .{
-                    .bgr555 = @alignCast(@constCast(std.mem.bytesAsSlice(Bgr555, pixels))),
-                };
-            },
-            .bgr24 => {
-                return .{
-                    .bgr24 = @constCast(std.mem.bytesAsSlice(Bgr24, pixels)),
-                };
-            },
-            .bgra32 => {
-                return .{
-                    .bgra32 = @constCast(std.mem.bytesAsSlice(Bgra32, pixels)),
-                };
-            },
-            .rgb48 => {
-                return .{
-                    .rgb48 = @constCast(std.mem.bytesAsSlice(Rgb48, pixels)),
-                };
-            },
-            .rgba64 => {
-                return .{
-                    .rgba64 = @constCast(std.mem.bytesAsSlice(Rgba64, pixels)),
-                };
-            },
-            .float32 => {
-                return .{
-                    .float32 = @constCast(std.mem.bytesAsSlice(Colorf32, pixels)),
-                };
-            },
+            .grayscale1 => .{ .grayscale1 = try rawPixelSlice(Grayscale1, pixels) },
+            .grayscale2 => .{ .grayscale2 = try rawPixelSlice(Grayscale2, pixels) },
+            .grayscale4 => .{ .grayscale4 = try rawPixelSlice(Grayscale4, pixels) },
+            .grayscale8 => .{ .grayscale8 = try rawPixelSlice(Grayscale8, pixels) },
+            .grayscale8Alpha => .{ .grayscale8Alpha = try rawPixelSlice(Grayscale8Alpha, pixels) },
+            .grayscale16 => .{ .grayscale16 = try rawPixelSlice(Grayscale16, pixels) },
+            .grayscale16Alpha => .{ .grayscale16Alpha = try rawPixelSlice(Grayscale16Alpha, pixels) },
+            .rgb332 => .{ .rgb332 = try rawPixelSlice(Rgb332, pixels) },
+            .sega_grb333 => .{ .sega_grb333 = try rawPixelSlice(SegaGrb333, pixels) },
+            .sega_bgr333 => .{ .sega_bgr333 = try rawPixelSlice(SegaBgr333, pixels) },
+            .sega_bgr222 => .{ .sega_bgr222 = try rawPixelSlice(SegaBgr222, pixels) },
+            .sega_bgr444 => .{ .sega_bgr444 = try rawPixelSlice(SegaBgr444, pixels) },
+            .rgb555 => .{ .rgb555 = try rawPixelSlice(Rgb555, pixels) },
+            .rgb565 => .{ .rgb565 = try rawPixelSlice(Rgb565, pixels) },
+            .rgb24 => .{ .rgb24 = try rawPixelSlice(Rgb24, pixels) },
+            .rgba32 => .{ .rgba32 = try rawPixelSlice(Rgba32, pixels) },
+            .bgr555 => .{ .bgr555 = try rawPixelSlice(Bgr555, pixels) },
+            .bgr24 => .{ .bgr24 = try rawPixelSlice(Bgr24, pixels) },
+            .bgra32 => .{ .bgra32 = try rawPixelSlice(Bgra32, pixels) },
+            .rgb48 => .{ .rgb48 = try rawPixelSlice(Rgb48, pixels) },
+            .rgba64 => .{ .rgba64 = try rawPixelSlice(Rgba64, pixels) },
+            .float32 => .{ .float32 = try rawPixelSlice(Colorf32, pixels) },
             else => error.Unsupported,
         };
+    }
+
+    fn rawPixelSlice(comptime T: type, pixels: []u8) ![]T {
+        if (pixels.len == 0 or pixels.len % @sizeOf(T) != 0) {
+            return error.InvalidData;
+        }
+        if (!std.mem.isAligned(@intFromPtr(pixels.ptr), @alignOf(T))) {
+            return error.InvalidData;
+        }
+
+        return @alignCast(std.mem.bytesAsSlice(T, pixels));
     }
 
     pub fn deinit(self: PixelStorage, allocator: Allocator) void {
@@ -1672,11 +1601,16 @@ pub const CIEXYZAlpha = extern struct {
     a: f32 align(1) = 1.0,
 
     pub inline fn fromFloat4(value: math.float4) CIEXYZAlpha {
-        return @bitCast(value);
+        return .{
+            .x = value[0],
+            .y = value[1],
+            .z = value[2],
+            .a = value[3],
+        };
     }
 
     pub inline fn toFloat4(self: CIEXYZAlpha) math.float4 {
-        return @bitCast(self);
+        return .{ self.x, self.y, self.z, self.a };
     }
 
     pub fn toXYZ(self: CIEXYZAlpha) CIEXYZ {
@@ -1830,11 +1764,16 @@ pub const CIELabAlpha = extern struct {
     }
 
     pub inline fn fromFloat4(value: math.float4) CIELabAlpha {
-        return @bitCast(value);
+        return .{
+            .l = value[0],
+            .a = value[1],
+            .b = value[2],
+            .alpha = value[3],
+        };
     }
 
     pub inline fn toFloat4(self: CIELabAlpha) math.float4 {
-        return @bitCast(self);
+        return .{ self.l, self.a, self.b, self.alpha };
     }
 };
 
@@ -2050,11 +1989,16 @@ pub const CIELuvAlpha = extern struct {
     }
 
     pub inline fn fromFloat4(value: math.float4) CIELuvAlpha {
-        return @bitCast(value);
+        return .{
+            .l = value[0],
+            .u = value[1],
+            .v = value[2],
+            .alpha = value[3],
+        };
     }
 
     pub inline fn toFloat4(self: CIELuvAlpha) math.float4 {
-        return @bitCast(self);
+        return .{ self.l, self.u, self.v, self.alpha };
     }
 };
 
@@ -2279,12 +2223,17 @@ pub const HSLuvAlpha = extern struct {
         };
     }
 
-    pub inline fn fromFloat4(value: math.float4) CIELuvAlpha {
-        return @bitCast(value);
+    pub inline fn fromFloat4(value: math.float4) HSLuvAlpha {
+        return .{
+            .h = value[0],
+            .s = value[1],
+            .l = value[2],
+            .alpha = value[3],
+        };
     }
 
-    pub inline fn toFloat4(self: CIELuvAlpha) math.float4 {
-        return @bitCast(self);
+    pub inline fn toFloat4(self: HSLuvAlpha) math.float4 {
+        return .{ self.h, self.s, self.l, self.alpha };
     }
 };
 
@@ -2386,11 +2335,16 @@ pub const OklabAlpha = extern struct {
     }
 
     pub inline fn fromFloat4(value: math.float4) OklabAlpha {
-        return @bitCast(value);
+        return .{
+            .l = value[0],
+            .a = value[1],
+            .b = value[2],
+            .alpha = value[3],
+        };
     }
 
     pub inline fn toFloat4(self: OklabAlpha) math.float4 {
-        return @bitCast(self);
+        return .{ self.l, self.a, self.b, self.alpha };
     }
 };
 
@@ -2840,7 +2794,7 @@ pub const RgbColorspace = struct {
         const all_ones: math.float4 = @splat(1.0);
 
         for (slice_rgba) |*rgba| {
-            const lab_alpha: CIELabAlpha = @bitCast(rgba.*);
+            const lab_alpha = CIELabAlpha.fromFloat4(rgba.to.float4());
 
             const xyza = lab_alpha.toXYZAlphaPrecomputedWhitePoint(white_point_xyz);
 
@@ -2918,7 +2872,7 @@ pub const RgbColorspace = struct {
         const all_ones: math.float4 = @splat(1.0);
 
         for (slice_rgba) |*rgba| {
-            const luv_alpha: CIELuvAlpha = @bitCast(rgba.*);
+            const luv_alpha = CIELuvAlpha.fromFloat4(rgba.to.float4());
 
             const xyza = luv_alpha.toXYZAlphaPrecomputedWhitePoint(white_point_xyz);
 
@@ -2996,7 +2950,7 @@ pub const RgbColorspace = struct {
         const all_ones: math.float4 = @splat(1.0);
 
         for (slice_rgba) |*rgba| {
-            const lab_alpha: OklabAlpha = @bitCast(rgba.*);
+            const lab_alpha = OklabAlpha.fromFloat4(rgba.to.float4());
 
             const xyza = lab_alpha.toXYZAlpha();
 

@@ -55,6 +55,15 @@ pub const CSI = struct {
         return .{ .bytes = self.params };
     }
 
+    pub fn parametersValid(self: CSI, comptime T: type) bool {
+        var iter = self.iterator(T);
+        while (iter.idx < iter.bytes.len) {
+            _ = iter.next();
+            if (iter.invalid) return false;
+        }
+        return !iter.invalid;
+    }
+
     pub fn format(self: CSI, writer: anytype) !void {
         if (self.private_marker == null and self.intermediate == null)
             try writer.print("CSI {s} {c}", .{
@@ -93,28 +102,45 @@ pub fn ParamIterator(T: type) type {
         next_is_sub: bool = false,
         /// indicates the current parameter was an empty string
         is_empty: bool = false,
+        /// indicates a malformed parameter or one which does not fit in T
+        invalid: bool = false,
 
         pub fn next(self: *Self) ?T {
             // reset state
             self.next_is_sub = false;
             self.is_empty = false;
+            if (self.invalid) return null;
 
             const start = self.idx;
             var val: T = 0;
             while (self.idx < self.bytes.len) {
-                defer self.idx += 1; // defer so we trigger on return as well
                 const b = self.bytes[self.idx];
                 switch (b) {
                     0x30...0x39 => {
-                        val = (val * 10) + (b - 0x30);
-                        if (self.idx == self.bytes.len - 1) return val;
+                        val = std.math.mul(T, val, 10) catch {
+                            self.invalid = true;
+                            self.idx = self.bytes.len;
+                            return null;
+                        };
+                        val = std.math.add(T, val, b - 0x30) catch {
+                            self.invalid = true;
+                            self.idx = self.bytes.len;
+                            return null;
+                        };
+                        self.idx += 1;
+                        if (self.idx == self.bytes.len) return val;
                     },
                     ':', ';' => {
                         self.next_is_sub = b == ':';
                         self.is_empty = self.idx == start;
+                        self.idx += 1;
                         return val;
                     },
-                    else => return null,
+                    else => {
+                        self.invalid = true;
+                        self.idx = self.bytes.len;
+                        return null;
+                    },
                 }
             }
             return null;
@@ -123,7 +149,15 @@ pub fn ParamIterator(T: type) type {
         /// verifies there are at least n more parameters
         pub fn hasAtLeast(self: *Self, n: usize) bool {
             const start = self.idx;
-            defer self.idx = start;
+            const next_is_sub = self.next_is_sub;
+            const is_empty = self.is_empty;
+            const invalid = self.invalid;
+            defer {
+                self.idx = start;
+                self.next_is_sub = next_is_sub;
+                self.is_empty = is_empty;
+                self.invalid = invalid;
+            }
 
             var i: usize = 0;
             while (self.next()) |_| {
@@ -133,4 +167,23 @@ pub fn ParamIterator(T: type) type {
             return i >= n;
         }
     };
+}
+
+test "CSI parameters reject numeric overflow" {
+    for ([_][]const u8{ "256", "999999999999999999999999999999", "256;1" }) |params| {
+        var iter: ParamIterator(u8) = .{ .bytes = params };
+        try std.testing.expectEqual(@as(?u8, null), iter.next());
+        try std.testing.expect(iter.invalid);
+        try std.testing.expectEqual(@as(?u8, null), iter.next());
+    }
+    var iter: ParamIterator(u8) = .{ .bytes = "255;0:6" };
+    try std.testing.expectEqual(@as(?u8, 255), iter.next());
+    try std.testing.expectEqual(@as(?u8, 0), iter.next());
+    try std.testing.expect(iter.next_is_sub);
+    try std.testing.expectEqual(@as(?u8, 6), iter.next());
+
+    const seq: CSI = .{ .params = "1;999999999999999999999999;2", .final = 'm' };
+    try std.testing.expect(!seq.parametersValid(u16));
+    try std.testing.expect(!seq.parametersValid(u8));
+    try std.testing.expect((CSI{ .params = "1;255;2", .final = 'm' }).parametersValid(u8));
 }

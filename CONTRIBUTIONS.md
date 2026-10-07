@@ -12,8 +12,8 @@ Requirements:
 Setup:
 
 ```bash
-git clone <repo-url>
-cd scrapers
+git clone https://github.com/SmallThingz/subdl.git
+cd subdl
 zig build
 zig build test
 ```
@@ -32,7 +32,7 @@ zig build test
 1. Focused changes with clear scope.
 2. Tests for behavior changes or bug fixes.
 3. Updated docs when CLI flags/API behavior changes.
-4. Notes for provider-specific caveats (pagination, Cloudflare, captcha, etc.).
+4. Notes for provider-specific caveats (pagination, Cloudflare, CAPTCHA, etc.).
 
 ## Coding Expectations
 
@@ -41,6 +41,10 @@ zig build test
 - Avoid shelling out to external HTTP tools in runtime paths.
 - Prefer explicit error handling and deterministic behavior.
 - Keep user-facing strings and CLI/TUI flows clear.
+- Do not add CAPTCHA solvers or access-control bypasses. Manual testing is
+  limited to challenges displayed to an authorized user in that user's session.
+- Keep dependencies on immutable commit/content-hash pins, and preserve Zig
+  `0.17.0` compatibility when updating them.
 
 ## Testing
 
@@ -51,6 +55,15 @@ zig build test
 ```
 
 The default test graph includes TUI behavior tests when TUI support is enabled. Run `zig build test-tui` for that focused suite.
+The executable and test targets require threaded I/O, even with the TUI disabled:
+HTTP request deadlines race a fetch against a timeout. Root builds reject
+`-Dsingle-threaded=true` instead of producing an executable whose requests fail
+with `ConcurrencyUnavailable`.
+On native Linux the default test graph also runs an offline process-cleanup
+contract for the live runner; install Bash 4.3 or newer, GNU `timeout`,
+`flock`, `mkfifo`, and standard `tee`, `grep`, `sed`, and `mktemp` utilities. It executes success,
+failure, and missing-marker cases; signal scenarios are deliberately not
+executed, while generated trap and cleanup structure is checked statically.
 
 Run provider-targeted live tests when touching provider behavior:
 
@@ -61,8 +74,12 @@ zig build test-live-single -Dlive=extensive -Dlive-providers=subsource.net
 Optional broader live checks:
 
 ```bash
-zig build test-live -Dlive=smoke -Dlive-providers=* -Dlive-include-captcha=false
+zig build test-live -Dlive=smoke '-Dlive-providers=*'
 ```
+
+Live tests require a native Linux target, Bash 4.3 or newer, GNU `timeout`,
+`flock`, `mkfifo`, and network access. They are not available on macOS even though deterministic
+development and test workflows are supported there.
 
 ## Commit and PR Hygiene
 

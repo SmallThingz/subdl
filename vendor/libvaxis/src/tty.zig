@@ -37,24 +37,70 @@ pub const PosixTty = struct {
 
     /// File.Writer for efficient buffered writing
     tty_writer: std.Io.File.Writer,
+    active: bool = true,
 
     pub const SignalHandler = struct {
         context: *anyopaque,
         callback: *const fn (context: *anyopaque) void,
+        /// Set this when the callback calls APIs tied to an Io implementation.
+        /// The dispatcher verifies that it runs in that same Io context, and
+        /// callback removal must also be initiated from that context. Leave it
+        /// null for callbacks owned and removed by unmanaged OS threads.
+        /// Callbacks must be unregistered by their owner before their context or
+        /// associated Tty is destroyed. Do not unregister from within the
+        /// callback itself, because removal waits for an in-flight callback.
+        io: ?std.Io = null,
     };
 
-    /// global signal handlers
-    var handlers: [8]SignalHandler = undefined;
-    var handler_io: std.Io = undefined;
-    var handler_mutex: std.Io.Mutex = .init;
-    var handler_idx: usize = 0;
+    const HandlerSlot = struct {
+        handler: SignalHandler = undefined,
+        generation: u64 = 0,
+        born_sequence: usize = 0,
+        live: bool = false,
+        executing: bool = false,
+    };
 
-    var signal_pipe: [2]std.Io.File = undefined;
-    var signal_thread: std.Io.Future(void) = undefined;
-    var signal_thread_running = false;
+    const HandlerToken = struct {
+        index: usize,
+        generation: u64,
+    };
+
+    const SignalThreadState = enum(u8) {
+        stopped,
+        running,
+        retiring,
+    };
+
+    const SignalWakeAction = enum {
+        delivered,
+        already_pending,
+        retry,
+        failed,
+    };
+
+    // Both callers need a bounded async-signal-safe operation. Teardown falls
+    // back to Future.cancel when this budget is exhausted, while SIGWINCH may
+    // safely coalesce with the next resize notification.
+    const signal_wake_interrupt_retries = 8;
+
+    var handlers: [8]HandlerSlot = @splat(.{});
+    var next_generation: u64 = 1;
+    var state_lock: std.atomic.Value(u8) = .init(0);
+    var tty_refcount: usize = 0;
+    var original_termios: posix.termios = undefined;
+
+    var signal_pipe: [2]posix.fd_t = .{ -1, -1 };
+    var signal_thread_state: std.atomic.Value(SignalThreadState) = .init(.stopped);
     var signal_thread_quit: std.atomic.Value(bool) = .init(false);
+    var signal_thread_joining: bool = false;
+    var signal_write_fd: std.atomic.Value(posix.fd_t) = .init(-1);
+    var signal_handler_frames: std.atomic.Value(usize) = .init(0);
+    var signal_sequence: std.atomic.Value(usize) = .init(0);
+    var signal_io: std.Io = undefined;
+    var signal_thread: std.Io.Future(void) = undefined;
 
     var handler_installed: bool = false;
+    var previous_sigwinch: posix.Sigaction = undefined;
 
     /// initializes a Tty instance by opening /dev/tty and "making it raw". A
     /// signal handler is installed for SIGWINCH. No callbacks are installed, be
@@ -63,18 +109,45 @@ pub const PosixTty = struct {
         // Open our tty
         var f = try std.Io.Dir.openFileAbsolute(io, "/dev/tty", .{ .mode = .read_write });
 
-        // Set the termios of the tty
-        const termios = try makeRaw(f.handle);
-        errdefer {
-            posix.tcsetattr(f.handle, .FLUSH, termios) catch {};
-            f.close(io);
+        errdefer f.close(io);
+
+        lockState();
+        // The final owner joins the managed dispatcher before a new lifecycle
+        // may start. Returning keeps a second task from racing that join.
+        if (tty_refcount == 0 and signal_thread_joining) {
+            unlockState();
+            return error.SignalDispatcherStopping;
+        }
+        // The dispatcher and all callbacks share one scheduler context. Using
+        // a different Io backend for another handle would make joining or
+        // callback-side synchronization operate on the wrong scheduler.
+        if (tty_refcount != 0 and !sameIo(io, signal_io)) {
+            unlockState();
+            return error.IncompatibleTtyIo;
         }
 
-        if (!handler_installed) {
-            try startSignalThread(io);
-            handler_io = io;
-            installSignalHandler();
+        // A dispatcher read failure retires the dispatcher and its callbacks.
+        // Do not attach another Tty to that failed lifecycle; the last active
+        // Tty must unwind it before a fresh lifecycle can be started.
+        if (tty_refcount != 0 and !signalDispatcherAcceptsRegistrations()) {
+            unlockState();
+            return error.SignalDispatcherUnavailable;
         }
+
+        if (tty_refcount == 0) {
+            original_termios = makeRaw(f.handle) catch |err| {
+                unlockState();
+                return err;
+            };
+            startSignalThread(io) catch |err| {
+                posix.tcsetattr(f.handle, .FLUSH, original_termios) catch {};
+                unlockState();
+                return err;
+            };
+        }
+        tty_refcount += 1;
+        const termios = original_termios;
+        unlockState();
 
         const self: PosixTty = .{
             .io = io,
@@ -89,30 +162,75 @@ pub const PosixTty = struct {
     }
 
     /// release resources associated with the Tty return it to its original state
-    pub fn deinit(self: PosixTty) void {
-        resetSignalHandler();
-        stopSignalThread();
-        posix.tcsetattr(self.fd.handle, .FLUSH, self.termios) catch |err| {
-            std.log.err("couldn't restore terminal: {}", .{err});
-        };
-        if (builtin.os.tag != .macos) // closing /dev/tty may block indefinitely on macos
-            self.fd.close(self.io);
-    }
-
-    /// Resets the signal handler to it's default
-    pub fn resetSignalHandler() void {
-        if (!handler_installed) {
-            handler_idx = 0;
-            return;
+    pub fn deinit(self: *PosixTty) void {
+        if (!self.active) return;
+        self.active = false;
+        if (global_tty) |current| {
+            if (current.fd.handle == self.fd.handle) global_tty = null;
         }
 
-        handler_mutex.lock(handler_io) catch @panic("unable to lock SIGWINCH handlers");
-        defer handler_mutex.unlock(handler_io);
-        handler_idx = 0;
-        resetSignalHandlerLocked();
+        var retired_handlers: [handlers.len]HandlerToken = undefined;
+        var retired_count: usize = 0;
+        var dispatcher_woken = true;
+        lockState();
+        std.debug.assert(tty_refcount > 0);
+        tty_refcount -= 1;
+        const last = tty_refcount == 0;
+        if (last) {
+            signal_thread_joining = true;
+            for (&handlers, 0..) |*slot, index| {
+                if (!slot.live) continue;
+                slot.live = false;
+                retired_handlers[retired_count] = .{ .index = index, .generation = slot.generation };
+                retired_count += 1;
+            }
+            disarmSignalHandlerLocked();
+            posix.tcsetattr(self.fd.handle, .FLUSH, original_termios) catch |err| {
+                std.log.err("couldn't restore terminal: {}", .{err});
+            };
+            signal_thread_quit.store(true, .release);
+            dispatcher_woken = wakeSignalThread(signal_pipe[1]);
+        }
+        unlockState();
+
+        for (retired_handlers[0..retired_count]) |token| waitForHandler(token);
+        if (last) {
+            if (dispatcher_woken)
+                signal_thread.await(signal_io)
+            else
+                // A broken wake descriptor must not leave teardown awaiting a
+                // dispatcher that is still blocked in readStreaming.
+                signal_thread.cancel(signal_io);
+            lockState();
+            signal_thread_joining = false;
+            unlockState();
+        }
+        // Darwin may block in close while another thread is still reading this
+        // descriptor. As on the other platforms, callers must stop and join
+        // input readers before destroying their Tty; within that ownership
+        // contract the descriptor must be closed rather than leaked.
+        self.fd.close(self.io);
     }
 
-    fn installSignalHandler() void {
+    /// Remove all registered resize callbacks and restore the previous SIGWINCH action.
+    pub fn resetSignalHandler() void {
+        var tokens: [handlers.len]HandlerToken = undefined;
+        var token_count: usize = 0;
+        lockState();
+        for (&handlers, 0..) |*slot, index| {
+            if (!slot.live) continue;
+            slot.live = false;
+            tokens[token_count] = .{ .index = index, .generation = slot.generation };
+            token_count += 1;
+        }
+        disarmSignalHandlerLocked();
+        unlockState();
+
+        for (tokens[0..token_count]) |token| waitForHandler(token);
+    }
+
+    fn installSignalHandlerLocked() void {
+        if (handler_installed) return;
         var act = posix.Sigaction{
             .handler = .{ .handler = PosixTty.handleWinch },
             .mask = switch (builtin.os.tag) {
@@ -121,22 +239,18 @@ pub const PosixTty = struct {
             },
             .flags = 0,
         };
-        posix.sigaction(posix.SIG.WINCH, &act, null);
+        signal_write_fd.store(signal_pipe[1], .seq_cst);
+        posix.sigaction(posix.SIG.WINCH, &act, &previous_sigwinch);
         handler_installed = true;
     }
 
-    fn resetSignalHandlerLocked() void {
+    fn disarmSignalHandlerLocked() void {
         if (!handler_installed) return;
+        signal_write_fd.store(-1, .seq_cst);
+        posix.sigaction(posix.SIG.WINCH, &previous_sigwinch, null);
         handler_installed = false;
-        var act = posix.Sigaction{
-            .handler = .{ .handler = posix.SIG.DFL },
-            .mask = switch (builtin.os.tag) {
-                .macos => 0,
-                else => posix.sigemptyset(),
-            },
-            .flags = 0,
-        };
-        posix.sigaction(posix.SIG.WINCH, &act, null);
+        while (signal_handler_frames.load(.seq_cst) != 0)
+            std.atomic.spinLoopHint();
     }
 
     pub fn writer(self: *PosixTty) *std.Io.Writer {
@@ -150,44 +264,103 @@ pub const PosixTty = struct {
     /// Install a signal handler for winsize. A maximum of 8 handlers may be
     /// installed
     pub fn notifyWinsize(handler: SignalHandler) !void {
-        try handler_mutex.lock(handler_io);
-        defer handler_mutex.unlock(handler_io);
-        if (handler_idx == handlers.len) return error.OutOfMemory;
-        // Removing the last subscriber restores SIG_DFL, but leaves the
-        // dispatch thread alive until deinit. Re-arm it for a new subscriber.
-        if (!handler_installed) installSignalHandler();
-        handlers[handler_idx] = handler;
-        handler_idx += 1;
+        lockState();
+        defer unlockState();
+        if (tty_refcount == 0 or !signalDispatcherAcceptsRegistrations())
+            return error.SignalDispatcherUnavailable;
+        if (handler.io) |io| {
+            if (!sameIo(io, signal_io))
+                return error.IncompatibleSignalHandlerIo;
+        }
+        for (&handlers) |*slot| {
+            if (slot.live or slot.executing) continue;
+            installSignalHandlerLocked();
+            slot.* = .{
+                .handler = handler,
+                .generation = next_generation,
+                .born_sequence = signal_sequence.load(.seq_cst),
+                .live = true,
+            };
+            // A read failure announces retirement without waiting for
+            // state_lock. Recheck after publishing the slot so registration
+            // cannot report success after that announcement won the race.
+            if (!signalDispatcherAcceptsRegistrations()) {
+                slot.live = false;
+                if (!hasLiveHandlersLocked()) disarmSignalHandlerLocked();
+                return error.SignalDispatcherUnavailable;
+            }
+            next_generation +%= 1;
+            if (next_generation == 0) next_generation = 1;
+            return;
+        }
+        return error.OutOfMemory;
     }
 
     /// Remove a previously installed winsize signal handler
     pub fn removeWinsize(handler: SignalHandler) void {
-        handler_mutex.lock(handler_io) catch @panic("unable to lock SIGWINCH handlers");
-        defer handler_mutex.unlock(handler_io);
+        lockState();
+        var token: ?HandlerToken = null;
+        for (&handlers, 0..) |*slot, index| {
+            if (!slot.live or slot.handler.context != handler.context or slot.handler.callback != handler.callback)
+                continue;
+            slot.live = false;
+            token = .{ .index = index, .generation = slot.generation };
+            break;
+        }
+        if (!hasLiveHandlersLocked()) disarmSignalHandlerLocked();
+        unlockState();
+        if (token) |value| waitForHandler(value);
+    }
 
-        var i: usize = 0;
-        while (i < handler_idx) : (i += 1) {
-            if (handlers[i].context == handler.context and handlers[i].callback == handler.callback) {
-                handler_idx -= 1;
-                if (i < handler_idx) {
-                    std.mem.copyForwards(SignalHandler, handlers[i..handler_idx], handlers[i + 1 .. handler_idx + 1]);
-                }
-                handlers[handler_idx] = undefined;
-                if (handler_idx == 0) resetSignalHandlerLocked();
-                return;
+    fn handleWinch(_: std.posix.SIG) callconv(.c) void {
+        // libc-backed write(2) reports failures through thread-local errno.
+        // A signal handler must restore the interrupted code's errno value.
+        const saved_errno = if (comptime @hasDecl(posix.system, "_errno"))
+            posix.system._errno().*
+        else {};
+        defer {
+            if (comptime @hasDecl(posix.system, "_errno"))
+                posix.system._errno().* = saved_errno;
+        }
+
+        _ = signal_handler_frames.fetchAdd(1, .seq_cst);
+        defer _ = signal_handler_frames.fetchSub(1, .seq_cst);
+        _ = signal_sequence.fetchAdd(1, .seq_cst);
+        const fd = signal_write_fd.load(.seq_cst);
+        if (fd < 0) return;
+        _ = wakeSignalThread(fd);
+    }
+
+    fn wakeSignalThread(fd: posix.fd_t) bool {
+        const byte = [1]u8{0};
+        var interrupted_retries: usize = 0;
+        while (true) {
+            const action = signalWakeAction(posix.errno(posix.system.write(fd, &byte, byte.len)));
+            switch (action) {
+                .delivered, .already_pending => return true,
+                .failed => return false,
+                .retry => {
+                    if (interrupted_retries == signal_wake_interrupt_retries)
+                        return false;
+                    interrupted_retries += 1;
+                },
             }
         }
     }
 
-    fn handleWinch(_: std.posix.SIG) callconv(.c) void {
-        // write(2) is async-signal-safe. All other work is deferred to a
-        // normal thread, where taking locks and posting events is safe.
-        const byte = [1]u8{0};
-        _ = posix.system.write(signal_pipe[1].handle, &byte, byte.len);
+    fn signalWakeAction(err: posix.E) SignalWakeAction {
+        return switch (err) {
+            .SUCCESS => .delivered,
+            .AGAIN => .already_pending,
+            .INTR => .retry,
+            else => .failed,
+        };
     }
 
     fn startSignalThread(io: std.Io) !void {
-        if (signal_thread_running) return;
+        if (signal_thread_state.load(.seq_cst) != .stopped)
+            return error.SignalDispatcherStopping;
+        if (comptime builtin.single_threaded) return error.ConcurrencyUnavailable;
 
         var fds: [2]posix.fd_t = undefined;
         switch (posix.errno(posix.system.pipe(&fds))) {
@@ -214,42 +387,148 @@ pub const PosixTty = struct {
             else => |err| return posix.unexpectedErrno(err),
         }
 
-        signal_pipe = .{
-            .{ .handle = fds[0], .flags = .{ .nonblocking = false } },
-            .{ .handle = fds[1], .flags = .{ .nonblocking = true } },
-        };
+        signal_pipe = fds;
         signal_thread_quit.store(false, .release);
-        signal_thread = try io.concurrent(runSignalThread, .{io});
-        signal_thread_running = true;
-    }
-
-    fn stopSignalThread() void {
-        if (!signal_thread_running) return;
-        signal_thread_quit.store(true, .release);
-        const byte = [1]u8{0};
-        _ = posix.system.write(signal_pipe[1].handle, &byte, byte.len);
-        signal_thread.await(handler_io);
-        signal_pipe[0].close(handler_io);
-        signal_pipe[1].close(handler_io);
-        signal_thread_running = false;
+        signal_io = io;
+        signal_thread_state.store(.running, .seq_cst);
+        signal_thread = io.concurrent(runSignalThread, .{io}) catch |err| {
+            signal_thread_state.store(.stopped, .seq_cst);
+            return err;
+        };
     }
 
     fn runSignalThread(io: std.Io) void {
+        const read_file: std.Io.File = .{
+            .handle = signal_pipe[0],
+            .flags = .{ .nonblocking = false },
+        };
         var buf: [64]u8 = undefined;
         while (true) {
-            _ = signal_pipe[0].readStreaming(io, &.{&buf}) catch return;
-            if (signal_thread_quit.load(.acquire)) return;
+            const len = read_file.readStreaming(io, &.{&buf}) catch |err| {
+                beginSignalThreadRetirement();
+                if (err != error.Canceled)
+                    std.log.scoped(.vaxis).err("SIGWINCH dispatcher read failed: {}", .{err});
+                break;
+            };
+            if (len == 0) {
+                beginSignalThreadRetirement();
+                std.log.scoped(.vaxis).err("SIGWINCH dispatcher pipe reached EOF", .{});
+                break;
+            }
+            if (signal_thread_quit.load(.acquire)) {
+                beginSignalThreadRetirement();
+                break;
+            }
+            dispatchHandlers(signal_sequence.load(.seq_cst));
+        }
 
-            {
-                handler_mutex.lock(io) catch return;
-                defer handler_mutex.unlock(io);
-                var i: usize = 0;
-                while (i < handler_idx) : (i += 1) {
-                    const handler = handlers[i];
-                    handler.callback(handler.context);
-                }
+        lockState();
+        // This is redundant on the normal last-Tty path, but essential after
+        // an unexpected read failure: no signal handler may retain a closed or
+        // subsequently reused descriptor, and no callback may remain live
+        // without a dispatcher capable of invoking/removing it.
+        signal_write_fd.store(-1, .seq_cst);
+        disarmSignalHandlerLocked();
+        retireHandlerSlots(&handlers);
+        const retired_pipe = signal_pipe;
+        signal_pipe = .{ -1, -1 };
+        signal_thread_quit.store(true, .release);
+        beginSignalThreadRetirement();
+        unlockState();
+
+        for (retired_pipe) |fd| {
+            if (fd >= 0) _ = posix.system.close(fd);
+        }
+        signal_thread_state.store(.stopped, .seq_cst);
+    }
+
+    fn retireHandlerSlots(slots: []HandlerSlot) void {
+        for (slots) |*slot| {
+            slot.live = false;
+            slot.executing = false;
+        }
+    }
+
+    fn dispatchHandlers(wake_sequence: usize) void {
+        var tokens: [handlers.len]HandlerToken = undefined;
+        var token_count: usize = 0;
+        lockState();
+        for (handlers, 0..) |slot, index| {
+            if (!slot.live or slot.born_sequence >= wake_sequence) continue;
+            tokens[token_count] = .{ .index = index, .generation = slot.generation };
+            token_count += 1;
+        }
+        unlockState();
+
+        for (tokens[0..token_count]) |token| {
+            lockState();
+            const slot = &handlers[token.index];
+            if (!slot.live or slot.generation != token.generation or slot.executing) {
+                unlockState();
+                continue;
+            }
+            slot.executing = true;
+            const handler = slot.handler;
+            unlockState();
+
+            handler.callback(handler.context);
+
+            lockState();
+            const current = &handlers[token.index];
+            if (current.generation == token.generation) current.executing = false;
+            unlockState();
+        }
+    }
+
+    fn waitForHandler(token: HandlerToken) void {
+        while (true) {
+            lockState();
+            const slot = &handlers[token.index];
+            const done = slot.generation != token.generation or !slot.executing;
+            const handler_io = if (done) null else slot.handler.io;
+            unlockState();
+            if (done) return;
+            if (handler_io) |io| {
+                io.sleep(.fromMilliseconds(1), .awake) catch {
+                    std.Thread.yield() catch {};
+                };
+            } else {
+                std.Thread.yield() catch {};
             }
         }
+    }
+
+    fn hasLiveHandlersLocked() bool {
+        for (handlers) |slot| {
+            if (slot.live) return true;
+        }
+        return false;
+    }
+
+    fn dispatcherAcceptsRegistration(state: SignalThreadState) bool {
+        return state == .running;
+    }
+
+    fn signalDispatcherAcceptsRegistrations() bool {
+        return dispatcherAcceptsRegistration(signal_thread_state.load(.seq_cst));
+    }
+
+    fn beginSignalThreadRetirement() void {
+        signal_thread_state.store(.retiring, .seq_cst);
+    }
+
+    fn sameIo(a: std.Io, b: std.Io) bool {
+        return a.userdata == b.userdata and a.vtable == b.vtable;
+    }
+
+    fn lockState() void {
+        while (state_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlockState() void {
+        state_lock.store(0, .release);
     }
 
     /// makeRaw enters the raw state for the terminal.
@@ -320,16 +599,24 @@ pub const WindowsTty = struct {
 
     /// File.Writer for efficient buffered writing
     tty_writer: std.Io.File.Writer,
+    active: bool = true,
 
     /// The last mouse button that was pressed. We store the previous state of button presses on each
     /// mouse event so we can detect which button was released
     last_mouse_button_press: u16 = 0,
 
     const utf8_codepage: c_uint = 65001;
+    var lifecycle_lock: std.atomic.Mutex = .unlocked;
+    var active_instance: bool = false;
+
+    fn lockLifecycle() void {
+        while (!lifecycle_lock.tryLock()) std.atomic.spinLoopHint();
+    }
 
     pub const SignalHandler = struct {
         context: *anyopaque,
         callback: *const fn (context: *anyopaque) void,
+        io: ?std.Io = null,
     };
 
     /// The input mode set by init
@@ -349,6 +636,10 @@ pub const WindowsTty = struct {
     };
 
     pub fn init(io: std.Io, buffer: []u8) !WindowsTty {
+        lockLifecycle();
+        defer lifecycle_lock.unlock();
+        if (active_instance) return error.TtyAlreadyInitialized;
+
         const stdin: std.Io.File = .stdin();
         const stdout: std.Io.File = .stdout();
         const input_stop = CreateEventW(null, .TRUE, .FALSE, null) orelse
@@ -356,7 +647,7 @@ pub const WindowsTty = struct {
         errdefer windows.CloseHandle(input_stop);
 
         // get initial modes
-        const initial_output_codepage = GetConsoleOutputCP();
+        const initial_output_codepage = try getConsoleOutputCodepage();
         const initial_input_mode = try getConsoleMode(CONSOLE_MODE_INPUT, stdin.handle);
         const initial_output_mode = try getConsoleMode(CONSOLE_MODE_OUTPUT, stdout.handle);
 
@@ -381,24 +672,41 @@ pub const WindowsTty = struct {
 
         // VT input alone loses key releases and modifier keys. Win32-input-mode
         // carries the original KEY_EVENT_RECORD fields in CSI ... _ sequences.
+        errdefer {
+            // A failed flush may already have emitted all or part of the enable
+            // sequence. Roll it back before the console modes/codepage are
+            // restored by the earlier error defers.
+            var rollback_output: std.Io.File.Writer = .initStreaming(stdout, io, &.{});
+            rollback_output.interface.writeAll("\x1b[?9001l") catch {};
+        }
         try self.writer().writeAll("\x1b[?9001h");
         try self.writer().flush();
 
         // save a copy of this tty as the global_tty for panic handling
         global_tty = self;
+        active_instance = true;
 
         return self;
     }
 
-    pub fn deinit(self: WindowsTty) void {
+    pub fn deinit(self: *WindowsTty) void {
+        lockLifecycle();
+        defer lifecycle_lock.unlock();
+        if (!self.active or !active_instance) return;
+        self.active = false;
+        active_instance = false;
+        if (global_tty) |current| {
+            if (current.stdout == self.stdout) global_tty = null;
+        }
         var output: std.Io.File.Writer = .initStreaming(self.tty_writer.file, self.tty_writer.io, &.{});
         output.interface.writeAll("\x1b[?9001l") catch {};
         _ = SetConsoleOutputCP(self.initial_codepage);
         setConsoleMode(self.stdin, self.initial_input_mode) catch {};
         setConsoleMode(self.stdout, self.initial_output_mode) catch {};
         windows.CloseHandle(self.input_stop);
-        windows.CloseHandle(self.stdin);
-        windows.CloseHandle(self.stdout);
+        // std.Io.File.stdin()/stdout() wrap process-global borrowed handles.
+        // Closing either here invalidates them for the entire process (and the
+        // handles may alias), so only the event created by init is owned.
     }
 
     pub const CONSOLE_MODE_INPUT = packed struct(u32) {
@@ -433,6 +741,18 @@ pub const WindowsTty = struct {
         return @bitCast(mode);
     }
 
+    fn getConsoleOutputCodepage() !c_uint {
+        const codepage = GetConsoleOutputCP();
+        if (codepage == 0)
+            return validateConsoleOutputCodepage(codepage, windows.GetLastError());
+        return codepage;
+    }
+
+    fn validateConsoleOutputCodepage(codepage: c_uint, last_error: windows.Win32Error) !c_uint {
+        if (codepage == 0) return windows.unexpectedError(last_error);
+        return codepage;
+    }
+
     pub fn setConsoleMode(handle: windows.HANDLE, mode: anytype) !void {
         if (SetConsoleMode(handle, @bitCast(mode)) == .FALSE) return switch (windows.GetLastError()) {
             .INVALID_HANDLE => error.InvalidHandle,
@@ -445,13 +765,15 @@ pub const WindowsTty = struct {
     }
 
     pub fn read(self: *const WindowsTty, buf: []u8) !usize {
-        return posix.read(self.fd, buf);
+        const input: std.Io.File = .{ .handle = self.stdin };
+        return try input.readStreaming(self.tty_writer.io, &.{buf});
     }
 
     pub fn resetInput(self: *WindowsTty) !void {
         if (ResetEvent(self.input_stop) == .FALSE)
             return windows.unexpectedError(windows.GetLastError());
         self.event_state = .{};
+        self.last_mouse_button_press = 0;
     }
 
     pub fn interruptInput(self: *WindowsTty) void {
@@ -871,7 +1193,10 @@ pub const WindowsTty = struct {
             },
             0x0010 => { // Focus events
                 switch (record.Event.FocusEvent.bSetFocus) {
-                    .FALSE => return .focus_out,
+                    .FALSE => {
+                        self.last_mouse_button_press = 0;
+                        return .focus_out;
+                    },
                     else => return .focus_in,
                 }
             },
@@ -1004,6 +1329,7 @@ pub const TestTty = switch (builtin.os.tag) {
         pub const SignalHandler = struct {
             context: *anyopaque,
             callback: *const fn (context: *anyopaque) void,
+            io: ?std.Io = null,
         };
 
         /// Initializes a TestTty.
@@ -1066,6 +1392,7 @@ pub const TestTty = switch (builtin.os.tag) {
         pub const SignalHandler = struct {
             context: *anyopaque,
             callback: *const fn (context: *anyopaque) void,
+            io: ?std.Io = null,
         };
 
         pub fn init(_: std.Io, buf: []u8) !@This() {
@@ -1099,6 +1426,60 @@ pub const TestTty = switch (builtin.os.tag) {
         }
     },
 };
+
+test "signal wake errno decisions distinguish retry and readable pipe" {
+    try std.testing.expectEqual(
+        PosixTty.SignalWakeAction.delivered,
+        PosixTty.signalWakeAction(.SUCCESS),
+    );
+    try std.testing.expectEqual(
+        PosixTty.SignalWakeAction.already_pending,
+        PosixTty.signalWakeAction(.AGAIN),
+    );
+    try std.testing.expectEqual(
+        PosixTty.SignalWakeAction.retry,
+        PosixTty.signalWakeAction(.INTR),
+    );
+    try std.testing.expectEqual(
+        PosixTty.SignalWakeAction.failed,
+        PosixTty.signalWakeAction(.BADF),
+    );
+}
+
+test "signal dispatcher retirement clears callback state" {
+    var slots: [3]PosixTty.HandlerSlot = @splat(.{});
+    slots[0].generation = 7;
+    slots[0].live = true;
+    slots[1].generation = 9;
+    slots[1].live = true;
+    slots[1].executing = true;
+
+    PosixTty.retireHandlerSlots(&slots);
+
+    for (slots) |slot| {
+        try std.testing.expect(!slot.live);
+        try std.testing.expect(!slot.executing);
+    }
+    try std.testing.expectEqual(@as(u64, 7), slots[0].generation);
+    try std.testing.expectEqual(@as(u64, 9), slots[1].generation);
+}
+
+test "signal dispatcher retirement rejects new registrations" {
+    try std.testing.expect(PosixTty.dispatcherAcceptsRegistration(.running));
+    try std.testing.expect(!PosixTty.dispatcherAcceptsRegistration(.retiring));
+    try std.testing.expect(!PosixTty.dispatcherAcceptsRegistration(.stopped));
+}
+
+test "Windows output codepage validation rejects the failure sentinel" {
+    try std.testing.expectEqual(
+        @as(c_uint, WindowsTty.utf8_codepage),
+        try WindowsTty.validateConsoleOutputCodepage(WindowsTty.utf8_codepage, .SUCCESS),
+    );
+    try std.testing.expectError(
+        error.Unexpected,
+        WindowsTty.validateConsoleOutputCodepage(0, .INVALID_FUNCTION),
+    );
+}
 
 test "Windows win32-input-mode fields and defaults" {
     const record = WindowsTty.parseWin32Input("\x1b[65;30;65;1;16;3_").?;
@@ -1199,6 +1580,51 @@ test "Windows paste delimiters wrapped in win32-input-mode" {
             }
         }
     }
+}
+
+test "Windows mouse state resets across input reset and focus loss" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var input: WindowsInputTest = .{};
+    const stop = WindowsTty.CreateEventW(null, .TRUE, .FALSE, null) orelse return error.Unexpected;
+    defer windows.CloseHandle(stop);
+    input.tty.input_stop = stop;
+
+    const press: WindowsTty.INPUT_RECORD = .{
+        .EventType = 0x0002,
+        .Event = .{ .MouseEvent = .{
+            .dwMousePosition = .{ .X = 3, .Y = 4 },
+            .dwButtonState = 0x0001,
+            .dwControlKeyState = 0,
+            .dwEventFlags = 0,
+        } },
+    };
+
+    const first = (try input.tty.eventFromRecord(&press, &input.tty.event_state, &input.parser, null)).?;
+    try std.testing.expect(first == .mouse);
+    try std.testing.expectEqual(Mouse.Type.press, first.mouse.type);
+    try std.testing.expectEqual(Mouse.Button.left, first.mouse.button);
+    try std.testing.expectEqual(@as(u16, 1), input.tty.last_mouse_button_press);
+
+    try input.tty.resetInput();
+    try std.testing.expectEqual(@as(u16, 0), input.tty.last_mouse_button_press);
+    const after_reset = (try input.tty.eventFromRecord(&press, &input.tty.event_state, &input.parser, null)).?;
+    try std.testing.expect(after_reset == .mouse);
+    try std.testing.expectEqual(Mouse.Type.press, after_reset.mouse.type);
+    try std.testing.expectEqual(Mouse.Button.left, after_reset.mouse.button);
+
+    const focus_out: WindowsTty.INPUT_RECORD = .{
+        .EventType = 0x0010,
+        .Event = .{ .FocusEvent = .{ .bSetFocus = .FALSE } },
+    };
+    const focus_event = (try input.tty.eventFromRecord(&focus_out, &input.tty.event_state, &input.parser, null)).?;
+    try std.testing.expect(focus_event == .focus_out);
+    try std.testing.expectEqual(@as(u16, 0), input.tty.last_mouse_button_press);
+
+    const after_focus = (try input.tty.eventFromRecord(&press, &input.tty.event_state, &input.parser, null)).?;
+    try std.testing.expect(after_focus == .mouse);
+    try std.testing.expectEqual(Mouse.Type.press, after_focus.mouse.type);
+    try std.testing.expectEqual(Mouse.Button.left, after_focus.mouse.button);
 }
 
 test "console errors distinguish interruption from permanent failures" {

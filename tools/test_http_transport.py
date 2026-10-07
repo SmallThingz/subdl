@@ -5,11 +5,30 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import subprocess
 import sys
 import threading
+import time
+import zlib
+
+if len(sys.argv) != 2:
+    raise SystemExit('usage: test_http_transport.py BINARY')
 
 requests = []
-ZSTD_PUBLIC = bytes.fromhex('28 b5 2f fd 04 58 51 00 00 47 45 54 20 70 75 62 6c 69 63 4f d3 b0 26')
+requests_lock = threading.Lock()
+
+def require(condition, message):
+    if not condition:
+        raise AssertionError(message)
+
+def header_values(headers, name):
+    return tuple(headers.get_all(name, []))
+
+def gzip_bytes(data):
+    return gzip.compress(data, mtime=0)
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(5)
     def do_HEAD(self):
         self.do_GET()
     def log_message(self, *_):
@@ -17,24 +36,64 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self.do_GET()
     def do_GET(self):
-        length = int(self.headers.get('Content-Length', '0'))
+        content_lengths = header_values(self.headers, 'Content-Length')
+        if len(content_lengths) > 1:
+            self.send_error(400, 'duplicate request Content-Length')
+            self.close_connection = True
+            return
+        try:
+            length = int(content_lengths[0]) if content_lengths else 0
+        except ValueError:
+            self.send_error(400, 'invalid request Content-Length')
+            self.close_connection = True
+            return
+        if length < 0 or length > 64 * 1024:
+            self.send_error(413, 'request body exceeds fixture limit')
+            self.close_connection = True
+            return
+        payload = b''
         if length:
-            self.rfile.read(length)
-        private = (self.headers.get('Cookie') == 'fixture=session'
-                   and self.headers.get('Authorization') == 'Bearer fixture-only'
-                   and self.headers.get('X-Api-Key') == 'fixture-api-key'
-                   and self.headers.get('User-Agent') == 'fixture-secret-agent'
-                   and self.headers.get('Accept-Encoding') == 'identity'
-                   and self.headers.get('Content-Type') == 'application/x-fixture-secret')
-        any_private = bool(self.headers.get('Cookie') or self.headers.get('Authorization')
-                           or self.headers.get('X-Api-Key')
-                           or self.headers.get('User-Agent') == 'fixture-secret-agent'
-                           or self.headers.get('Connection') == 'close'
-                           or self.headers.get('Accept-Encoding') == 'identity'
-                           or self.headers.get('Content-Type') == 'application/x-fixture-secret')
-        requests.append((self.server.role, self.path, self.command, any_private))
+            payload = self.rfile.read(length)
+            if len(payload) != length:
+                self.close_connection = True
+                return
+        if self.command == 'POST' and (self.path != '/post' or payload != b'synthetic input'):
+            self.send_error(400, 'unexpected fixture POST body')
+            self.close_connection = True
+            return
+        cookies = header_values(self.headers, 'Cookie')
+        authorizations = header_values(self.headers, 'Authorization')
+        api_keys = header_values(self.headers, 'X-Api-Key')
+        user_agents = header_values(self.headers, 'User-Agent')
+        content_types = header_values(self.headers, 'Content-Type')
+        transfer_encodings = header_values(self.headers, 'Transfer-Encoding')
+        body_shape_valid = ((self.command == 'POST' and self.path == '/post'
+                             and payload == b'synthetic input' and not transfer_encodings)
+                            or (self.command != 'POST' and not payload and not transfer_encodings))
+        private = (cookies == ('fixture=session',)
+                   and authorizations == ('Bearer fixture-only',)
+                   and api_keys == ('fixture-api-key',)
+                   and user_agents == ('fixture-secret-agent',)
+                   and content_types == ('application/x-fixture-secret',)
+                   and body_shape_valid)
+        any_private = bool(cookies or authorizations or api_keys or transfer_encodings
+                           or payload
+                           or any('fixture-secret-agent' in value for value in user_agents)
+                           or any('application/x-fixture-secret' in value for value in content_types))
+        accept_encodings = header_values(self.headers, 'Accept-Encoding')
+        accept_encoding = ','.join(accept_encodings)
+        with requests_lock:
+            request_limit_exceeded = len(requests) >= 1024
+            if not request_limit_exceeded:
+                requests.append((self.server.role, self.path, self.command, any_private,
+                                 accept_encodings, len(payload)))
+        if request_limit_exceeded:
+            self.send_error(508, 'fixture request limit exceeded')
+            self.close_connection = True
+            return
         destination = {
             '/same': '/echo', '/cross': other + '/echo',
+            '/cross-strict': other + '/strict-target',
             '/roundtrip': other + '/back', '/back': origin + '/echo',
             '/post': other + '/echo', '/loop': '/loop',
         }.get(self.path)
@@ -60,36 +119,90 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
             self.close_connection = True
             return
-        body = (self.command + (' private' if private else ' leaked' if any_private else ' public')).encode()
-        if self.path in ('/gzip', '/gzip-chunked', '/gzip-wire-chunked', '/gzip-members', '/gzip-truncated', '/gzip-garbage'):
-            body = gzip.compress(body)
-        if self.path == '/gzip-members':
-            body = gzip.compress(b'GET ') + gzip.compress(b'private')
-        if self.path == '/gzip-garbage':
-            body += b'garbage'
-        if self.path == '/zstd':
-            if 'zstd' not in self.headers.get('Accept-Encoding', '').lower():
-                self.send_error(400, 'zstd was not advertised')
+        if self.path == '/encoding-policy':
+            encodings = {part.strip().lower() for part in accept_encoding.split(',') if part.strip()}
+            if (len(accept_encodings) != 1 or 'gzip' not in encodings
+                    or 'deflate' not in encodings or 'zstd' in encodings):
+                self.send_error(400, 'unsafe or incomplete Accept-Encoding policy')
                 return
-            body = ZSTD_PUBLIC
+        if self.path == '/identity' and (len(accept_encodings) != 1
+                                         or accept_encoding.lower().strip() != 'identity'):
+            self.send_error(400, 'identity override was not serialized exactly once')
+            return
+        if self.path == '/slow':
+            time.sleep(3)
+        body = (self.command + (' private' if private else ' leaked' if any_private else ' public')).encode()
+        if self.path == '/chunked-cap':
+            body = b'0123456789'
+        gzip_paths = ('/gzip', '/gzip-chunked', '/gzip-wire-chunked', '/gzip-members',
+                      '/gzip-truncated', '/gzip-garbage', '/gzip-bad-crc', '/gzip-bad-size')
+        if self.path in gzip_paths:
+            body = gzip_bytes(body)
+        if self.path == '/gzip-members':
+            body = gzip_bytes(b'GET ') + gzip_bytes(b'private')
+        if self.path == '/gzip-garbage':
+            # A complete synthetic next-member header makes the rejection
+            # deterministic instead of depending on short-read diagnostics.
+            body += b'garbage!!!'
+        if self.path == '/gzip-bad-crc':
+            body = body[:-8] + bytes([body[-8] ^ 1]) + body[-7:]
+        if self.path == '/gzip-bad-size':
+            body = body[:-4] + bytes([body[-4] ^ 1]) + body[-3:]
+        if self.path in ('/deflate', '/deflate-bad-checksum'):
+            body = zlib.compress(body)
+        if self.path == '/deflate-bad-checksum':
+            body = body[:-1] + bytes([body[-1] ^ 1])
+        chunked_paths = ('/chunked', '/chunked-extension', '/chunked-cap',
+                         '/chunked-truncated', '/chunk-invalid-size',
+                         '/chunk-overflow-size', '/chunk-missing-crlf', '/te-cl',
+                         '/gzip-chunked', '/gzip-wire-chunked', '/gzip-truncated')
         self.send_response(200)
-        if self.path in ('/gzip-chunked', '/gzip-wire-chunked', '/gzip-truncated'):
+        if self.path in chunked_paths:
             self.send_header('Transfer-Encoding', 'chunked')
+            if self.path == '/te-cl':
+                self.send_header('Content-Length', str(len(body)))
+        elif self.path == '/duplicate-content-length':
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Content-Length', str(len(body)))
+        elif self.path == '/content-length-overflow':
+            self.send_header('Content-Length', '18446744073709551616')
         else:
             self.send_header('Content-Length', str(len(body) + (100 if self.path == '/truncated' else 0)))
-        if self.path in ('/gzip', '/gzip-chunked', '/gzip-wire-chunked', '/gzip-members', '/gzip-truncated', '/gzip-garbage'):
+        if self.path in gzip_paths:
             self.send_header('Content-Encoding', 'gzip')
-        if self.path == '/zstd':
-            self.send_header('Content-Encoding', 'zstd')
+        if self.path in ('/deflate', '/deflate-bad-checksum'):
+            self.send_header('Content-Encoding', 'deflate')
         self.send_header('Connection', 'close')
         self.end_headers()
-        if self.path in ('/gzip-chunked', '/gzip-wire-chunked', '/gzip-truncated'):
-            self.wfile.write(f'{len(body):x}\r\n'.encode() + body + (b'\r\n0\r\nX-Fixture: end\r\n\r\n' if self.path != '/gzip-truncated' else b'\r\n'))
-        else:
-            self.wfile.write(body)
+        try:
+            if self.path in ('/gzip-chunked', '/gzip-wire-chunked', '/gzip-truncated'):
+                self.wfile.write(f'{len(body):x}\r\n'.encode() + body + (b'\r\n0\r\nX-Fixture: end\r\n\r\n' if self.path != '/gzip-truncated' else b'\r\n'))
+            elif self.path in ('/chunked', '/chunked-cap', '/te-cl'):
+                self.wfile.write(f'{len(body):x}\r\n'.encode() + body + b'\r\n0\r\n\r\n')
+            elif self.path == '/chunked-extension':
+                self.wfile.write(f'{len(body):x};fixture=yes\r\n'.encode() + body + b'\r\n0\r\nX-Fixture: end\r\n\r\n')
+            elif self.path == '/chunked-truncated':
+                self.wfile.write(f'{len(body) + 5:x}\r\n'.encode() + body)
+            elif self.path == '/chunk-invalid-size':
+                self.wfile.write(b'g\r\n' + body + b'\r\n0\r\n\r\n')
+            elif self.path == '/chunk-overflow-size':
+                self.wfile.write(b'10000000000000000\r\n')
+            elif self.path == '/chunk-missing-crlf':
+                self.wfile.write(f'{len(body):x}\r\n'.encode() + body + b'0\r\n\r\n')
+            else:
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
         self.close_connection = True
 
-servers = [ThreadingHTTPServer(('127.0.0.1', 0), Handler) for _ in range(2)]
+class FixtureServer(ThreadingHTTPServer):
+    daemon_threads = True
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+servers = [FixtureServer(('127.0.0.1', 0), Handler) for _ in range(2)]
 origin, other = [f'http://127.0.0.1:{server.server_port}' for server in servers]
 threads = []
 try:
@@ -103,10 +216,37 @@ try:
     sys.stderr.write(result.stderr)
     if result.returncode:
         raise SystemExit(result.returncode)
-    assert 'HTTP_TRANSPORT_PASS cases=21' in result.stderr
-    assert not any(private for role, _, _, private in requests if role == 1), requests
-    assert any(role == 0 and path == '/echo' and not private for role, path, _, private in requests), requests
-    print(f'HTTP_LOOPBACK_PASS requests={len(requests)} cross_origin_credentials=0')
+    require('HTTP_TRANSPORT_PASS checks=53' in result.stderr,
+            'Zig transport fixture did not emit its completion marker')
+    with requests_lock:
+        observed = list(requests)
+    require(not any(private for role, _, _, private, _, _ in observed if role == 1),
+            f'cross-origin credentials or request body leaked: {observed!r}')
+    require(any(role == 0 and path == '/echo' and not private
+                for role, path, _, private, _, _ in observed),
+            f'cross-origin round trip did not remain public: {observed!r}')
+    require(any(role == 0 and path == '/post' and method == 'POST' and body_len == len(b'synthetic input')
+                for role, path, method, _, _, body_len in observed),
+            f'POST fixture did not receive the expected method and payload: {observed!r}')
+    require(any(role == 0 and path == '/head' and method == 'HEAD'
+                for role, path, method, _, _, _ in observed),
+            f'HEAD fixture did not receive a HEAD request: {observed!r}')
+    require(not any(path in ('/must-not-arrive', '/strict-target')
+                    for _, path, _, _, _, _ in observed),
+            f'locally rejected request reached a fixture server: {observed!r}')
+    require(any(role == 0 and path == '/cross-strict' for role, path, _, _, _, _ in observed),
+            f'same-origin policy probe did not reach its initial origin: {observed!r}')
+    require(any(role == 0 and path == '/slow' for role, path, _, _, _, _ in observed),
+            f'deadline probe expired before reaching the slow fixture: {observed!r}')
+    require(any(path == '/encoding-policy' and len(encodings) == 1
+                and 'zstd' not in encodings[0].lower()
+                for _, path, _, _, encodings, _ in observed),
+            f'default encoding policy was not observed exactly once: {observed!r}')
+    require(any(path == '/identity' and len(encodings) == 1
+                and encodings[0].lower().strip() == 'identity'
+                for _, path, _, _, encodings, _ in observed),
+            f'identity encoding override was not observed exactly once: {observed!r}')
+    print(f'HTTP_LOOPBACK_PASS requests={len(observed)} cross_origin_credentials=0')
 finally:
     for server in servers:
         server.shutdown()

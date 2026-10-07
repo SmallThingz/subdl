@@ -18,26 +18,34 @@ vx: vaxis.Vaxis,
 timers: std.ArrayList(vxfw.Tick),
 wants_focus: ?vxfw.Widget,
 
+test "cell pixel size is defined before the initial winsize" {
+    try std.testing.expectEqual(@as(u16, 0), cellPixelSize(0, 0));
+    try std.testing.expectEqual(@as(u16, 0), cellPixelSize(120, 0));
+    try std.testing.expectEqual(@as(u16, 8), cellPixelSize(640, 80));
+}
+
 /// Runtime options
 pub const Options = struct {
     /// Frames per second
     framerate: u8 = 60,
 };
 
-/// Create an application. We require stable pointers to do the set up, so this will create an App
-/// object on the heap. Call destroy when the app is complete to reset terminal state and release
-/// resources
+/// Create an application. Keep the returned value at a stable address while it
+/// is running, and call `deinit` to reset terminal state and release resources.
 pub fn init(io: std.Io, allocator: Allocator, env_map: *std.process.Environ.Map, buffer: []u8) !App {
+    var tty = try vaxis.Tty.init(io, buffer);
+    errdefer tty.deinit();
+    const vx = try vaxis.init(io, allocator, env_map, .{
+        .system_clipboard_allocator = allocator,
+        .kitty_keyboard_flags = .{
+            .report_events = true,
+        },
+    });
     return .{
         .io = io,
         .allocator = allocator,
-        .tty = try vaxis.Tty.init(io, buffer),
-        .vx = try vaxis.init(io, allocator, env_map, .{
-            .system_clipboard_allocator = allocator,
-            .kitty_keyboard_flags = .{
-                .report_events = true,
-            },
-        }),
+        .tty = tty,
+        .vx = vx,
         .timers = .empty,
         .wants_focus = null,
     };
@@ -54,13 +62,13 @@ pub fn run(self: *App, widget: vxfw.Widget, opts: Options) anyerror!void {
     const vx = &self.vx;
 
     var loop: EventLoop = .init(self.io, tty, vx);
+    // Queue lifecycle events before the input producer starts. Terminal setup
+    // below may take up to the query timeout; without this ordering, keyboard
+    // or resize events can overtake widget initialization in the FIFO.
+    try loop.postEvent(.init);
+    try loop.postEvent(.focus_in);
     try loop.start();
     defer loop.stop();
-
-    // Send the init event
-    try loop.postEvent(.init);
-    // Also always initialize the app with a focus event
-    try loop.postEvent(.focus_in);
 
     try vx.enterAltScreen(tty.writer());
     try vx.queryTerminal(tty.writer(), .fromSeconds(1));
@@ -71,13 +79,32 @@ pub fn run(self: *App, widget: vxfw.Widget, opts: Options) anyerror!void {
     // a signal handler for the tty. We wait to installResizeHandler the
     // loop until we know if we need this handler. We don't need it if the
     // terminal supports in-band-resize.
-    const use_signal_resize = !vx.state.in_band_resize;
-    if (use_signal_resize) try loop.installResizeHandler();
-    defer if (use_signal_resize) loop.uninstallResizeHandler();
+    const use_signal_resize = !vx.state.in_band_resize.load(.acquire);
+    if (use_signal_resize) {
+        try loop.installResizeHandler();
+        // The input task may discover in-band resize after the load above but
+        // before fallback registration begins. Its early uninstall then sees
+        // no registration, so close that interleaving with a post-install
+        // acquire check. A later discovery removes the installed handler from
+        // the input task itself.
+        if (vx.state.in_band_resize.load(.acquire))
+            loop.uninstallResizeHandler();
+    }
+    defer if (use_signal_resize) {
+        // The input task can unregister after discovering in-band resize. Join
+        // it first so teardown cannot race that same per-loop registration.
+        loop.stop();
+        loop.uninstallResizeHandler();
+    };
 
     // NOTE: We don't use pixel mouse anywhere
     vx.caps.sgr_pixels = false;
     try vx.setMouseMode(tty.writer(), true);
+
+    // Establish a usable layout before init/focus handlers can request the
+    // first redraw. The input thread also reports later size changes, but its
+    // initial event is asynchronous (and Windows may not emit one at all).
+    try vx.resize(self.allocator, tty.writer(), try tty.getWinsize());
 
     vxfw.DrawContext.init(vx.screen.width_method);
 
@@ -108,7 +135,10 @@ pub fn run(self: *App, widget: vxfw.Widget, opts: Options) anyerror!void {
         .redraw = false,
         .quit = false,
     };
-    defer ctx.cmds.deinit(self.allocator);
+    defer {
+        for (ctx.cmds.items) |cmd| cmd.deinit(self.allocator);
+        ctx.cmds.deinit(self.allocator);
+    }
 
     while (true) {
         const now = std.Io.Timestamp.now(self.io, .awake);
@@ -225,11 +255,15 @@ fn doLayout(
             .height = @intCast(vx.screen.height),
         },
         .cell_size = .{
-            .width = vx.screen.width_pix / vx.screen.width,
-            .height = vx.screen.height_pix / vx.screen.height,
+            .width = cellPixelSize(vx.screen.width_pix, vx.screen.width),
+            .height = cellPixelSize(vx.screen.height_pix, vx.screen.height),
         },
     };
     return widget.draw(draw_context);
+}
+
+fn cellPixelSize(pixels: u16, cells: u16) u16 {
+    return if (cells == 0) 0 else pixels / cells;
 }
 
 fn render(
@@ -260,14 +294,16 @@ fn addTick(self: *App, tick: vxfw.Tick) Allocator.Error!void {
 }
 
 fn handleCommand(self: *App, cmds: *vxfw.CommandList) Allocator.Error!void {
-    defer cmds.clearRetainingCapacity();
+    defer {
+        for (cmds.items) |cmd| cmd.deinit(self.allocator);
+        cmds.clearRetainingCapacity();
+    }
     for (cmds.items) |cmd| {
         switch (cmd) {
             .tick => |tick| try self.addTick(tick),
             .set_mouse_shape => |shape| self.vx.setMouseShape(shape),
             .request_focus => |widget| self.wants_focus = widget,
             .copy_to_clipboard => |content| {
-                defer self.allocator.free(content);
                 self.vx.copyToSystemClipboard(self.tty.writer(), content, self.allocator) catch |err| {
                     switch (err) {
                         error.OutOfMemory => return Allocator.Error.OutOfMemory,
@@ -276,7 +312,6 @@ fn handleCommand(self: *App, cmds: *vxfw.CommandList) Allocator.Error!void {
                 };
             },
             .set_title => |title| {
-                defer self.allocator.free(title);
                 self.vx.setTitle(self.tty.writer(), title) catch |err| {
                     std.log.err("set_title error: {}", .{err});
                 };
@@ -286,11 +321,6 @@ fn handleCommand(self: *App, cmds: *vxfw.CommandList) Allocator.Error!void {
                 self.vx.notify(self.tty.writer(), notification.title, notification.body) catch |err| {
                     std.log.err("notify error: {}", .{err});
                 };
-                const alloc = self.allocator;
-                if (notification.title) |title| {
-                    alloc.free(title);
-                }
-                alloc.free(notification.body);
             },
             .query_color => |kind| {
                 self.vx.queryColor(self.tty.writer(), kind) catch |err| {
@@ -408,9 +438,9 @@ const MouseHandler = struct {
             }
         }
 
-        // Store a copy of this hit list for next frame
-        app.allocator.free(self.last_hit_list);
-        self.last_hit_list = try app.allocator.dupe(vxfw.HitResult, hits.items);
+        // Store a copy of this hit list for next frame. Allocate first so an
+        // out-of-memory error leaves the previous hover state valid.
+        try self.replaceHitList(app.allocator, hits.items);
     }
 
     fn handleMouse(self: *MouseHandler, app: *App, ctx: *vxfw.EventContext, mouse: vaxis.Mouse) anyerror!void {
@@ -471,9 +501,9 @@ const MouseHandler = struct {
                 }
             }
 
-            // Store a copy of this hit list for next frame
-            app.allocator.free(self.last_hit_list);
-            self.last_hit_list = try app.allocator.dupe(vxfw.HitResult, hits.items);
+            // Store a copy of this hit list for next frame. Allocate first so an
+            // out-of-memory error leaves the previous hover state valid.
+            try self.replaceHitList(app.allocator, hits.items);
         }
 
         const target = hits.pop() orelse return;
@@ -517,10 +547,23 @@ const MouseHandler = struct {
 
     /// sends .mouse_leave to all of the widgets from the last_hit_list
     fn mouseExit(self: *MouseHandler, app: *App, ctx: *vxfw.EventContext) anyerror!void {
-        for (self.last_hit_list) |item| {
+        // Detach the old list before invoking user callbacks. This makes focus
+        // loss idempotent and keeps the state cleared even if a callback fails.
+        const previous = self.last_hit_list;
+        self.last_hit_list = &.{};
+        self.mouse = null;
+        defer app.allocator.free(previous);
+        for (previous) |item| {
             try item.widget.handleEvent(ctx, .mouse_leave);
             try app.handleCommand(&ctx.cmds);
         }
+    }
+
+    fn replaceHitList(self: *MouseHandler, allocator: Allocator, next: []const vxfw.HitResult) Allocator.Error!void {
+        const replacement = try allocator.dupe(vxfw.HitResult, next);
+        const previous = self.last_hit_list;
+        self.last_hit_list = replacement;
+        allocator.free(previous);
     }
 };
 
@@ -947,6 +990,120 @@ test "MouseHandler: negative coordinates leave the hovered widget" {
     try testing.expectEqual(2, test_widget.mouse_events);
     try testing.expectEqual(2, test_widget.mouse_enters);
     try testing.expectEqual(2, test_widget.mouse_leaves);
+}
+
+test "MouseHandler hit-list replacement preserves state on allocation failure" {
+    const testing = std.testing;
+    var userdata: u8 = 0;
+    const TestWidget = struct {
+        fn handle(_: *anyopaque, _: *vxfw.EventContext, _: vxfw.Event) anyerror!void {}
+        fn draw(_: *anyopaque, _: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
+            unreachable;
+        }
+    };
+    const widget: Widget = .{
+        .userdata = &userdata,
+        .eventHandler = TestWidget.handle,
+        .drawFn = TestWidget.draw,
+    };
+    const original = vxfw.HitResult{ .local = .{ .row = 1, .col = 2 }, .widget = widget };
+    const replacement = vxfw.HitResult{ .local = .{ .row = 3, .col = 4 }, .widget = widget };
+
+    var handler = MouseHandler.init(widget);
+    handler.last_hit_list = try testing.allocator.dupe(vxfw.HitResult, &.{original});
+    defer handler.deinit(testing.allocator);
+    const original_ptr = handler.last_hit_list.ptr;
+
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        handler.replaceHitList(failing.allocator(), &.{replacement}),
+    );
+    try testing.expectEqual(original_ptr, handler.last_hit_list.ptr);
+    try testing.expectEqualDeep(original, handler.last_hit_list[0]);
+}
+
+test "MouseHandler focus exit clears hover state exactly once, including callback failure" {
+    const testing = std.testing;
+    const TestWidget = struct {
+        leaves: usize = 0,
+        fail: bool = false,
+
+        fn handle(userdata: *anyopaque, _: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(userdata));
+            if (event != .mouse_leave) return;
+            self.leaves += 1;
+            if (self.fail) return error.LeaveFailed;
+        }
+
+        fn draw(_: *anyopaque, _: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
+            unreachable;
+        }
+    };
+
+    var app: App = .{
+        .io = testing.io,
+        .allocator = testing.allocator,
+        .tty = undefined,
+        .vx = undefined,
+        .timers = .empty,
+        .wants_focus = null,
+    };
+    defer app.timers.deinit(testing.allocator);
+    var ctx: vxfw.EventContext = .{
+        .io = testing.io,
+        .alloc = testing.allocator,
+        .phase = .capturing,
+        .cmds = .empty,
+        .consume_event = false,
+        .redraw = false,
+        .quit = false,
+    };
+    defer ctx.cmds.deinit(testing.allocator);
+    const mouse: vaxis.Mouse = .{
+        .row = 0,
+        .col = 0,
+        .button = .none,
+        .mods = .{},
+        .type = .motion,
+    };
+
+    var normal_widget_state: TestWidget = .{};
+    const normal_widget: Widget = .{
+        .userdata = &normal_widget_state,
+        .eventHandler = TestWidget.handle,
+        .drawFn = TestWidget.draw,
+    };
+    var normal = MouseHandler.init(normal_widget);
+    defer normal.deinit(testing.allocator);
+    normal.mouse = mouse;
+    normal.last_hit_list = try testing.allocator.dupe(vxfw.HitResult, &.{.{
+        .local = .{ .row = 0, .col = 0 },
+        .widget = normal_widget,
+    }});
+    try normal.mouseExit(&app, &ctx);
+    try normal.mouseExit(&app, &ctx);
+    try testing.expectEqual(1, normal_widget_state.leaves);
+    try testing.expectEqual(0, normal.last_hit_list.len);
+    try testing.expect(normal.mouse == null);
+
+    var failing_widget_state: TestWidget = .{ .fail = true };
+    const failing_widget: Widget = .{
+        .userdata = &failing_widget_state,
+        .eventHandler = TestWidget.handle,
+        .drawFn = TestWidget.draw,
+    };
+    var failing = MouseHandler.init(failing_widget);
+    defer failing.deinit(testing.allocator);
+    failing.mouse = mouse;
+    failing.last_hit_list = try testing.allocator.dupe(vxfw.HitResult, &.{.{
+        .local = .{ .row = 0, .col = 0 },
+        .widget = failing_widget,
+    }});
+    try testing.expectError(error.LeaveFailed, failing.mouseExit(&app, &ctx));
+    try testing.expectEqual(1, failing_widget_state.leaves);
+    try testing.expectEqual(0, failing.last_hit_list.len);
+    try testing.expect(failing.mouse == null);
 }
 
 test {

@@ -54,31 +54,17 @@ pub const TIFF = struct {
             const tag: TagField = tags_map.get(key.*).?;
             switch (key.*) {
                 .image_width => {
-                    bitmap.image_width = tag.toLongOrShort(endianess);
+                    bitmap.image_width = try tag.toLongOrShort(endianess);
                 },
                 .image_height => {
-                    bitmap.image_height = tag.toLongOrShort(endianess);
+                    bitmap.image_height = try tag.toLongOrShort(endianess);
                 },
                 .compression => {
-                    bitmap.compression = @enumFromInt(tag.toShort(endianess));
+                    const value = try tag.toShort(endianess);
+                    bitmap.compression = std.enums.fromInt(types.CompressionType, value) orelse return Image.ReadError.InvalidData;
                 },
-                .color_map => {
-                    // get color_map data: TIFF stores components as 16-bit values
-                    // and stores each component first.
-                    // RRRRRRRRRR
-                    // GGGGGGGGGG
-                    // BBBBBBBBBB
-                    const palette = try tag.readTagData(allocator, read_stream, endianess);
-                    defer allocator.free(palette);
-                    const num_colors: u16 = std.math.pow(u16, 2, bitmap.bits_per_sample.data[0]);
-
-                    var color_map = &bitmap.color_map;
-                    color_map.resize(num_colors);
-                    for (0..num_colors) |color_index| {
-                        // TIFF colors are stored as 16-bit components
-                        color_map.data[color_index] = color.Rgba32.from.rgb(@truncate(palette[color_index] / 256), @truncate(palette[color_index + num_colors] / 256), @truncate(palette[color_index + num_colors * 2] / 256));
-                    }
-                },
+                // Parsed after the unordered tag walk, once bits_per_sample is known.
+                .color_map => {},
                 .strip_byte_counts => {
                     bitmap.strip_byte_counts = try tag.readTagData(allocator, read_stream, endianess);
                 },
@@ -86,28 +72,32 @@ pub const TIFF = struct {
                     bitmap.strip_offsets = try tag.readTagData(allocator, read_stream, endianess);
                 },
                 .rows_per_strip => {
-                    bitmap.rows_per_strip = tag.toLongOrShort(endianess);
+                    bitmap.rows_per_strip = try tag.toLongOrShort(endianess);
                 },
                 .photometric_interpretation => {
-                    bitmap.photometric_interpretation = tag.toShort(endianess);
+                    bitmap.photometric_interpretation = try tag.toShort(endianess);
                 },
                 .samples_per_pixel => {
-                    bitmap.samples_per_pixel = tag.toShort(endianess);
+                    bitmap.samples_per_pixel = try tag.toShort(endianess);
                 },
                 .resolution_unit => {
-                    bitmap.resolution_unit = @enumFromInt(tag.toShort(endianess));
+                    const value = try tag.toShort(endianess);
+                    bitmap.resolution_unit = std.enums.fromInt(types.ResolutionUnit, value) orelse return Image.ReadError.InvalidData;
                 },
                 .new_subfile_type => {
-                    bitmap.new_subfile_type = tag.toLong();
+                    bitmap.new_subfile_type = try tag.toLong();
                 },
                 .bits_per_sample => {
                     var bits_per_sample = &bitmap.bits_per_sample;
-                    bits_per_sample.resize(tag.data_count);
                     switch (tag.data_count) {
-                        1 => bits_per_sample.data[0] = tag.toShort(endianess),
+                        1 => {
+                            bits_per_sample.resize(1);
+                            bits_per_sample.data[0] = try tag.toShort(endianess);
+                        },
                         3, 4 => {
                             const components_bits_per_sample = try tag.readTagData(allocator, read_stream, endianess);
                             defer allocator.free(components_bits_per_sample);
+                            bits_per_sample.resize(tag.data_count);
                             for (0..tag.data_count) |index| {
                                 bits_per_sample.data[index] = @truncate(components_bits_per_sample[index]);
                             }
@@ -117,9 +107,11 @@ pub const TIFF = struct {
                 },
                 .extra_samples => {
                     var extra_samples = &bitmap.extra_samples;
-                    extra_samples.resize(tag.data_count);
                     switch (tag.data_count) {
-                        1 => extra_samples.data[0] = tag.toShort(endianess),
+                        1 => {
+                            extra_samples.resize(1);
+                            extra_samples.data[0] = try tag.toShort(endianess);
+                        },
                         else => return Image.Error.Unsupported,
                     }
                 },
@@ -130,16 +122,39 @@ pub const TIFF = struct {
                     bitmap.y_resolution = try tag.readRational(read_stream, endianess);
                 },
                 .planar_configuration => {
-                    bitmap.planar_configuration = tag.toShort(endianess);
+                    bitmap.planar_configuration = try tag.toShort(endianess);
                 },
                 .predictor => {
-                    bitmap.predictor = tag.toShort(endianess);
+                    bitmap.predictor = try tag.toShort(endianess);
                 },
                 else => {
                     // skip optional tags
                 },
             }
         }
+
+        if (tags_map.get(.color_map)) |tag| {
+            const bits = bitmap.bits_per_sample.data[0];
+            if (bits > 8) return Image.Error.Unsupported;
+
+            const num_colors = @as(usize, 1) << @intCast(bits);
+            const expected_count = std.math.mul(usize, num_colors, 3) catch return Image.ReadError.InvalidData;
+            const palette = try tag.readTagData(allocator, read_stream, endianess);
+            defer allocator.free(palette);
+            if (palette.len != expected_count) return Image.ReadError.InvalidData;
+
+            var color_map = &bitmap.color_map;
+            color_map.resize(num_colors);
+            for (0..num_colors) |color_index| {
+                // TIFF stores all 16-bit red, green, then blue components.
+                color_map.data[color_index] = color.Rgba32.from.rgb(@truncate(palette[color_index] / 256), @truncate(palette[color_index + num_colors] / 256), @truncate(palette[color_index + num_colors * 2] / 256));
+            }
+        } else if (bitmap.photometric_interpretation == 3) {
+            return Image.ReadError.InvalidData;
+        }
+
+        // The TIFF default is one strip containing the whole image.
+        if (!tags_map.contains(.rows_per_strip)) bitmap.rows_per_strip = bitmap.image_height;
     }
 
     pub fn uncompressDeflate(_: *TIFF, read_stream: *io.ReadStream, dest_buffer: []u8) !void {
@@ -192,18 +207,22 @@ pub const TIFF = struct {
         };
     }
 
-    pub fn calRowByteSize(self: *TIFF) !usize {
+    pub fn calRowByteSize(self: *TIFF) Image.ReadError!usize {
         const bitmap = &self.bitmap;
+        const sample_count = std.math.cast(usize, bitmap.samples_per_pixel) orelse return Image.ReadError.InvalidData;
+        if (sample_count == 0 or sample_count > bitmap.bits_per_sample.data.len) return Image.ReadError.InvalidData;
+
         var total_bits: usize = 0;
 
-        for (0..bitmap.samples_per_pixel) |index| {
-            total_bits += bitmap.bits_per_sample.data[index];
+        for (bitmap.bits_per_sample.data[0..sample_count]) |bits| {
+            total_bits = std.math.add(usize, total_bits, @as(usize, bits)) catch return Image.ReadError.InvalidData;
         }
 
+        const pixel_width = std.math.cast(usize, bitmap.image_width) orelse return Image.ReadError.InvalidData;
         if (total_bits == 1) {
-            return bitmap.image_width >> 3;
-        } else if (total_bits >= 8) {
-            return bitmap.image_width * (total_bits / 8);
+            return pixel_width / 8 + @intFromBool(pixel_width % 8 != 0);
+        } else if (total_bits >= 8 and total_bits % 8 == 0) {
+            return std.math.mul(usize, pixel_width, total_bits / 8) catch return Image.ReadError.InvalidData;
         }
 
         return Image.Error.Unsupported;
@@ -211,35 +230,44 @@ pub const TIFF = struct {
 
     pub fn readStrips(self: *TIFF, allocator: std.mem.Allocator, read_stream: *io.ReadStream, pixel_storage: *color.PixelStorage) Image.ReadError!void {
         const bitmap = &self.bitmap;
-        const total_strips = (bitmap.image_height + bitmap.rows_per_strip - 1) / bitmap.rows_per_strip;
-        const byte_counts_array = bitmap.strip_byte_counts.?;
-        const offsets_array = bitmap.strip_offsets.?;
-        const image_width = bitmap.image_width;
-        const image_height = bitmap.image_height;
-        const rows_per_strip = @min(bitmap.rows_per_strip, bitmap.image_height);
+        const image_width = std.math.cast(usize, bitmap.image_width) orelse return Image.ReadError.InvalidData;
+        const image_height = std.math.cast(usize, bitmap.image_height) orelse return Image.ReadError.InvalidData;
+        const rows_per_strip = std.math.cast(usize, bitmap.rows_per_strip) orelse return Image.ReadError.InvalidData;
+        if (image_width == 0 or image_height == 0 or rows_per_strip == 0) return Image.ReadError.InvalidData;
+
+        const total_strips = 1 + (image_height - 1) / rows_per_strip;
+        const byte_counts_array = bitmap.strip_byte_counts orelse return Image.ReadError.InvalidData;
+        const offsets_array = bitmap.strip_offsets orelse return Image.ReadError.InvalidData;
+        if (byte_counts_array.len < total_strips or offsets_array.len < total_strips) return Image.ReadError.InvalidData;
+
+        const pixel_count = std.math.mul(usize, image_width, image_height) catch return Image.ReadError.InvalidData;
+        if (pixel_storage.len() != pixel_count) return Image.ReadError.InvalidData;
+
         const photometric_interpretation = bitmap.photometric_interpretation;
         const predictor = bitmap.predictor;
         const compression = bitmap.compression;
-        const row_remainder = image_height % rows_per_strip;
-        // Note: not sure why but row_per_strip may be bigger than the image_height
-        const last_strip_row_count = if (image_height > rows_per_strip and row_remainder > 0) row_remainder else rows_per_strip;
         const row_byte_size = try self.calRowByteSize();
         const reader = read_stream.reader();
 
         for (0..total_strips) |index| {
-            // last strip may have less rows than rows_per_strip
-            const current_row_size = if (total_strips > 1 and index < total_strips - 1) rows_per_strip else last_strip_row_count;
-            const byte_count = current_row_size * row_byte_size;
+            const row_start = std.math.mul(usize, index, rows_per_strip) catch return Image.ReadError.InvalidData;
+            if (row_start >= image_height) return Image.ReadError.InvalidData;
+            const current_row_size = @min(rows_per_strip, image_height - row_start);
+            const byte_count = std.math.mul(usize, current_row_size, row_byte_size) catch return Image.ReadError.InvalidData;
             const compressed_byte_count = byte_counts_array[index];
+            const compressed_byte_count_usize = std.math.cast(usize, compressed_byte_count) orelse return Image.ReadError.InvalidData;
             const offset = offsets_array[index];
+            var pixel_index = std.math.mul(usize, row_start, image_width) catch return Image.ReadError.InvalidData;
             // allocate buffer for the uncompressed strip_buffer
             const strip_buffer: []u8 = try allocator.alloc(u8, byte_count);
-            var pixel_index = index * rows_per_strip * image_width;
             defer allocator.free(strip_buffer);
             _ = try read_stream.seekTo(offset);
 
             switch (compression) {
-                .uncompressed => _ = try reader.readSliceShort(strip_buffer[0..]),
+                .uncompressed => {
+                    if (compressed_byte_count_usize < byte_count) return Image.ReadError.InvalidData;
+                    try reader.readSliceAll(strip_buffer);
+                },
                 .packbits => _ = try packbits.decode(read_stream, strip_buffer, compressed_byte_count),
                 .ccitt_rle => _ = try self.uncompressCCITT(read_stream, strip_buffer, image_width, current_row_size),
                 .lzw => try self.uncompressLZW(allocator, read_stream, strip_buffer, compressed_byte_count),
@@ -249,14 +277,14 @@ pub const TIFF = struct {
 
             blk: switch (pixel_storage.*) {
                 .grayscale1 => |pixels| {
-                    for (0..byte_count) |strip_index| {
-                        const byte = strip_buffer[strip_index];
-                        for (0..8) |bit_index| {
-                            const value: u1 = @truncate(byte >> @intCast(@as(u3, 7) - bit_index) & 1);
+                    for (0..current_row_size) |strip_row| {
+                        const source_row_start = strip_row * row_byte_size;
+                        const source_row = strip_buffer[source_row_start..][0..row_byte_size];
+                        for (0..image_width) |column| {
+                            const bit_shift: u3 = @intCast(7 - column % 8);
+                            const value: u1 = @truncate(source_row[column / 8] >> bit_shift);
                             pixels[pixel_index].value = if (photometric_interpretation == 1) value else value ^ 1;
                             pixel_index += 1;
-                            if (pixel_index >= pixels.len)
-                                break :blk;
                         }
                     }
                 },
@@ -331,6 +359,7 @@ pub const TIFF = struct {
             .version = try reader.takeInt(u16, self.endianess),
             .idf_offset = try reader.takeInt(u32, self.endianess),
         };
+        if (self.header.version != 42) return Image.ReadError.InvalidData;
 
         self.bitmap = BitmapDescriptor{};
 
@@ -345,7 +374,12 @@ pub const TIFF = struct {
 
         const pixel_format = try self.bitmap.guessPixelFormat();
 
-        var pixels = try color.PixelStorage.init(allocator, pixel_format, self.bitmap.image_width * self.bitmap.image_height);
+        const image_width = std.math.cast(usize, self.bitmap.image_width) orelse return Image.ReadError.InvalidData;
+        const image_height = std.math.cast(usize, self.bitmap.image_height) orelse return Image.ReadError.InvalidData;
+        if (image_width == 0 or image_height == 0) return Image.ReadError.InvalidData;
+        const pixel_count = std.math.mul(usize, image_width, image_height) catch return Image.ReadError.InvalidData;
+
+        var pixels = try color.PixelStorage.init(allocator, pixel_format, pixel_count);
         errdefer pixels.deinit(allocator);
 
         switch (pixels) {

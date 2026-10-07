@@ -50,25 +50,29 @@ pub const Scraper = struct {
         return .{ .allocator = allocator, .client = client, .language_code = "en" };
     }
 
+    /// Explicit unsupported languages are rejected by search before network access.
     pub fn initWithLanguage(allocator: Allocator, client: *std.http.Client, language_code: []const u8) Scraper {
         return .{
             .allocator = allocator,
             .client = client,
-            .language_code = providerLanguageCode(language_code) orelse "en",
+            .language_code = providerLanguageCode(language_code) orelse "",
         };
     }
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
+        const language = providerLanguageCode(self.language_code) orelse return error.UnsupportedLanguage;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
 
         const parsed_query = parseQuery(query);
         if (parsed_query.title.len < 2) return .{ .arena = arena, .items = &.{} };
+        const wanted = try common.normalizeTitle(a, parsed_query.title);
+        if (wanted.len == 0) return .{ .arena = arena, .items = &.{} };
 
         const response = try fetchSearch(self.client, a, query);
         const records = try parseRecords(a, response.body);
-        const items = try buildSearchItems(a, records, query, parsed_query, self.language_code);
+        const items = try buildSearchItems(a, records, query, parsed_query, language);
         return .{ .arena = arena, .items = items };
     }
 
@@ -77,19 +81,22 @@ pub const Scraper = struct {
         item: SearchItem,
         requested_language: []const u8,
     ) !SubtitlesResponse {
+        const language = providerLanguageCode(requested_language) orelse return error.UnsupportedLanguage;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
 
         const response = try fetchSearch(self.client, a, item.search_query);
         const records = try parseRecords(a, response.body);
-        const language = providerLanguageCode(requested_language) orelse "en";
 
         var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
+        var seen_ids = std.AutoHashMapUnmanaged(i64, void).empty;
         for (records) |record| {
             if (subtitles.items.len >= max_subtitle_items) break;
             if (!recordMatchesItem(record, item)) continue;
             if (!std.ascii.eqlIgnoreCase(record.language_code, language)) continue;
+            if (seen_ids.contains(record.id)) continue;
+            try seen_ids.put(a, record.id, {});
 
             try subtitles.append(a, .{
                 .language_code = try a.dupe(u8, record.language_code),
@@ -114,6 +121,8 @@ fn fetchSearch(client: *std.http.Client, allocator: Allocator, query: []const u8
         .accept = "application/xml,text/xml,text/plain,*/*",
         .max_attempts = 2,
         .require_public_origin = true,
+        .require_https = true,
+        .require_same_origin = true,
     });
 }
 
@@ -129,13 +138,15 @@ fn buildSearchItems(
     var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
 
     for (records) |record| {
-        if (exact.items.len + partial.items.len >= max_search_items * 4) break;
+        if (exact.items.len >= max_search_items and partial.items.len >= max_search_items) break;
         if (!std.ascii.eqlIgnoreCase(record.language_code, requested_language)) continue;
         const base_title = stripEpisodeSuffix(record.title, record.season, record.episode);
         const normalized = try common.normalizeTitle(allocator, base_title);
         const is_exact = wanted.len > 0 and std.mem.eql(u8, normalized, wanted);
-        const is_partial = wanted.len > 0 and std.mem.indexOf(u8, normalized, wanted) != null;
+        const is_partial = common.normalizedTitlesRelated(normalized, wanted);
         if (!is_exact and !is_partial) continue;
+        if ((is_exact and exact.items.len >= max_search_items) or
+            (!is_exact and partial.items.len >= max_search_items)) continue;
 
         const media_kind: MediaKind = if (parsed_query.episode != null or record.episode != null) .tv else .movie;
         const season = if (media_kind == .tv) parsed_query.season orelse record.season else null;
@@ -195,8 +206,16 @@ fn parseRecords(allocator: Allocator, body: []const u8) ![]const SubtitleRecord 
     var records: std.ArrayListUnmanaged(SubtitleRecord) = .empty;
     var cursor: usize = 0;
     while (findIgnoreCase(body[cursor..], "<subtitle>")) |relative_start| {
-        const start = cursor + relative_start + "<subtitle>".len;
-        const relative_end = findIgnoreCase(body[start..], "</subtitle>") orelse break;
+        const marker_start = cursor + relative_start;
+        const start = marker_start + "<subtitle>".len;
+        const relative_end = findIgnoreCase(body[start..], "</subtitle>") orelse {
+            cursor = start;
+            continue;
+        };
+        if (findIgnoreCase(body[start .. start + relative_end], "<subtitle>")) |nested_start| {
+            cursor = start + nested_start;
+            continue;
+        }
         const block = body[start .. start + relative_end];
         cursor = start + relative_end + "</subtitle>".len;
 
@@ -270,6 +289,7 @@ fn parseRecordSeasonEpisode(value: []const u8) SeasonEpisode {
     while (i < value.len) : (i += 1) {
         if (!std.ascii.isDigit(value[i])) continue;
         const season_start = i;
+        if (season_start > 0 and std.ascii.isAlphanumeric(value[season_start - 1])) continue;
         var cursor = i;
         while (cursor < value.len and std.ascii.isDigit(value[cursor]) and cursor - season_start < 2) : (cursor += 1) {}
         if (cursor == season_start or cursor >= value.len or std.ascii.toLower(value[cursor]) != 'x') continue;
@@ -278,6 +298,7 @@ fn parseRecordSeasonEpisode(value: []const u8) SeasonEpisode {
         const episode_start = cursor;
         while (cursor < value.len and std.ascii.isDigit(value[cursor]) and cursor - episode_start < 3) : (cursor += 1) {}
         if (cursor == episode_start) continue;
+        if (cursor < value.len and std.ascii.isAlphanumeric(value[cursor])) continue;
         const episode = std.fmt.parseInt(u16, value[episode_start..cursor], 10) catch continue;
         return .{ .season = season, .episode = episode, .marker_start = season_start };
     }
@@ -352,6 +373,36 @@ fn decodeEntities(allocator: Allocator, input: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+test "napisy24 rejects explicit invalid language before network access" {
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.Io.failing };
+    defer client.deinit();
+    const item: SearchItem = .{
+        .title = "Avatar",
+        .year = 2009,
+        .media_kind = .movie,
+        .imdb_id = "tt0499549",
+        .season = null,
+        .episode = null,
+        .search_query = "Avatar",
+        .page_url = site,
+    };
+    var default_scraper = Scraper.init(std.testing.allocator, &client);
+    try std.testing.expectEqualStrings("en", default_scraper.language_code);
+    for ([_][]const u8{ "not-a-language", "" }) |language| {
+        var scraper = Scraper.initWithLanguage(std.testing.allocator, &client, language);
+        try std.testing.expectError(error.UnsupportedLanguage, scraper.search("Avatar"));
+        try std.testing.expectError(error.UnsupportedLanguage, default_scraper.fetchSubtitlesBySearchItem(item, language));
+    }
+    for ([_]struct { input: []const u8, expected: []const u8 }{
+        .{ .input = "eng", .expected = "en" },
+        .{ .input = "pol", .expected = "pl" },
+        .{ .input = "PL", .expected = "pl" },
+    }) |case| {
+        const scraper = Scraper.initWithLanguage(std.testing.allocator, &client, case.input);
+        try std.testing.expectEqualStrings(case.expected, scraper.language_code);
+    }
+}
+
 test "napisy24 parses movie and episode queries" {
     const movie = parseQuery("Avatar");
     try std.testing.expectEqualStrings("Avatar", movie.title);
@@ -378,11 +429,60 @@ test "napisy24 parses record fragments and groups title results" {
     try std.testing.expectEqualStrings("tt0499549", items[0].imdb_id);
 }
 
+test "napisy24 partial cap does not hide a later exact title match" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const records = try a.alloc(SubtitleRecord, max_search_items * 4 + 1);
+    for (records[0 .. records.len - 1], 0..) |*record, index| {
+        record.* = .{
+            .id = @intCast(index + 1),
+            .title = "Avatar extended",
+            .imdb_id = "",
+            .year = 2000 + @as(i64, @intCast(index)),
+            .language_code = "en",
+            .release_name = "partial",
+            .season = null,
+            .episode = null,
+        };
+    }
+    records[records.len - 1] = .{
+        .id = @intCast(records.len),
+        .title = "Avatar",
+        .imdb_id = "tt0499549",
+        .year = 2009,
+        .language_code = "en",
+        .release_name = "exact",
+        .season = null,
+        .episode = null,
+    };
+
+    const items = try buildSearchItems(a, records, "Avatar", parseQuery("Avatar"), "en");
+    try std.testing.expectEqual(@as(usize, max_search_items), items.len);
+    try std.testing.expectEqualStrings("Avatar", items[0].title);
+    try std.testing.expectEqualStrings("tt0499549", items[0].imdb_id);
+}
+
+test "napisy24 record scanner recovers after a malformed leading record" {
+    const fixture =
+        "<subtitle><id>broken</id>" ++
+        "<subtitle><id>42</id><title>Avatar</title><imdb>tt0499549</imdb>" ++
+        "<year>2009</year><release>WEB-DL</release><language>en</language></subtitle>";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const records = try parseRecords(arena.allocator(), fixture);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqual(@as(i64, 42), records[0].id);
+    try std.testing.expectEqualStrings("Avatar", records[0].title);
+}
+
 test "napisy24 strips 1x01 episode suffix" {
     const se = parseRecordSeasonEpisode("Breaking Bad 1x01");
     try std.testing.expectEqual(@as(?u16, 1), se.season);
     try std.testing.expectEqual(@as(?u16, 1), se.episode);
     try std.testing.expectEqualStrings("Breaking Bad", stripEpisodeSuffix("Breaking Bad 1x01", se.season, se.episode));
+    try std.testing.expectEqual(@as(?u16, null), parseRecordSeasonEpisode("Release101x01").episode);
+    try std.testing.expectEqual(@as(?u16, null), parseRecordSeasonEpisode("Release 1x0123").episode);
 }
 
 test "napisy24 decodes named and numeric entities" {

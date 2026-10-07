@@ -647,8 +647,13 @@ test "Should import raw pixels and take ownership of the pixel data" {
         Colors(color.Rgb24).White,
     };
 
-    const pixel_data = std.mem.sliceAsBytes(color_data);
-    const image = try Image.fromRawPixelsOwned(8, 1, pixel_data, .rgb24);
+    const owned_colors = try helpers.zigimg_test_allocator.dupe(color.Rgb24, color_data);
+    const pixel_data = std.mem.sliceAsBytes(owned_colors);
+    var image = Image.fromRawPixelsOwned(8, 1, pixel_data, .rgb24) catch |err| {
+        helpers.zigimg_test_allocator.free(owned_colors);
+        return err;
+    };
+    defer image.deinit(helpers.zigimg_test_allocator);
 
     try helpers.expectEq(std.meta.activeTag(image.pixels), .rgb24);
     try helpers.expectEq(image.width, 8);
@@ -662,6 +667,19 @@ test "Should import raw pixels and take ownership of the pixel data" {
     try helpers.expectEq(image.pixels.rgb24[5], Colors(color.Rgb24).Yellow);
     try helpers.expectEq(image.pixels.rgb24[6], Colors(color.Rgb24).Black);
     try helpers.expectEq(image.pixels.rgb24[7], Colors(color.Rgb24).White);
+}
+
+test "Owned raw pixels preserve typed allocation alignment" {
+    const owned_pixels = try helpers.zigimg_test_allocator.alloc(color.Grayscale16, 1);
+    owned_pixels[0] = .{ .value = 0x1234 };
+
+    var image = Image.fromRawPixelsOwned(1, 1, std.mem.sliceAsBytes(owned_pixels), .grayscale16) catch |err| {
+        helpers.zigimg_test_allocator.free(owned_pixels);
+        return err;
+    };
+    defer image.deinit(helpers.zigimg_test_allocator);
+
+    try helpers.expectEq(image.pixels.grayscale16[0].value, 0x1234);
 }
 
 test "Should import raw pixels and create a copy of pixel data" {
@@ -692,6 +710,45 @@ test "Should import raw pixels and create a copy of pixel data" {
     try helpers.expectEq(image.pixels.rgb24[5], Colors(color.Rgb24).Yellow);
     try helpers.expectEq(image.pixels.rgb24[6], Colors(color.Rgb24).Black);
     try helpers.expectEq(image.pixels.rgb24[7], Colors(color.Rgb24).White);
+}
+
+test "Raw pixel imports reject malformed and unsupported input" {
+    var rgb_data = [_]u8{ 0, 0, 0 };
+
+    try std.testing.expectError(error.InvalidData, Image.fromRawPixelsOwned(0, 1, rgb_data[0..0], .rgb24));
+    try std.testing.expectError(error.InvalidData, Image.fromRawPixelsOwned(1, 1, rgb_data[0..2], .rgb24));
+    try std.testing.expectError(error.InvalidData, Image.fromRawPixelsOwned(std.math.maxInt(usize), 2, rgb_data[0..], .rgb24));
+    try std.testing.expectError(error.Unsupported, Image.fromRawPixelsOwned(1, 1, rgb_data[0..1], .indexed8));
+    try std.testing.expectError(error.Unsupported, Image.fromRawPixelsOwned(1, 1, rgb_data[0..1], .invalid));
+
+    try std.testing.expectError(error.InvalidData, Image.fromRawPixels(helpers.zigimg_test_allocator, 1, 1, rgb_data[0..2], .rgb24));
+    try std.testing.expectError(error.Unsupported, Image.Managed.fromRawPixels(helpers.zigimg_test_allocator, 1, 1, rgb_data[0..1], .indexed8));
+}
+
+test "Raw pixel storage rejects empty, incomplete, unaligned, and unsupported input" {
+    var empty: [0]u8 = .{};
+    var incomplete = [_]u8{ 0, 0 };
+    var aligned: [3]u8 align(2) = .{ 0, 0, 0 };
+    var unsupported = [_]u8{0};
+
+    try std.testing.expectError(error.InvalidData, color.PixelStorage.initRawPixels(empty[0..], .rgb24));
+    try std.testing.expectError(error.InvalidData, color.PixelStorage.initRawPixels(incomplete[0..], .rgb24));
+    try std.testing.expectError(error.InvalidData, color.PixelStorage.initRawPixels(aligned[1..3], .grayscale16));
+    try std.testing.expectError(error.Unsupported, color.PixelStorage.initRawPixels(unsupported[0..], .indexed8));
+}
+
+test "Image creation rejects invalid dimensions, overflow, and format" {
+    try std.testing.expectError(error.InvalidData, Image.create(helpers.zigimg_test_allocator, 0, 1, .rgb24));
+    try std.testing.expectError(error.InvalidData, Image.Managed.create(helpers.zigimg_test_allocator, std.math.maxInt(usize), 2, .rgb24));
+    try std.testing.expectError(error.Unsupported, Image.create(helpers.zigimg_test_allocator, 1, 1, .invalid));
+}
+
+test "Empty images have a zero row byte size" {
+    const image: Image = .{};
+    const managed_image = Image.Managed.init(helpers.zigimg_test_allocator);
+
+    try helpers.expectEq(image.rowByteSize(), 0);
+    try helpers.expectEq(managed_image.rowByteSize(), 0);
 }
 
 test "Image to Managed" {
@@ -761,10 +818,6 @@ test "Image.dupe()" {
         Colors(color.Rgb24).Black,
         Colors(color.Rgb24).Yellow,
         Colors(color.Rgb24).Magenta,
-        Colors(color.Rgb24).Cyan,
-        Colors(color.Rgb24).Blue,
-        Colors(color.Rgb24).Green,
-        Colors(color.Rgb24).Red,
     };
 
     const pixel_data = std.mem.sliceAsBytes(color_data);
@@ -784,7 +837,7 @@ test "Image.dupe()" {
 
     try image.animation.frames.append(helpers.zigimg_test_allocator, .{
         .duration = 12.3456,
-        .frame_width = 8,
+        .frame_width = 4,
         .frame_height = 1,
         .pixels = frame1_pixels,
     });
@@ -815,8 +868,24 @@ test "Image.dupe()" {
     try helpers.expectEq(duped_image.animation.frames.items[1].pixels.rgb24[1], Colors(color.Rgb24).Black);
     try helpers.expectEq(duped_image.animation.frames.items[1].pixels.rgb24[2], Colors(color.Rgb24).Yellow);
     try helpers.expectEq(duped_image.animation.frames.items[1].pixels.rgb24[3], Colors(color.Rgb24).Magenta);
-    try helpers.expectEq(duped_image.animation.frames.items[1].pixels.rgb24[4], Colors(color.Rgb24).Cyan);
-    try helpers.expectEq(duped_image.animation.frames.items[1].pixels.rgb24[5], Colors(color.Rgb24).Blue);
-    try helpers.expectEq(duped_image.animation.frames.items[1].pixels.rgb24[6], Colors(color.Rgb24).Green);
-    try helpers.expectEq(duped_image.animation.frames.items[1].pixels.rgb24[7], Colors(color.Rgb24).Red);
+}
+
+test "Image.dupe() preserves indexed palettes" {
+    var image = try Image.create(helpers.zigimg_test_allocator, 2, 1, .indexed2);
+    defer image.deinit(helpers.zigimg_test_allocator);
+
+    image.pixels.indexed2.indices[0] = 1;
+    image.pixels.indexed2.indices[1] = 3;
+    image.pixels.indexed2.palette[1] = Colors(color.Rgba32).Red;
+    image.pixels.indexed2.palette[3] = Colors(color.Rgba32).Blue;
+
+    var duplicate = try image.dupe(helpers.zigimg_test_allocator);
+    defer duplicate.deinit(helpers.zigimg_test_allocator);
+
+    try std.testing.expect(duplicate.pixels.indexed2.indices.ptr != image.pixels.indexed2.indices.ptr);
+    try std.testing.expect(duplicate.pixels.indexed2.palette.ptr != image.pixels.indexed2.palette.ptr);
+    try helpers.expectEq(duplicate.pixels.indexed2.indices[0], 1);
+    try helpers.expectEq(duplicate.pixels.indexed2.indices[1], 3);
+    try helpers.expectEq(duplicate.pixels.indexed2.palette[1], Colors(color.Rgba32).Red);
+    try helpers.expectEq(duplicate.pixels.indexed2.palette[3], Colors(color.Rgba32).Blue);
 }

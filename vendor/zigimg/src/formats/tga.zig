@@ -199,7 +199,10 @@ const TargaRLEDecoder = struct {
     fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const self: *TargaRLEDecoder = @alignCast(@fieldParentPtr("reader", reader));
 
-        var remaining: usize = @intFromEnum(limit);
+        const output_limit = @backingInt(limit);
+        if (output_limit == 0) return 0;
+
+        var remaining: usize = output_limit;
 
         state_machine: switch (self.state) {
             .read_header => {
@@ -230,7 +233,7 @@ const TargaRLEDecoder = struct {
                         self.state = .read_header;
                         continue :state_machine .read_header;
                     } else {
-                        return @intFromEnum(limit) - remaining;
+                        return output_limit - remaining;
                     }
                 } else {
                     self.state = .read_header;
@@ -241,6 +244,7 @@ const TargaRLEDecoder = struct {
                 if (self.wrote_repeat_data > 0 and self.wrote_repeat_data < self.repeat_data.len) {
                     const to_write = @min(self.repeat_data.len - self.wrote_repeat_data, remaining);
                     const written = try writer.write(self.repeat_data[self.wrote_repeat_data..(self.wrote_repeat_data + to_write)]);
+                    if (written == 0) return output_limit - remaining;
                     remaining -|= written;
 
                     if ((self.wrote_repeat_data + written) == self.repeat_data.len) {
@@ -255,10 +259,12 @@ const TargaRLEDecoder = struct {
                     const repeated_byte_count = try writer.writeSplat(&.{self.repeat_data}, effective_repeat_count);
                     if (repeated_byte_count > 0) {
                         self.repeat_count -|= repeated_byte_count / self.repeat_data.len;
+                        self.wrote_repeat_data = repeated_byte_count % self.repeat_data.len;
                         remaining -|= repeated_byte_count;
                     } else {
                         const to_write = @min(self.repeat_data.len - self.wrote_repeat_data, remaining);
                         const written = try writer.write(self.repeat_data[self.wrote_repeat_data..(self.wrote_repeat_data + to_write)]);
+                        if (written == 0) return output_limit - remaining;
                         remaining -|= written;
 
                         if ((self.wrote_repeat_data + written) == self.repeat_data.len) {
@@ -281,7 +287,7 @@ const TargaRLEDecoder = struct {
                         continue :state_machine .repeated;
                     }
                 } else {
-                    return @intFromEnum(limit) - remaining;
+                    return output_limit - remaining;
                 }
             },
         }
@@ -455,6 +461,19 @@ fn RLEStreamEncoder(comptime ColorType: type) type {
             else => @compileError("Not supported color format"),
         };
 
+        fn colorToInt(value: ColorType) IntType {
+            return switch (ColorType) {
+                color.Bgr24 => @as(u24, value.b) |
+                    (@as(u24, value.g) << 8) |
+                    (@as(u24, value.r) << 16),
+                color.Bgra32 => @as(u32, value.b) |
+                    (@as(u32, value.g) << 8) |
+                    (@as(u32, value.r) << 16) |
+                    (@as(u32, value.a) << 24),
+                else => unreachable,
+            };
+        }
+
         pub fn encode(self: *@This(), writer: *std.Io.Writer, value: ColorType) !void {
             if (self.rle_value == null) {
                 self.rle_value = value;
@@ -466,7 +485,7 @@ fn RLEStreamEncoder(comptime ColorType: type) type {
                 if (std.mem.eql(u8, std.mem.asBytes(&rle_value), std.mem.asBytes(&value))) {
                     self.length += 1;
                 } else {
-                    try RunLengthEncoderCommon.flush(IntType, writer, @as(IntType, @bitCast(rle_value)), self.length);
+                    try RunLengthEncoderCommon.flush(IntType, writer, colorToInt(rle_value), self.length);
 
                     self.length = 1;
                     self.rle_value = value;
@@ -480,10 +499,115 @@ fn RLEStreamEncoder(comptime ColorType: type) type {
             }
 
             if (self.rle_value) |rle_value| {
-                try RunLengthEncoderCommon.flush(IntType, writer, @as(IntType, @bitCast(rle_value)), self.length);
+                try RunLengthEncoderCommon.flush(IntType, writer, colorToInt(rle_value), self.length);
             }
         }
     };
+}
+
+test "TGA RLE decoder preserves partial pixel writes" {
+    const ShortWriter = struct {
+        output: std.Io.Writer.Allocating,
+        writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+
+        fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("writer", writer));
+            return self.output.writer.writeSplatHeaderLimit(&.{}, data, splat, .limited(1));
+        }
+    };
+
+    for ([_][]const u8{ &.{ 0x11, 0x22, 0x33 }, &.{ 0x11, 0x22, 0x33, 0x44 } }) |pixel| {
+        var encoded: [5]u8 = undefined;
+        encoded[0] = 0x81;
+        @memcpy(encoded[1..][0..pixel.len], pixel);
+        var source: std.Io.Reader = .fixed(encoded[0 .. pixel.len + 1]);
+        var decoder = try TargaRLEDecoder.init(std.testing.allocator, &source, pixel.len, &.{});
+        defer decoder.deinit();
+        var output: ShortWriter = .{ .output = .init(std.testing.allocator) };
+        defer output.output.deinit();
+
+        const count = try decoder.reader.stream(&output.writer, .limited(pixel.len * 2));
+        try std.testing.expectEqual(pixel.len * 2, count);
+        try std.testing.expectEqualSlices(u8, pixel, output.output.written()[0..pixel.len]);
+        try std.testing.expectEqualSlices(u8, pixel, output.output.written()[pixel.len..]);
+        try std.testing.expectEqual(@as(usize, 0), decoder.repeat_count);
+    }
+}
+
+test "TGA RLE decoder zero limit does not consume input" {
+    const encoded = [_]u8{ 0x81, 0x11, 0x22, 0x33 };
+    var source: std.Io.Reader = .fixed(&encoded);
+    var decoder = try TargaRLEDecoder.init(std.testing.allocator, &source, 3, &.{});
+    defer decoder.deinit();
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), try decoder.reader.stream(&output.writer, .nothing));
+    try std.testing.expectEqual(@as(usize, 0), source.seek);
+    try std.testing.expectEqual(TargaRLEDecoder.State.read_header, decoder.state);
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+}
+
+test "TGA RLE decoder returns on zero writer progress" {
+    const StallingWriter = struct {
+        remaining_before_stall: usize,
+        output: std.Io.Writer.Allocating,
+        writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+
+        fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("writer", writer));
+            if (self.remaining_before_stall == 0) return 0;
+
+            const written = try self.output.writer.writeSplatHeaderLimit(
+                &.{},
+                data,
+                splat,
+                .limited(self.remaining_before_stall),
+            );
+            self.remaining_before_stall -|= written;
+            return written;
+        }
+    };
+
+    const encoded = [_]u8{ 0x81, 0x11, 0x22, 0x33 };
+    for ([_]usize{ 0, 1 }) |bytes_before_stall| {
+        var source: std.Io.Reader = .fixed(&encoded);
+        var decoder = try TargaRLEDecoder.init(std.testing.allocator, &source, 3, &.{});
+        defer decoder.deinit();
+        var output: StallingWriter = .{
+            .remaining_before_stall = bytes_before_stall,
+            .output = .init(std.testing.allocator),
+        };
+        defer output.output.deinit();
+
+        const count = try decoder.reader.stream(&output.writer, .limited(6));
+        try std.testing.expectEqual(bytes_before_stall, count);
+        try std.testing.expectEqual(@as(usize, encoded.len), source.seek);
+        try std.testing.expectEqual(TargaRLEDecoder.State.repeated, decoder.state);
+        try std.testing.expectEqual(@as(usize, 2), decoder.repeat_count);
+        try std.testing.expectEqual(bytes_before_stall, decoder.wrote_repeat_data);
+        try std.testing.expectEqual(bytes_before_stall, output.output.written().len);
+    }
+}
+
+test "TGA RLE stream encoder packs BGR colors explicitly" {
+    var bgr_writer = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer bgr_writer.deinit();
+    var bgr_encoder: RLEStreamEncoder(color.Bgr24) = .{};
+    const bgr: color.Bgr24 = .{ .b = 0x11, .g = 0x22, .r = 0x33 };
+    try bgr_encoder.encode(&bgr_writer.writer, bgr);
+    try bgr_encoder.encode(&bgr_writer.writer, bgr);
+    try bgr_encoder.flush(&bgr_writer.writer);
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 0x11, 0x22, 0x33 }, bgr_writer.written());
+
+    var bgra_writer = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer bgra_writer.deinit();
+    var bgra_encoder: RLEStreamEncoder(color.Bgra32) = .{};
+    const bgra: color.Bgra32 = .{ .b = 0x11, .g = 0x22, .r = 0x33, .a = 0x44 };
+    try bgra_encoder.encode(&bgra_writer.writer, bgra);
+    try bgra_encoder.encode(&bgra_writer.writer, bgra);
+    try bgra_encoder.flush(&bgra_writer.writer);
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 0x11, 0x22, 0x33, 0x44 }, bgra_writer.written());
 }
 
 test "TGA RLE SIMD u8 (bytes) encoder" {

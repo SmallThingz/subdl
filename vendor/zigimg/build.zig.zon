@@ -9,6 +9,7 @@
         "zigimg.zig",
         "README.md",
         "LICENSE",
+        "THIRD_PARTY_LICENSES",
         "src",
         "tests",
     },

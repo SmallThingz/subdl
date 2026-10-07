@@ -30,6 +30,10 @@ pub const Scraper = struct {
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
         const trimmed = std.mem.trim(u8, query, " \t\r\n");
         if (trimmed.len == 0) return .{ .arena = std.heap.ArenaAllocator.init(self.allocator), .items = &.{} };
+        const wanted = try common.normalizeTitle(self.allocator, trimmed);
+        defer self.allocator.free(wanted);
+        if (wanted.len == 0) return .{ .arena = std.heap.ArenaAllocator.init(self.allocator), .items = &.{} };
+        const deadline_ms = common.compatMilliTimestamp() +| common.default_fetch_timeout_ms;
 
         var payload_attempt: usize = 0;
         while (payload_attempt < payload_max_attempts) : (payload_attempt += 1) {
@@ -44,10 +48,11 @@ pub const Scraper = struct {
                 .cache = false,
                 .max_attempts = 2,
                 .require_public_origin = true,
+                .deadline_ms = deadline_ms,
             });
             const parsed = parseSearchJson(common.takeArena(&arena), response.body, trimmed) catch |err| {
                 if (!shouldRetryPayloadError(err, payload_attempt)) return err;
-                try common.sleepMillisecondsCancelable(payload_retry_delay_ms);
+                try sleepBeforeDeadline(deadline_ms, payload_retry_delay_ms);
                 continue;
             };
             return parsed;
@@ -56,7 +61,8 @@ pub const Scraper = struct {
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
-        try validateProviderEndpoint(item.page_url);
+        try validateListingEndpoint(item.page_url);
+        const deadline_ms = common.compatMilliTimestamp() +| common.default_fetch_timeout_ms;
         var parsed = parsed_response: {
             var payload_attempt: usize = 0;
             while (payload_attempt < payload_max_attempts) : (payload_attempt += 1) {
@@ -70,10 +76,11 @@ pub const Scraper = struct {
                     .cache = false,
                     .max_attempts = 2,
                     .require_public_origin = true,
+                    .deadline_ms = deadline_ms,
                 });
                 const value = parseSubtitlesJson(common.takeArena(&arena), response.body, item) catch |err| {
                     if (!shouldRetryPayloadError(err, payload_attempt)) return err;
-                    try common.sleepMillisecondsCancelable(payload_retry_delay_ms);
+                    try sleepBeforeDeadline(deadline_ms, payload_retry_delay_ms);
                     continue;
                 };
                 break :parsed_response value;
@@ -81,7 +88,7 @@ pub const Scraper = struct {
             unreachable;
         };
         errdefer parsed.deinit();
-        try resolveSubtitleRedirectsUsing(resolveDownloadRedirect, self.client, &parsed);
+        try resolveSubtitleRedirectsUsing(resolveDownloadRedirect, self.client, &parsed, deadline_ms);
         return parsed;
     }
 };
@@ -90,11 +97,12 @@ fn resolveSubtitleRedirectsUsing(
     comptime resolve: anytype,
     client: *std.http.Client,
     parsed: *SubtitlesResponse,
+    deadline_ms: i64,
 ) !void {
     const parsed_allocator = parsed.arena.allocator();
     var resolved: std.ArrayListUnmanaged(SubtitleItem) = .empty;
     for (parsed.subtitles) |subtitle| {
-        const direct_url = resolve(client, parsed_allocator, subtitle.download_url) catch |err| {
+        const direct_url = resolve(client, parsed_allocator, subtitle.download_url, deadline_ms) catch |err| {
             if (common.mustPropagateOptionalFailure(err)) return err;
             continue;
         };
@@ -110,6 +118,15 @@ fn resolveSubtitleRedirectsUsing(
 fn shouldRetryPayloadError(err: anyerror, attempt: usize) bool {
     if (attempt + 1 >= payload_max_attempts) return false;
     return !common.mustPropagateOptionalFailure(err);
+}
+
+fn sleepBeforeDeadline(deadline_ms: i64, requested_ms: u64) !void {
+    const now_ms = common.compatMilliTimestamp();
+    if (now_ms >= deadline_ms) return error.Timeout;
+    const remaining_ms: u64 = @intCast(deadline_ms -| now_ms);
+    const delay_ms = @min(requested_ms, remaining_ms);
+    try common.sleepMillisecondsCancelable(delay_ms);
+    if (common.compatMilliTimestamp() >= deadline_ms) return error.Timeout;
 }
 
 fn buildSearchUrl(allocator: Allocator, title: []const u8, year: ?i64) ![]u8 {
@@ -139,6 +156,7 @@ fn parseSearchJson(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     };
 
     const wanted = try common.normalizeTitle(a, query);
+    if (wanted.len == 0) return .{ .arena = owned_arena, .items = &.{} };
     var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
     var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
     var seen = std.StringHashMapUnmanaged(void).empty;
@@ -160,11 +178,8 @@ fn parseSearchJson(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
         const original_normalized = if (original_title) |value| try common.normalizeTitle(a, value) else "";
         const exact_match = std.mem.eql(u8, local_normalized, wanted) or
             (original_normalized.len > 0 and std.mem.eql(u8, original_normalized, wanted));
-        const partial_match = std.mem.indexOf(u8, local_normalized, wanted) != null or
-            std.mem.indexOf(u8, wanted, local_normalized) != null or
-            (original_normalized.len > 0 and
-                (std.mem.indexOf(u8, original_normalized, wanted) != null or
-                    std.mem.indexOf(u8, wanted, original_normalized) != null));
+        const partial_match = common.normalizedTitlesRelated(local_normalized, wanted) or
+            (original_normalized.len > 0 and common.normalizedTitlesRelated(original_normalized, wanted));
         if (!exact_match and !partial_match) continue;
 
         const page_url = try buildSearchUrl(a, local_title, year);
@@ -231,6 +246,8 @@ fn parseSubtitlesJson(arena: std.heap.ArenaAllocator, body: []const u8, item: Se
         const filename = common.jsonString(entry_obj, "filename") orelse continue;
         const raw_download_url = common.jsonString(entry_obj, "telechargement") orelse continue;
         const download_url = try normalizeProviderUrl(a, raw_download_url);
+        errdefer a.free(download_url);
+        try validateInitialDownloadEndpoint(download_url);
         if (seen.contains(download_url)) continue;
         try seen.put(a, download_url, {});
 
@@ -254,16 +271,60 @@ fn normalizeProviderUrl(allocator: Allocator, raw_url: []const u8) ![]const u8 {
         const normalized = try std.fmt.allocPrint(allocator, "http://{s}", .{absolute["https://".len..]});
         allocator.free(absolute);
         errdefer allocator.free(normalized);
-        try validateProviderEndpoint(normalized);
+        _ = try providerUri(normalized);
         return normalized;
     }
     errdefer allocator.free(absolute);
-    try validateProviderEndpoint(absolute);
+    _ = try providerUri(absolute);
     return absolute;
 }
 
-fn resolveDownloadRedirect(client: *std.http.Client, allocator: Allocator, url: []const u8) ![]const u8 {
-    try validateProviderEndpoint(url);
+fn resolveDownloadRedirect(client: *std.http.Client, allocator: Allocator, url: []const u8, deadline_ms: i64) ![]const u8 {
+    const now_ms = common.compatMilliTimestamp();
+    if (now_ms >= deadline_ms) return error.Timeout;
+
+    const FetchTask = struct {
+        fn run(result: *?[]const u8, task_client: *std.http.Client, task_allocator: Allocator, task_url: []const u8) !void {
+            result.* = try resolveDownloadRedirectUnbounded(task_client, task_allocator, task_url);
+        }
+    };
+    const FetchResult = @typeInfo(@TypeOf(FetchTask.run)).@"fn".return_type.?;
+    const TimeoutResult = @typeInfo(@TypeOf(std.Io.Timeout.sleep)).@"fn".return_type.?;
+    const Selection = union(enum) {
+        fetch: FetchResult,
+        timeout: TimeoutResult,
+    };
+    var selection_buffer: [2]Selection = undefined;
+    var selection = std.Io.Select(Selection).init(client.io, &selection_buffer);
+    var owned_url: ?[]const u8 = null;
+    defer {
+        selection.cancelDiscard();
+        if (owned_url) |value| allocator.free(value);
+    }
+
+    const timeout: std.Io.Timeout = .{ .deadline = std.Io.Clock.Timestamp.fromNow(client.io, .{
+        .raw = std.Io.Duration.fromMilliseconds(deadline_ms -| now_ms),
+        .clock = .awake,
+    }) };
+    try selection.concurrent(.fetch, FetchTask.run, .{ &owned_url, client, allocator, url });
+    try selection.concurrent(.timeout, std.Io.Timeout.sleep, .{ timeout, client.io });
+
+    switch (try selection.await()) {
+        .fetch => |result| {
+            try result;
+            const value = owned_url orelse return error.MissingHttpResponse;
+            owned_url = null;
+            return value;
+        },
+        .timeout => |result| {
+            try result;
+            return error.Timeout;
+        },
+    }
+}
+
+fn resolveDownloadRedirectUnbounded(client: *std.http.Client, allocator: Allocator, url: []const u8) ![]const u8 {
+    try validateInitialDownloadEndpoint(url);
     const normalized = try common.normalizeUrlForFetch(allocator, url);
     defer allocator.free(normalized);
     const uri = try std.Uri.parse(normalized);
@@ -302,24 +363,46 @@ fn resolveDownloadRedirect(client: *std.http.Client, allocator: Allocator, url: 
     var interim_count: usize = 0;
     while (response.head.status.class() == .informational) {
         if (response.head.status == .switching_protocols) return error.UnsupportedProtocolUpgrade;
+        try validateRawRedirectResponseHead(response.head);
         interim_count += 1;
         if (interim_count > 16) return error.TooManyInformationalResponses;
         response = req.receiveHead(&head_buffer) catch |err| return common.normalizeRequestReadError(&req, err);
     }
+    try validateRawRedirectResponseHead(response.head);
     try requireRedirectResponseStatus(response.head.status);
     if (response.head.status == .ok) return try allocator.dupe(u8, url);
 
     const location = try extractHeader(allocator, response.head.bytes, "location") orelse return error.MissingField;
     defer allocator.free(location);
-    const location_for_resolve = if (std.mem.startsWith(u8, location, "http://") or
-        std.mem.startsWith(u8, location, "https://") or
-        std.mem.startsWith(u8, location, "/"))
-        location
-    else
-        try std.fmt.allocPrint(allocator, "/{s}", .{location});
+    return try resolveRedirectLocation(allocator, location);
+}
+
+fn validateRawRedirectResponseHead(head: std.http.Client.Response.Head) !void {
+    try common.validateResponseFraming(head);
+}
+
+fn resolveRedirectLocation(allocator: Allocator, location: []const u8) ![]const u8 {
+    const normalized_location = try common.normalizeUrlForFetch(allocator, location);
+    defer allocator.free(normalized_location);
+
+    var owned_location_for_resolve: ?[]u8 = null;
+    defer if (owned_location_for_resolve) |value| allocator.free(value);
+
+    const location_for_resolve: []const u8 = if (std.mem.startsWith(u8, normalized_location, "http://") or
+        std.mem.startsWith(u8, normalized_location, "https://") or
+        std.mem.startsWith(u8, normalized_location, "/"))
+        normalized_location
+    else prefixed: {
+        const value = try std.fmt.allocPrint(allocator, "/{s}", .{normalized_location});
+        owned_location_for_resolve = value;
+        break :prefixed value;
+    };
     const resolved = try common.resolveUrl(allocator, site, location_for_resolve);
     defer allocator.free(resolved);
-    return try normalizeProviderUrl(allocator, resolved);
+    const normalized = try normalizeProviderUrl(allocator, resolved);
+    errdefer allocator.free(normalized);
+    try validateFinalArchiveEndpoint(normalized);
+    return normalized;
 }
 
 fn requireRedirectResponseStatus(status: std.http.Status) !void {
@@ -328,9 +411,152 @@ fn requireRedirectResponseStatus(status: std.http.Status) !void {
     if (status != .ok and !common.isRedirectStatus(status)) return error.UnexpectedHttpStatus;
 }
 
-fn validateProviderEndpoint(url: []const u8) !void {
+fn providerUri(url: []const u8) !std.Uri {
     try common.validatePublicHttpUrl(url);
     if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+    const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
+    if (uri.user != null or uri.password != null) return error.InvalidDownloadUrl;
+    return uri;
+}
+
+fn uriPath(uri: std.Uri) []const u8 {
+    return switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+}
+
+fn uriQuery(uri: std.Uri) ?[]const u8 {
+    const component = uri.query orelse return null;
+    return switch (component) {
+        .raw, .percent_encoded => |value| value,
+    };
+}
+
+fn validateListingEndpoint(url: []const u8) !void {
+    const uri = try providerUri(url);
+    if (uri.fragment != null or !std.mem.eql(u8, uriPath(uri), "/include/ajax/subMarin.php"))
+        return error.InvalidDownloadUrl;
+    const query = uriQuery(uri) orelse return error.InvalidDownloadUrl;
+    const title_prefix = "title=";
+    const year_marker = "&year=";
+    if (!std.mem.startsWith(u8, query, title_prefix)) return error.InvalidDownloadUrl;
+    const marker_index = std.mem.indexOf(u8, query[title_prefix.len..], year_marker) orelse
+        return error.InvalidDownloadUrl;
+    const title_end = title_prefix.len + marker_index;
+    const title = query[title_prefix.len..title_end];
+    const year = query[title_end + year_marker.len ..];
+    if (!isCanonicalEncodedQueryValue(title) or std.mem.indexOfScalar(u8, year, '&') != null)
+        return error.InvalidDownloadUrl;
+    if (year.len != 0 and !isCanonicalSignedDecimal(year)) return error.InvalidDownloadUrl;
+}
+
+fn validateInitialDownloadEndpoint(url: []const u8) !void {
+    const uri = try providerUri(url);
+    if (uri.query != null or uri.fragment != null) return error.InvalidDownloadUrl;
+    const path = uriPath(uri);
+    const prefix = "/telecharger-le-fichier-";
+    const suffix = ".html";
+    if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix))
+        return error.InvalidDownloadUrl;
+    const id_text = path[prefix.len .. path.len - suffix.len];
+    if (!isCanonicalPositiveDecimal(id_text)) return error.InvalidDownloadUrl;
+}
+
+fn validateFinalArchiveEndpoint(url: []const u8) !void {
+    const uri = try providerUri(url);
+    if (uri.query != null or uri.fragment != null or !isSafeArchivePath(uriPath(uri)))
+        return error.InvalidDownloadUrl;
+}
+
+fn isCanonicalPositiveDecimal(value: []const u8) bool {
+    if (value.len == 0 or value.len > 20 or value[0] == '0') return false;
+    for (value) |byte| if (!std.ascii.isDigit(byte)) return false;
+    _ = std.fmt.parseInt(u64, value, 10) catch return false;
+    return true;
+}
+
+fn isCanonicalSignedDecimal(value: []const u8) bool {
+    if (value.len == 0 or value.len > 20) return false;
+    const digits = if (value[0] == '-') value[1..] else value;
+    if (digits.len == 0 or (digits.len > 1 and digits[0] == '0') or
+        (value[0] == '-' and std.mem.eql(u8, digits, "0")))
+    {
+        return false;
+    }
+    for (digits) |byte| if (!std.ascii.isDigit(byte)) return false;
+    _ = std.fmt.parseInt(i64, value, 10) catch return false;
+    return true;
+}
+
+fn isCanonicalEncodedQueryValue(value: []const u8) bool {
+    if (value.len == 0 or value.len > 4096) return false;
+    var index: usize = 0;
+    while (index < value.len) {
+        const byte = value[index];
+        if (std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.' or byte == '~') {
+            index += 1;
+            continue;
+        }
+        if (byte != '%' or value.len - index < 3) return false;
+        const high = value[index + 1];
+        const low = value[index + 2];
+        if (!isUpperHexDigit(high) or !isUpperHexDigit(low)) return false;
+        const decoded = (std.fmt.charToDigit(high, 16) catch return false) * 16 +
+            (std.fmt.charToDigit(low, 16) catch return false);
+        const decoded_byte: u8 = @intCast(decoded);
+        if (std.ascii.isAlphanumeric(decoded_byte) or decoded_byte == '-' or
+            decoded_byte == '_' or decoded_byte == '.' or decoded_byte == '~')
+        {
+            return false;
+        }
+        index += 3;
+    }
+    return true;
+}
+
+fn isUpperHexDigit(byte: u8) bool {
+    return std.ascii.isDigit(byte) or (byte >= 'A' and byte <= 'F');
+}
+
+fn isSafeArchivePath(path: []const u8) bool {
+    if (path.len < "/a.zip".len or path.len > 4096 or path[0] != '/' or
+        !std.ascii.endsWithIgnoreCase(path, ".zip"))
+    {
+        return false;
+    }
+
+    var index: usize = 1;
+    var segment_len: usize = 0;
+    var segment_all_dots = true;
+    while (index < path.len) {
+        if (path[index] == '/') {
+            if (segment_len == 0 or (segment_all_dots and segment_len <= 2)) return false;
+            segment_len = 0;
+            segment_all_dots = true;
+            index += 1;
+            continue;
+        }
+
+        const byte = if (path[index] == '%') blk: {
+            if (path.len - index < 3) return false;
+            const high = std.fmt.charToDigit(path[index + 1], 16) catch return false;
+            const low = std.fmt.charToDigit(path[index + 2], 16) catch return false;
+            index += 3;
+            break :blk @as(u8, @intCast(high * 16 + low));
+        } else blk: {
+            const raw = path[index];
+            index += 1;
+            break :blk raw;
+        };
+        if (byte < 0x20 or byte == 0x7f or byte == '%' or byte == '/' or byte == '\\' or
+            byte == '?' or byte == '#')
+        {
+            return false;
+        }
+        segment_len += 1;
+        if (byte != '.') segment_all_dots = false;
+    }
+    return segment_len != 0 and !(segment_all_dots and segment_len <= 2);
 }
 
 fn extractHeader(allocator: Allocator, headers: []const u8, wanted: []const u8) !?[]u8 {
@@ -403,6 +629,64 @@ test "subsynchro rejects unsafe provider redirect targets before fetch" {
     try std.testing.expectError(error.UnsafeHttpTarget, normalizeProviderUrl(std.testing.allocator, "https://www.google.com/private"));
 }
 
+test "subsynchro accepts only the canonical listing route" {
+    try validateListingEndpoint(
+        site ++ "/include/ajax/subMarin.php?title=The%20Matrix&year=1999",
+    );
+    try validateListingEndpoint(
+        site ++ "/include/ajax/subMarin.php?title=Inception&year=",
+    );
+
+    for ([_][]const u8{
+        site ++ "/admin?title=Inception&year=2010",
+        site ++ "/include/ajax/subMarin.php",
+        site ++ "/include/ajax/subMarin.php?year=2010&title=Inception",
+        site ++ "/include/ajax/subMarin.php?title=&year=2010",
+        site ++ "/include/ajax/subMarin.php?title=%49nception&year=2010",
+        site ++ "/include/ajax/subMarin.php?title=Inception&year=-0",
+        site ++ "/include/ajax/subMarin.php?title=Inception&year=2010&admin=1",
+        site ++ "/include/ajax/subMarin.php?title=Inception&year=2010#result",
+    }) |url| {
+        try std.testing.expectError(error.InvalidDownloadUrl, validateListingEndpoint(url));
+    }
+}
+
+test "subsynchro separates initial download and final archive routes" {
+    try validateInitialDownloadEndpoint(site ++ "/telecharger-le-fichier-42.html");
+    try validateFinalArchiveEndpoint(site ++ "/archive.zip");
+    try validateFinalArchiveEndpoint(site ++ "/uploads/subtitles/movie.ZIP");
+
+    for ([_][]const u8{
+        site ++ "/admin",
+        site ++ "/telecharger-le-fichier-0.html",
+        site ++ "/telecharger-le-fichier-01.html",
+        site ++ "/telecharger-le-fichier-42.html?download=1",
+        site ++ "/telecharger-le-fichier-42.html/extra",
+    }) |url| {
+        try std.testing.expectError(
+            error.InvalidDownloadUrl,
+            validateInitialDownloadEndpoint(url),
+        );
+    }
+
+    for ([_][]const u8{
+        site ++ "/admin",
+        site ++ "/archive.rar",
+        site ++ "/archive.zip?token=secret",
+        site ++ "/archive.zip#fragment",
+        site ++ "/uploads/../archive.zip",
+        site ++ "/uploads/%2e%2e/archive.zip",
+        site ++ "/uploads%2Farchive.zip",
+        site ++ "/uploads%252Farchive.zip",
+        site ++ "/uploads%5Carchive.zip",
+    }) |url| {
+        try std.testing.expectError(
+            error.InvalidDownloadUrl,
+            validateFinalArchiveEndpoint(url),
+        );
+    }
+}
+
 test "subsynchro classifies redirect response failures" {
     try requireRedirectResponseStatus(.ok);
     try requireRedirectResponseStatus(.moved_permanently);
@@ -410,6 +694,34 @@ test "subsynchro classifies redirect response failures" {
     try std.testing.expectError(error.ProviderAccessBlocked, requireRedirectResponseStatus(.unauthorized));
     try std.testing.expectError(error.ProviderAccessBlocked, requireRedirectResponseStatus(.forbidden));
     try std.testing.expectError(error.UnexpectedHttpStatus, requireRedirectResponseStatus(.internal_server_error));
+}
+
+test "subsynchro HEAD probe rejects an expired deadline before I/O" {
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    try std.testing.expectError(
+        error.Timeout,
+        resolveDownloadRedirect(&client, std.testing.allocator, site ++ "/archive.zip", common.compatMilliTimestamp()),
+    );
+}
+
+test "subsynchro payload retry sleep rejects an expired shared deadline" {
+    try std.testing.expectError(
+        error.Timeout,
+        sleepBeforeDeadline(common.compatMilliTimestamp(), payload_retry_delay_ms),
+    );
+}
+
+test "subsynchro frees a prefixed relative redirect location" {
+    const resolved = try resolveRedirectLocation(std.testing.allocator, "archive.zip");
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expectEqualStrings(site ++ "/archive.zip", resolved);
+}
+
+test "subsynchro accepts mixed-case absolute redirect schemes" {
+    const resolved = try resolveRedirectLocation(std.testing.allocator, "HtTp://www.subsynchro.com/archive.zip");
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expectEqualStrings(site ++ "/archive.zip", resolved);
 }
 
 test "subsynchro only retries non-terminal malformed payload failures" {
@@ -420,27 +732,38 @@ test "subsynchro only retries non-terminal malformed payload failures" {
     try std.testing.expect(!shouldRetryPayloadError(error.ProviderAccessBlocked, 0));
     try std.testing.expect(!shouldRetryPayloadError(error.UnsafeHttpTarget, 0));
     try std.testing.expect(!shouldRetryPayloadError(error.InvalidDownloadUrl, 0));
+    try std.testing.expect(!shouldRetryPayloadError(error.Timeout, 0));
     try std.testing.expect(!shouldRetryPayloadError(error.UnexpectedEndOfInput, payload_max_attempts - 1));
 }
 
 test "subsynchro skips one ordinary redirect failure" {
     const Resolve = struct {
-        fn redirect(_: *std.http.Client, allocator: Allocator, url: []const u8) anyerror![]const u8 {
-            if (std.mem.indexOf(u8, url, "file-1") != null) return error.ConnectionResetByPeer;
+        fn redirect(_: *std.http.Client, allocator: Allocator, url: []const u8, _: i64) anyerror![]const u8 {
+            if (std.mem.indexOf(u8, url, "fichier-1") != null) return error.ConnectionResetByPeer;
             return allocator.dupe(u8, "http://www.subsynchro.com/archive.zip");
         }
     };
     var response = try parseSubtitlesJson(
         std.heap.ArenaAllocator.init(std.testing.allocator),
-        "{\"status\":200,\"data\":[{\"filename\":\"one.srt\",\"titre\":\"Movie\",\"telechargement\":\"http://www.subsynchro.com/file-1\"},{\"filename\":\"two.srt\",\"titre\":\"Movie\",\"telechargement\":\"http://www.subsynchro.com/file-2\"}]}",
+        "{\"status\":200,\"data\":[{\"filename\":\"one.srt\",\"titre\":\"Movie\",\"telechargement\":\"http://www.subsynchro.com/telecharger-le-fichier-1.html\"},{\"filename\":\"two.srt\",\"titre\":\"Movie\",\"telechargement\":\"http://www.subsynchro.com/telecharger-le-fichier-2.html\"}]}",
         .{ .title = "Movie", .year = null, .page_url = "unused" },
     );
     defer response.deinit();
     var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
     defer client.deinit();
-    try resolveSubtitleRedirectsUsing(Resolve.redirect, &client, &response);
+    try resolveSubtitleRedirectsUsing(Resolve.redirect, &client, &response, common.compatMilliTimestamp() +| common.default_fetch_timeout_ms);
     try std.testing.expectEqual(@as(usize, 1), response.subtitles.len);
     try std.testing.expectEqualStrings("two.srt", response.subtitles[0].filename);
+}
+
+test "subsynchro raw redirect transport rejects ambiguous response framing" {
+    for ([_][]const u8{
+        "HTTP/1.1 302 Found\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\nLocation: /archive.zip\r\n\r\n",
+        "HTTP/1.1 302 Found\r\nContent-Length: 1\r\nContent-Length: 1\r\nLocation: /archive.zip\r\n\r\n",
+    }) |raw_head| {
+        const head = try std.http.Client.Response.Head.parse(raw_head);
+        try std.testing.expectError(error.AmbiguousHttpFraming, validateRawRedirectResponseHead(head));
+    }
 }
 
 test "live subsynchro movie search, listing and download" {

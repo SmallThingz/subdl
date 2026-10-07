@@ -32,19 +32,27 @@ pub const Scraper = struct {
     }
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
+        return self.searchUsing(common.fetchBytes, query);
+    }
+
+    fn searchUsing(self: *Scraper, comptime fetch: anytype, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
 
         const trimmed = std.mem.trim(u8, query, " \t\r\n");
         if (trimmed.len == 0) return .{ .arena = arena, .items = &.{} };
+        const wanted = try common.normalizeTitle(a, stripReleaseNoise(trimmed));
+        if (wanted.len == 0) return .{ .arena = arena, .items = &.{} };
         const encoded = try common.encodeUriComponent(a, trimmed);
         const url = try std.fmt.allocPrint(a, "{s}?search={s}&per_page=20", .{ api_search, encoded });
-        const response = try common.fetchBytes(self.client, a, url, .{
+        const response = try fetch(self.client, a, url, .{
             .accept = "application/json",
             .cache = false,
             .max_attempts = 2,
             .require_public_origin = true,
+            .require_https = true,
+            .require_same_origin = true,
         });
 
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
@@ -52,9 +60,9 @@ pub const Scraper = struct {
             .array => |value| value,
             else => return error.InvalidFieldType,
         };
-        const wanted = try common.normalizeTitle(a, stripReleaseNoise(trimmed));
         var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
         var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
+        var seen_ids = std.AutoHashMapUnmanaged(i64, void).empty;
 
         for (array.items) |entry| {
             const obj = switch (entry) {
@@ -66,6 +74,7 @@ pub const Scraper = struct {
             const page_url = common.jsonString(obj, "url") orelse continue;
             if (post_id <= 0 or title.len == 0 or page_url.len == 0) continue;
             validateProviderUrl(page_url) catch continue;
+            if (seen_ids.contains(post_id)) continue;
 
             const se = common.parseSeasonEpisode(title);
             const media_kind: MediaKind = if (se.episode != null) .tv else .movie;
@@ -88,6 +97,7 @@ pub const Scraper = struct {
                 try exact.append(a, item)
             else
                 try partial.append(a, item);
+            try seen_ids.put(a, post_id, {});
         }
 
         var items: std.ArrayListUnmanaged(SearchItem) = .empty;
@@ -97,19 +107,49 @@ pub const Scraper = struct {
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
+        return self.fetchSubtitlesBySearchItemUsing(common.fetchBytes, item);
+    }
+
+    fn fetchSubtitlesBySearchItemUsing(self: *Scraper, comptime fetch: anytype, item: SearchItem) !SubtitlesResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
 
+        if (item.post_id <= 0) return error.InvalidDownloadUrl;
         try validateProviderUrl(item.page_url);
 
-        const response = try common.fetchBytes(self.client, a, item.page_url, .{
+        const response = try fetch(self.client, a, item.page_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
             .require_public_origin = true,
+            .require_https = true,
+            .require_same_origin = true,
         });
-        const download_url = try parseDownloadHref(a, response.body, item.page_url, item.post_id);
+        const download_url = if (try parseExplicitDownloadHref(a, response.body, item.page_url, item.post_id)) |url|
+            url
+        else blk: {
+            const identity_url = try std.fmt.allocPrint(a, "{s}/wp-json/wp/v2/posts/{d}", .{ site, item.post_id });
+            const identity_response = try fetch(self.client, a, identity_url, .{
+                .accept = "application/json",
+                .cache = false,
+                .max_attempts = 2,
+                .require_public_origin = true,
+                .require_https = true,
+                .require_same_origin = true,
+            });
+            const identity_root = try std.json.parseFromSliceLeaky(std.json.Value, a, identity_response.body, .{});
+            const identity_obj = switch (identity_root) {
+                .object => |value| value,
+                else => return error.InvalidFieldType,
+            };
+            try validatePostIdentity(identity_obj, item);
+            break :blk try std.fmt.allocPrint(
+                a,
+                "{s}/wp-content/themes/simple-grid/zip-attachments.php?post_id={d}",
+                .{ site, item.post_id },
+            );
+        };
 
         const subtitles = try a.alloc(SubtitleItem, 1);
         subtitles[0] = .{
@@ -125,31 +165,78 @@ pub const Scraper = struct {
     }
 };
 
-fn parseDownloadHref(allocator: Allocator, body: []const u8, page_url: []const u8, post_id: i64) ![]const u8 {
-    if (anchorHrefBeforeText(body, "BAIXAR LEGENDA")) |href|
-        return resolvePublicDownloadUrl(allocator, page_url, href);
-
-    const patterns = [_][]const u8{ "?dl_id=", "?download=" };
-    for (patterns) |pattern| {
-        if (std.mem.indexOf(u8, body, pattern)) |pos| {
-            const quote_start = std.mem.lastIndexOfScalar(u8, body[0..pos], '"') orelse continue;
-            const tail = body[quote_start + 1 ..];
-            const quote_end = std.mem.indexOfScalar(u8, tail, '"') orelse continue;
-            return resolvePublicDownloadUrl(allocator, page_url, tail[0..quote_end]);
-        }
+fn parseExplicitDownloadHref(
+    allocator: Allocator,
+    body: []const u8,
+    page_url: []const u8,
+    expected_post_id: i64,
+) !?[]const u8 {
+    var anchor_cursor: usize = 0;
+    while (anchorHrefBeforeText(body, "BAIXAR LEGENDA", &anchor_cursor)) |href| {
+        const resolved = resolveExplicitDownloadUrl(allocator, page_url, href, expected_post_id) catch |err| {
+            if (err == error.OutOfMemory or err == error.Canceled) return err;
+            continue;
+        };
+        return resolved;
     }
 
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}/wp-content/themes/simple-grid/zip-attachments.php?post_id={d}",
-        .{ site, post_id },
-    );
+    const pattern = "?dl_id=";
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, body, cursor, pattern)) |pos| {
+        cursor = pos + pattern.len;
+        const quote_start = std.mem.lastIndexOfScalar(u8, body[0..pos], '"') orelse continue;
+        const tail = body[quote_start + 1 ..];
+        const quote_end = std.mem.indexOfScalar(u8, tail, '"') orelse continue;
+        const resolved = resolveExplicitDownloadUrl(allocator, page_url, tail[0..quote_end], expected_post_id) catch |err| {
+            if (err == error.OutOfMemory or err == error.Canceled) return err;
+            continue;
+        };
+        return resolved;
+    }
+
+    return null;
+}
+
+fn resolveExplicitDownloadUrl(
+    allocator: Allocator,
+    page_url: []const u8,
+    href: []const u8,
+    expected_post_id: i64,
+) ![]const u8 {
+    if (expected_post_id <= 0) return error.InvalidDownloadUrl;
+    const resolved = try resolvePublicDownloadUrl(allocator, page_url, href);
+    errdefer allocator.free(resolved);
+
+    const uri = std.Uri.parse(resolved) catch return error.InvalidDownloadUrl;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    if (!std.mem.eql(u8, path, "/") or uri.query == null) return error.InvalidDownloadUrl;
+
+    const query_start = std.mem.indexOfScalar(u8, resolved, '?') orelse return error.InvalidDownloadUrl;
+    const query = resolved[query_start + 1 ..];
+    const prefix = "dl_id=";
+    if (!std.mem.startsWith(u8, query, prefix)) return error.InvalidDownloadUrl;
+    const id = query[prefix.len..];
+    if (!isCanonicalPositivePostId(id)) return error.InvalidDownloadUrl;
+    const parsed_id = std.fmt.parseInt(i64, id, 10) catch return error.InvalidDownloadUrl;
+    if (parsed_id != expected_post_id) return error.InvalidDownloadUrl;
+    return resolved;
+}
+
+fn isCanonicalPositivePostId(value: []const u8) bool {
+    if (value.len == 0 or value.len > 19 or value[0] == '0') return false;
+    for (value) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
 }
 
 fn resolvePublicDownloadUrl(allocator: Allocator, page_url: []const u8, href: []const u8) ![]const u8 {
     const resolved = try common.resolveUrl(allocator, page_url, href);
     errdefer allocator.free(resolved);
     try common.validatePublicHttpUrl(resolved);
+    if (!(try common.sameOrigin(site, resolved))) return error.UnsafeHttpTarget;
+    const uri = std.Uri.parse(resolved) catch return error.InvalidDownloadUrl;
+    if (uri.fragment != null) return error.InvalidDownloadUrl;
     return resolved;
 }
 
@@ -157,16 +244,107 @@ fn validateProviderUrl(url: []const u8) !void {
     const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
     if (uri.user != null or uri.password != null) return error.InvalidDownloadUrl;
     if (!(common.sameOrigin(site, url) catch false)) return error.InvalidDownloadUrl;
+    if (uri.query != null or uri.fragment != null) return error.InvalidDownloadUrl;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    if (path.len < 2 or path[0] != '/' or std.mem.indexOf(u8, path, "//") != null) return error.InvalidDownloadUrl;
+    const without_trailing = if (path[path.len - 1] == '/') path[1 .. path.len - 1] else path[1..];
+    var segments = std.mem.splitScalar(u8, without_trailing, '/');
+    var segment_count: usize = 0;
+    while (segments.next()) |segment| {
+        if (!isSafeEncodedSegment(segment)) return error.InvalidDownloadUrl;
+        if (segment_count == 0 and isReservedProviderSegment(segment)) return error.InvalidDownloadUrl;
+        segment_count += 1;
+    }
+    if (segment_count == 0 or segment_count > 2) return error.InvalidDownloadUrl;
 }
 
-fn anchorHrefBeforeText(body: []const u8, needle: []const u8) ?[]const u8 {
-    var cursor: usize = 0;
-    while (std.mem.indexOfPos(u8, body, cursor, needle)) |text_pos| {
-        cursor = text_pos + needle.len;
+fn validatePostIdentity(obj: std.json.ObjectMap, item: SearchItem) !void {
+    const detail_id = jsonInt(obj, "id") orelse return error.InvalidDownloadUrl;
+    if (detail_id != item.post_id) return error.InvalidDownloadUrl;
+    const detail_link = common.jsonString(obj, "link") orelse return error.InvalidDownloadUrl;
+    if (!canonicalProviderPagesEqual(detail_link, item.page_url)) return error.InvalidDownloadUrl;
+}
+
+fn canonicalProviderPagesEqual(a: []const u8, b: []const u8) bool {
+    const a_path = canonicalProviderPagePath(a) orelse return false;
+    const b_path = canonicalProviderPagePath(b) orelse return false;
+    return std.mem.eql(u8, a_path, b_path);
+}
+
+fn canonicalProviderPagePath(url: []const u8) ?[]const u8 {
+    validateProviderUrl(url) catch return null;
+    const uri = std.Uri.parse(url) catch return null;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    return if (path.len > 1 and path[path.len - 1] == '/') path[0 .. path.len - 1] else path;
+}
+
+fn isReservedProviderSegment(segment: []const u8) bool {
+    return encodedAsciiEqualsIgnoreCase(segment, "wp-admin") or
+        encodedAsciiEqualsIgnoreCase(segment, "wp-json") or
+        encodedAsciiEqualsIgnoreCase(segment, "wp-content") or
+        encodedAsciiEqualsIgnoreCase(segment, "wp-includes") or
+        encodedAsciiEqualsIgnoreCase(segment, "wp-login.php") or
+        encodedAsciiEqualsIgnoreCase(segment, "xmlrpc.php");
+}
+
+fn encodedAsciiEqualsIgnoreCase(encoded: []const u8, expected: []const u8) bool {
+    var encoded_index: usize = 0;
+    var expected_index: usize = 0;
+    while (encoded_index < encoded.len and expected_index < expected.len) : (expected_index += 1) {
+        const byte = if (encoded[encoded_index] == '%') blk: {
+            if (encoded.len - encoded_index < 3) return false;
+            const high = std.fmt.charToDigit(encoded[encoded_index + 1], 16) catch return false;
+            const low = std.fmt.charToDigit(encoded[encoded_index + 2], 16) catch return false;
+            encoded_index += 3;
+            break :blk @as(u8, @intCast(high * 16 + low));
+        } else blk: {
+            const value = encoded[encoded_index];
+            encoded_index += 1;
+            break :blk value;
+        };
+        if (std.ascii.toLower(byte) != std.ascii.toLower(expected[expected_index])) return false;
+    }
+    return encoded_index == encoded.len and expected_index == expected.len;
+}
+
+fn isSafeEncodedSegment(value: []const u8) bool {
+    if (value.len == 0 or value.len > 512) return false;
+    var decoded_len: usize = 0;
+    var decoded_all_dots = true;
+    var index: usize = 0;
+    while (index < value.len) {
+        var byte = value[index];
+        if (byte == '%') {
+            if (value.len - index < 3) return false;
+            const high = std.fmt.charToDigit(value[index + 1], 16) catch return false;
+            const low = std.fmt.charToDigit(value[index + 2], 16) catch return false;
+            byte = @intCast(high * 16 + low);
+            index += 3;
+        } else {
+            if (!(std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.' or byte == '~')) return false;
+            index += 1;
+        }
+        if (byte < 0x20 or byte == 0x7f or byte == '%' or byte == '/' or byte == '\\' or byte == '?' or byte == '#') return false;
+        decoded_len += 1;
+        if (byte != '.') decoded_all_dots = false;
+    }
+    return !(decoded_all_dots and (decoded_len == 1 or decoded_len == 2));
+}
+
+fn anchorHrefBeforeText(body: []const u8, needle: []const u8, cursor: *usize) ?[]const u8 {
+    while (std.mem.indexOfPos(u8, body, cursor.*, needle)) |text_pos| {
+        cursor.* = text_pos + needle.len;
         const prefix = body[0..text_pos];
         const anchor_pos = std.mem.lastIndexOf(u8, prefix, "<a ") orelse continue;
         const tag_end = std.mem.indexOfPos(u8, body, anchor_pos, ">") orelse continue;
         if (tag_end > text_pos) continue;
+        if (std.ascii.findIgnoreCase(body[tag_end + 1 ..], "</a")) |close_rel| {
+            if (tag_end + 1 + close_rel < text_pos) continue;
+        }
         const tag = body[anchor_pos .. tag_end + 1];
         if (attributeValue(tag, "href")) |href| return href;
     }
@@ -174,14 +352,36 @@ fn anchorHrefBeforeText(body: []const u8, needle: []const u8) ?[]const u8 {
 }
 
 fn attributeValue(tag: []const u8, name: []const u8) ?[]const u8 {
-    const marker = std.mem.indexOf(u8, tag, name) orelse return null;
-    const eq = std.mem.indexOfPos(u8, tag, marker + name.len, "=") orelse return null;
-    if (eq + 1 >= tag.len) return null;
-    const quote = tag[eq + 1];
-    if (quote != '"' and quote != '\'') return null;
-    const start = eq + 2;
-    const end_rel = std.mem.indexOfScalar(u8, tag[start..], quote) orelse return null;
-    return tag[start .. start + end_rel];
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, tag, cursor, name)) |marker| {
+        cursor = marker + name.len;
+        if (isInsideAttributeQuote(tag[0..marker])) continue;
+        if (marker > 0 and tag[marker - 1] != '<' and !std.ascii.isWhitespace(tag[marker - 1])) continue;
+        var eq = cursor;
+        while (eq < tag.len and std.ascii.isWhitespace(tag[eq])) : (eq += 1) {}
+        if (eq >= tag.len or tag[eq] != '=') continue;
+        eq += 1;
+        while (eq < tag.len and std.ascii.isWhitespace(tag[eq])) : (eq += 1) {}
+        if (eq >= tag.len) return null;
+        const quote = tag[eq];
+        if (quote != '"' and quote != '\'') continue;
+        const start = eq + 1;
+        const end_rel = std.mem.indexOfScalar(u8, tag[start..], quote) orelse return null;
+        return tag[start .. start + end_rel];
+    }
+    return null;
+}
+
+fn isInsideAttributeQuote(prefix: []const u8) bool {
+    var quote: ?u8 = null;
+    for (prefix) |byte| {
+        if (quote) |active| {
+            if (byte == active) quote = null;
+        } else if (byte == '"' or byte == '\'') {
+            quote = byte;
+        }
+    }
+    return quote != null;
 }
 
 fn languageCodeFromTitle(title: []const u8) []const u8 {
@@ -224,23 +424,190 @@ test "legendei parses media hints and download anchor" {
     try std.testing.expectEqualStrings("pt", languageCodeFromTitle("Chernobyl S01E01"));
     try std.testing.expectEqualStrings("en", languageCodeFromTitle("Chernobyl S01E01 [English Subtitle]"));
 
-    const url = try parseDownloadHref(
+    const url = (try parseExplicitDownloadHref(
         allocator,
         "<a href=\"https://legendei.net/?dl_id=26215\"><i></i> BAIXAR LEGENDA</a>",
         site ++ "/post/",
-        1,
-    );
+        26215,
+    )) orelse return error.MissingField;
     defer allocator.free(url);
     try std.testing.expectEqualStrings("https://legendei.net/?dl_id=26215", url);
 }
 
+test "legendei rejects normalized-empty searches before HTTPS same-origin I/O" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, url: []const u8, options: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            try std.testing.expectEqualStrings(api_search ++ "?search=Matrix&per_page=20", url);
+            try std.testing.expect(options.require_public_origin);
+            try std.testing.expect(options.require_https);
+            try std.testing.expect(options.require_same_origin);
+            return .{ .status = .ok, .body = try allocator.dupe(u8, "[]") };
+        }
+    };
+
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+    var empty = try scraper.searchUsing(Fixture.fetch, "---");
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 0), empty.items.len);
+
+    var normal = try scraper.searchUsing(Fixture.fetch, "Matrix");
+    defer normal.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 0), normal.items.len);
+}
+
+test "legendei binds the synthesized fallback to a fresh REST identity" {
+    const Case = struct { body: []const u8, accepted: bool };
+    const Fixture = struct {
+        client: std.http.Client,
+        identity_body: []const u8,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, url: []const u8, options: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            try std.testing.expect(options.require_public_origin);
+            try std.testing.expect(options.require_https);
+            try std.testing.expect(options.require_same_origin);
+            return switch (self.calls) {
+                1 => blk: {
+                    try std.testing.expectEqualStrings(site ++ "/post/example", url);
+                    break :blk .{ .status = .ok, .body = try allocator.dupe(u8, "<html>No explicit download</html>") };
+                },
+                2 => blk: {
+                    try std.testing.expectEqualStrings(site ++ "/wp-json/wp/v2/posts/42", url);
+                    break :blk .{ .status = .ok, .body = try allocator.dupe(u8, self.identity_body) };
+                },
+                else => error.TestUnexpectedResult,
+            };
+        }
+    };
+
+    for ([_]Case{
+        .{ .body = "{\"id\":42,\"link\":\"https://legendei.net/post/example/\"}", .accepted = true },
+        .{ .body = "{\"id\":41,\"link\":\"https://legendei.net/post/example/\"}", .accepted = false },
+        .{ .body = "{\"id\":42,\"link\":\"https://legendei.net/post/other/\"}", .accepted = false },
+        .{ .body = "{\"id\":42,\"link\":\"https://legendei.net/post/example/?next=/admin\"}", .accepted = false },
+        .{ .body = "{\"id\":42}", .accepted = false },
+    }) |case| {
+        var fixture: Fixture = .{
+            .client = .{ .allocator = std.testing.allocator, .io = std.testing.io },
+            .identity_body = case.body,
+        };
+        defer fixture.client.deinit();
+        var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+        const item: SearchItem = .{
+            .title = "Example",
+            .post_id = 42,
+            .media_kind = .movie,
+            .season = null,
+            .episode = null,
+            .language_code = "pt",
+            .page_url = site ++ "/post/example",
+        };
+        if (case.accepted) {
+            var response = try scraper.fetchSubtitlesBySearchItemUsing(Fixture.fetch, item);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(usize, 1), response.subtitles.len);
+            try std.testing.expectEqualStrings(
+                site ++ "/wp-content/themes/simple-grid/zip-attachments.php?post_id=42",
+                response.subtitles[0].download_url,
+            );
+        } else {
+            try std.testing.expectError(
+                error.InvalidDownloadUrl,
+                scraper.fetchSubtitlesBySearchItemUsing(Fixture.fetch, item),
+            );
+        }
+        try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    }
+}
+
+test "legendei download scanner skips an unsafe leading anchor" {
+    const url = (try parseExplicitDownloadHref(
+        std.testing.allocator,
+        "<a href=\"http://127.0.0.1/private.zip\">BAIXAR LEGENDA</a>" ++
+            "<a href=\"/?dl_id=42\">BAIXAR LEGENDA</a>",
+        site ++ "/post/example",
+        42,
+    )) orelse return error.MissingField;
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings(site ++ "/?dl_id=42", url);
+    try std.testing.expectEqualStrings("/right.zip", attributeValue("<a data-href=\"/wrong.zip\" href = \"/right.zip\">", "href").?);
+    try std.testing.expectEqualStrings("/right.zip", attributeValue("<a title=\" href='/wrong.zip'\" href=\"/right.zip\">", "href").?);
+}
+
+test "legendei download text must belong to its anchor" {
+    const url = (try parseExplicitDownloadHref(
+        std.testing.allocator,
+        "<a href=\"/wrong.zip\">Other</a> BAIXAR LEGENDA" ++
+            "<a href=\"/?dl_id=42\">BAIXAR LEGENDA</a>",
+        site ++ "/post/example",
+        42,
+    )) orelse return error.MissingField;
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings(site ++ "/?dl_id=42", url);
+}
+
+test "legendei explicit downloads require the root route and matching post id" {
+    const body =
+        "<a href=\"https://evil.example/?dl_id=42\">BAIXAR LEGENDA</a>" ++
+        "<a href=\"/?dl_id=41\">BAIXAR LEGENDA</a>" ++
+        "<a href=\"/?dl_id=042\">BAIXAR LEGENDA</a>" ++
+        "<a href=\"/?download=42\">BAIXAR LEGENDA</a>" ++
+        "<a href=\"/post/example?dl_id=42\">BAIXAR LEGENDA</a>" ++
+        "<a href=\"/?dl_id=42&next=/admin\">BAIXAR LEGENDA</a>" ++
+        "<a href=\"/?dl_id=42\">BAIXAR LEGENDA</a>";
+    const url = (try parseExplicitDownloadHref(
+        std.testing.allocator,
+        body,
+        site ++ "/post/example",
+        42,
+    )) orelse return error.MissingField;
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings(site ++ "/?dl_id=42", url);
+
+    try std.testing.expect((try parseExplicitDownloadHref(
+        std.testing.allocator,
+        "<a href=\"/?download=42\">BAIXAR LEGENDA</a>",
+        site ++ "/post/example",
+        42,
+    )) == null);
+}
+
 test "legendei rejects unsafe provider and download targets" {
     try validateProviderUrl("https://legendei.net/post/example");
-    try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl("https://legendei.net.example/post/example"));
-    try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl("https://user@legendei.net/post/example"));
+    for ([_][]const u8{
+        "https://legendei.net.example/post/example",
+        "https://user@legendei.net/post/example",
+        "https://legendei.net/wp-admin/users.php",
+        "https://legendei.net/%77p-admin/users.php",
+        "https://legendei.net/post/example?next=/admin",
+        "https://legendei.net/post/example#fragment",
+        "https://legendei.net/post/../admin",
+        "https://legendei.net/post/a%2fb",
+        "https://legendei.net/post/a%252fb",
+        "https://legendei.net/a/b/c",
+    }) |url| try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl(url));
     try std.testing.expectError(
         error.UnsafeHttpTarget,
         resolvePublicDownloadUrl(std.testing.allocator, site ++ "/post/example", "http://127.0.0.1/archive.zip"),
+    );
+    try std.testing.expectError(
+        error.UnsafeHttpTarget,
+        resolvePublicDownloadUrl(std.testing.allocator, site ++ "/post/example", "https://attacker.example/archive.zip"),
+    );
+    try std.testing.expectError(
+        error.InvalidDownloadUrl,
+        resolvePublicDownloadUrl(std.testing.allocator, site ++ "/post/example", "/archive.zip#fragment"),
     );
 }
 

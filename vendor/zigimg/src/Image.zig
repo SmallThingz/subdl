@@ -143,6 +143,35 @@ const all_interface_funcs = blk: {
     break :blk result[0..];
 };
 
+fn checkedPixelCount(width: usize, height: usize) !usize {
+    if (width == 0 or height == 0) return error.InvalidData;
+    return std.math.mul(usize, width, height) catch error.InvalidData;
+}
+
+fn validateRawPixels(width: usize, height: usize, pixels_len: usize, pixel_format: PixelFormat) !usize {
+    if (pixel_format == .invalid or pixel_format.isIndexed()) return error.Unsupported;
+
+    const pixel_count = try checkedPixelCount(width, height);
+    const expected_len = std.math.mul(usize, pixel_count, @as(usize, pixel_format.pixelStride())) catch return error.InvalidData;
+    if (pixels_len != expected_len) return error.InvalidData;
+
+    return pixel_count;
+}
+
+fn duplicatePixelStorage(allocator: std.mem.Allocator, source: color.PixelStorage) !color.PixelStorage {
+    var result = try color.PixelStorage.init(allocator, std.meta.activeTag(source), source.len());
+    errdefer result.deinit(allocator);
+
+    @memcpy(result.asBytes(), source.asConstBytes());
+
+    if (source.getPalette()) |source_palette| {
+        result.resizePalette(source_palette.len);
+        @memcpy(result.getPalette().?, source_palette);
+    }
+
+    return result;
+}
+
 /// Deinit the image
 pub fn deinit(self: *Image, allocator: std.mem.Allocator) void {
     self.pixels.deinit(allocator);
@@ -189,12 +218,15 @@ pub fn fromMemory(allocator: std.mem.Allocator, buffer: []const u8) !Image {
     return internalRead(allocator, &read_stream);
 }
 
-/// Create an Image from a raw memory stream.
-/// The resulting Image will take ownership of the pixel data because it will be a wrapper
-/// around the raw bytes.
+/// Create an Image from mutable, allocator-owned raw pixels. Ownership transfers
+/// only on success; on error, the caller retains `pixels`. The allocation must
+/// be the complete allocation, have the element type and alignment corresponding
+/// to `pixel_format`, and use the allocator later passed to deinit().
 ///
 /// Use fromRawPixels() to take a copy of the pixel data.
-pub fn fromRawPixelsOwned(width: usize, height: usize, pixels: []const u8, pixel_format: PixelFormat) !Image {
+pub fn fromRawPixelsOwned(width: usize, height: usize, pixels: []u8, pixel_format: PixelFormat) !Image {
+    _ = try validateRawPixels(width, height, pixels.len, pixel_format);
+
     return .{
         .width = width,
         .height = height,
@@ -205,19 +237,29 @@ pub fn fromRawPixelsOwned(width: usize, height: usize, pixels: []const u8, pixel
 /// Create an Image from a raw memory stream and create a copy of it.
 /// The resulting Image will own the pixel data.
 pub fn fromRawPixels(allocator: std.mem.Allocator, width: usize, height: usize, pixels: []const u8, pixel_format: PixelFormat) !Image {
+    const pixel_count = try validateRawPixels(width, height, pixels.len, pixel_format);
+    var storage = try color.PixelStorage.init(allocator, pixel_format, pixel_count);
+    errdefer storage.deinit(allocator);
+
+    if (storage.asBytes().len != pixels.len) return error.InvalidData;
+    @memcpy(storage.asBytes(), pixels);
+
     return .{
         .width = width,
         .height = height,
-        .pixels = try color.PixelStorage.initRawPixels(try allocator.dupe(u8, pixels), pixel_format),
+        .pixels = storage,
     };
 }
 
 /// Create a pixel surface from scratch
 pub fn create(allocator: std.mem.Allocator, width: usize, height: usize, pixel_format: PixelFormat) !Image {
+    if (pixel_format == .invalid) return error.Unsupported;
+    const pixel_count = try checkedPixelCount(width, height);
+
     const result = Image{
         .width = width,
         .height = height,
-        .pixels = try color.PixelStorage.init(allocator, pixel_format, width * height),
+        .pixels = try color.PixelStorage.init(allocator, pixel_format, pixel_count),
     };
 
     return result;
@@ -228,10 +270,9 @@ pub fn dupe(self: Image, allocator: std.mem.Allocator) !Image {
     var result: Image = .{
         .width = self.width,
         .height = self.height,
-        .pixels = try color.PixelStorage.init(allocator, std.meta.activeTag(self.pixels), self.width * self.height),
+        .pixels = try duplicatePixelStorage(allocator, self.pixels),
     };
-
-    @memcpy(result.pixels.asBytes(), self.pixels.asConstBytes());
+    errdefer result.deinit(allocator);
 
     result.animation.frames = try .initCapacity(allocator, self.animation.frames.items.len);
     result.animation.loop_count = self.animation.loop_count;
@@ -241,11 +282,10 @@ pub fn dupe(self: Image, allocator: std.mem.Allocator) !Image {
         if (index == 0) {
             dupe_frame.pixels = result.pixels;
         } else {
-            dupe_frame.pixels = try color.PixelStorage.init(allocator, std.meta.activeTag(self_frame.pixels), result.pixels.len());
-            @memcpy(dupe_frame.pixels.asBytes(), self_frame.pixels.asConstBytes());
+            dupe_frame.pixels = try duplicatePixelStorage(allocator, self_frame.pixels);
         }
 
-        try result.animation.frames.append(allocator, dupe_frame);
+        result.animation.frames.appendAssumeCapacity(dupe_frame);
     }
 
     return result;
@@ -263,6 +303,7 @@ pub fn rawBytes(self: Image) []const u8 {
 
 /// Return the byte size of a row in the image
 pub fn rowByteSize(self: Image) usize {
+    if (self.height == 0) return 0;
     return self.imageByteSize() / self.height;
 }
 

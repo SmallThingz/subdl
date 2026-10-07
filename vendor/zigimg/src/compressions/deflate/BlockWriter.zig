@@ -1,5 +1,4 @@
 const std = @import("std");
-const io = std.io;
 const assert = std.debug.assert;
 
 const hc = @import("huffman_encoder.zig");

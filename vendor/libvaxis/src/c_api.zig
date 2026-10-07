@@ -268,7 +268,9 @@ const CWinsizeHandler = struct {
 
     fn notify(context: *anyopaque) void {
         const self: *const CWinsizeHandler = @ptrCast(@alignCast(context));
-        self.callback(self.context);
+        const callback = self.callback;
+        const callback_context = self.context;
+        callback(callback_context);
     }
 };
 const CTty = struct {
@@ -349,9 +351,10 @@ fn cStyle(style: Cell.Style) CStyle {
 }
 
 fn copyCell(strings: *GraphemeStore, cell: CCell) error{ Invalid, OutOfMemory }!Cell {
+    const style = zigStyle(cell.style) orelse return error.Invalid;
     const text = sliceFrom(cell.grapheme.ptr, cell.grapheme.len) orelse return error.Invalid;
     const grapheme = strings.dupe(text) catch return error.OutOfMemory;
-    return .{ .char = .{ .grapheme = grapheme, .width = cell.width }, .style = zigStyle(cell.style) orelse return error.Invalid };
+    return .{ .char = .{ .grapheme = grapheme, .width = cell.width }, .style = style };
 }
 
 fn exportCell(cell: Cell) CCell {
@@ -433,6 +436,7 @@ pub fn window_fill(window: ?*CWindow, cell: ?*const CCell) callconv(.c) Result {
 pub fn window_write_cell(window: ?*CWindow, col: u16, row: u16, cell: ?*const CCell) callconv(.c) Result {
     const w = window orelse return .err_invalid;
     const c = cell orelse return .err_invalid;
+    if (w.window.readCell(col, row) == null) return .err_range;
     w.window.writeCell(col, row, copyCell(w.strings, c.*) catch |e| return if (e == error.OutOfMemory) .err_oom else .err_invalid);
     w.strings.compactIfNeeded(w.window.screen) catch return .err_oom;
     return .ok;
@@ -483,8 +487,11 @@ pub fn window_print(window: ?*CWindow, segments: ?[*]const CSegment, count: usiz
     for (0..count) |i| {
         const cs = segments.?[i];
         const text = sliceFrom(cs.text.ptr, cs.text.len) orelse return .err_invalid;
-        const owned = w.strings.dupe(text) catch return .err_oom;
-        zs[i] = .{ .text = owned, .style = zigStyle(cs.style) orelse return .err_invalid };
+        const style = zigStyle(cs.style) orelse return .err_invalid;
+        zs[i] = .{ .text = text, .style = style };
+    }
+    for (zs) |*segment| {
+        segment.text = w.strings.dupe(segment.text) catch return .err_oom;
     }
     const r = w.window.print(zs, .{ .row_offset = opts.row_offset, .col_offset = opts.col_offset, .wrap = @fromBackingInt(@intCast(opts.wrap)), .commit = opts.commit });
     w.strings.compactIfNeeded(w.window.screen) catch return .err_oom;
@@ -680,7 +687,7 @@ pub fn terminal_new_with_allocator(custom: ?*const CAllocator, cargv: ?[*]const 
     const options = opts orelse return .err_invalid;
     if (!validTerminalSize(options.size, options.scrollback_size)) return .err_range;
     const handle = terminalCreate(custom, cargv orelse return .err_invalid, argc, options.*) catch |err| return switch (err) {
-        error.InvalidArgument, error.Invalid => .err_invalid,
+        error.InvalidArgument, error.Invalid, error.InvalidCommand => .err_invalid,
         error.OutOfMemory => .err_oom,
         else => .err_io,
     };
@@ -784,10 +791,24 @@ pub fn tty_new_with_allocator(custom: ?*const CAllocator, out: ?*?*CTty) callcon
 pub fn tty_free(tty: ?*CTty) callconv(.c) void {
     const t = tty orelse return;
     const allocator = t.allocator.get();
-    if (t.tty) |x| x.deinit();
+    if (comptime builtin.os.tag != .windows)
+        clearTtyWinsizeHandlers(t, vaxis.tty.PosixTty.removeWinsize);
+    if (t.tty) |*x| x.deinit();
     t.threaded.deinit();
     allocator.destroy(t);
 }
+
+const WinsizeHandlerRemover = *const fn (vaxis.tty.PosixTty.SignalHandler) void;
+
+fn clearTtyWinsizeHandlers(t: *CTty, remove: WinsizeHandlerRemover) void {
+    for (&t.winsize_handlers) |*slot| {
+        if (slot.*) |*handler| {
+            remove(.{ .context = handler, .callback = CWinsizeHandler.notify });
+            slot.* = null;
+        }
+    }
+}
+
 pub fn tty_winsize(tty: ?*CTty, out: ?*CWinsize) callconv(.c) Result {
     const t = tty orelse return .err_invalid;
     const o = out orelse return .err_invalid;
@@ -955,8 +976,7 @@ fn applyRuntimeEvent(vx: *Vaxis, e: *const CEvent) void {
             vx.queries_done.store(true, .unordered);
         },
         .winsize => {
-            vx.state.in_band_resize = true;
-            if (comptime builtin.os.tag != .windows) Tty.resetSignalHandler();
+            vx.state.in_band_resize.store(true, .release);
         },
         else => {},
     }
@@ -1472,6 +1492,71 @@ test "c api: screen owns input strings and bounds overwritten storage" {
     try testing.expect(screen.?.strings.allocated_bytes <= 64 * 1024);
 }
 
+test "c api: invalid writes do not consume string storage" {
+    var screen: ?*CScreen = null;
+    try testing.expectEqual(.ok, screen_new(.{ .rows = 2, .cols = 8, .x_pixel = 80, .y_pixel = 160 }, &screen));
+    defer screen_free(screen);
+    const window = screen_window(screen) orelse return error.OutOfMemory;
+    defer window_free(window);
+
+    const baseline = screen.?.strings.allocated_bytes;
+    var invalid_style = cStyle(.{});
+    invalid_style.underline = 255;
+    const invalid_cell: CCell = .{
+        .grapheme = .init("invalid"),
+        .width = 1,
+        .style = invalid_style,
+    };
+    try testing.expectEqual(.err_invalid, window_fill(window, &invalid_cell));
+    try testing.expectEqual(baseline, screen.?.strings.allocated_bytes);
+
+    const segments = [_]CSegment{
+        .{ .text = .init("valid"), .style = cStyle(.{}) },
+        .{ .text = .init("invalid"), .style = invalid_style },
+    };
+    var print_result: CPrintResult = undefined;
+    try testing.expectEqual(.err_invalid, window_print(
+        window,
+        segments[0..].ptr,
+        segments.len,
+        .{ .row_offset = 0, .col_offset = 0, .wrap = 0, .commit = true },
+        &print_result,
+    ));
+    try testing.expectEqual(baseline, screen.?.strings.allocated_bytes);
+
+    const valid_cell: CCell = .{
+        .grapheme = .init("outside"),
+        .width = 1,
+        .style = cStyle(.{}),
+    };
+    try testing.expectEqual(.err_range, window_write_cell(window, 8, 0, &valid_cell));
+    try testing.expectEqual(baseline, screen.?.strings.allocated_bytes);
+}
+
+test "c api: tty teardown drains owned winsize handlers" {
+    var removed: usize = 0;
+    const callback = struct {
+        fn run(_: ?*anyopaque) callconv(.c) void {}
+    }.run;
+    const remover = struct {
+        fn run(signal_handler: vaxis.tty.PosixTty.SignalHandler) void {
+            const handler: *const CWinsizeHandler = @ptrCast(@alignCast(signal_handler.context));
+            const count: *usize = @ptrCast(@alignCast(handler.context.?));
+            count.* += 1;
+        }
+    }.run;
+
+    var tty: CTty = undefined;
+    tty.winsize_handlers = @splat(null);
+    tty.winsize_handlers[1] = .{ .callback = callback, .context = &removed };
+    tty.winsize_handlers[6] = .{ .callback = callback, .context = &removed };
+
+    clearTtyWinsizeHandlers(&tty, remover);
+    try testing.expectEqual(@as(usize, 2), removed);
+    for (tty.winsize_handlers) |handler|
+        try testing.expect(handler == null);
+}
+
 test "c api: environment entries are parsed and copied" {
     var map = std.process.Environ.Map.init(testing.allocator);
     defer map.deinit();
@@ -1499,7 +1584,7 @@ test "c api: runtime capability events update Vaxis state" {
     try testing.expectEqual(vaxis.gwidth.Method.unicode, vx.caps.unicode);
     event.type = .winsize;
     applyRuntimeEvent(&vx, &event);
-    try testing.expect(vx.state.in_band_resize);
+    try testing.expect(vx.state.in_band_resize.load(.acquire));
 }
 
 test "c api: terminal dimensions are validated" {

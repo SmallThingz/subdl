@@ -35,57 +35,50 @@ pub const Scraper = struct {
 
         const trimmed = std.mem.trim(u8, query, " \t\r\n");
         if (trimmed.len < 2) return .{ .arena = arena, .items = &.{} };
+        const wanted = try common.normalizeTitle(a, trimmed);
+        if (wanted.len == 0) return .{ .arena = arena, .items = &.{} };
         const encoded = try common.encodeUriComponent(a, trimmed);
         const url = try std.fmt.allocPrint(a, "{s}/titles/search/{s}", .{ api_site, encoded });
-        const response = try common.fetchBytes(self.client, a, url, .{
-            .accept = "application/json",
-            .max_attempts = 2,
-            .require_public_origin = true,
-        });
+        const response = try common.fetchBytes(self.client, a, url, fixedFetchOptions("application/json"));
 
-        return parseSearchJson(common.takeArena(&arena), response.body);
+        return parseSearchJson(common.takeArena(&arena), response.body, trimmed);
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
-        try validateWebEndpoint(item.page_url);
+        try validateWebEndpoint(item.page_url, item.slug);
 
-        const response = try common.fetchBytes(self.client, a, item.page_url, .{
-            .accept = "text/html,application/xhtml+xml,*/*",
-            .max_attempts = 2,
-            .require_public_origin = true,
-        });
+        const response = try common.fetchBytes(self.client, a, item.page_url, fixedFetchOptions("text/html,application/xhtml+xml,*/*"));
 
-        var parsed = try common.parseHtmlStable(a, response.body);
-        var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
-        var seen = std.StringHashMapUnmanaged(void).empty;
-        var anchors = parsed.doc.queryAll("a[href^='https://api.subt.is/v1/subtitle/link/']");
-        while (anchors.next()) |anchor| {
-            const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
-            try validateApiEndpoint(href);
-            if (seen.contains(href)) continue;
-            try seen.put(a, href, {});
-            const id = trailingPathSegment(href) orelse "subtitle";
-            try subtitles.append(a, .{
-                .filename = try std.fmt.allocPrint(a, "subtis-{s}.srt", .{id}),
-                .download_url = try a.dupe(u8, href),
-            });
-        }
+        const subtitles = try parseSubtitleLinks(a, response.body);
 
         return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
-            .subtitles = try subtitles.toOwnedSlice(a),
+            .subtitles = subtitles,
         });
     }
 };
 
-fn parseSearchJson(arena: std.heap.ArenaAllocator, body: []const u8) !SearchResponse {
+fn fixedFetchOptions(accept: []const u8) common.FetchOptions {
+    return .{
+        .accept = accept,
+        .max_attempts = 2,
+        .require_public_origin = true,
+        .require_https = true,
+        .require_same_origin = true,
+    };
+}
+
+fn parseSearchJson(arena: std.heap.ArenaAllocator, body: []const u8, query: []const u8) !SearchResponse {
     var owned_arena = arena;
     errdefer owned_arena.deinit();
     const a = owned_arena.allocator();
+
+    const wanted = try common.normalizeTitle(a, query);
+    if (wanted.len == 0) return .{ .arena = owned_arena, .items = &.{} };
 
     const root = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{});
     const obj = switch (root) {
@@ -98,7 +91,8 @@ fn parseSearchJson(arena: std.heap.ArenaAllocator, body: []const u8) !SearchResp
         else => return error.InvalidFieldType,
     };
 
-    var items: std.ArrayListUnmanaged(SearchItem) = .empty;
+    var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
+    var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
     for (results.items) |entry| {
         const entry_obj = switch (entry) {
             .object => |value| value,
@@ -107,59 +101,192 @@ fn parseSearchJson(arena: std.heap.ArenaAllocator, body: []const u8) !SearchResp
         const media_type = common.jsonString(entry_obj, "type") orelse continue;
         if (!std.mem.eql(u8, media_type, "movie")) continue;
         const title = common.jsonString(entry_obj, "title_name") orelse continue;
+        const normalized = try common.normalizeTitle(a, title);
+        const exact_match = std.mem.eql(u8, normalized, wanted);
+        if (!exact_match and !common.normalizedTitlesRelated(normalized, wanted)) continue;
         const slug = common.jsonString(entry_obj, "slug") orelse continue;
+        if (!isCanonicalSlug(slug)) continue;
         const year = if (entry_obj.get("year")) |value| common.jsonInt(value) else null;
 
         const page_url = try std.fmt.allocPrint(a, "{s}/subtitles/movie/{s}", .{ web_site, slug });
-        try validateWebEndpoint(page_url);
-        try items.append(a, .{
+        validateWebEndpoint(page_url, slug) catch continue;
+        const item: SearchItem = .{
             .title = try a.dupe(u8, title),
             .year = year,
             .slug = try a.dupe(u8, slug),
             .page_url = page_url,
-        });
+        };
+        if (exact_match) try exact.append(a, item) else try partial.append(a, item);
     }
 
+    var items: std.ArrayListUnmanaged(SearchItem) = .empty;
+    try items.appendSlice(a, exact.items);
+    try items.appendSlice(a, partial.items);
     return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) });
 }
 
-fn trailingPathSegment(url: []const u8) ?[]const u8 {
-    var end = std.mem.indexOfAny(u8, url, "?#") orelse url.len;
-    while (end > 0 and url[end - 1] == '/') end -= 1;
-    if (end == 0) return null;
-    const slash = std.mem.lastIndexOfScalar(u8, url[0..end], '/') orelse return url[0..end];
-    if (slash + 1 >= end) return null;
-    return url[slash + 1 .. end];
+fn parseSubtitleLinks(allocator: Allocator, body: []const u8) ![]const SubtitleItem {
+    var parsed = try common.parseHtmlStable(allocator, body);
+    defer parsed.deinit();
+    var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
+    errdefer {
+        for (subtitles.items) |item| {
+            allocator.free(item.filename);
+            allocator.free(item.download_url);
+        }
+        subtitles.deinit(allocator);
+    }
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(allocator);
+    var anchors = parsed.doc.queryAll("a[href^='https://api.subt.is/v1/subtitle/link/']");
+    while (anchors.next()) |anchor| {
+        const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
+        const id = subtitleLinkId(href) orelse continue;
+        if (seen.contains(href)) continue;
+        try seen.put(allocator, href, {});
+        const filename = try std.fmt.allocPrint(allocator, "subtis-{s}.srt", .{id});
+        const download_url = allocator.dupe(u8, href) catch |err| {
+            allocator.free(filename);
+            return err;
+        };
+        subtitles.append(allocator, .{
+            .filename = filename,
+            .download_url = download_url,
+        }) catch |err| {
+            allocator.free(filename);
+            allocator.free(download_url);
+            return err;
+        };
+    }
+    return subtitles.toOwnedSlice(allocator);
 }
 
-fn validateWebEndpoint(url: []const u8) !void {
+fn validateWebEndpoint(url: []const u8, expected_slug: []const u8) !void {
+    if (!isCanonicalSlug(expected_slug)) return error.UnsafeHttpTarget;
     try common.validatePublicHttpUrl(url);
     if (!(try common.sameOrigin(web_site, url))) return error.UnsafeHttpTarget;
+    const uri = std.Uri.parse(url) catch return error.UnsafeHttpTarget;
+    if (uri.query != null or uri.fragment != null) return error.UnsafeHttpTarget;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    const prefix = "/subtitles/movie/";
+    if (!std.mem.startsWith(u8, path, prefix)) return error.UnsafeHttpTarget;
+    const slug = path[prefix.len..];
+    if (!std.mem.eql(u8, slug, expected_slug)) return error.UnsafeHttpTarget;
 }
 
 fn validateApiEndpoint(url: []const u8) !void {
-    try common.validatePublicHttpUrl(url);
-    if (!(try common.sameOrigin(api_site, url))) return error.UnsafeHttpTarget;
+    if (subtitleLinkId(url) == null) return error.UnsafeHttpTarget;
+}
+
+fn subtitleLinkId(url: []const u8) ?[]const u8 {
+    common.validatePublicHttpUrl(url) catch return null;
+    if (!(common.sameOrigin(api_site, url) catch false)) return null;
+    const uri = std.Uri.parse(url) catch return null;
+    if (uri.query != null or uri.fragment != null) return null;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    const prefix = "/v1/subtitle/link/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const id = path[prefix.len..];
+    if (!isCanonicalLinkId(id)) return null;
+    return id;
+}
+
+fn isCanonicalSlug(value: []const u8) bool {
+    if (value.len == 0 or value.len > 256 or value[0] == '-' or value[value.len - 1] == '-') return false;
+    var previous_dash = false;
+    for (value) |c| {
+        if (c == '-') {
+            if (previous_dash) return false;
+            previous_dash = true;
+        } else {
+            if (!(std.ascii.isDigit(c) or (c >= 'a' and c <= 'z'))) return false;
+            previous_dash = false;
+        }
+    }
+    return true;
+}
+
+fn isCanonicalLinkId(value: []const u8) bool {
+    if (value.len == 0 or value.len > 256) return false;
+    for (value) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '_')) return false;
+    }
+    return true;
 }
 
 test "subtis rejects unsafe web and API endpoints" {
-    try std.testing.expectError(error.UnsafeHttpTarget, validateWebEndpoint("http://127.0.0.1/private"));
-    try std.testing.expectError(error.UnsafeHttpTarget, validateWebEndpoint("https://user:pass@subtis.io/private"));
-    try std.testing.expectError(error.UnsafeHttpTarget, validateWebEndpoint("https://subtis.io.evil.com/private"));
-    try std.testing.expectError(error.UnsafeHttpTarget, validateApiEndpoint("https://api.subt.is.evil.com/v1/subtitle/link/1"));
+    try validateWebEndpoint("https://subtis.io/subtitles/movie/the-matrix-1999", "the-matrix-1999");
+    try validateApiEndpoint("https://api.subt.is/v1/subtitle/link/1");
+    for ([_][]const u8{
+        "http://127.0.0.1/private",
+        "https://user:pass@subtis.io/subtitles/movie/the-matrix-1999",
+        "https://subtis.io.evil.com/subtitles/movie/the-matrix-1999",
+        "https://subtis.io/subtitles/movie/the-matrix-1999/extra",
+        "https://subtis.io/subtitles/movie/the-matrix-1999?next=/admin",
+    }) |url| try std.testing.expectError(error.UnsafeHttpTarget, validateWebEndpoint(url, "the-matrix-1999"));
+    for ([_][]const u8{
+        "https://api.subt.is.evil.com/v1/subtitle/link/1",
+        "https://api.subt.is/v1/subtitle/link/1/extra",
+        "https://api.subt.is/v1/subtitle/link/1?next=/admin",
+        "https://api.subt.is/v1/subtitle/link/%2e%2e",
+        "https://api.subt.is/v1/subtitle/link/..",
+    }) |url| try std.testing.expectError(error.UnsafeHttpTarget, validateApiEndpoint(url));
 }
 
 test "subtis parses movie search payload" {
     const arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     var response = try parseSearchJson(arena,
-        \\{"total":2,"results":[{"slug":"the-matrix-1999","type":"movie","year":1999,"title_name":"The Matrix"},{"slug":"matrix-show","type":"tv","year":2024,"title_name":"Matrix Show"}]}
-    );
+        \\{"total":3,"results":[{"slug":"../admin?x=1","type":"movie","year":1999,"title_name":"Malformed"},{"slug":"the-matrix-1999","type":"movie","year":1999,"title_name":"The Matrix"},{"slug":"matrix-show","type":"tv","year":2024,"title_name":"Matrix Show"}]}
+    , "The Matrix");
     defer response.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), response.items.len);
     try std.testing.expectEqualStrings("The Matrix", response.items[0].title);
     try std.testing.expectEqual(@as(?i64, 1999), response.items[0].year);
     try std.testing.expectEqualStrings("https://subtis.io/subtitles/movie/the-matrix-1999", response.items[0].page_url);
+}
+
+test "subtis fixed fetches stay on their HTTPS origin" {
+    const options = fixedFetchOptions("application/json");
+    try std.testing.expect(options.require_public_origin);
+    try std.testing.expect(options.require_https);
+    try std.testing.expect(options.require_same_origin);
+}
+
+test "subtis search relevance uses the returned title field" {
+    const arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var response = try parseSearchJson(
+        arena,
+        \\{"results":[{"slug":"preacher-2016","type":"movie","title_name":"Preacher"},{"slug":"jack-reacher-2012","type":"movie","title_name":"Jack Reacher"},{"slug":"matrix-1999","type":"movie","title_name":"The Matrix"}]}
+    ,
+        "Reacher",
+    );
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), response.items.len);
+    try std.testing.expectEqualStrings("Jack Reacher", response.items[0].title);
+}
+
+test "subtis skips malformed selector links without dropping valid siblings" {
+    const allocator = std.testing.allocator;
+    const subtitles = try parseSubtitleLinks(allocator, "<a href='https://api.subt.is/v1/subtitle/link/../admin'>bad</a>" ++
+        "<a href='https://api.subt.is/v1/subtitle/link/1?next=/admin'>bad query</a>" ++
+        "<a href='https://api.subt.is/v1/subtitle/link/valid-2'>good</a>");
+    defer {
+        for (subtitles) |item| {
+            allocator.free(item.filename);
+            allocator.free(item.download_url);
+        }
+        allocator.free(subtitles);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), subtitles.len);
+    try std.testing.expectEqualStrings("subtis-valid-2.srt", subtitles[0].filename);
+    try std.testing.expectEqualStrings("https://api.subt.is/v1/subtitle/link/valid-2", subtitles[0].download_url);
 }
 
 test "live subtis movie search subtitle listing and download" {

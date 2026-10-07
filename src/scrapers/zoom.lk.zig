@@ -36,6 +36,8 @@ pub const Scraper = struct {
         const trimmed = std.mem.trim(u8, query, " \t\r\n");
         if (trimmed.len == 0) return .{ .arena = arena, .items = &.{} };
         const parsed_query = try parseSearchQuery(trimmed);
+        const wanted = try common.normalizeTitle(a, parsed_query.title);
+        if (wanted.len == 0) return .{ .arena = arena, .items = &.{} };
 
         const encoded = try common.encodeUriComponent(a, parsed_query.title);
         const url = try std.fmt.allocPrint(a, "{s}/?s={s}", .{ site, encoded });
@@ -44,13 +46,15 @@ pub const Scraper = struct {
             .cache = false,
             .max_attempts = 2,
             .require_public_origin = true,
+            .require_https = true,
+            .require_same_origin = true,
         });
 
         return parseSearchHtml(common.takeArena(&arena), response.body, trimmed);
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
-        try validateZoomUrl(item.page_url);
+        try validateZoomUrl(item.page_url, .page);
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -60,6 +64,8 @@ pub const Scraper = struct {
             .cache = false,
             .max_attempts = 2,
             .require_public_origin = true,
+            .require_https = true,
+            .require_same_origin = true,
         });
         const download_url = try parseDownloadUrl(a, response.body);
         const download_id = trailingNumericSegment(download_url) orelse "subtitle";
@@ -93,24 +99,35 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8, query: []co
     var cursor: usize = 0;
     const marker = "<h3 class=\"entry-title td-module-title\">";
     while (std.mem.indexOfPos(u8, body, cursor, marker)) |h3_pos| {
-        const h3_end = std.mem.indexOfPos(u8, body, h3_pos + marker.len, "</h3>") orelse break;
+        const content_start = h3_pos + marker.len;
+        const next_h3 = std.mem.indexOfPos(u8, body, content_start, marker);
+        const h3_end_opt = std.mem.indexOfPos(u8, body, content_start, "</h3>");
+        if (next_h3) |next| {
+            if (h3_end_opt == null or next < h3_end_opt.?) {
+                cursor = next;
+                continue;
+            }
+        }
+        const h3_end = h3_end_opt orelse break;
         const block = body[h3_pos..h3_end];
         cursor = h3_end + "</h3>".len;
 
-        const href = attributeValue(block, "href") orelse continue;
-        const raw_title = attributeValue(block, "title") orelse continue;
-        validateZoomUrl(href) catch continue;
+        const anchor_tag = firstOpeningTag(block, "a") orelse continue;
+        const raw_href = attributeValue(anchor_tag, "href") orelse continue;
+        const raw_title = attributeValue(anchor_tag, "title") orelse continue;
+        const href = try decodeHtmlEntities(a, raw_href);
+        const decoded_title = try decodeHtmlEntities(a, raw_title);
+        validateZoomUrl(href, .page) catch continue;
         if (seen.contains(href)) continue;
 
-        const parsed_title = parsePostTitle(raw_title);
+        const parsed_title = parsePostTitle(decoded_title);
         if (parsed_title.title.len == 0) continue;
         if (parsed_query.season) |season| {
             if (parsed_title.media_kind != .tv or parsed_title.season != season) continue;
         }
         const normalized = try common.normalizeTitle(a, parsed_title.title);
         if (normalized.len == 0) continue;
-        if (std.mem.indexOf(u8, normalized, wanted) == null and
-            std.mem.indexOf(u8, wanted, normalized) == null) continue;
+        if (!common.normalizedTitlesRelated(normalized, wanted)) continue;
 
         try seen.put(a, try a.dupe(u8, href), {});
         const item: SearchItem = .{
@@ -140,7 +157,9 @@ const ParsedTitle = struct {
     season: ?i64,
 };
 
-fn validateZoomUrl(url: []const u8) !void {
+const ZoomRoute = enum { page, download };
+
+fn validateZoomUrl(url: []const u8, route: ZoomRoute) !void {
     try common.validatePublicHttpUrl(url);
     for (url) |byte| {
         if (byte <= 0x20 or byte == 0x7f or byte == '\\') return error.UnsafeHttpTarget;
@@ -155,6 +174,53 @@ fn validateZoomUrl(url: []const u8) !void {
     };
     if (!std.ascii.eqlIgnoreCase(host_bytes, "zoom.lk")) return error.UnsafeHttpTarget;
     if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+    if (uri.query != null or uri.fragment != null) return error.UnsafeHttpTarget;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |bytes| bytes,
+    };
+    const valid = switch (route) {
+        .page => isCanonicalPostPath(path),
+        .download => isCanonicalDownloadPath(path),
+    };
+    if (!valid) return error.UnsafeHttpTarget;
+}
+
+fn isCanonicalDownloadPath(path: []const u8) bool {
+    const prefix = "/sub-download/";
+    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    const id = path[prefix.len..];
+    if (id.len == 0 or id.len > 19 or id[0] == '0') return false;
+    for (id) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
+}
+
+fn isCanonicalPostPath(path: []const u8) bool {
+    if (path.len < 2 or path[0] != '/') return false;
+    const without_trailing = if (path[path.len - 1] == '/') path[0 .. path.len - 1] else path;
+    if (without_trailing.len < 2 or std.mem.indexOfScalar(u8, without_trailing[1..], '/') != null)
+        return false;
+    return isSafePathSegment(without_trailing[1..]);
+}
+
+fn isSafePathSegment(value: []const u8) bool {
+    if (value.len == 0 or std.mem.eql(u8, value, ".") or std.mem.eql(u8, value, "..")) return false;
+    var index: usize = 0;
+    while (index < value.len) {
+        const byte = value[index];
+        if (std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.' or byte == '~') {
+            index += 1;
+            continue;
+        }
+        if (byte != '%' or value.len - index < 3 or
+            !std.ascii.isHex(value[index + 1]) or !std.ascii.isHex(value[index + 2])) return false;
+        const high = std.fmt.charToDigit(value[index + 1], 16) catch return false;
+        const low = std.fmt.charToDigit(value[index + 2], 16) catch return false;
+        const decoded: u8 = @intCast(high * 16 + low);
+        if (decoded < 0x20 or decoded == 0x7f or decoded == '/' or decoded == '\\' or
+            decoded == '?' or decoded == '#' or decoded == '.') return false;
+        index += 3;
+    }
+    return true;
 }
 
 fn parsePostTitle(raw: []const u8) ParsedTitle {
@@ -247,14 +313,24 @@ fn parseSearchQuery(value: []const u8) !struct { title: []const u8, season: ?i64
 
 fn parseDownloadUrl(allocator: Allocator, body: []const u8) ![]const u8 {
     const marker = "https://zoom.lk/sub-download/";
-    const pos = std.mem.indexOf(u8, body, marker) orelse return error.MissingField;
-    var end = pos + marker.len;
-    while (end < body.len and std.ascii.isDigit(body[end])) : (end += 1) {}
-    if (end == pos + marker.len) return error.MissingField;
-    const url = try allocator.dupe(u8, body[pos..end]);
-    errdefer allocator.free(url);
-    try validateZoomUrl(url);
-    return url;
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, body, cursor, marker)) |pos| {
+        var end = pos + marker.len;
+        while (end < body.len and std.ascii.isDigit(body[end])) : (end += 1) {}
+        cursor = @max(end, pos + marker.len);
+        if (end == pos + marker.len) continue;
+        if (body[pos + marker.len] == '0') continue;
+        if (end < body.len and (std.ascii.isAlphanumeric(body[end]) or body[end] == '-' or body[end] == '_'))
+            continue;
+        const url = try allocator.dupe(u8, body[pos..end]);
+        errdefer allocator.free(url);
+        validateZoomUrl(url, .download) catch {
+            allocator.free(url);
+            continue;
+        };
+        return url;
+    }
+    return error.MissingField;
 }
 
 fn trailingNumericSegment(url: []const u8) ?[]const u8 {
@@ -266,22 +342,136 @@ fn trailingNumericSegment(url: []const u8) ?[]const u8 {
     return value;
 }
 
+fn firstOpeningTag(input: []const u8, name: []const u8) ?[]const u8 {
+    var cursor: usize = 0;
+    while (cursor + name.len + 1 <= input.len) : (cursor += 1) {
+        if (input[cursor] != '<') continue;
+        const name_start = cursor + 1;
+        const name_end = name_start + name.len;
+        if (name_end > input.len or !std.ascii.eqlIgnoreCase(input[name_start..name_end], name)) continue;
+        if (name_end < input.len and !std.ascii.isWhitespace(input[name_end]) and
+            input[name_end] != '>' and input[name_end] != '/') continue;
+
+        var active_quote: ?u8 = null;
+        var end = name_end;
+        while (end < input.len) : (end += 1) {
+            if (active_quote) |quote| {
+                if (input[end] == quote) active_quote = null;
+                continue;
+            }
+            if (input[end] == '"' or input[end] == '\'') {
+                active_quote = input[end];
+                continue;
+            }
+            if (input[end] == '>') return input[cursor .. end + 1];
+        }
+        return null;
+    }
+    return null;
+}
+
 fn attributeValue(tag: []const u8, name: []const u8) ?[]const u8 {
     var cursor: usize = 0;
-    while (std.mem.indexOfPos(u8, tag, cursor, name)) |pos| {
-        const after = pos + name.len;
-        if (after >= tag.len or tag[after] != '=') {
-            cursor = after;
+    var active_quote: ?u8 = null;
+    while (cursor + name.len <= tag.len) {
+        if (active_quote) |quote| {
+            if (tag[cursor] == quote) active_quote = null;
+            cursor += 1;
             continue;
         }
-        if (after + 1 >= tag.len) return null;
-        const quote = tag[after + 1];
+        if (tag[cursor] == '"' or tag[cursor] == '\'') {
+            active_quote = tag[cursor];
+            cursor += 1;
+            continue;
+        }
+        const pos = cursor;
+        if (!std.ascii.eqlIgnoreCase(tag[pos .. pos + name.len], name)) {
+            cursor += 1;
+            continue;
+        }
+        if (pos == 0 or !std.ascii.isWhitespace(tag[pos - 1])) {
+            cursor = pos + name.len;
+            continue;
+        }
+        var after = pos + name.len;
+        while (after < tag.len and std.ascii.isWhitespace(tag[after])) : (after += 1) {}
+        if (after >= tag.len or tag[after] != '=') {
+            cursor = pos + name.len;
+            continue;
+        }
+        after += 1;
+        while (after < tag.len and std.ascii.isWhitespace(tag[after])) : (after += 1) {}
+        if (after >= tag.len) return null;
+        const quote = tag[after];
         if (quote != '"' and quote != '\'') return null;
-        const start = after + 2;
+        const start = after + 1;
         const end_rel = std.mem.indexOfScalar(u8, tag[start..], quote) orelse return null;
         return tag[start .. start + end_rel];
     }
     return null;
+}
+
+fn decodeHtmlEntities(allocator: Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] != '&') {
+            try out.append(allocator, input[i]);
+            i += 1;
+            continue;
+        }
+
+        const tail = input[i..];
+        const replacements = [_]struct { encoded: []const u8, decoded: u8 }{
+            .{ .encoded = "&amp;", .decoded = '&' },
+            .{ .encoded = "&quot;", .decoded = '"' },
+            .{ .encoded = "&apos;", .decoded = '\'' },
+            .{ .encoded = "&lt;", .decoded = '<' },
+            .{ .encoded = "&gt;", .decoded = '>' },
+            .{ .encoded = "&nbsp;", .decoded = ' ' },
+        };
+        var matched = false;
+        for (replacements) |replacement| {
+            if (!std.mem.startsWith(u8, tail, replacement.encoded)) continue;
+            try out.append(allocator, replacement.decoded);
+            i += replacement.encoded.len;
+            matched = true;
+            break;
+        }
+        if (matched) continue;
+
+        if (std.mem.startsWith(u8, tail, "&#")) {
+            const semicolon = std.mem.indexOfScalar(u8, tail, ';') orelse {
+                try out.append(allocator, input[i]);
+                i += 1;
+                continue;
+            };
+            if (semicolon > 2 and semicolon <= 10) {
+                const numeric = tail[2..semicolon];
+                const hex = numeric.len > 1 and (numeric[0] == 'x' or numeric[0] == 'X');
+                const digits = if (hex) numeric[1..] else numeric;
+                const codepoint = std.fmt.parseInt(u21, digits, if (hex) 16 else 10) catch {
+                    try out.append(allocator, input[i]);
+                    i += 1;
+                    continue;
+                };
+                var encoded: [4]u8 = undefined;
+                const encoded_len = std.unicode.utf8Encode(codepoint, &encoded) catch {
+                    try out.append(allocator, input[i]);
+                    i += 1;
+                    continue;
+                };
+                try out.appendSlice(allocator, encoded[0..encoded_len]);
+                i += semicolon + 1;
+                continue;
+            }
+        }
+
+        try out.append(allocator, input[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 test "zoom parses movie and tv titles" {
@@ -316,9 +506,37 @@ test "zoom verifies season packs and rejects unsupported episode selection" {
     try std.testing.expectError(error.UnsupportedEpisodeSelection, scraper.search("Teen Wolf S10E01"));
 }
 
-test "zoom only accepts the exact public HTTPS origin before acquisition" {
-    try validateZoomUrl("https://zoom.lk/post");
-    try validateZoomUrl("HTTPS://ZOOM.LK:443/post");
+test "zoom matches exact attribute names and decodes title entities" {
+    const fixture =
+        "<h3 class=\"entry-title td-module-title\"><span href=\"https://zoom.lk/nested-wrong\" title=\"Nested Wrong\"></span><a data-href=\"https://zoom.lk/wrong\" href = \"https://zoom.lk/right\" aria-title=\"Wrong\" data-note=\" title='Injected'\" title=\"Tom &amp; Jerry (2021) Sinhala Subtitle\">x</a></h3>";
+    var response = try parseSearchHtml(std.heap.ArenaAllocator.init(std.testing.allocator), fixture, "Tom & Jerry");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(usize, 1), response.items.len);
+    try std.testing.expectEqualStrings("Tom & Jerry", response.items[0].title);
+    try std.testing.expectEqualStrings("https://zoom.lk/right", response.items[0].page_url);
+    try std.testing.expectEqual(@as(?i64, 2021), response.items[0].year);
+
+    const decoded = try decodeHtmlEntities(std.testing.allocator, "Rock&#39;n&#x20AC;");
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("Rock'n€", decoded);
+}
+
+test "zoom malformed heading does not consume the following valid sibling" {
+    const fixture =
+        "<h3 class=\"entry-title td-module-title\"><a href=\"https://zoom.lk/bad\" title=\"broken\">" ++
+        "<h3 class=\"entry-title td-module-title\"><a href=\"https://zoom.lk/centigrade\" title=\"Centigrade (2020) Sinhala Subtitle\">good</a></h3>";
+    var response = try parseSearchHtml(std.heap.ArenaAllocator.init(std.testing.allocator), fixture, "Centigrade");
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), response.items.len);
+    try std.testing.expectEqualStrings("Centigrade", response.items[0].title);
+    try std.testing.expectEqualStrings("https://zoom.lk/centigrade", response.items[0].page_url);
+}
+
+test "zoom only accepts exact public HTTPS provider routes before acquisition" {
+    try validateZoomUrl("https://zoom.lk/post", .page);
+    try validateZoomUrl("HTTPS://ZOOM.LK:443/post", .page);
+    try validateZoomUrl("https://zoom.lk/sub-download/42", .download);
     for ([_][]const u8{
         "https://zoom.lk.attacker.example/post",
         "https://zoom.lk@attacker.example/post",
@@ -329,8 +547,18 @@ test "zoom only accepts the exact public HTTPS origin before acquisition" {
         "https://zoom.lk./post",
         "https://zoom.lk\\@attacker.example/post",
         "https://zoom.lk/post\n",
-    }) |url| try std.testing.expectError(error.UnsafeHttpTarget, validateZoomUrl(url));
-    try std.testing.expectError(error.InvalidDownloadUrl, validateZoomUrl("file:///post"));
+        "https://zoom.lk/admin/users",
+        "https://zoom.lk/post?next=/admin",
+        "https://zoom.lk/post#fragment",
+        "https://zoom.lk/%2e%2e",
+    }) |url| try std.testing.expectError(error.UnsafeHttpTarget, validateZoomUrl(url, .page));
+    try std.testing.expectError(error.InvalidDownloadUrl, validateZoomUrl("file:///post", .page));
+    for ([_][]const u8{
+        "https://zoom.lk/sub-download/0",
+        "https://zoom.lk/sub-download/01",
+        "https://zoom.lk/sub-download/42/extra",
+        "https://zoom.lk/sub-download/42?next=/admin",
+    }) |url| try std.testing.expectError(error.UnsafeHttpTarget, validateZoomUrl(url, .download));
 
     const fixture =
         "<h3 class=\"entry-title td-module-title\"><a href=\"https://zoom.lk.attacker.example/post\" title=\"Centigrade (2020) Sinhala Subtitle\">x</a></h3>" ++
@@ -353,6 +581,16 @@ test "zoom only accepts the exact public HTTPS origin before acquisition" {
     }));
 }
 
+test "zoom download scanner skips malformed first candidates" {
+    const url = try parseDownloadUrl(
+        std.testing.allocator,
+        "https://zoom.lk/sub-download/not-an-id https://zoom.lk/sub-download/01 " ++
+            "https://zoom.lk/sub-download/12evil https://zoom.lk/sub-download/42",
+    );
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings("https://zoom.lk/sub-download/42", url);
+}
+
 test "live zoom movie and tv downloads" {
     if (!common.shouldRunLiveTests(std.testing.allocator)) return error.SkipZigTest;
     if (!common.providerMatchesLiveFilter(common.liveProviderFilter(), "zoom.lk")) return error.SkipZigTest;
@@ -371,6 +609,7 @@ test "live zoom movie and tv downloads" {
         .accept = "application/octet-stream,application/x-rar-compressed,*/*",
         .cache = false,
         .require_public_origin = true,
+        .require_https = true,
     });
     defer std.testing.allocator.free(movie_dl.body);
     try std.testing.expect(movie_dl.body.len > 8);
@@ -388,6 +627,7 @@ test "live zoom movie and tv downloads" {
         .accept = "application/octet-stream,application/x-rar-compressed,*/*",
         .cache = false,
         .require_public_origin = true,
+        .require_https = true,
     });
     defer std.testing.allocator.free(tv_dl.body);
     try std.testing.expect(tv_dl.body.len > 8);

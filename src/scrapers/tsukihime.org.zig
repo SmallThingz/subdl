@@ -49,6 +49,8 @@ pub const Scraper = struct {
         const parsed_query = parseQuery(query);
         if (parsed_query.title.len == 0) return .{ .arena = arena, .items = &.{} };
         try validateSeasonSelection(parsed_query.season);
+        const wanted = try common.normalizeTitle(a, parsed_query.title);
+        if (wanted.len == 0) return .{ .arena = arena, .items = &.{} };
 
         const encoded = try common.encodeUriComponent(a, parsed_query.title);
         const search_url = try std.fmt.allocPrint(
@@ -61,6 +63,8 @@ pub const Scraper = struct {
             .cache = false,
             .max_attempts = 2,
             .require_public_origin = true,
+            .require_https = true,
+            .require_same_origin = true,
         });
 
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, search_response.body, .{});
@@ -68,51 +72,19 @@ pub const Scraper = struct {
         const results = common.jsonArray(root_obj.get("results") orelse return error.MissingField) orelse
             return error.InvalidFieldType;
 
-        const wanted = try common.normalizeTitle(a, parsed_query.title);
-        var exact_ids: std.ArrayListUnmanaged(i64) = .empty;
-        var partial_ids: std.ArrayListUnmanaged(i64) = .empty;
-        var seen_ids = std.AutoHashMapUnmanaged(i64, void).empty;
-
-        for (results.items) |value| {
-            const obj = common.jsonObject(value) orelse continue;
-            if (!isCompletedNativeResult(obj)) continue;
-            const anime = common.jsonObject(obj.get("anime") orelse continue) orelse continue;
-            const anime_id = objectInt(anime, "id") orelse continue;
-            if (seen_ids.contains(anime_id)) continue;
-
-            const title = common.jsonString(anime, "title") orelse "";
-            const english_title = common.jsonString(anime, "english_title") orelse "";
-            const normalized_title = try common.normalizeTitle(a, title);
-            const normalized_english = try common.normalizeTitle(a, english_title);
-            const exact_match = std.mem.eql(u8, normalized_title, wanted) or
-                std.mem.eql(u8, normalized_english, wanted);
-            const partial_match = containsEither(normalized_title, wanted) or
-                containsEither(normalized_english, wanted);
-            if (!exact_match and !partial_match) continue;
-
-            try seen_ids.put(a, anime_id, {});
-            if (exact_match)
-                try exact_ids.append(a, anime_id)
-            else
-                try partial_ids.append(a, anime_id);
-            if (exact_ids.items.len + partial_ids.items.len >= max_anime_matches) break;
-        }
-
-        var anime_ids: std.ArrayListUnmanaged(i64) = .empty;
-        if (exact_ids.items.len > 0) {
-            try anime_ids.appendSlice(a, exact_ids.items[0..@min(max_anime_matches, exact_ids.items.len)]);
-        } else {
-            try anime_ids.appendSlice(a, partial_ids.items[0..@min(max_anime_matches, partial_ids.items.len)]);
-        }
+        const anime_ids = try selectAnimeIds(a, results.items, wanted);
 
         var items: std.ArrayListUnmanaged(SearchItem) = .empty;
-        for (anime_ids.items) |anime_id| {
+        for (anime_ids) |anime_id| {
+            if (items.items.len >= max_search_items) break;
             const meta_url = try std.fmt.allocPrint(a, "{s}/animes/{d}?limit={d}", .{ api, anime_id, search_limit });
             const meta_response = try common.fetchBytes(self.client, a, meta_url, .{
                 .accept = "application/json,*/*",
                 .cache = false,
                 .max_attempts = 2,
                 .require_public_origin = true,
+                .require_https = true,
+                .require_same_origin = true,
             });
             const meta_root = try std.json.parseFromSliceLeaky(std.json.Value, a, meta_response.body, .{});
             const meta_obj = common.jsonObject(meta_root) orelse continue;
@@ -144,6 +116,7 @@ pub const Scraper = struct {
                 }
 
                 const torrent_id = objectInt(torrent, "id") orelse continue;
+                if (torrent_id <= 0) continue;
                 const release = common.jsonString(torrent, "name") orelse continue;
                 const page_url = try std.fmt.allocPrint(a, "{s}/torrents/{d}", .{ api, torrent_id });
                 try items.append(a, .{
@@ -168,13 +141,15 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        try validateApiUrl(item.page_url);
+        try validateTorrentApiUrl(item.page_url, item.torrent_id);
 
         const response = try common.fetchBytes(self.client, a, item.page_url, .{
             .accept = "application/json,*/*",
             .cache = false,
             .max_attempts = 2,
             .require_public_origin = true,
+            .require_https = true,
+            .require_same_origin = true,
         });
         const root = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body, .{});
         const root_obj = common.jsonObject(root) orelse return error.InvalidFieldType;
@@ -192,7 +167,7 @@ pub const Scraper = struct {
                 const attachment = common.jsonObject(attachment_value) orelse continue;
                 if ((objectInt(attachment, "type") orelse -1) != 1) continue;
                 const attachment_id = objectInt(attachment, "id") orelse continue;
-                if (seen.contains(attachment_id)) continue;
+                if (attachment_id <= 0 or attachment_id > std.math.maxInt(u32) or seen.contains(attachment_id)) continue;
 
                 const info = common.jsonObject(attachment.get("info") orelse continue) orelse continue;
                 if ((objectInt(info, "cached") orelse 1) == 0) continue;
@@ -202,8 +177,7 @@ pub const Scraper = struct {
                 const track_name = common.jsonString(info, "name") orelse "";
                 if (looksSignsOnly(track_name)) continue;
 
-                const raw_language = common.jsonString(info, "lang") orelse "en";
-                const language = common.normalizeLanguageCode(raw_language) orelse raw_language;
+                const language = attachmentLanguage(info);
                 try seen.put(a, attachment_id, {});
                 try subtitles.append(a, .{
                     .language_code = try a.dupe(u8, language),
@@ -234,6 +208,8 @@ pub const Scraper = struct {
             .cache = false,
             .max_attempts = 2,
             .require_public_origin = true,
+            .require_https = true,
+            .require_same_origin = true,
         });
         defer allocator.free(response.body);
         if (response.status != .ok) return error.UnexpectedHttpStatus;
@@ -249,6 +225,58 @@ pub const Scraper = struct {
     }
 };
 
+fn selectAnimeIds(allocator: Allocator, results: []const std.json.Value, wanted: []const u8) ![]const i64 {
+    var exact_ids: std.ArrayListUnmanaged(i64) = .empty;
+    var partial_ids: std.ArrayListUnmanaged(i64) = .empty;
+
+    for (results) |value| {
+        const obj = common.jsonObject(value) orelse continue;
+        if (!isCompletedNativeResult(obj)) continue;
+        const anime = common.jsonObject(obj.get("anime") orelse continue) orelse continue;
+        const anime_id = objectInt(anime, "id") orelse continue;
+        if (anime_id <= 0) continue;
+
+        const title = common.jsonString(anime, "title") orelse "";
+        const english_title = common.jsonString(anime, "english_title") orelse "";
+        const normalized_title = try common.normalizeTitle(allocator, title);
+        const normalized_english = try common.normalizeTitle(allocator, english_title);
+        const exact_match = std.mem.eql(u8, normalized_title, wanted) or
+            std.mem.eql(u8, normalized_english, wanted);
+        const partial_match = containsEither(normalized_title, wanted) or
+            containsEither(normalized_english, wanted);
+        if (!exact_match and !partial_match) continue;
+
+        if (exact_match) {
+            if (animeIdIndex(exact_ids.items, anime_id) != null) continue;
+            if (animeIdIndex(partial_ids.items, anime_id)) |index| {
+                _ = partial_ids.orderedRemove(index);
+            }
+            try exact_ids.append(allocator, anime_id);
+            if (exact_ids.items.len >= max_anime_matches) break;
+        } else {
+            if (animeIdIndex(exact_ids.items, anime_id) != null or
+                animeIdIndex(partial_ids.items, anime_id) != null or
+                partial_ids.items.len >= max_anime_matches) continue;
+            try partial_ids.append(allocator, anime_id);
+        }
+    }
+
+    var anime_ids: std.ArrayListUnmanaged(i64) = .empty;
+    if (exact_ids.items.len > 0) {
+        try anime_ids.appendSlice(allocator, exact_ids.items[0..@min(max_anime_matches, exact_ids.items.len)]);
+    } else {
+        try anime_ids.appendSlice(allocator, partial_ids.items[0..@min(max_anime_matches, partial_ids.items.len)]);
+    }
+    return anime_ids.toOwnedSlice(allocator);
+}
+
+fn animeIdIndex(ids: []const i64, wanted: i64) ?usize {
+    for (ids, 0..) |id, index| {
+        if (id == wanted) return index;
+    }
+    return null;
+}
+
 const DownloadToken = struct {
     attachment_id: i64,
     extension: []const u8,
@@ -259,13 +287,32 @@ fn validateSeasonSelection(season: ?u16) !void {
     if (season) |value| if (value != 1) return error.UnsupportedSeasonSelection;
 }
 
-fn validateApiUrl(url: []const u8) !void {
+fn validateTorrentApiUrl(url: []const u8, expected_torrent_id: i64) !void {
     try common.validatePublicHttpUrl(url);
     if (!(try common.sameOrigin(api, url))) return error.UnsafeHttpTarget;
+    if (expected_torrent_id <= 0) return error.InvalidDownloadUrl;
+
+    const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
+    if (uri.user != null or uri.password != null or uri.query != null or uri.fragment != null)
+        return error.InvalidDownloadUrl;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    const prefix = "/v1/torrents/";
+    if (!std.mem.startsWith(u8, path, prefix)) return error.InvalidDownloadUrl;
+    const id_text = path[prefix.len..];
+    if (id_text.len == 0 or id_text.len > 19 or id_text[0] == '0')
+        return error.InvalidDownloadUrl;
+    for (id_text) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidDownloadUrl;
+    const torrent_id = std.fmt.parseInt(i64, id_text, 10) catch
+        return error.InvalidDownloadUrl;
+    if (torrent_id != expected_torrent_id) return error.InvalidDownloadUrl;
 }
 
 pub fn makeDownloadToken(allocator: Allocator, attachment_id: i64, extension: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}{d}|{s}", .{ download_token_prefix, attachment_id, extension });
+    if (attachment_id <= 0 or attachment_id > std.math.maxInt(u32)) return error.InvalidDownloadUrl;
+    const canonical_extension = supportedSubtitleCodec(extension) orelse return error.InvalidDownloadUrl;
+    return std.fmt.allocPrint(allocator, "{s}{d}|{s}", .{ download_token_prefix, attachment_id, canonical_extension });
 }
 
 pub fn parseDownloadToken(value: []const u8) ?DownloadToken {
@@ -273,10 +320,14 @@ pub fn parseDownloadToken(value: []const u8) ?DownloadToken {
     const payload = value[download_token_prefix.len..];
     const sep = std.mem.indexOfScalar(u8, payload, '|') orelse return null;
     if (sep == 0 or sep + 1 >= payload.len) return null;
-    const attachment_id = std.fmt.parseInt(i64, payload[0..sep], 10) catch return null;
-    if (attachment_id <= 0) return null;
+    const id_text = payload[0..sep];
+    if (id_text[0] == '0') return null;
+    for (id_text) |c| if (!std.ascii.isDigit(c)) return null;
+    const attachment_id = std.fmt.parseInt(i64, id_text, 10) catch return null;
+    if (attachment_id <= 0 or attachment_id > std.math.maxInt(u32)) return null;
     const extension = payload[sep + 1 ..];
-    if (supportedSubtitleCodec(extension) == null) return null;
+    const canonical_extension = supportedSubtitleCodec(extension) orelse return null;
+    if (!std.mem.eql(u8, extension, canonical_extension)) return null;
     return .{ .attachment_id = attachment_id, .extension = extension };
 }
 
@@ -313,13 +364,19 @@ fn supportedSubtitleCodec(codec: []const u8) ?[]const u8 {
     return null;
 }
 
+fn attachmentLanguage(info: std.json.ObjectMap) []const u8 {
+    const raw = common.jsonString(info, "lang") orelse return "und";
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return "und";
+    return common.normalizeLanguageCode(trimmed) orelse trimmed;
+}
+
 fn looksSignsOnly(name: []const u8) bool {
     return std.ascii.findIgnoreCase(name, "sign") != null;
 }
 
 fn containsEither(a: []const u8, b: []const u8) bool {
-    if (a.len == 0 or b.len == 0) return false;
-    return std.mem.indexOf(u8, a, b) != null or std.mem.indexOf(u8, b, a) != null;
+    return common.normalizedTitlesRelated(a, b);
 }
 
 fn objectInt(obj: std.json.ObjectMap, key: []const u8) ?i64 {
@@ -348,6 +405,60 @@ test "tsukihime parses episode query" {
     try std.testing.expectEqualStrings("Death Note", parsed.title);
     try std.testing.expectEqual(@as(?u16, 1), parsed.season);
     try std.testing.expectEqual(@as(?u16, 1), parsed.episode);
+}
+
+test "tsukihime search relevance respects normalized token boundaries" {
+    try std.testing.expect(!containsEither("preacher", "reacher"));
+    try std.testing.expect(containsEither("jack reacher", "reacher"));
+    try std.testing.expect(containsEither("reacher", "reacher the series"));
+    try std.testing.expect(!containsEither("the matrix", "reacher"));
+}
+
+test "tsukihime invalid exact anime ids do not consume the candidate cap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{"results":[
+        \\  {"state":"completed","anime":{"id":0,"title":"Target"}},
+        \\  {"state":"completed","anime":{"id":-1,"title":"Target"}},
+        \\  {"state":"completed","anime":{"id":-2,"title":"Target"}},
+        \\  {"state":"completed","anime":{"id":-3,"title":"Target"}},
+        \\  {"state":"completed","anime":{"id":42,"title":"Target"}}
+        \\]}
+    ,
+        .{},
+    );
+    const root_obj = common.jsonObject(root).?;
+    const results = common.jsonArray(root_obj.get("results").?).?;
+    const ids = try selectAnimeIds(allocator, results.items, "target");
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    try std.testing.expectEqual(@as(i64, 42), ids[0]);
+}
+
+test "tsukihime later exact anime match displaces capped partial matches" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        \\{"results":[
+        \\  {"state":"completed","anime":{"id":42,"title":"Target One"}},
+        \\  {"state":"completed","anime":{"id":2,"title":"Target Two"}},
+        \\  {"state":"completed","anime":{"id":3,"title":"Target Three"}},
+        \\  {"state":"completed","anime":{"id":4,"title":"Target Four"}},
+        \\  {"state":"completed","anime":{"id":42,"title":"Target"}}
+        \\]}
+    ,
+        .{},
+    );
+    const root_obj = common.jsonObject(root).?;
+    const results = common.jsonArray(root_obj.get("results").?).?;
+    const ids = try selectAnimeIds(allocator, results.items, "target");
+    try std.testing.expectEqualSlices(i64, &.{42}, ids);
 }
 
 test "tsukihime rejects unverified season claims before acquisition" {
@@ -382,6 +493,37 @@ test "tsukihime download token and native storage path" {
         "https://storage.tsukihime.org/attach/000031DD/12765.xz",
         url,
     );
+
+    const canonical = try makeDownloadToken(std.testing.allocator, 1, "ASS");
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expectEqualStrings("ass", parseDownloadToken(canonical).?.extension);
+    for ([_]i64{ -1, 0, @as(i64, std.math.maxInt(u32)) + 1 }) |invalid_id| {
+        try std.testing.expectError(
+            error.InvalidDownloadUrl,
+            makeDownloadToken(std.testing.allocator, invalid_id, "ass"),
+        );
+    }
+    try std.testing.expectError(
+        error.InvalidDownloadUrl,
+        makeDownloadToken(std.testing.allocator, 1, "exe"),
+    );
+    try std.testing.expect(parseDownloadToken(download_token_prefix ++ "01|ass") == null);
+    try std.testing.expect(parseDownloadToken(download_token_prefix ++ "1|ASS") == null);
+}
+
+test "tsukihime does not mislabel missing attachment languages as English" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        "{\"missing\":{},\"blank\":{\"lang\":\"  \"},\"english\":{\"lang\":\"en\"}}",
+        .{},
+    );
+    const obj = common.jsonObject(root).?;
+    try std.testing.expectEqualStrings("und", attachmentLanguage(common.jsonObject(obj.get("missing").?).?));
+    try std.testing.expectEqualStrings("und", attachmentLanguage(common.jsonObject(obj.get("blank").?).?));
+    try std.testing.expectEqualStrings("en", attachmentLanguage(common.jsonObject(obj.get("english").?).?));
 }
 
 test "tsukihime rejects unsafe api urls before fetch" {
@@ -390,8 +532,32 @@ test "tsukihime rejects unsafe api urls before fetch" {
         "https://user@api.tsukihime.org/v1/torrents/1",
         "https://api.tsukihime.org.attacker.example/v1/torrents/1",
     }) |url| {
-        try std.testing.expectError(error.UnsafeHttpTarget, validateApiUrl(url));
+        try std.testing.expectError(error.UnsafeHttpTarget, validateTorrentApiUrl(url, 1));
     }
+}
+
+test "tsukihime accepts only the selected canonical torrent API route" {
+    try validateTorrentApiUrl("https://api.tsukihime.org/v1/torrents/12765", 12765);
+
+    for ([_][]const u8{
+        "https://api.tsukihime.org/v1/torrents/12766",
+        "https://api.tsukihime.org/v1/torrents/012765",
+        "https://api.tsukihime.org/v1/torrents/-12765",
+        "https://api.tsukihime.org/v1/torrents/12765/attachments",
+        "https://api.tsukihime.org/v1/torrents/12765?include=files",
+        "https://api.tsukihime.org/v1/torrents/12765#files",
+        "https://api.tsukihime.org/v1/animes/12765",
+        "https://api.tsukihime.org/v1/admin",
+    }) |url| {
+        try std.testing.expectError(
+            error.InvalidDownloadUrl,
+            validateTorrentApiUrl(url, 12765),
+        );
+    }
+    try std.testing.expectError(
+        error.InvalidDownloadUrl,
+        validateTorrentApiUrl("https://api.tsukihime.org/v1/torrents/1", 0),
+    );
 }
 
 test "live tsukihime movie and episode downloads" {

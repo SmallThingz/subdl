@@ -1,5 +1,4 @@
 const std = @import("std");
-const unicode = std.unicode;
 const testing = std.testing;
 const uucode = @import("uucode");
 
@@ -52,72 +51,62 @@ pub fn gwidth(str: []const u8, method: Method) u16 {
             var total: u16 = 0;
             var grapheme_iter = uucode.grapheme.Iterator(uucode.utf8.Iterator).init(.init(str));
 
-            var grapheme_start: usize = 0;
-            var prev_break: bool = true;
+            while (grapheme_iter.nextGrapheme()) |grapheme| {
+                const grapheme_bytes = str[grapheme.start..grapheme.end];
 
-            while (grapheme_iter.nextCodePoint()) |result| {
-                if (prev_break and !result.is_break) {
-                    // Start of a new grapheme
-                    const cp_len: usize = std.unicode.utf8CodepointSequenceLength(result.code_point) catch 1;
-                    grapheme_start = grapheme_iter.i - cp_len;
-                }
+                // Calculate grapheme width
+                var g_iter = uucode.utf8.Iterator.init(grapheme_bytes);
+                var width: i16 = 0;
+                var has_emoji_vs: bool = false;
+                var has_text_vs: bool = false;
+                var has_emoji_base: bool = false;
+                var has_emoji_presentation: bool = false;
+                var ri_count: u8 = 0;
 
-                if (result.is_break) {
-                    // End of a grapheme - calculate its width
-                    const grapheme_end = grapheme_iter.i;
-                    const grapheme_bytes = str[grapheme_start..grapheme_end];
-
-                    // Calculate grapheme width
-                    var g_iter = uucode.utf8.Iterator.init(grapheme_bytes);
-                    var width: i16 = 0;
-                    var has_emoji_vs: bool = false;
-                    var has_text_vs: bool = false;
-                    var has_emoji_presentation: bool = false;
-                    var ri_count: u8 = 0;
-
-                    while (g_iter.next()) |cp| {
-                        // Check for emoji variation selector (U+FE0F)
-                        if (cp == 0xfe0f) {
-                            has_emoji_vs = true;
-                            continue;
-                        }
-
-                        // Check for text variation selector (U+FE0E)
-                        if (cp == 0xfe0e) {
-                            has_text_vs = true;
-                            continue;
-                        }
-
-                        // Check if this codepoint has emoji presentation
-                        if (uucode.get(.is_emoji_presentation, cp)) {
-                            has_emoji_presentation = true;
-                        }
-
-                        // Count regional indicators (for flag emojis)
-                        if (cp >= 0x1F1E6 and cp <= 0x1F1FF) {
-                            ri_count += 1;
-                        }
-
-                        const eaw = uucode.get(.east_asian_width, cp);
-                        const w = eawToWidth(cp, eaw);
-                        // Take max of non-zero widths
-                        if (w > 0 and w > width) width = w;
+                while (g_iter.next()) |cp| {
+                    // Check for emoji variation selector (U+FE0F)
+                    if (cp == 0xfe0f) {
+                        has_emoji_vs = true;
+                        continue;
                     }
 
-                    // Handle variation selectors and emoji presentation
-                    if (has_text_vs) {
-                        // Text presentation explicit - keep width as-is (usually 1)
-                        width = @max(1, width);
-                    } else if (has_emoji_vs or has_emoji_presentation or ri_count == 2) {
-                        // Emoji presentation or flag pair - force width 2
-                        width = @max(2, width);
+                    // Check for text variation selector (U+FE0E)
+                    if (cp == 0xfe0e) {
+                        has_text_vs = true;
+                        continue;
                     }
 
-                    total += @max(0, width);
+                    // Presentation selectors only affect emoji-capable bases.
+                    if (uucode.get(.is_emoji, cp)) {
+                        has_emoji_base = true;
+                    }
 
-                    grapheme_start = grapheme_end;
+                    // Check if this codepoint has emoji presentation
+                    if (uucode.get(.is_emoji_presentation, cp)) {
+                        has_emoji_presentation = true;
+                    }
+
+                    // Count regional indicators (for flag emojis)
+                    if (cp >= 0x1F1E6 and cp <= 0x1F1FF) {
+                        ri_count += 1;
+                    }
+
+                    const eaw = uucode.get(.east_asian_width, cp);
+                    const w = eawToWidth(cp, eaw);
+                    // Take max of non-zero widths
+                    if (w > 0 and w > width) width = w;
                 }
-                prev_break = result.is_break;
+
+                // Handle variation selectors and emoji presentation
+                if (has_text_vs and has_emoji_base) {
+                    // Text presentation explicit - keep width as-is (usually 1)
+                    width = @max(1, width);
+                } else if ((has_emoji_vs and has_emoji_base) or has_emoji_presentation or ri_count == 2) {
+                    // Emoji presentation or flag pair - force width 2
+                    width = @max(2, width);
+                }
+
+                total +|= @intCast(@max(0, width));
             }
 
             return total;
@@ -134,7 +123,7 @@ pub fn gwidth(str: []const u8, method: Method) u16 {
                         break :blk eawToWidth(cp, eaw);
                     },
                 };
-                total += @intCast(@max(0, w));
+                total +|= @intCast(@max(0, w));
             }
             return total;
         },
@@ -142,7 +131,7 @@ pub fn gwidth(str: []const u8, method: Method) u16 {
             var iter = std.mem.splitSequence(u8, str, "\u{200D}");
             var result: u16 = 0;
             while (iter.next()) |s| {
-                result += gwidth(s, .unicode);
+                result +|= gwidth(s, .unicode);
             }
             return result;
         },
@@ -203,6 +192,12 @@ test "gwidth: text variation selector" {
     try testing.expectEqual(1, gwidth("❤︎", .unicode));
 }
 
+test "gwidth: variation selectors require an emoji base" {
+    try testing.expectEqual(0, gwidth("\u{FE0E}", .unicode));
+    try testing.expectEqual(0, gwidth("\u{FE0F}", .unicode));
+    try testing.expectEqual(1, gwidth("A\u{FE0F}", .unicode));
+}
+
 test "gwidth: keycap sequence" {
     // Digit 1 + U+FE0F + U+20E3 (combining enclosing keycap)
     // Should be width 2
@@ -213,6 +208,30 @@ test "gwidth: base letter with combining mark" {
     // 'a' + combining acute accent (NFD form)
     // Should be width 1 (combining mark is zero-width)
     try testing.expectEqual(1, gwidth("á", .unicode));
+}
+
+test "gwidth: malformed utf8 before combining mark" {
+    try testing.expectEqual(1, gwidth("\xff\xcc\x81", .unicode));
+}
+
+test "gwidth: saturates at the public return width" {
+    const over_max: [@as(usize, std.math.maxInt(u16)) + 1]u8 = @splat('a');
+    const at_max = over_max[0..std.math.maxInt(u16)];
+
+    try testing.expectEqual(std.math.maxInt(u16), gwidth(at_max, .unicode));
+    try testing.expectEqual(std.math.maxInt(u16), gwidth(&over_max, .unicode));
+    try testing.expectEqual(std.math.maxInt(u16), gwidth(at_max, .wcwidth));
+    try testing.expectEqual(std.math.maxInt(u16), gwidth(&over_max, .wcwidth));
+    try testing.expectEqual(std.math.maxInt(u16), gwidth(at_max, .no_zwj));
+    try testing.expectEqual(std.math.maxInt(u16), gwidth(&over_max, .no_zwj));
+}
+
+test "gwidth: no_zwj saturates across individually bounded segments" {
+    const segment: [32768]u8 = @splat('a');
+    const joined = segment ++ "\u{200D}" ++ segment;
+
+    try testing.expectEqual(@as(u16, 32768), gwidth(&segment, .unicode));
+    try testing.expectEqual(std.math.maxInt(u16), gwidth(joined, .no_zwj));
 }
 
 test {

@@ -26,6 +26,11 @@ test "Flip image vertically" {
     try std.testing.expectEqualSlices(color.Rgb24, unflipped.pixels.rgb24, flipped.pixels.rgb24);
 }
 
+test "Flip rejects empty image storage" {
+    var image: Image = .{};
+    try std.testing.expectError(error.InvalidData, image.flipVertically(helpers.zigimg_test_allocator));
+}
+
 test "normalise_simple" {
     const box = (ImageEditor.Box{
         .x = 0,
@@ -63,6 +68,49 @@ test "normalise_overflow2" {
     try std.testing.expectEqual(6, box.y);
     try std.testing.expectEqual(6, box.width);
     try std.testing.expectEqual(4, box.height);
+}
+
+test "normalise clamps coordinates and sizes without overflow" {
+    const box = (ImageEditor.Box{
+        .x = std.math.maxInt(usize),
+        .y = std.math.maxInt(usize),
+        .width = std.math.maxInt(usize),
+        .height = std.math.maxInt(usize),
+    }).clamp(10, 20);
+    try std.testing.expectEqual(10, box.x);
+    try std.testing.expectEqual(20, box.y);
+    try std.testing.expectEqual(0, box.width);
+    try std.testing.expectEqual(0, box.height);
+}
+
+test "ImageEditor.crop rejects invalid and inconsistent images" {
+    const invalid_image: Image = .{};
+    try std.testing.expectError(error.Unsupported, invalid_image.crop(helpers.zigimg_test_allocator, .{}));
+
+    var inconsistent_image: Image = .{
+        .width = 2,
+        .height = 1,
+        .pixels = try color.PixelStorage.init(helpers.zigimg_test_allocator, .rgb24, 1),
+    };
+    defer inconsistent_image.deinit(helpers.zigimg_test_allocator);
+    try std.testing.expectError(error.InvalidData, inconsistent_image.crop(helpers.zigimg_test_allocator, .{ .width = 1, .height = 1 }));
+}
+
+test "ImageEditor.crop returns an empty image for an out-of-bounds area" {
+    var image = try Image.create(helpers.zigimg_test_allocator, 2, 2, .rgb24);
+    defer image.deinit(helpers.zigimg_test_allocator);
+
+    var cropped = try image.crop(helpers.zigimg_test_allocator, .{
+        .x = std.math.maxInt(usize),
+        .y = std.math.maxInt(usize),
+        .width = std.math.maxInt(usize),
+        .height = std.math.maxInt(usize),
+    });
+    defer cropped.deinit(helpers.zigimg_test_allocator);
+
+    try helpers.expectEq(cropped.width, 0);
+    try helpers.expectEq(cropped.height, 0);
+    try helpers.expectEq(cropped.imageByteSize(), 0);
 }
 
 test "ImageEditor.crop: crop grayscale1 images" {

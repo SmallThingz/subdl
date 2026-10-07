@@ -6,13 +6,14 @@
     .dependencies = .{
         .zigimg = .{ .path = "../zigimg" },
         .uucode = .{
-            .url = "git+https://github.com/jacobsandlund/uucode#ea62149739404a73c202b48a33bf6dd2af4bd9b0",
-            .hash = "uucode-0.2.0-ZZjBPoGFVgCiflJNFc6Io8xzC67B6PA5bUkk4LT0kCxg",
+            .url = "git+https://github.com/jacobsandlund/uucode#1fb73433bba5d93366c57f23ff2e9d7939746500",
+            .hash = "uucode-0.2.0-ZZjBPm6FVgBcY-79AHV8ckQj86z0JwOyVyj89VeZrEiv",
             .lazy = true,
         },
     },
     .paths = .{
         "LICENSE",
+        "THIRD_PARTY_LICENSES",
         "build.zig",
         "build.zig.zon",
         "include",

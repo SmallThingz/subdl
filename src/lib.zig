@@ -1,5 +1,12 @@
 const std = @import("std");
 
+/// Install the caller's I/O runtime before using scraper APIs. Call once before
+/// starting workers, and keep the runtime alive until all scraper work ends.
+/// HTTP deadlines require a runtime that supports concurrent tasks.
+pub fn setIo(io: std.Io) void {
+    @import("runtime_io").set(io);
+}
+
 pub const subdl = @import("scrapers/subdl.zig");
 pub const providers_app = @import("app/providers_app.zig");
 

@@ -35,12 +35,19 @@ pub const Scraper = struct {
     }
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
+        return self.searchUsing(common.fetchBytes, query);
+    }
+
+    fn searchUsing(self: *Scraper, comptime fetch: anytype, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
-        const encoded = try common.encodeUriComponent(a, std.mem.trim(u8, query, " \t\r\n"));
+        const trimmed = std.mem.trim(u8, query, " \t\r\n");
+        if (trimmed.len == 0) return .{ .arena = arena, .items = &.{} };
+
+        const encoded = try common.encodeUriComponent(a, trimmed);
         const url = try std.fmt.allocPrint(a, "{s}/suggest?query={s}", .{ site, encoded });
-        const response = try common.fetchBytes(self.client, a, url, providerFetchOptions("application/json"));
+        const response = try fetch(self.client, a, url, providerFetchOptions("application/json"));
         try requireSuccessfulResponse(response.status, response.body);
         return parseSuggestJson(common.takeArena(&arena), response.body);
     }
@@ -49,7 +56,7 @@ pub const Scraper = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
-        try validateProviderEndpoint(page_url);
+        try validateProviderEndpoint(page_url, .listing);
         const response = try common.fetchBytes(
             self.client,
             a,
@@ -71,6 +78,8 @@ fn providerFetchOptions(accept: []const u8) common.FetchOptions {
         .retry_on_429 = false,
         .cache = false,
         .require_public_origin = true,
+        .require_https = true,
+        .require_same_origin = true,
     };
 }
 
@@ -143,13 +152,17 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8) !SearchResp
     var links = parsed.doc.queryAll("a[href^='/subscene/'], a[href^='/subtitles/']");
     while (links.next()) |link| {
         const href = link.getAttributeValue("href") orelse continue;
-        if (seen.contains(href)) continue;
         const title = try common.innerTextTrimmedOwned(a, link);
         if (title.len == 0 or std.ascii.eqlIgnoreCase(title, "Imdb")) continue;
-        try seen.put(a, href, {});
+        const page_url = resolveProviderUrl(a, href, .listing) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            continue;
+        };
+        if (seen.contains(page_url)) continue;
+        try seen.put(a, page_url, {});
         try items.append(a, .{
             .title = title,
-            .page_url = try resolveProviderUrl(a, href),
+            .page_url = page_url,
         });
     }
     return common.finishResponse(SearchResponse, &owned_arena, .{ .arena = owned_arena, .items = try items.toOwnedSlice(a) });
@@ -170,10 +183,22 @@ fn parseSubtitlesHtml(arena: std.heap.ArenaAllocator, body: []const u8) !Subtitl
     var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
     var rows = parsed.doc.queryAll("table tbody tr");
     while (rows.next()) |row| {
-        const anchor = row.queryOne("a[href^='/subtitle/']") orelse continue;
-        const href = anchor.getAttributeValue("href") orelse continue;
-        const id = std.mem.trimStart(u8, href["/subtitle/".len..], "/");
-        if (id.len == 0) continue;
+        var id: ?[]const u8 = null;
+        var details_url: ?[]const u8 = null;
+        var anchors = row.queryAll("a[href^='/subtitle/']");
+        while (anchors.next()) |anchor| {
+            const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
+            const candidate_id = routePositiveId(href, "/subtitle/") orelse continue;
+            const candidate_url = resolveProviderUrl(a, href, .subtitle) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                continue;
+            };
+            id = candidate_id;
+            details_url = candidate_url;
+            break;
+        }
+        const subtitle_id = id orelse continue;
+        const resolved_details_url = details_url orelse continue;
         const language = try optionalText(a, row.queryOne("span.l"));
         const release = try optionalText(a, row.queryOne("span.new"));
         const hi_text = try optionalText(a, row.queryOne("td.a40"));
@@ -185,8 +210,8 @@ fn parseSubtitlesHtml(arena: std.heap.ArenaAllocator, body: []const u8) !Subtitl
             .hearing_impaired = if (hi_text) |value| !isBlankCell(value) else false,
             .uploader = try optionalText(a, row.queryOne("td.a5")),
             .comment = try optionalText(a, row.queryOne("td.a6")),
-            .details_url = try resolveProviderUrl(a, href),
-            .download_url = try std.fmt.allocPrint(a, "{s}/download/{s}", .{ site, id }),
+            .details_url = resolved_details_url,
+            .download_url = try std.fmt.allocPrint(a, "{s}/download/{s}", .{ site, subtitle_id }),
         });
     }
     return common.finishResponse(SubtitlesResponse, &owned_arena, .{ .arena = owned_arena, .title = title, .subtitles = try subtitles.toOwnedSlice(a) });
@@ -212,22 +237,105 @@ fn requireSuccessfulResponse(status: std.http.Status, body: []const u8) !void {
     if (status != .ok) return error.UnexpectedHttpStatus;
 }
 
-fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+const ProviderRoute = enum {
+    listing,
+    subtitle,
+    download,
+};
+
+fn resolveProviderUrl(allocator: Allocator, href: []const u8, route: ProviderRoute) ![]const u8 {
     const resolved = try common.resolveUrl(allocator, site, href);
     errdefer allocator.free(resolved);
-    try validateProviderEndpoint(resolved);
+    try validateProviderEndpoint(resolved, route);
     return resolved;
 }
 
-fn validateProviderEndpoint(url: []const u8) !void {
+fn validateProviderEndpoint(url: []const u8, route: ProviderRoute) !void {
     try common.validatePublicHttpUrl(url);
     if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+
+    const uri = std.Uri.parse(url) catch return error.UnsafeHttpTarget;
+    if (uri.query != null or uri.fragment != null) return error.UnsafeHttpTarget;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+
+    const valid = switch (route) {
+        .listing => routePositiveId(path, "/subscene/") != null or
+            routeSafeSlug(path, "/subtitles/") != null,
+        .subtitle => routePositiveId(path, "/subtitle/") != null,
+        .download => routePositiveId(path, "/download/") != null,
+    };
+    if (!valid) return error.UnsafeHttpTarget;
+}
+
+fn routePositiveId(path: []const u8, prefix: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const id = path[prefix.len..];
+    if (id.len == 0 or id.len > 19 or id[0] == '0') return null;
+    for (id) |c| if (!std.ascii.isDigit(c)) return null;
+    return id;
+}
+
+fn routeSafeSlug(path: []const u8, prefix: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const slug = path[prefix.len..];
+    if (slug.len == 0 or std.mem.eql(u8, slug, ".") or std.mem.eql(u8, slug, "..")) return null;
+    for (slug) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~')) return null;
+    }
+    return slug;
+}
+
+test "sub-scene trims queries and does not fetch empty searches" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, url: []const u8, _: common.FetchOptions) !common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            try std.testing.expectEqualStrings(site ++ "/suggest?query=Matrix", url);
+            return .{ .status = .ok, .body = try allocator.dupe(u8, "{\"film\":[],\"tv\":[]}") };
+        }
+    };
+
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+
+    var empty = try scraper.searchUsing(Fixture.fetch, " \t\r\n ");
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+
+    var trimmed = try scraper.searchUsing(Fixture.fetch, "  Matrix\t");
+    defer trimmed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), trimmed.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
 }
 
 test "sub-scene rejects unsafe provider endpoints" {
-    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("http://127.0.0.1/private"));
-    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("https://user:pass@sub-scene.com/private"));
-    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("https://sub-scene.com.evil.com/private"));
+    try validateProviderEndpoint(site ++ "/subscene/42", .listing);
+    try validateProviderEndpoint(site ++ "/subtitles/the-matrix", .listing);
+    try validateProviderEndpoint(site ++ "/subtitle/99", .subtitle);
+    try validateProviderEndpoint(site ++ "/download/99", .download);
+
+    const invalid = [_]struct { url: []const u8, route: ProviderRoute }{
+        .{ .url = "http://127.0.0.1/subscene/42", .route = .listing },
+        .{ .url = "https://user:pass@sub-scene.com/subscene/42", .route = .listing },
+        .{ .url = "https://sub-scene.com.evil.com/subscene/42", .route = .listing },
+        .{ .url = site ++ "/admin", .route = .listing },
+        .{ .url = site ++ "/subscene/42/extra", .route = .listing },
+        .{ .url = site ++ "/subscene/042", .route = .listing },
+        .{ .url = site ++ "/subtitle/99?next=/admin", .route = .subtitle },
+        .{ .url = site ++ "/subtitle/99#fragment", .route = .subtitle },
+        .{ .url = site ++ "/subtitle/99%2f..%2fadmin", .route = .subtitle },
+        .{ .url = site ++ "/download/99/extra", .route = .download },
+    };
+    for (invalid) |case| {
+        try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint(case.url, case.route));
+    }
 }
 
 test "sub-scene detects positive challenge pages independently of status" {
@@ -287,4 +395,47 @@ test "sub-scene parses search and subtitle pages" {
     try std.testing.expectEqualStrings("https://sub-scene.com/download/99", subs.subtitles[0].download_url);
     try std.testing.expect(subs.subtitles[0].hearing_impaired);
     try std.testing.expect(!subs.subtitles[1].hearing_impaired);
+}
+
+test "sub-scene skips malicious route siblings without hiding valid rows" {
+    const search_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var search = try parseSearchHtml(
+        search_arena,
+        "<a href='/subscene/42?next=/admin'>Bad query</a>" ++
+            "<a href='/subscene/42/extra'>Bad suffix</a>" ++
+            "<a href='/subscene/42'>The Matrix</a>",
+    );
+    defer search.deinit();
+    try std.testing.expectEqual(@as(usize, 1), search.items.len);
+    try std.testing.expectEqualStrings(site ++ "/subscene/42", search.items[0].page_url);
+
+    const subtitles_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var subtitles = try parseSubtitlesHtml(
+        subtitles_arena,
+        "<table><tbody>" ++
+            "<tr><td data-title='Download'><a href='/subtitle/99?next=/admin'>bad</a></td></tr>" ++
+            "<tr><td data-title='Download'><a href='/subtitle/99/extra'>bad</a></td></tr>" ++
+            "<tr><td data-title='Download'><a href='/subtitle/99%2f..%2fadmin'>bad</a></td></tr>" ++
+            "<tr><td data-title='Download'><a href='/subtitle/99'><span class='l'>English</span></a></td></tr>" ++
+            "</tbody></table>",
+    );
+    defer subtitles.deinit();
+    try std.testing.expectEqual(@as(usize, 1), subtitles.subtitles.len);
+    try std.testing.expectEqualStrings(site ++ "/subtitle/99", subtitles.subtitles[0].details_url);
+    try std.testing.expectEqualStrings(site ++ "/download/99", subtitles.subtitles[0].download_url);
+}
+
+test "sub-scene malformed first row link does not shadow a later candidate" {
+    const arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var subtitles = try parseSubtitlesHtml(
+        arena,
+        "<table><tbody><tr><td data-title='Download'>" ++
+            "<a href='/subtitle/99/extra'>bad</a>" ++
+            "<a href='/subtitle/101'><span class='l'>English</span></a>" ++
+            "</td></tr></tbody></table>",
+    );
+    defer subtitles.deinit();
+    try std.testing.expectEqual(@as(usize, 1), subtitles.subtitles.len);
+    try std.testing.expectEqualStrings(site ++ "/subtitle/101", subtitles.subtitles[0].details_url);
+    try std.testing.expectEqualStrings(site ++ "/download/101", subtitles.subtitles[0].download_url);
 }

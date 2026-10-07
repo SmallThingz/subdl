@@ -66,7 +66,7 @@ test "extensive live suite provider: tvsubtitles.net" {
 }
 
 fn extensiveProbeEnabled(provider_name: []const u8) bool {
-    if (!common.shouldRunLiveTests(std.testing.allocator)) return false;
+    if (!common.liveTestsEnabled()) return false;
     if (!suite.shouldRunExtensiveLiveSuite(std.testing.allocator)) return false;
     return common.providerMatchesLiveFilter(common.liveProviderFilter(), provider_name);
 }
@@ -115,8 +115,9 @@ fn runSubdl(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     defer search.deinit();
     phaseDone("subdl.com", "search", search_started_ms);
     try suite.expectPositive(search.items.len);
-    const item = search.items[0];
-    std.debug.print("[live][subdl.com][search][0]\n", .{});
+    const chosen_idx = pickFirstSubdlContaining(search.items, "matrix") orelse return error.TestUnexpectedResult;
+    const item = search.items[chosen_idx];
+    std.debug.print("[live][subdl.com][search][{d}]\n", .{chosen_idx});
     std.debug.print("[live] media_type={s}\n", .{@tagName(item.media_type)});
     try common.livePrintField(allocator, "name", item.name);
     try common.livePrintField(allocator, "poster_url", item.poster_url);
@@ -192,7 +193,7 @@ fn runISubtitles(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     phaseDone("isubtitles.org", "search", search_started_ms);
     try suite.expectPositive(search.items.len);
 
-    const chosen_idx = pickFirstContaining(isubtitles_org.SearchItem, search.items, "matrix") orelse 0;
+    const chosen_idx = pickFirstContaining(isubtitles_org.SearchItem, search.items, "matrix") orelse return error.TestUnexpectedResult;
     const match = search.items[chosen_idx];
     std.debug.print("[live][isubtitles.org][search][{d}]\n", .{chosen_idx});
     try common.livePrintField(allocator, "title", match.title);
@@ -232,7 +233,7 @@ fn runMovieSubtitlesOrg(allocator: std.mem.Allocator, client: *std.http.Client) 
     defer search.deinit();
     phaseDone("moviesubtitles.org", "search", search_started_ms);
     try suite.expectPositive(search.items.len);
-    const chosen_idx = pickFirstContaining(moviesubtitles_org.SearchItem, search.items, "matrix") orelse 0;
+    const chosen_idx = pickFirstContaining(moviesubtitles_org.SearchItem, search.items, "matrix") orelse return error.TestUnexpectedResult;
     const movie = search.items[chosen_idx];
     std.debug.print("[live][moviesubtitles.org][search][{d}]\n", .{chosen_idx});
     try common.livePrintField(allocator, "title", movie.title);
@@ -268,7 +269,7 @@ fn runMovieSubtitlesRt(allocator: std.mem.Allocator, client: *std.http.Client) !
     phaseDone("moviesubtitlesrt.com", "search", search_started_ms);
     try suite.expectPositive(search.items.len);
 
-    const chosen_idx = pickFirstContaining(moviesubtitlesrt_com.SearchItem, search.items, "matrix") orelse 0;
+    const chosen_idx = pickFirstContaining(moviesubtitlesrt_com.SearchItem, search.items, "matrix") orelse return error.TestUnexpectedResult;
     const hit = search.items[chosen_idx];
     std.debug.print("[live][moviesubtitlesrt.com][search][{d}]\n", .{chosen_idx});
     try common.livePrintField(allocator, "title", hit.title);
@@ -305,7 +306,7 @@ fn runMySubs(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     phaseDone("my-subs.co", "search", search_started_ms);
     try suite.expectPositive(search.items.len);
 
-    const chosen_idx = pickFirstContaining(my_subs_co.SearchItem, search.items, "matrix") orelse 0;
+    const chosen_idx = pickFirstContaining(my_subs_co.SearchItem, search.items, "matrix") orelse return error.TestUnexpectedResult;
     const match = search.items[chosen_idx];
     std.debug.print("[live][my-subs.co][search][{d}]\n", .{chosen_idx});
     try common.livePrintField(allocator, "title", match.title);
@@ -350,7 +351,7 @@ fn runPodnapisi(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     phaseDone("podnapisi.net", "search", search_started_ms);
     try suite.expectPositive(search.items.len);
 
-    const chosen_idx = pickFirstContaining(podnapisi_net.SearchItem, search.items, "matrix") orelse 0;
+    const chosen_idx = pickFirstContaining(podnapisi_net.SearchItem, search.items, "matrix") orelse return error.TestUnexpectedResult;
     const match = search.items[chosen_idx];
     std.debug.print("[live][podnapisi.net][search][{d}]\n", .{chosen_idx});
     try common.livePrintField(allocator, "id", match.id);
@@ -394,7 +395,7 @@ fn runSubtitleCat(allocator: std.mem.Allocator, client: *std.http.Client) !void 
     phaseDone("subtitlecat.com", "search", search_started_ms);
     try suite.expectPositive(search.items.len);
 
-    const chosen_idx = pickFirstContaining(subtitlecat_com.SearchItem, search.items, "matrix") orelse 0;
+    const chosen_idx = pickFirstContaining(subtitlecat_com.SearchItem, search.items, "matrix") orelse return error.TestUnexpectedResult;
     const entry = search.items[chosen_idx];
     std.debug.print("[live][subtitlecat.com][search][{d}]\n", .{chosen_idx});
     try common.livePrintField(allocator, "title", entry.title);
@@ -432,7 +433,6 @@ fn runSubsource(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     const search_started_ms = phaseStart("subsource.net", "search");
     var search = try scraper.searchWithOptions("The Matrix", .{
         .include_seasons = true,
-        .max_pages = 1,
         .auto_cloudflare_session = false,
     });
     defer search.deinit();
@@ -440,7 +440,7 @@ fn runSubsource(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     try common.livePrintField(allocator, "query_used", search.query_used);
     try suite.expectPositive(search.items.len);
 
-    const chosen_idx = pickFirstContaining(subsource_net.SearchItem, search.items, "matrix") orelse 0;
+    const chosen_idx = pickFirstContaining(subsource_net.SearchItem, search.items, "matrix") orelse return error.TestUnexpectedResult;
     const match = search.items[chosen_idx];
     std.debug.print("[live][subsource.net][search][{d}]\n", .{chosen_idx});
     std.debug.print("[live] id={d}\n", .{match.id});
@@ -516,6 +516,9 @@ fn runSubScene(allocator: std.mem.Allocator, client: *std.http.Client) !void {
     const download = try common.fetchBytes(client, allocator, first.download_url, .{
         .accept = "application/zip,application/octet-stream,*/*",
         .cache = false,
+        .require_public_origin = true,
+        .require_https = true,
+        .require_same_origin = true,
     });
     defer allocator.free(download.body);
     phaseDone("sub-scene.com", "download", download_started_ms);
@@ -532,7 +535,7 @@ fn runTvSubtitles(allocator: std.mem.Allocator, client: *std.http.Client) !void 
     phaseDone("tvsubtitles.net", "search", search_started_ms);
     try suite.expectPositive(search.items.len);
 
-    const chosen_idx = pickFirstContaining(tvsubtitles_net.SearchItem, search.items, "chernobyl") orelse 0;
+    const chosen_idx = pickFirstContaining(tvsubtitles_net.SearchItem, search.items, "chernobyl") orelse return error.TestUnexpectedResult;
     const match = search.items[chosen_idx];
     std.debug.print("[live][tvsubtitles.net][search][{d}]\n", .{chosen_idx});
     try common.livePrintField(allocator, "title", match.title);
@@ -565,6 +568,13 @@ fn runTvSubtitles(allocator: std.mem.Allocator, client: *std.http.Client) !void 
 fn pickFirstContaining(comptime T: type, items: []const T, needle: []const u8) ?usize {
     for (items, 0..) |item, idx| {
         if (containsIgnoreCase(@field(item, "title"), needle)) return idx;
+    }
+    return null;
+}
+
+fn pickFirstSubdlContaining(items: []const subdl_com.SearchItem, needle: []const u8) ?usize {
+    for (items, 0..) |item, idx| {
+        if (containsIgnoreCase(item.name, needle)) return idx;
     }
     return null;
 }

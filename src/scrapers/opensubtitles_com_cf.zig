@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const browser_support = @import("alldriver");
+const build_options = @import("build_options");
 const common = @import("common.zig");
 const chromium_pipe = @import("chromium_pipe.zig");
 const runtime_io = @import("runtime_io");
@@ -10,10 +10,73 @@ const shared_cache_filename = "cloudflare_shared_sessions.json";
 const session_ttl_seconds: i64 = 5 * 60 * 60;
 const challenge_timeout_ms: i64 = 4 * 60 * 1000;
 const challenge_poll_interval_ms: i64 = 1000;
+const automatic_headed_probe_ms: i64 = 60 * 1000;
+const automatic_headless_reserve_ms: i64 = 60 * 1000;
 const cache_lock_timeout_ms: i64 = 5 * 1000;
 const max_browser_user_agent_bytes: usize = 4096;
+const max_session_cache_bytes: usize = 2 * 1024 * 1024;
+const max_session_cache_records: usize = 256;
+const max_session_cookies: usize = 4096;
 var session_acquire_lock = std.atomic.Value(u8).init(0);
 var last_session_generation = std.atomic.Value(u64).init(0);
+
+const BrowserLaunchMode = enum {
+    automatic,
+    headed,
+    headless,
+};
+
+const BrowserLaunchPlan = struct {
+    mode: BrowserLaunchMode,
+    auto_starts_headed: bool,
+
+    fn primaryHeadless(self: BrowserLaunchPlan) bool {
+        return switch (self.mode) {
+            .automatic => !self.auto_starts_headed,
+            .headed => false,
+            .headless => true,
+        };
+    }
+
+    fn passCount(self: BrowserLaunchPlan) usize {
+        return if (self.mode == .automatic and self.auto_starts_headed) 2 else 1;
+    }
+
+    fn headlessForPass(self: BrowserLaunchPlan, pass_index: usize) bool {
+        return switch (self.mode) {
+            .automatic => !self.auto_starts_headed or pass_index == 1,
+            .headed => false,
+            .headless => true,
+        };
+    }
+};
+
+const BrowserLaunchAttempt = struct {
+    executable_index: usize,
+    headless: bool,
+};
+
+const BrowserLaunchIterator = struct {
+    plan: BrowserLaunchPlan,
+    pass_index: usize = 0,
+    executable_index: usize = 0,
+
+    fn next(self: *BrowserLaunchIterator, executable_count: usize) ?BrowserLaunchAttempt {
+        while (self.pass_index < self.plan.passCount()) {
+            if (self.executable_index < executable_count) {
+                const index = self.executable_index;
+                self.executable_index += 1;
+                return .{
+                    .executable_index = index,
+                    .headless = self.plan.headlessForPass(self.pass_index),
+                };
+            }
+            self.pass_index += 1;
+            self.executable_index = 0;
+        }
+        return null;
+    }
+};
 
 const SessionAcquireGuard = struct {
     fn lockUntil(deadline_ms: i64) !SessionAcquireGuard {
@@ -41,6 +104,9 @@ const SessionAcquireGuard = struct {
 
 pub const Error = error{
     CloudflareSessionUnavailable,
+    BrowserAutomationDisabled,
+    BrowserAutomationUnavailable,
+    InvalidBrowserExecutable,
     BrowserAutomationFailed,
     InvalidSessionPayload,
 };
@@ -116,7 +182,7 @@ pub fn ensureDomainSession(allocator: Allocator, options: EnsureDomainOptions) !
         owned_challenge_url = try std.fmt.allocPrint(allocator, "https://{s}/", .{normalized_domain});
         break :blk owned_challenge_url orelse return error.OutOfMemory;
     };
-    if (!urlHasExactHttpsHost(challenge_url, normalized_domain)) return error.InvalidSessionPayload;
+    try validateChallengeTarget(challenge_url, normalized_domain);
 
     if (try loadSessionForDomain(allocator, normalized_domain, deadline)) |cached| {
         if (try reuseLoadedSessionUsing(
@@ -211,7 +277,7 @@ fn canReuseCachedSession(session: Session, options: EnsureDomainOptions, challen
 }
 
 fn loadSessionForDomain(allocator: Allocator, domain_input: []const u8, deadline: i64) !?Session {
-    if (!browser_support.enabled or !diskSessionCacheSupported(builtin.os.tag)) return null;
+    if (!build_options.enable_alldriver or !diskSessionCacheSupported(builtin.os.tag)) return null;
     try browserDeadlineCheckpoint(deadline);
     const io = runtime_io.get();
     const cache_lock = acquireSessionCacheLock(allocator, deadline) catch |err| {
@@ -249,7 +315,7 @@ fn loadSessionForDomain(allocator: Allocator, domain_input: []const u8, deadline
 }
 
 fn saveSessionForDomain(allocator: Allocator, domain_input: []const u8, session: Session, deadline: i64) !void {
-    if (!browser_support.enabled or !diskSessionCacheSupported(builtin.os.tag)) return;
+    if (!build_options.enable_alldriver or !diskSessionCacheSupported(builtin.os.tag)) return;
     try browserDeadlineCheckpoint(deadline);
 
     const io = runtime_io.get();
@@ -276,7 +342,7 @@ fn saveSessionForDomain(allocator: Allocator, domain_input: []const u8, session:
 }
 
 fn removeCachedSessionForDomain(allocator: Allocator, domain_input: []const u8, rejected: Session, deadline: i64) !void {
-    if (!browser_support.enabled or !diskSessionCacheSupported(builtin.os.tag)) return;
+    if (!build_options.enable_alldriver or !diskSessionCacheSupported(builtin.os.tag)) return;
     try browserDeadlineCheckpoint(deadline);
 
     const io = runtime_io.get();
@@ -632,6 +698,9 @@ fn mustPropagateOperationError(err: anyerror) bool {
     return err == error.Canceled or
         err == error.OutOfMemory or
         err == error.CloudflareSessionUnavailable or
+        err == error.BrowserAutomationDisabled or
+        err == error.BrowserAutomationUnavailable or
+        err == error.InvalidBrowserExecutable or
         err == error.UnsafeHttpTarget;
 }
 
@@ -655,7 +724,7 @@ fn readCacheRecords(allocator: Allocator, deadline: i64) !std.ArrayListUnmanaged
 fn readCacheRecordsStrict(allocator: Allocator, deadline: i64) !std.ArrayListUnmanaged(CacheRecord) {
     var records: std.ArrayListUnmanaged(CacheRecord) = .empty;
     errdefer freeCacheRecords(allocator, &records);
-    if (!browser_support.enabled or !diskSessionCacheSupported(builtin.os.tag)) return records;
+    if (!build_options.enable_alldriver or !diskSessionCacheSupported(builtin.os.tag)) return records;
 
     const path = try cachePath(allocator);
     defer allocator.free(path);
@@ -682,8 +751,14 @@ fn readCacheRecordsStrict(allocator: Allocator, deadline: i64) !std.ArrayListUnm
     }
 
     var read_buffer: [4096]u8 = undefined;
-    var file_reader = file.reader(io, &read_buffer);
-    const data = try file_reader.interface.allocRemaining(allocator, .limited(2 * 1024 * 1024));
+    // The file was already stat'ed above. Streaming mode avoids a second
+    // implicit stat whose cancellation could be memoized as an ordinary size
+    // failure before the reader falls back to streaming I/O.
+    var file_reader = file.readerStreaming(io, &read_buffer);
+    const data = file_reader.interface.allocRemaining(allocator, .limited(max_session_cache_bytes)) catch |err| switch (err) {
+        error.OutOfMemory, error.StreamTooLong => return err,
+        error.ReadFailed => return file_reader.err orelse err,
+    };
     defer allocator.free(data);
     try browserDeadlineCheckpoint(deadline);
 
@@ -702,6 +777,7 @@ fn readCacheRecordsStrict(allocator: Allocator, deadline: i64) !std.ArrayListUnm
         .array => |a| a,
         else => return error.InvalidSessionPayload,
     };
+    if (sessions.items.len > max_session_cache_records) return error.InvalidSessionPayload;
 
     for (sessions.items) |entry| {
         const obj = switch (entry) {
@@ -716,6 +792,14 @@ fn readCacheRecordsStrict(allocator: Allocator, deadline: i64) !std.ArrayListUnm
         else
             try parseCachedCookies(allocator, obj.get("cookies") orelse return error.InvalidSessionPayload);
         defer freeCookies(allocator, cookies);
+        for (cookies) |cookie| {
+            if (cookie.host_only) {
+                if (!std.ascii.eqlIgnoreCase(cookie.domain, domain))
+                    return error.InvalidSessionPayload;
+            } else if (!isSameOrSubdomain(domain, cookie.domain)) {
+                return error.InvalidSessionPayload;
+            }
+        }
 
         const cf_clearance = (try getOptionalString(obj, "cf_clearance")) orelse
             findCookieValueByName(cookies, "cf_clearance") orelse "";
@@ -767,7 +851,10 @@ fn cacheFileOwnedByCurrentUser(file: std.Io.File) bool {
             .{ .UID = true },
             &statx_buf,
         );
-        return std.os.linux.errno(rc) == .SUCCESS and statx_buf.mask.UID and statx_buf.uid == std.os.linux.geteuid();
+        if (std.os.linux.errno(rc) == .SUCCESS and statx_buf.mask.UID)
+            return statx_buf.uid == std.os.linux.geteuid();
+        // Older kernels and some seccomp profiles omit or deny statx while
+        // still permitting fstat. Fall through to the libc handle check.
     }
     if (comptime builtin.link_libc and @hasDecl(std.c, "fstat") and @hasDecl(std.c, "geteuid")) {
         if (comptime switch (@typeInfo(std.c.Stat)) {
@@ -795,6 +882,8 @@ fn parseCachedCookies(allocator: Allocator, value: std.json.Value) ![]Cookie {
         .array => |items| items,
         else => return error.InvalidSessionPayload,
     };
+    if (array.items.len == 0 or array.items.len > max_session_cookies)
+        return error.InvalidSessionPayload;
     var cookies: std.ArrayListUnmanaged(Cookie) = .empty;
     errdefer deinitCookieList(allocator, &cookies);
 
@@ -824,7 +913,6 @@ fn parseCachedCookies(allocator: Allocator, value: std.json.Value) ![]Cookie {
             return err;
         };
     }
-    if (cookies.items.len == 0) return error.InvalidSessionPayload;
     return try cookies.toOwnedSlice(allocator);
 }
 
@@ -833,6 +921,7 @@ fn parseLegacyCookieHeader(allocator: Allocator, domain: []const u8, header: []c
     errdefer deinitCookieList(allocator, &cookies);
     var fields = std.mem.splitScalar(u8, header, ';');
     while (fields.next()) |raw_field| {
+        if (cookies.items.len == max_session_cookies) return error.InvalidSessionPayload;
         const field = std.mem.trim(u8, raw_field, " \t");
         const equals = std.mem.indexOfScalar(u8, field, '=') orelse return error.InvalidSessionPayload;
         const name = std.mem.trim(u8, field[0..equals], " \t");
@@ -859,8 +948,13 @@ fn parseLegacyCookieHeader(allocator: Allocator, domain: []const u8, header: []c
 }
 
 fn writeCacheRecords(allocator: Allocator, records: []const CacheRecord, deadline: i64) !void {
-    if (!browser_support.enabled) return;
+    if (!build_options.enable_alldriver) return;
     try browserDeadlineCheckpoint(deadline);
+    if (records.len > max_session_cache_records) return error.InvalidSessionPayload;
+    for (records) |record| {
+        if (record.cookies.len == 0 or record.cookies.len > max_session_cookies)
+            return error.InvalidSessionPayload;
+    }
     const path = try cachePath(allocator);
     defer allocator.free(path);
 
@@ -874,6 +968,7 @@ fn writeCacheRecords(allocator: Allocator, records: []const CacheRecord, deadlin
         .sessions = records,
     }, .{ .whitespace = .indent_2 })});
     defer allocator.free(json_data);
+    if (json_data.len > max_session_cache_bytes) return error.InvalidSessionPayload;
 
     try browserDeadlineCheckpoint(deadline);
     try writeSessionCacheAtomically(std.Io.Dir.cwd(), runtime_io.get(), path, json_data);
@@ -977,7 +1072,7 @@ fn isRawTextElement(name: []const u8) bool {
 fn findRawTextClose(content: []const u8, name: []const u8) ?usize {
     var offset: usize = 0;
     while (offset < content.len) {
-        const relative = std.ascii.indexOfIgnoreCase(content[offset..], "</") orelse return null;
+        const relative = std.ascii.findIgnoreCase(content[offset..], "</") orelse return null;
         const start = offset + relative;
         const name_start = start + 2;
         const name_end = name_start + name.len;
@@ -1086,7 +1181,7 @@ fn tagHasChallengeAttribute(tag: []const u8) bool {
 
 fn hasChallengeAttributeToken(value: []const u8) bool {
     var remaining = value;
-    while (std.ascii.indexOfIgnoreCase(remaining, "cf-chl-")) |index| {
+    while (std.ascii.findIgnoreCase(remaining, "cf-chl-")) |index| {
         if (index == 0 or std.ascii.isWhitespace(remaining[index - 1])) return true;
         remaining = remaining[index + "cf-chl-".len ..];
     }
@@ -1130,12 +1225,12 @@ fn tagHasChallengePagePath(tag: []const u8) bool {
 fn valueHasChallengePagePath(value: []const u8) bool {
     const prefix = "/cdn-cgi/challenge-platform/";
     var remaining = value;
-    while (std.ascii.indexOfIgnoreCase(remaining, prefix)) |start| {
+    while (std.ascii.findIgnoreCase(remaining, prefix)) |start| {
         remaining = remaining[start + prefix.len ..];
         const end = std.mem.indexOfAny(u8, remaining, " \t\r\n\"'<>\\?#") orelse remaining.len;
         const path = remaining[0..end];
         if (std.ascii.startsWithIgnoreCase(path, "orchestrate/chl_page/") or
-            std.ascii.indexOfIgnoreCase(path, "/orchestrate/chl_page/") != null) return true;
+            std.ascii.findIgnoreCase(path, "/orchestrate/chl_page/") != null) return true;
     }
     return false;
 }
@@ -1186,7 +1281,7 @@ fn freeCacheRecords(allocator: Allocator, records: *std.ArrayListUnmanaged(Cache
 }
 
 fn cachePath(allocator: Allocator) ![]u8 {
-    if (!browser_support.enabled) return error.CloudflareSessionUnavailable;
+    if (!build_options.enable_alldriver) return error.BrowserAutomationDisabled;
 
     const local_app_data = try common.getenvOwned(allocator, "LOCALAPPDATA");
     defer if (local_app_data) |value| allocator.free(value);
@@ -1238,8 +1333,215 @@ fn absoluteEnvPath(os_tag: std.Target.Os.Tag, value_opt: ?[]const u8) ?[]const u
     return null;
 }
 
+const BrowserLaunchContext = struct {
+    allocator: Allocator,
+    navigation_policy: *const chromium_pipe.NavigationPolicy,
+    domain: []const u8,
+    challenge_url: []const u8,
+    user_agent_failed: *bool,
+};
+
+fn BrowserLaunchResult(comptime BrowserType: type) type {
+    return struct {
+        browser: BrowserType,
+        headless: bool,
+        deadline: i64,
+    };
+}
+
+fn browserAttemptDeadline(plan: BrowserLaunchPlan, headless: bool, now: i64, global_deadline: i64) i64 {
+    if (plan.mode != .automatic or headless or now >= global_deadline) return global_deadline;
+
+    const remaining = global_deadline - now;
+    // Once only the fallback reserve remains, skip all further headed launches.
+    // A headed browser that starts but cannot display or complete its challenge
+    // must not consume the global deadline reserved for headless operation.
+    if (remaining <= automatic_headless_reserve_ms) return now;
+    const fallback_boundary = global_deadline - automatic_headless_reserve_ms;
+    return @min(fallback_boundary, now +| automatic_headed_probe_ms);
+}
+
+fn launchChromiumBrowser(
+    context: BrowserLaunchContext,
+    executable: []const u8,
+    headless: bool,
+    deadline: i64,
+) !chromium_pipe.Browser {
+    return chromium_pipe.Browser.launch(
+        context.allocator,
+        executable,
+        context.navigation_policy,
+        headless,
+        deadline,
+    );
+}
+
+fn launchBrowserCheckpoint(_: BrowserLaunchContext, deadline: i64) !void {
+    return browserDeadlineCheckpoint(deadline);
+}
+
+fn launchBrowserNow(_: BrowserLaunchContext) i64 {
+    return common.compatMilliTimestamp();
+}
+
+fn deinitChromiumBrowser(_: BrowserLaunchContext, browser: *chromium_pipe.Browser) void {
+    browser.deinit();
+}
+
+fn launchNextBrowserUsing(
+    comptime BrowserType: type,
+    context: anytype,
+    executables: anytype,
+    iterator: *BrowserLaunchIterator,
+    deadline: i64,
+    comptime launch: anytype,
+    comptime checkpoint: anytype,
+    comptime now: anytype,
+) !?BrowserLaunchResult(BrowserType) {
+    while (iterator.next(executables.len)) |attempt| {
+        try checkpoint(context, deadline);
+        const current = now(context);
+        const attempt_deadline = browserAttemptDeadline(iterator.plan, attempt.headless, current, deadline);
+        if (attempt_deadline <= current) continue;
+        const browser = launch(
+            context,
+            executables[attempt.executable_index],
+            attempt.headless,
+            attempt_deadline,
+        ) catch |err| {
+            const classified = normalizeBrowserOperationError(err);
+            if (mustPropagateOperationError(classified)) return classified;
+            try checkpoint(context, deadline);
+            continue;
+        };
+        return .{ .browser = browser, .headless = attempt.headless, .deadline = attempt_deadline };
+    }
+    return null;
+}
+
+fn runBrowserAttemptsUsing(
+    comptime BrowserType: type,
+    comptime ResultType: type,
+    context: anytype,
+    executables: anytype,
+    plan: BrowserLaunchPlan,
+    deadline: i64,
+    comptime launch: anytype,
+    comptime checkpoint: anytype,
+    comptime now: anytype,
+    comptime deinit_browser: anytype,
+    comptime try_acquire: anytype,
+) !?ResultType {
+    var iterator: BrowserLaunchIterator = .{ .plan = plan };
+    while (try launchNextBrowserUsing(
+        BrowserType,
+        context,
+        executables,
+        &iterator,
+        deadline,
+        launch,
+        checkpoint,
+        now,
+    )) |launched| {
+        var browser = launched.browser;
+        defer deinit_browser(context, &browser);
+        if (try try_acquire(
+            context,
+            &browser,
+            launched.headless,
+            launched.deadline,
+            deadline,
+        )) |result| return result;
+    }
+    return null;
+}
+
+fn browserAttemptHasTime(attempt_deadline: i64, global_deadline: i64) !bool {
+    try browserDeadlineCheckpoint(global_deadline);
+    return common.compatMilliTimestamp() < attempt_deadline;
+}
+
+fn tryAcquireSessionFromBrowser(
+    context: BrowserLaunchContext,
+    browser: *chromium_pipe.Browser,
+    headless: bool,
+    attempt_deadline: i64,
+    global_deadline: i64,
+) !?Session {
+    _ = headless;
+    if (!try browserAttemptHasTime(attempt_deadline, global_deadline)) return null;
+
+    browser.navigate(context.challenge_url, attempt_deadline) catch |err| {
+        const classified = normalizeBrowserOperationError(err);
+        if (mustPropagateOperationError(classified)) return classified;
+        try browserDeadlineCheckpoint(global_deadline);
+        return null;
+    };
+    while (try browserAttemptHasTime(attempt_deadline, global_deadline)) {
+        const browser_cookies = browser.getCookiesForUrl(context.allocator, context.challenge_url, attempt_deadline) catch |err| {
+            const classified = normalizeBrowserOperationError(err);
+            if (mustPropagateOperationError(classified)) return classified;
+            try browserDeadlineCheckpoint(global_deadline);
+            return null;
+        };
+        defer chromium_pipe.freeCookies(context.allocator, browser_cookies);
+        const cookies = try cloneBrowserCookiesForHost(context.allocator, browser_cookies, context.domain);
+        defer freeCookies(context.allocator, cookies);
+
+        const cf_value = findCookieValueForUrl(cookies, context.challenge_url, "cf_clearance", common.compatUnixTimestamp()) orelse {
+            const pause = remainingTimeoutMs(common.compatMilliTimestamp(), attempt_deadline, challenge_poll_interval_ms) orelse {
+                try browserDeadlineCheckpoint(global_deadline);
+                return null;
+            };
+            browser.waitForPolicyEvents(pause, attempt_deadline) catch |err| {
+                const classified = normalizeBrowserOperationError(err);
+                if (mustPropagateOperationError(classified)) return classified;
+                try browserDeadlineCheckpoint(global_deadline);
+                return null;
+            };
+            continue;
+        };
+
+        if (!try browserAttemptHasTime(attempt_deadline, global_deadline)) return null;
+        const user_agent = browser.getUserAgent(context.allocator, attempt_deadline) catch |err| {
+            const classified = normalizeBrowserOperationError(err);
+            if (mustPropagateOperationError(classified)) return classified;
+            context.user_agent_failed.* = true;
+            try browserDeadlineCheckpoint(global_deadline);
+            return null;
+        };
+        var owns_user_agent = true;
+        defer if (owns_user_agent) context.allocator.free(user_agent);
+        if (!validBrowserUserAgent(user_agent)) {
+            context.user_agent_failed.* = true;
+            try browserDeadlineCheckpoint(global_deadline);
+            return null;
+        }
+
+        const owned_cookies = try cloneCookies(context.allocator, cookies);
+        var owns_cookies = true;
+        defer if (owns_cookies) freeCookies(context.allocator, owned_cookies);
+        const owned_clearance = try context.allocator.dupe(u8, cf_value);
+        var owns_clearance = true;
+        defer if (owns_clearance) context.allocator.free(owned_clearance);
+        if (!try browserAttemptHasTime(attempt_deadline, global_deadline)) return null;
+
+        owns_user_agent = false;
+        owns_cookies = false;
+        owns_clearance = false;
+        return .{
+            .cookies = owned_cookies,
+            .cf_clearance = owned_clearance,
+            .user_agent = user_agent,
+            .acquired_at_unix = common.compatUnixTimestamp(),
+            .generation = nextSessionGeneration(),
+        };
+    }
+    return null;
+}
+
 fn acquireSessionViaBrowser(allocator: Allocator, domain: []const u8, challenge_url: []const u8, deadline: i64) !Session {
-    if (!browser_support.enabled) return error.CloudflareSessionUnavailable;
+    if (!build_options.enable_alldriver) return error.BrowserAutomationDisabled;
     try browserDeadlineCheckpoint(deadline);
     var executables = chromium_pipe.discoverExecutables(allocator, deadline) catch |err|
         return normalizeBrowserAcquisitionError(err);
@@ -1248,90 +1550,36 @@ fn acquireSessionViaBrowser(allocator: Allocator, domain: []const u8, challenge_
 
     if (executables.items.len == 0) return error.CloudflareSessionUnavailable;
 
-    const headless = try shouldLaunchHeadless(allocator);
+    const launch_plan = try browserLaunchPlan(allocator);
     var user_agent_failed = false;
     var navigation_policy = chromium_pipe.NavigationPolicy.create(allocator, challenge_url, deadline) catch |err|
         return normalizeBrowserAcquisitionError(err);
     defer navigation_policy.deinit(allocator);
+    const launch_context: BrowserLaunchContext = .{
+        .allocator = allocator,
+        .navigation_policy = &navigation_policy,
+        .domain = domain,
+        .challenge_url = challenge_url,
+        .user_agent_failed = &user_agent_failed,
+    };
 
-    browser_attempt: for (executables.items) |executable| {
-        try browserDeadlineCheckpoint(deadline);
-        var browser = chromium_pipe.Browser.launch(allocator, executable, &navigation_policy, headless, deadline) catch |err| {
-            const classified = normalizeBrowserOperationError(err);
-            if (mustPropagateOperationError(classified)) return classified;
-            try browserDeadlineCheckpoint(deadline);
-            continue;
-        };
-        defer browser.deinit();
-        try browserDeadlineCheckpoint(deadline);
-
-        browser.navigate(challenge_url, deadline) catch |err| {
-            const classified = normalizeBrowserOperationError(err);
-            if (mustPropagateOperationError(classified)) return classified;
-            try browserDeadlineCheckpoint(deadline);
-            continue;
-        };
-        if (!headless) {
-            clearTerminalScreen();
-            const safe_url = common.redactUrlForLog(allocator, challenge_url) catch null;
-            defer if (safe_url) |value| allocator.free(value);
-            std.log.info("cloudflare verification opened for {s}; complete challenge if prompted", .{safe_url orelse "<redacted-url>"});
-        }
-
-        while (common.compatMilliTimestamp() < deadline) {
-            try browserDeadlineCheckpoint(deadline);
-            const browser_cookies = browser.getCookiesForUrl(allocator, challenge_url, deadline) catch |err| {
-                const classified = normalizeBrowserOperationError(err);
-                if (mustPropagateOperationError(classified)) return classified;
-                try browserDeadlineCheckpoint(deadline);
-                continue :browser_attempt;
-            };
-            defer chromium_pipe.freeCookies(allocator, browser_cookies);
-            const cookies = try cloneBrowserCookiesForHost(allocator, browser_cookies, domain);
-            defer freeCookies(allocator, cookies);
-
-            const cf_value = findCookieValueForUrl(cookies, challenge_url, "cf_clearance", common.compatUnixTimestamp()) orelse {
-                const pause = remainingTimeoutMs(common.compatMilliTimestamp(), deadline, challenge_poll_interval_ms) orelse
-                    break :browser_attempt;
-                browser.waitForPolicyEvents(pause, deadline) catch |err| {
-                    const classified = normalizeBrowserOperationError(err);
-                    if (mustPropagateOperationError(classified)) return classified;
-                    try browserDeadlineCheckpoint(deadline);
-                    continue :browser_attempt;
-                };
-                continue;
-            };
-
-            try browserDeadlineCheckpoint(deadline);
-            const user_agent = browser.getUserAgent(allocator, deadline) catch |err| {
-                const classified = normalizeBrowserOperationError(err);
-                if (mustPropagateOperationError(classified)) return classified;
-                user_agent_failed = true;
-                try browserDeadlineCheckpoint(deadline);
-                continue :browser_attempt;
-            };
-            if (!validBrowserUserAgent(user_agent)) {
-                allocator.free(user_agent);
-                user_agent_failed = true;
-                try browserDeadlineCheckpoint(deadline);
-                continue :browser_attempt;
-            }
-            errdefer allocator.free(user_agent);
-            const owned_cookies = try cloneCookies(allocator, cookies);
-            errdefer freeCookies(allocator, owned_cookies);
-            const owned_clearance = try allocator.dupe(u8, cf_value);
-            errdefer allocator.free(owned_clearance);
-            try browserDeadlineCheckpoint(deadline);
-
-            return .{
-                .cookies = owned_cookies,
-                .cf_clearance = owned_clearance,
-                .user_agent = user_agent,
-                .acquired_at_unix = common.compatUnixTimestamp(),
-                .generation = nextSessionGeneration(),
-            };
-        }
-    }
+    // Automatic graphical mode probes each headed browser for a bounded time,
+    // then exhausts the remaining headed candidates before its headless pass.
+    // Every browser remains subject to the original absolute deadline.
+    const acquired = try runBrowserAttemptsUsing(
+        chromium_pipe.Browser,
+        Session,
+        launch_context,
+        executables.items,
+        launch_plan,
+        deadline,
+        launchChromiumBrowser,
+        launchBrowserCheckpoint,
+        launchBrowserNow,
+        deinitChromiumBrowser,
+        tryAcquireSessionFromBrowser,
+    );
+    if (acquired) |session| return session;
 
     if (user_agent_failed) return error.BrowserAutomationFailed;
     return error.CloudflareSessionUnavailable;
@@ -1377,6 +1625,7 @@ fn cloneBrowserCookiesForHost(allocator: Allocator, browser_cookies: anytype, ho
         if (expires_unix_seconds) |expires| {
             if (expires >= 0 and expires <= now) continue;
         }
+        if (cookies.items.len == max_session_cookies) return error.InvalidSessionPayload;
         const cookie = try dupeCookie(allocator, .{
             .name = browser_cookie.name,
             .value = browser_cookie.value,
@@ -1392,10 +1641,6 @@ fn cloneBrowserCookiesForHost(allocator: Allocator, browser_cookies: anytype, ho
         };
     }
     return try cookies.toOwnedSlice(allocator);
-}
-
-fn clearTerminalScreen() void {
-    std.debug.print("\x1b[2J\x1b[H", .{});
 }
 
 fn validBrowserUserAgent(value: []const u8) bool {
@@ -1454,8 +1699,17 @@ fn parseCookieRequestTarget(url: []const u8) ?CookieRequestTarget {
 }
 
 fn urlHasExactHttpsHost(url: []const u8, expected_host: []const u8) bool {
+    const uri = std.Uri.parse(url) catch return false;
+    if (uri.port) |port| if (port != 443) return false;
     const target = parseCookieRequestTarget(url) orelse return false;
     return target.secure and std.ascii.eqlIgnoreCase(target.host, expected_host);
+}
+
+fn validateChallengeTarget(url: []const u8, expected_host: []const u8) !void {
+    if (!urlHasExactHttpsHost(url, expected_host)) return error.InvalidSessionPayload;
+    // Apply the public-origin policy before consulting the credential cache.
+    // A cache hit must not bypass the policy enforced by browser acquisition.
+    try common.validatePublicHttpUrl(url);
 }
 
 fn buildCookieHeaderForUrl(allocator: Allocator, cookies: []const Cookie, url: []const u8, now: i64) !?[]u8 {
@@ -1559,26 +1813,50 @@ fn normalizeDomain(allocator: Allocator, input: []const u8) ![]u8 {
     return out;
 }
 
-fn shouldLaunchHeadless(allocator: Allocator) !bool {
+fn browserLaunchPlan(allocator: Allocator) !BrowserLaunchPlan {
     const configured = try common.getenvOwned(allocator, "SUBDL_CF_HEADLESS");
     defer if (configured) |value| allocator.free(value);
-    if (configured) |raw| {
-        if (std.mem.eql(u8, raw, "1") or std.ascii.eqlIgnoreCase(raw, "true") or std.ascii.eqlIgnoreCase(raw, "yes")) return true;
-        if (std.mem.eql(u8, raw, "0") or std.ascii.eqlIgnoreCase(raw, "false") or std.ascii.eqlIgnoreCase(raw, "no")) return false;
-    }
+    const display = try common.getenvOwned(allocator, "DISPLAY");
+    defer if (display) |value| allocator.free(value);
+    const wayland_display = try common.getenvOwned(allocator, "WAYLAND_DISPLAY");
+    defer if (wayland_display) |value| allocator.free(value);
 
-    return defaultHeadlessForEnvironment(
-        builtin.os.tag,
-        common.hasEnv("DISPLAY"),
-        common.hasEnv("WAYLAND_DISPLAY"),
-    );
+    return browserLaunchPlanForEnvironment(builtin.os.tag, configured, display, wayland_display);
 }
 
-fn defaultHeadlessForEnvironment(os_tag: std.Target.Os.Tag, has_display: bool, has_wayland: bool) bool {
-    return switch (os_tag) {
-        .windows, .macos => false,
-        else => !has_display and !has_wayland,
+fn browserLaunchPlanForEnvironment(
+    os_tag: std.Target.Os.Tag,
+    configured: ?[]const u8,
+    display: ?[]const u8,
+    wayland_display: ?[]const u8,
+) BrowserLaunchPlan {
+    const mode = browserLaunchModeFromValue(configured);
+    const auto_starts_headed = switch (os_tag) {
+        .windows, .macos => true,
+        else => hasNonEmptyEnvironmentValue(display) or hasNonEmptyEnvironmentValue(wayland_display),
     };
+    return .{
+        .mode = mode,
+        .auto_starts_headed = auto_starts_headed,
+    };
+}
+
+fn browserLaunchModeFromValue(value: ?[]const u8) BrowserLaunchMode {
+    const raw = std.mem.trim(u8, value orelse return .automatic, " \t\r\n");
+    if (std.mem.eql(u8, raw, "1") or
+        std.ascii.eqlIgnoreCase(raw, "true") or
+        std.ascii.eqlIgnoreCase(raw, "yes") or
+        std.ascii.eqlIgnoreCase(raw, "headless")) return .headless;
+    if (std.mem.eql(u8, raw, "0") or
+        std.ascii.eqlIgnoreCase(raw, "false") or
+        std.ascii.eqlIgnoreCase(raw, "no") or
+        std.ascii.eqlIgnoreCase(raw, "headed")) return .headed;
+    return .automatic;
+}
+
+fn hasNonEmptyEnvironmentValue(value: ?[]const u8) bool {
+    const raw = value orelse return false;
+    return std.mem.trim(u8, raw, " \t\r\n").len != 0;
 }
 
 fn getString(obj: std.json.ObjectMap, field: []const u8) ![]const u8 {
@@ -1645,10 +1923,22 @@ test "normalize domain" {
     try std.testing.expectEqualStrings("www.example.com", normalized);
 }
 
-test "cache and browser operations preserve cancellation and allocation failure" {
+test "challenge URL host validation rejects non-HTTPS origins and alternate ports" {
+    try validateChallengeTarget("https://www.example.com/path", "www.example.com");
+    try validateChallengeTarget("https://www.example.com:443/path", "www.example.com");
+    try std.testing.expectError(error.InvalidSessionPayload, validateChallengeTarget("https://www.example.com:8443/path", "www.example.com"));
+    try std.testing.expectError(error.InvalidSessionPayload, validateChallengeTarget("http://www.example.com/path", "www.example.com"));
+    try std.testing.expectError(error.InvalidSessionPayload, validateChallengeTarget("https://api.example.com/path", "www.example.com"));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateChallengeTarget("https://127.0.0.1/path", "127.0.0.1"));
+}
+
+test "cache and browser operations preserve cancellation, allocation, and browser configuration failures" {
     try std.testing.expect(mustPropagateOperationError(error.Canceled));
     try std.testing.expect(mustPropagateOperationError(error.OutOfMemory));
     try std.testing.expect(mustPropagateOperationError(error.CloudflareSessionUnavailable));
+    try std.testing.expect(mustPropagateOperationError(error.BrowserAutomationDisabled));
+    try std.testing.expect(mustPropagateOperationError(error.BrowserAutomationUnavailable));
+    try std.testing.expect(mustPropagateOperationError(error.InvalidBrowserExecutable));
     try std.testing.expect(mustPropagateOperationError(error.UnsafeHttpTarget));
     try std.testing.expect(!mustPropagateOperationError(error.FileNotFound));
     try std.testing.expect(!mustPropagateOperationError(error.BrowserAutomationFailed));
@@ -1768,8 +2058,25 @@ test "browser resolver deadline is a classified session failure" {
     try std.testing.expectEqual(error.CloudflareSessionUnavailable, normalizeBrowserAcquisitionError(error.BrowserOperationTimeout));
     try std.testing.expectEqual(error.Canceled, normalizeBrowserAcquisitionError(error.Canceled));
     try std.testing.expectEqual(error.OutOfMemory, normalizeBrowserAcquisitionError(error.OutOfMemory));
+    try std.testing.expectEqual(error.BrowserAutomationUnavailable, normalizeBrowserAcquisitionError(error.BrowserAutomationUnavailable));
+    try std.testing.expectEqual(error.InvalidBrowserExecutable, normalizeBrowserAcquisitionError(error.InvalidBrowserExecutable));
     try std.testing.expectEqual(error.UnsafeHttpTarget, normalizeBrowserOperationError(error.UnsafeBrowserNavigation));
     try std.testing.expectEqual(error.BrowserOperationTimeout, normalizeBrowserOperationError(error.BrowserOperationTimeout));
+}
+
+test "disabled browser support reports its build configuration" {
+    if (!build_options.enable_alldriver) {
+        try std.testing.expectError(error.BrowserAutomationDisabled, cachePath(std.testing.allocator));
+        try std.testing.expectError(
+            error.BrowserAutomationDisabled,
+            acquireSessionViaBrowser(
+                std.testing.allocator,
+                "example.com",
+                "https://example.com/",
+                std.math.maxInt(i64),
+            ),
+        );
+    }
 }
 
 test "session acquisition lock wait preserves cancellation" {
@@ -1812,12 +2119,236 @@ test "challenge timeout is global and bounded" {
     try std.testing.expectEqual(@as(?u64, null), remainingTimeoutMs(250, 250, 100));
 }
 
-test "manual browser headless default is OS-aware" {
-    try std.testing.expect(!defaultHeadlessForEnvironment(.windows, false, false));
-    try std.testing.expect(!defaultHeadlessForEnvironment(.macos, false, false));
-    try std.testing.expect(defaultHeadlessForEnvironment(.linux, false, false));
-    try std.testing.expect(!defaultHeadlessForEnvironment(.linux, true, false));
-    try std.testing.expect(!defaultHeadlessForEnvironment(.linux, false, true));
+test "browser launch mode distinguishes explicit choices from automatic" {
+    try std.testing.expectEqual(BrowserLaunchMode.automatic, browserLaunchModeFromValue(null));
+    try std.testing.expectEqual(BrowserLaunchMode.automatic, browserLaunchModeFromValue("auto"));
+    try std.testing.expectEqual(BrowserLaunchMode.automatic, browserLaunchModeFromValue("invalid"));
+    try std.testing.expectEqual(BrowserLaunchMode.headless, browserLaunchModeFromValue(" true "));
+    try std.testing.expectEqual(BrowserLaunchMode.headless, browserLaunchModeFromValue("headless"));
+    try std.testing.expectEqual(BrowserLaunchMode.headed, browserLaunchModeFromValue("0"));
+    try std.testing.expectEqual(BrowserLaunchMode.headed, browserLaunchModeFromValue("headed"));
+}
+
+test "automatic browser mode ignores empty display variables" {
+    const linux_empty = browserLaunchPlanForEnvironment(.linux, null, "", " \t");
+    try std.testing.expect(linux_empty.primaryHeadless());
+    try std.testing.expectEqual(@as(usize, 1), linux_empty.passCount());
+
+    const linux_x11 = browserLaunchPlanForEnvironment(.linux, "auto", ":0", null);
+    try std.testing.expect(!linux_x11.primaryHeadless());
+    try std.testing.expectEqual(@as(usize, 2), linux_x11.passCount());
+    const linux_wayland = browserLaunchPlanForEnvironment(.linux, null, null, "wayland-1");
+    try std.testing.expect(!linux_wayland.primaryHeadless());
+    const windows = browserLaunchPlanForEnvironment(.windows, null, null, null);
+    try std.testing.expect(!windows.primaryHeadless());
+    const macos = browserLaunchPlanForEnvironment(.macos, null, null, null);
+    try std.testing.expect(!macos.primaryHeadless());
+
+    const explicit_headed = browserLaunchPlanForEnvironment(.linux, "false", "", "");
+    try std.testing.expect(!explicit_headed.primaryHeadless());
+    const explicit_headless = browserLaunchPlanForEnvironment(.linux, "true", ":0", null);
+    try std.testing.expect(explicit_headless.primaryHeadless());
+}
+
+test "automatic launch exhausts headed candidates before one headless pass" {
+    const Fixture = struct {
+        executables: [4][]const u8 = undefined,
+        attempts: [4]bool = undefined,
+        deadlines: [4]i64 = undefined,
+        attempt_count: usize = 0,
+        checkpoint_deadlines: [8]i64 = undefined,
+        checkpoint_count: usize = 0,
+
+        fn launch(self: *@This(), executable: []const u8, headless: bool, deadline: i64) !u8 {
+            const attempt = self.attempt_count;
+            self.executables[attempt] = executable;
+            self.attempts[attempt] = headless;
+            self.deadlines[attempt] = deadline;
+            self.attempt_count += 1;
+            if (std.mem.eql(u8, executable, "missing") or !headless)
+                return error.BrowserAutomationFailed;
+            return 7;
+        }
+
+        fn checkpoint(self: *@This(), deadline: i64) !void {
+            self.checkpoint_deadlines[self.checkpoint_count] = deadline;
+            self.checkpoint_count += 1;
+        }
+
+        fn now(_: *@This()) i64 {
+            return 0;
+        }
+    };
+
+    const deadline: i64 = challenge_timeout_ms;
+    const plan = browserLaunchPlanForEnvironment(.linux, "auto", ":0", null);
+    var iterator: BrowserLaunchIterator = .{ .plan = plan };
+    var fixture: Fixture = .{};
+    const launched = (try launchNextBrowserUsing(
+        u8,
+        &fixture,
+        &[_][]const u8{ "missing", "browser" },
+        &iterator,
+        deadline,
+        Fixture.launch,
+        Fixture.checkpoint,
+        Fixture.now,
+    )) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u8, 7), launched.browser);
+    try std.testing.expect(launched.headless);
+    try std.testing.expectEqual(@as(usize, 4), fixture.attempt_count);
+    try std.testing.expectEqualStrings("missing", fixture.executables[0]);
+    try std.testing.expectEqualStrings("browser", fixture.executables[1]);
+    try std.testing.expectEqualStrings("missing", fixture.executables[2]);
+    try std.testing.expectEqualStrings("browser", fixture.executables[3]);
+    try std.testing.expect(!fixture.attempts[0]);
+    try std.testing.expect(!fixture.attempts[1]);
+    try std.testing.expect(fixture.attempts[2]);
+    try std.testing.expect(fixture.attempts[3]);
+    const headed_deadline = browserAttemptDeadline(plan, false, 0, deadline);
+    for (fixture.deadlines[0..2]) |attempt_deadline|
+        try std.testing.expectEqual(headed_deadline, attempt_deadline);
+    for (fixture.deadlines[2..fixture.attempt_count]) |attempt_deadline|
+        try std.testing.expectEqual(deadline, attempt_deadline);
+    try std.testing.expectEqual(deadline, launched.deadline);
+    for (fixture.checkpoint_deadlines[0..fixture.checkpoint_count]) |checkpoint_deadline|
+        try std.testing.expectEqual(deadline, checkpoint_deadline);
+    try std.testing.expectEqual(@as(usize, 7), fixture.checkpoint_count);
+
+    if (try launchNextBrowserUsing(
+        u8,
+        &fixture,
+        &[_][]const u8{ "missing", "browser" },
+        &iterator,
+        deadline,
+        Fixture.launch,
+        Fixture.checkpoint,
+        Fixture.now,
+    )) |_| return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 4), fixture.attempt_count);
+}
+
+test "automatic headed probe expiry leaves time for a successful headless fallback" {
+    const Fixture = struct {
+        current: i64 = 0,
+        launch_headless: [2]bool = undefined,
+        launch_deadlines: [2]i64 = undefined,
+        launch_count: usize = 0,
+        navigation_count: usize = 0,
+        clearance_checks: usize = 0,
+        deinit_count: usize = 0,
+
+        fn checkpoint(self: *@This(), deadline: i64) !void {
+            if (self.current >= deadline) return error.CloudflareSessionUnavailable;
+        }
+
+        fn now(self: *@This()) i64 {
+            return self.current;
+        }
+
+        fn launch(self: *@This(), _: []const u8, headless: bool, deadline: i64) !u8 {
+            self.launch_headless[self.launch_count] = headless;
+            self.launch_deadlines[self.launch_count] = deadline;
+            self.launch_count += 1;
+            return @intCast(self.launch_count);
+        }
+
+        fn deinit(self: *@This(), _: *u8) void {
+            self.deinit_count += 1;
+        }
+
+        fn acquire(
+            self: *@This(),
+            browser: *u8,
+            headless: bool,
+            attempt_deadline: i64,
+            global_deadline: i64,
+        ) !?u8 {
+            self.navigation_count += 1;
+            self.clearance_checks += 1;
+            if (!headless) {
+                // Navigation succeeded, but this headed browser never produced
+                // clearance. Advance deterministically to its bounded deadline.
+                self.current = attempt_deadline;
+                return null;
+            }
+            try std.testing.expect(self.current < global_deadline);
+            try std.testing.expectEqual(global_deadline, attempt_deadline);
+            return browser.*;
+        }
+    };
+
+    const global_deadline: i64 = challenge_timeout_ms;
+    const plan = browserLaunchPlanForEnvironment(.linux, "auto", ":0", null);
+    var fixture: Fixture = .{};
+    const acquired = (try runBrowserAttemptsUsing(
+        u8,
+        u8,
+        &fixture,
+        &[_][]const u8{"browser"},
+        plan,
+        global_deadline,
+        Fixture.launch,
+        Fixture.checkpoint,
+        Fixture.now,
+        Fixture.deinit,
+        Fixture.acquire,
+    )) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqual(@as(u8, 2), acquired);
+    try std.testing.expectEqual(@as(usize, 2), fixture.launch_count);
+    try std.testing.expectEqual(@as(usize, 2), fixture.navigation_count);
+    try std.testing.expectEqual(@as(usize, 2), fixture.clearance_checks);
+    try std.testing.expectEqual(@as(usize, 2), fixture.deinit_count);
+    try std.testing.expect(!fixture.launch_headless[0]);
+    try std.testing.expect(fixture.launch_headless[1]);
+    try std.testing.expectEqual(automatic_headed_probe_ms, fixture.launch_deadlines[0]);
+    try std.testing.expectEqual(global_deadline, fixture.launch_deadlines[1]);
+    try std.testing.expectEqual(automatic_headed_probe_ms, fixture.current);
+}
+
+test "explicit headed launch never enters a headless pass" {
+    const Fixture = struct {
+        attempts: [4]bool = undefined,
+        deadlines: [4]i64 = undefined,
+        attempt_count: usize = 0,
+        checkpoint_count: usize = 0,
+
+        fn launch(self: *@This(), _: []const u8, headless: bool, deadline: i64) !u8 {
+            self.attempts[self.attempt_count] = headless;
+            self.deadlines[self.attempt_count] = deadline;
+            self.attempt_count += 1;
+            return error.BrowserAutomationFailed;
+        }
+
+        fn checkpoint(self: *@This(), _: i64) !void {
+            self.checkpoint_count += 1;
+        }
+
+        fn now(_: *@This()) i64 {
+            return 0;
+        }
+    };
+
+    const explicit_headed = browserLaunchPlanForEnvironment(.linux, "0", ":0", null);
+    var iterator: BrowserLaunchIterator = .{ .plan = explicit_headed };
+    var headed_fixture: Fixture = .{};
+    if (try launchNextBrowserUsing(
+        u8,
+        &headed_fixture,
+        &[_][]const u8{ "missing", "browser" },
+        &iterator,
+        900,
+        Fixture.launch,
+        Fixture.checkpoint,
+        Fixture.now,
+    )) |_| return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), headed_fixture.attempt_count);
+    try std.testing.expect(!headed_fixture.attempts[0]);
+    try std.testing.expect(!headed_fixture.attempts[1]);
+    try std.testing.expectEqual(@as(i64, 900), headed_fixture.deadlines[0]);
+    try std.testing.expectEqual(@as(i64, 900), headed_fixture.deadlines[1]);
+    try std.testing.expectEqual(@as(usize, 4), headed_fixture.checkpoint_count);
 }
 
 test "session cache path uses native cache roots with deterministic fallbacks" {
@@ -2048,7 +2579,7 @@ test "browser user agent must be nonempty bounded and header safe" {
     try std.testing.expect(!validBrowserUserAgent(""));
     try std.testing.expect(!validBrowserUserAgent("   "));
     try std.testing.expect(!validBrowserUserAgent("Mozilla/5.0\r\nInjected: yes"));
-    try std.testing.expect(!validBrowserUserAgent("x" ** (max_browser_user_agent_bytes + 1)));
+    try std.testing.expect(!validBrowserUserAgent(&@as([max_browser_user_agent_bytes + 1]u8, @splat('x'))));
 }
 
 fn checkRecordClone(allocator: Allocator) !void {

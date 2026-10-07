@@ -19,6 +19,13 @@ pub const SearchItem = struct {
     subtitle_page_url: []const u8,
 };
 
+const SearchCandidate = struct {
+    anime_id: i64,
+    search_title: []const u8,
+    page_url: []const u8,
+    slug: []const u8,
+};
+
 pub const SubtitleItem = common.SubtitleFile;
 
 pub const SearchResponse = common.SearchResponse(SearchItem);
@@ -44,6 +51,8 @@ pub const Scraper = struct {
 
         const trimmed = std.mem.trim(u8, query, " \t\r\n");
         if (trimmed.len == 0) return .{ .arena = arena, .items = &.{} };
+        const wanted = try common.normalizeTitle(a, trimmed);
+        if (wanted.len == 0) return .{ .arena = arena, .items = &.{} };
 
         const encoded = try common.encodeUriComponent(a, trimmed);
         const url = try std.fmt.allocPrint(a, "{s}/search?search={s}&per_page=20", .{ api, encoded });
@@ -54,6 +63,8 @@ pub const Scraper = struct {
             .retry_on_429 = false,
             .allow_non_ok = true,
             .require_public_origin = true,
+            .require_https = true,
+            .require_same_origin = true,
         });
         if (response.status == .too_many_requests) return error.RateLimited;
         if (response.status != .ok) return error.UnexpectedHttpStatus;
@@ -64,13 +75,12 @@ pub const Scraper = struct {
             else => return error.InvalidFieldType,
         };
 
-        const wanted = try common.normalizeTitle(a, trimmed);
         var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
         var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
-        var inspected: usize = 0;
+        var exact_candidates: std.ArrayListUnmanaged(SearchCandidate) = .empty;
+        var partial_candidates: std.ArrayListUnmanaged(SearchCandidate) = .empty;
 
         for (array.items) |entry| {
-            if (inspected >= 10) break;
             const obj = switch (entry) {
                 .object => |value| value,
                 else => continue,
@@ -81,10 +91,32 @@ pub const Scraper = struct {
             const search_title = common.jsonString(obj, "title") orelse continue;
             const page_url = common.jsonString(obj, "url") orelse continue;
             if (anime_id <= 0 or search_title.len == 0 or page_url.len == 0) continue;
-            validateProviderEndpoint(page_url) catch continue;
+            const slug = pageSlug(page_url) orelse continue;
+            const normalized_search_title = try common.normalizeTitle(a, search_title);
+            const candidate: SearchCandidate = .{
+                .anime_id = anime_id,
+                .search_title = search_title,
+                .page_url = page_url,
+                .slug = slug,
+            };
+            if (std.mem.eql(u8, normalized_search_title, wanted))
+                try exact_candidates.append(a, candidate)
+            else
+                try partial_candidates.append(a, candidate);
+        }
+
+        var candidates: std.ArrayListUnmanaged(SearchCandidate) = .empty;
+        try candidates.appendSlice(a, exact_candidates.items);
+        try candidates.appendSlice(a, partial_candidates.items);
+        var inspected_ids = std.AutoHashMapUnmanaged(i64, void).empty;
+        var inspected: usize = 0;
+        for (candidates.items) |candidate| {
+            if (inspected_ids.contains(candidate.anime_id)) continue;
+            if (inspected >= 10) break;
+            try inspected_ids.put(a, candidate.anime_id, {});
             inspected += 1;
 
-            const detail_url = try std.fmt.allocPrint(a, "{s}/anime/{d}", .{ api, anime_id });
+            const detail_url = try std.fmt.allocPrint(a, "{s}/anime/{d}", .{ api, candidate.anime_id });
             const detail_response = fetch(self.client, a, detail_url, .{
                 .accept = "application/json",
                 .cache = false,
@@ -92,6 +124,8 @@ pub const Scraper = struct {
                 .retry_on_429 = false,
                 .allow_non_ok = true,
                 .require_public_origin = true,
+                .require_https = true,
+                .require_same_origin = true,
             }) catch |err| {
                 if (common.mustPropagateOptionalFailure(err)) return err;
                 continue;
@@ -106,8 +140,10 @@ pub const Scraper = struct {
                 .object => |value| value,
                 else => continue,
             };
+            const detail_id = common.jsonIntField(detail_obj, "id") orelse continue;
+            if (detail_id != candidate.anime_id) continue;
 
-            const rendered_title = nestedString(detail_obj, &.{ "title", "rendered" }) orelse search_title;
+            const rendered_title = nestedString(detail_obj, &.{ "title", "rendered" }) orelse candidate.search_title;
             const english_title = nestedString(detail_obj, &.{ "acf", "basic_data", "anime_titles", "english_title" });
             const type_code = nestedString(detail_obj, &.{ "acf", "basic_data", "type" }) orelse "";
             const episodes = nestedInt(detail_obj, &.{ "acf", "basic_data", "episodes" });
@@ -116,16 +152,15 @@ pub const Scraper = struct {
             else
                 .tv;
 
-            const slug = pageSlug(page_url) orelse continue;
-            const subtitle_page_url = try std.fmt.allocPrint(a, "{s}/subtitle/{s}/", .{ site, slug });
+            const subtitle_page_url = try std.fmt.allocPrint(a, "{s}/subtitle/{s}/", .{ site, candidate.slug });
             const title = try a.dupe(u8, rendered_title);
             const item: SearchItem = .{
                 .title = title,
                 .english_title = if (english_title) |value| try a.dupe(u8, value) else null,
-                .anime_id = anime_id,
+                .anime_id = candidate.anime_id,
                 .media_kind = media_kind,
                 .episodes = episodes,
-                .page_url = try a.dupe(u8, page_url),
+                .page_url = try a.dupe(u8, candidate.page_url),
                 .subtitle_page_url = subtitle_page_url,
             };
 
@@ -147,13 +182,18 @@ pub const Scraper = struct {
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
+        return self.fetchSubtitlesBySearchItemUsing(common.fetchBytes, item);
+    }
+
+    fn fetchSubtitlesBySearchItemUsing(self: *Scraper, comptime fetch: anytype, item: SearchItem) !SubtitlesResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        try validateProviderEndpoint(item.page_url);
-        try validateProviderEndpoint(item.subtitle_page_url);
-        const response = try common.fetchBytes(self.client, a, item.subtitle_page_url, .{
+        const slug = pageSlug(item.page_url) orelse return error.UnsafeHttpTarget;
+        const subtitle_slug = subtitlePageSlug(item.subtitle_page_url) orelse return error.UnsafeHttpTarget;
+        if (!std.mem.eql(u8, slug, subtitle_slug)) return error.UnsafeHttpTarget;
+        const response = try fetch(self.client, a, item.subtitle_page_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .extra_headers = &[_]std.http.Header{.{ .name = "referer", .value = item.page_url }},
             .cache = false,
@@ -161,37 +201,52 @@ pub const Scraper = struct {
             .retry_on_429 = false,
             .allow_non_ok = true,
             .require_public_origin = true,
+            .require_https = true,
+            .require_same_origin = true,
         });
         if (response.status == .too_many_requests) return error.RateLimited;
         if (response.status != .ok) return error.UnexpectedHttpStatus;
 
-        var parsed = try common.parseHtmlStable(a, response.body);
-        var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
-        var seen = std.StringHashMapUnmanaged(void).empty;
-        var anchors = parsed.doc.queryAll("a.download-file[href]");
-        while (anchors.next()) |anchor| {
-            const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
-            if (std.ascii.findIgnoreCase(href, "font") != null) continue;
-            if (!hasArchiveExtension(href)) continue;
-            if (seen.contains(href)) continue;
-            try seen.put(a, try a.dupe(u8, href), {});
-
-            const download_url = try common.resolveUrl(a, site, href);
-            try common.validatePublicHttpUrl(download_url);
-            try subtitles.append(a, .{
-                .language_code = "ar",
-                .filename = try filenameFromUrl(a, download_url, item.title),
-                .download_url = download_url,
-            });
-        }
+        const subtitles = try parseSubtitleItems(a, response.body, item.title);
 
         return common.finishResponse(SubtitlesResponse, &arena, .{
             .arena = arena,
             .title = try a.dupe(u8, item.title),
-            .subtitles = try subtitles.toOwnedSlice(a),
+            .subtitles = subtitles,
         });
     }
 };
+
+fn parseSubtitleItems(allocator: Allocator, body: []const u8, fallback_title: []const u8) ![]SubtitleItem {
+    var parsed = try common.parseHtmlStable(allocator, body);
+    var subtitles: std.ArrayListUnmanaged(SubtitleItem) = .empty;
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    var anchors = parsed.doc.queryAll("a.download-file[href]");
+    while (anchors.next()) |anchor| {
+        const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
+        if (std.ascii.findIgnoreCase(href, "font") != null) continue;
+        if (!hasArchiveExtension(href)) continue;
+        // Reject malformed absolute URLs before resolution can reinterpret them as paths.
+        if (std.mem.indexOfAny(u8, href, ":/?#")) |separator| {
+            if (href[separator] == ':') common.validatePublicHttpUrl(href) catch continue;
+        }
+
+        const download_url = common.resolveUrl(allocator, site, href) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => continue,
+        };
+        common.validatePublicHttpUrl(download_url) catch continue;
+        if (seen.contains(download_url)) continue;
+        try seen.put(allocator, download_url, {});
+
+        try subtitles.append(allocator, .{
+            .language_code = "ar",
+            .filename = try filenameFromUrl(allocator, download_url, fallback_title),
+            .download_url = download_url,
+        });
+    }
+    return subtitles.toOwnedSlice(allocator);
+}
 
 fn validateProviderEndpoint(url: []const u8) !void {
     try common.validatePublicHttpUrl(url);
@@ -225,12 +280,40 @@ fn nestedInt(root: std.json.ObjectMap, path: []const []const u8) ?i64 {
 }
 
 fn pageSlug(page_url: []const u8) ?[]const u8 {
-    var end = page_url.len;
-    while (end > 0 and page_url[end - 1] == '/') end -= 1;
-    if (end == 0) return null;
-    const slash = std.mem.lastIndexOfScalar(u8, page_url[0..end], '/') orelse return null;
-    if (slash + 1 >= end) return null;
-    return page_url[slash + 1 .. end];
+    return routeSlug(page_url, "/anime/");
+}
+
+fn subtitlePageSlug(page_url: []const u8) ?[]const u8 {
+    return routeSlug(page_url, "/subtitle/");
+}
+
+fn routeSlug(page_url: []const u8, prefix: []const u8) ?[]const u8 {
+    validateProviderEndpoint(page_url) catch return null;
+    const uri = std.Uri.parse(page_url) catch return null;
+    if (uri.query != null or uri.fragment != null) return null;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, "/")) return null;
+    if (path.len <= prefix.len + 1) return null;
+    const slug = path[prefix.len .. path.len - 1];
+    if (!isCanonicalSlug(slug)) return null;
+    return slug;
+}
+
+fn isCanonicalSlug(value: []const u8) bool {
+    if (value.len == 0 or value.len > 256 or value[0] == '-' or value[value.len - 1] == '-') return false;
+    var previous_dash = false;
+    for (value) |c| {
+        if (c == '-') {
+            if (previous_dash) return false;
+            previous_dash = true;
+        } else {
+            if (!(std.ascii.isDigit(c) or (c >= 'a' and c <= 'z'))) return false;
+            previous_dash = false;
+        }
+    }
+    return true;
 }
 
 fn hasArchiveExtension(url: []const u8) bool {
@@ -266,6 +349,234 @@ test "miraianime rejects unsafe provider URLs before fetch" {
     try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("http://127.0.0.1/private"));
     try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("https://user:pass@miraianime.net/private"));
     try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint("https://www.google.com/private"));
+}
+
+test "miraianime accepts only canonical anime and subtitle page routes" {
+    try std.testing.expectEqualStrings("death-note", pageSlug("https://miraianime.net/anime/death-note/").?);
+    try std.testing.expectEqualStrings("death-note", subtitlePageSlug("https://miraianime.net/subtitle/death-note/").?);
+    for ([_][]const u8{
+        "https://miraianime.net/anime/death-note",
+        "https://miraianime.net/anime/death-note/extra/",
+        "https://miraianime.net/anime/death-note/?next=/admin",
+        "https://miraianime.net/anime/%2e%2e/",
+        "https://miraianime.net/anime/death%2fnote/",
+        "https://miraianime.net/other/death-note/",
+    }) |url| try std.testing.expect(pageSlug(url) == null);
+}
+
+test "miraianime provider fetches require public HTTPS same-origin" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, url: []const u8, options: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            try std.testing.expect(options.require_public_origin);
+            try std.testing.expect(options.require_https);
+            try std.testing.expect(options.require_same_origin);
+
+            if (std.mem.indexOf(u8, url, "/search?") != null) return .{
+                .status = .ok,
+                .body = try allocator.dupe(u8, "[{\"subtype\":\"anime\",\"id\":7,\"title\":\"Target\",\"url\":\"https://miraianime.net/anime/target/\"}]"),
+            };
+            if (std.mem.endsWith(u8, url, "/anime/7")) return .{
+                .status = .ok,
+                .body = try allocator.dupe(u8, "{\"id\":7,\"title\":{\"rendered\":\"Target\"},\"acf\":{\"basic_data\":{\"type\":\"3\",\"episodes\":1}}}"),
+            };
+
+            try std.testing.expectEqualStrings(site ++ "/subtitle/target/", url);
+            return .{
+                .status = .ok,
+                .body = try allocator.dupe(u8, "<a class='download-file' href='/files/target.zip'>download</a>"),
+            };
+        }
+    };
+
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+    var search_response = try scraper.searchUsing(Fixture.fetch, "Target");
+    defer search_response.deinit();
+    try std.testing.expectEqual(@as(usize, 1), search_response.items.len);
+
+    var subtitles_response = try scraper.fetchSubtitlesBySearchItemUsing(Fixture.fetch, search_response.items[0]);
+    defer subtitles_response.deinit();
+    try std.testing.expectEqual(@as(usize, 1), subtitles_response.subtitles.len);
+    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
+}
+
+test "miraianime skips detail responses for a different anime id" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, url: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            if (std.mem.indexOf(u8, url, "/search?") != null) return .{
+                .status = .ok,
+                .body = try allocator.dupe(u8, "[{\"subtype\":\"anime\",\"id\":1,\"title\":\"Target\",\"url\":\"https://miraianime.net/anime/target/\"}]"),
+            };
+            try std.testing.expect(std.mem.endsWith(u8, url, "/anime/1"));
+            return .{
+                .status = .ok,
+                .body = try allocator.dupe(u8, "{\"id\":2,\"title\":{\"rendered\":\"Target\"},\"acf\":{\"basic_data\":{\"type\":\"3\",\"episodes\":1}}}"),
+            };
+        }
+    };
+
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+    var response = try scraper.searchUsing(Fixture.fetch, "Target");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(usize, 0), response.items.len);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+}
+
+test "miraianime rejects normalized-empty searches before I/O" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, _: Allocator, _: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+    var response = try scraper.searchUsing(Fixture.fetch, "---");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 0), response.items.len);
+}
+
+test "miraianime duplicate ids do not consume the detail request budget" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, url: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            if (std.mem.indexOf(u8, url, "/search?") != null) return .{
+                .status = .ok,
+                .body = try allocator.dupe(u8,
+                    \\[
+                    \\  {"subtype":"anime","id":1,"title":"Target","url":"https://miraianime.net/anime/duplicate/"},
+                    \\  {"subtype":"anime","id":1,"title":"Target","url":"https://miraianime.net/anime/duplicate/"},
+                    \\  {"subtype":"anime","id":1,"title":"Target","url":"https://miraianime.net/anime/duplicate/"},
+                    \\  {"subtype":"anime","id":1,"title":"Target","url":"https://miraianime.net/anime/duplicate/"},
+                    \\  {"subtype":"anime","id":1,"title":"Target","url":"https://miraianime.net/anime/duplicate/"},
+                    \\  {"subtype":"anime","id":1,"title":"Target","url":"https://miraianime.net/anime/duplicate/"},
+                    \\  {"subtype":"anime","id":1,"title":"Target","url":"https://miraianime.net/anime/duplicate/"},
+                    \\  {"subtype":"anime","id":1,"title":"Target","url":"https://miraianime.net/anime/duplicate/"},
+                    \\  {"subtype":"anime","id":1,"title":"Target","url":"https://miraianime.net/anime/duplicate/"},
+                    \\  {"subtype":"anime","id":1,"title":"Target","url":"https://miraianime.net/anime/duplicate/"},
+                    \\  {"subtype":"anime","id":2,"title":"Target","url":"https://miraianime.net/anime/target/"}
+                    \\]
+                ),
+            };
+            if (std.mem.endsWith(u8, url, "/anime/1"))
+                return .{ .status = .not_found, .body = try allocator.dupe(u8, "missing") };
+            try std.testing.expect(std.mem.endsWith(u8, url, "/anime/2"));
+            return .{
+                .status = .ok,
+                .body = try allocator.dupe(u8, "{\"id\":2,\"title\":{\"rendered\":\"Target\"},\"acf\":{\"basic_data\":{\"type\":\"3\",\"episodes\":1}}}"),
+            };
+        }
+    };
+
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+    var response = try scraper.searchUsing(Fixture.fetch, "Target");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 1), response.items.len);
+    try std.testing.expectEqual(@as(i64, 2), response.items[0].anime_id);
+}
+
+test "miraianime skips malformed archive links before a valid candidate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const subtitles = try parseSubtitleItems(
+        arena.allocator(),
+        "<a class='download-file' href='https://miraianime.net:bad/broken.zip'>bad uri</a>" ++
+            "<a class='download-file' href='https://miraianime.net:99999/overflow.zip'>bad port</a>" ++
+            "<a class='download-file' href='//miraianime.net:bad/broken.zip'>bad authority</a>" ++
+            "<a class='download-file' href='javascript:broken.zip'>bad scheme</a>" ++
+            "<a class='download-file' href='http://127.0.0.1/private.zip'>unsafe</a>" ++
+            "<a class='download-file' href='/files/target.zip'>valid</a>",
+        "Target",
+    );
+    try std.testing.expectEqual(@as(usize, 1), subtitles.len);
+    try std.testing.expectEqualStrings(site ++ "/files/target.zip", subtitles[0].download_url);
+}
+
+test "miraianime preserves relative and public external archive links" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const subtitles = try parseSubtitleItems(
+        arena.allocator(),
+        "<a class='download-file' href='files/part:1.zip'>relative</a>" ++
+            "<a class='download-file' href='https://example.com:8443/target.zip'>external</a>" ++
+            "<a class='download-file' href='//example.com/target.rar'>scheme relative</a>",
+        "Target",
+    );
+    try std.testing.expectEqual(@as(usize, 3), subtitles.len);
+    try std.testing.expectEqualStrings(site ++ "/files/part:1.zip", subtitles[0].download_url);
+    try std.testing.expectEqualStrings("https://example.com:8443/target.zip", subtitles[1].download_url);
+    try std.testing.expectEqualStrings("https://example.com/target.rar", subtitles[2].download_url);
+}
+
+test "miraianime promotes an exact eleventh candidate into the detail budget" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+        first_detail_was_exact: bool = false,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, url: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            if (std.mem.indexOf(u8, url, "/search?") != null) return .{
+                .status = .ok,
+                .body = try allocator.dupe(u8, "[{\"subtype\":\"anime\",\"id\":1,\"title\":\"Partial 1\",\"url\":\"https://miraianime.net/anime/partial-1/\"}," ++
+                    "{\"subtype\":\"anime\",\"id\":2,\"title\":\"Partial 2\",\"url\":\"https://miraianime.net/anime/partial-2/\"}," ++
+                    "{\"subtype\":\"anime\",\"id\":3,\"title\":\"Partial 3\",\"url\":\"https://miraianime.net/anime/partial-3/\"}," ++
+                    "{\"subtype\":\"anime\",\"id\":4,\"title\":\"Partial 4\",\"url\":\"https://miraianime.net/anime/partial-4/\"}," ++
+                    "{\"subtype\":\"anime\",\"id\":5,\"title\":\"Partial 5\",\"url\":\"https://miraianime.net/anime/partial-5/\"}," ++
+                    "{\"subtype\":\"anime\",\"id\":6,\"title\":\"Partial 6\",\"url\":\"https://miraianime.net/anime/partial-6/\"}," ++
+                    "{\"subtype\":\"anime\",\"id\":7,\"title\":\"Partial 7\",\"url\":\"https://miraianime.net/anime/partial-7/\"}," ++
+                    "{\"subtype\":\"anime\",\"id\":8,\"title\":\"Partial 8\",\"url\":\"https://miraianime.net/anime/partial-8/\"}," ++
+                    "{\"subtype\":\"anime\",\"id\":9,\"title\":\"Partial 9\",\"url\":\"https://miraianime.net/anime/partial-9/\"}," ++
+                    "{\"subtype\":\"anime\",\"id\":10,\"title\":\"Partial 10\",\"url\":\"https://miraianime.net/anime/partial-10/\"}," ++
+                    "{\"subtype\":\"anime\",\"id\":11,\"title\":\"Target\",\"url\":\"https://miraianime.net/anime/target/\"}]"),
+            };
+
+            if (self.calls == 2) self.first_detail_was_exact = std.mem.endsWith(u8, url, "/anime/11");
+            if (std.mem.endsWith(u8, url, "/anime/11")) return .{
+                .status = .ok,
+                .body = try allocator.dupe(u8, "{\"id\":11,\"title\":{\"rendered\":\"Target\"},\"acf\":{\"basic_data\":{\"type\":\"3\",\"episodes\":1}}}"),
+            };
+            return .{ .status = .not_found, .body = try allocator.dupe(u8, "missing") };
+        }
+    };
+
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+    var response = try scraper.searchUsing(Fixture.fetch, "Target");
+    defer response.deinit();
+    try std.testing.expect(fixture.first_detail_was_exact);
+    try std.testing.expectEqual(@as(usize, 11), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 1), response.items.len);
+    try std.testing.expectEqualStrings("Target", response.items[0].title);
 }
 
 test "miraianime stops detail fallback on rate limits and cancellation" {
@@ -327,7 +638,7 @@ test "miraianime skips one ordinary detail failure" {
             if (std.mem.endsWith(u8, url, "/anime/1")) return error.ConnectionResetByPeer;
             return .{
                 .status = .ok,
-                .body = try allocator.dupe(u8, "{\"title\":{\"rendered\":\"Second\"},\"acf\":{\"basic_data\":{\"type\":\"3\",\"episodes\":1}}}"),
+                .body = try allocator.dupe(u8, "{\"id\":2,\"title\":{\"rendered\":\"Second\"},\"acf\":{\"basic_data\":{\"type\":\"3\",\"episodes\":1}}}"),
             };
         }
     };

@@ -20,11 +20,14 @@ pub fn Loop(comptime T: type) type {
         tty: *Tty,
         vaxis: *Vaxis,
 
-        queue: Queue(T, 512),
+        queue: Queue(T, GraphemeCache.event_queue_capacity),
         thread: ?std.Io.Future(void) = null,
         // Queued key text must outlive the input task, including on failure.
         cache: GraphemeCache = .{},
-        resize_handler_installed: bool = false,
+        // 0 absent, 1 installing, 2 installed, 3 removal requested/in progress.
+        // The input task can discover in-band resize while the owner is still
+        // installing the fallback, so a boolean is not sufficient here.
+        resize_handler_state: std.atomic.Value(u8) = .init(0),
 
         /// Initialize the event loop. This is an intrusive init so that we have
         /// a stable pointer to register signal callbacks with posix TTYs
@@ -41,9 +44,18 @@ pub fn Loop(comptime T: type) type {
             switch (builtin.os.tag) {
                 .windows => {},
                 else => {
-                    if (!builtin.is_test and !self.resize_handler_installed) {
-                        try Tty.notifyWinsize(self.resizeHandler());
-                        self.resize_handler_installed = true;
+                    if (builtin.is_test) return;
+                    if (self.resize_handler_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null)
+                        return;
+                    Tty.notifyWinsize(self.resizeHandler()) catch |err| {
+                        self.resize_handler_state.store(0, .release);
+                        return err;
+                    };
+                    // If the input task requested removal during registration,
+                    // the installer owns the now-complete unregister operation.
+                    if (self.resize_handler_state.cmpxchgStrong(1, 2, .acq_rel, .acquire) != null) {
+                        Tty.removeWinsize(self.resizeHandler());
+                        self.resize_handler_state.store(0, .release);
                     }
                 },
             }
@@ -53,9 +65,23 @@ pub fn Loop(comptime T: type) type {
             switch (builtin.os.tag) {
                 .windows => {},
                 else => {
-                    if (!builtin.is_test and self.resize_handler_installed) {
-                        Tty.removeWinsize(self.resizeHandler());
-                        self.resize_handler_installed = false;
+                    if (builtin.is_test) return;
+                    while (true) {
+                        switch (self.resize_handler_state.load(.acquire)) {
+                            0, 3 => return,
+                            1 => {
+                                if (self.resize_handler_state.cmpxchgWeak(1, 3, .acq_rel, .acquire) == null)
+                                    return;
+                            },
+                            2 => {
+                                if (self.resize_handler_state.cmpxchgWeak(2, 3, .acq_rel, .acquire) == null) {
+                                    Tty.removeWinsize(self.resizeHandler());
+                                    self.resize_handler_state.store(0, .release);
+                                    return;
+                                }
+                            },
+                            else => unreachable,
+                        }
                     }
                 },
             }
@@ -65,6 +91,7 @@ pub fn Loop(comptime T: type) type {
             return .{
                 .context = self,
                 .callback = Self.winsizeCallback,
+                .io = self.io,
             };
         }
 
@@ -96,7 +123,8 @@ pub fn Loop(comptime T: type) type {
         }
 
         /// Returns the next event, blocking until available. After buffered events
-        /// are drained, returns Closed on stop or the input task's failure.
+        /// are drained, returns Closed on stop or the input task's failure. Key text
+        /// remains valid until the next successful event dequeue on this loop.
         pub fn nextEvent(self: *Self) !T {
             return try self.queue.pop();
         }
@@ -107,7 +135,8 @@ pub fn Loop(comptime T: type) type {
             try self.queue.poll();
         }
 
-        /// returns an event if one is available, otherwise null. Non-blocking.
+        /// returns an event if one is available, otherwise null. Non-blocking. Key
+        /// text remains valid until the next successful event dequeue on this loop.
         pub fn tryEvent(self: *Self) !?T {
             return try self.queue.tryPop();
         }
@@ -124,9 +153,6 @@ pub fn Loop(comptime T: type) type {
 
         pub fn winsizeCallback(ptr: *anyopaque) void {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            // We will be receiving winsize updates in-band
-            if (self.vaxis.state.in_band_resize) return;
-
             const winsize = self.tty.getWinsize() catch return;
             if (@hasField(Event, "winsize")) {
                 // Resize notifications may be coalesced when the queue is full.
@@ -335,8 +361,12 @@ pub fn handleEventGeneric(self: anytype, vx: *Vaxis, cache: *GraphemeCache, Even
                     if (@hasField(Event, "key_press")) {
                         // HACK: yuck. there has to be a better way
                         var mut_key = key;
+                        var cached_text: ?[]u8 = null;
+                        errdefer if (cached_text) |text| cache.discardLast(text);
                         if (key.text) |text| {
-                            mut_key.text = cache.put(text);
+                            const stored = try cache.put(text);
+                            cached_text = stored;
+                            mut_key.text = stored;
                         }
                         return self.postEvent(.{ .key_press = mut_key });
                     }
@@ -345,8 +375,12 @@ pub fn handleEventGeneric(self: anytype, vx: *Vaxis, cache: *GraphemeCache, Even
                     if (@hasField(Event, "key_release")) {
                         // HACK: yuck. there has to be a better way
                         var mut_key = key;
+                        var cached_text: ?[]u8 = null;
+                        errdefer if (cached_text) |text| cache.discardLast(text);
                         if (key.text) |text| {
-                            mut_key.text = cache.put(text);
+                            const stored = try cache.put(text);
+                            cached_text = stored;
+                            mut_key.text = stored;
                         }
                         return self.postEvent(.{ .key_release = mut_key });
                     }
@@ -401,8 +435,12 @@ pub fn handleEventGeneric(self: anytype, vx: *Vaxis, cache: *GraphemeCache, Even
                     if (@hasField(Event, "key_press")) {
                         // HACK: yuck. there has to be a better way
                         var mut_key = key;
+                        var cached_text: ?[]u8 = null;
+                        errdefer if (cached_text) |text| cache.discardLast(text);
                         if (key.text) |text| {
-                            mut_key.text = cache.put(text);
+                            const stored = try cache.put(text);
+                            cached_text = stored;
+                            mut_key.text = stored;
                         }
                         return self.postEvent(.{ .key_press = mut_key });
                     }
@@ -411,8 +449,12 @@ pub fn handleEventGeneric(self: anytype, vx: *Vaxis, cache: *GraphemeCache, Even
                     if (@hasField(Event, "key_release")) {
                         // HACK: yuck. there has to be a better way
                         var mut_key = key;
+                        var cached_text: ?[]u8 = null;
+                        errdefer if (cached_text) |text| cache.discardLast(text);
                         if (key.text) |text| {
-                            mut_key.text = cache.put(text);
+                            const stored = try cache.put(text);
+                            cached_text = stored;
+                            mut_key.text = stored;
                         }
                         return self.postEvent(.{ .key_release = mut_key });
                     }
@@ -484,11 +526,16 @@ pub fn handleEventGeneric(self: anytype, vx: *Vaxis, cache: *GraphemeCache, Even
                     vx.queries_done.store(true, .unordered);
                 },
                 .winsize => |winsize| {
-                    vx.state.in_band_resize = true;
+                    // Publish capability before removing the fallback. App's
+                    // post-install acquire check then closes the case where
+                    // this task observes state 0 immediately before App starts
+                    // registration.
+                    vx.state.in_band_resize.store(true, .release);
                     switch (builtin.os.tag) {
                         .windows => {},
-                        // Reset the signal handler if we are receiving in_band_resize
-                        else => Tty.resetSignalHandler(),
+                        // This loop no longer needs its fallback; other TTYs
+                        // may still have independent SIGWINCH subscriptions.
+                        else => self.uninstallResizeHandler(),
                     }
                     if (@hasField(Event, "winsize")) {
                         return self.postEvent(.{ .winsize = winsize });
@@ -671,7 +718,7 @@ test "Windows reader recovers, resets retries, and reports failure after queued 
     try testing.expectEqual('z', second.codepoint);
     try testing.expectEqualStrings("abc", first.text.?);
     try testing.expectEqualStrings("zy", second.text.?);
-    try testing.expect(first.text.?.ptr == loop.cache.buf[0..].ptr);
+    try testing.expect(first.text.?.ptr == loop.cache.entries[0][0..].ptr);
     try testing.expectError(error.AccessDenied, loop.nextEvent());
     try testing.expectError(error.AccessDenied, loop.tryEvent());
     try testing.expectError(error.AccessDenied, loop.pollEvent());
@@ -758,6 +805,36 @@ test "failed paste enqueue frees its allocation" {
         @as(vaxis.Event, .{ .paste = text }),
         std.testing.allocator,
     ));
+}
+
+test "failed key enqueue releases its cache reservation" {
+    const Event = union(enum) { key_press: vaxis.Key };
+    var vx: Vaxis = undefined;
+    var loop: Loop(Event) = .init(std.testing.io, undefined, &vx);
+    loop.queue.close(error.Closed);
+
+    try std.testing.expectError(error.Closed, handleEventGeneric(
+        &loop,
+        &vx,
+        &loop.cache,
+        Event,
+        @as(vaxis.Event, .{ .key_press = .{ .codepoint = 'a', .text = "first" } }),
+        null,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), loop.cache.next_slot);
+
+    loop.queue.reopen();
+    try handleEventGeneric(
+        &loop,
+        &vx,
+        &loop.cache,
+        Event,
+        @as(vaxis.Event, .{ .key_press = .{ .codepoint = 'b', .text = "second" } }),
+        null,
+    );
+    const key_event = (try loop.nextEvent()).key_press;
+    try std.testing.expectEqualStrings("second", key_event.text.?);
+    try std.testing.expect(key_event.text.?.ptr == loop.cache.entries[0][0..].ptr);
 }
 
 test {

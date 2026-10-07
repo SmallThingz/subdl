@@ -81,9 +81,12 @@ const State = enum {
     ss3,
 };
 
+/// Maximum byte length of key text produced through the parser scratch buffer.
+pub const max_key_text_bytes: usize = 128;
+
 // a buffer to temporarily store text in. We need this to encode
 // text-as-codepoints
-buf: [128]u8 = undefined,
+buf: [max_key_text_bytes]u8 = undefined,
 
 /// Share Vaxis.cursor_position_requests when using a custom event loop.
 /// Without pending requests, CSI R sequences retain their F3 key meaning.

@@ -15,6 +15,9 @@ pub const Grapheme = struct {
 pub const GraphemeIterator = struct {
     str: []const u8,
     inner: uucode.grapheme.Iterator(uucode.utf8.Iterator),
+    // Retained for source compatibility with the previous wrapper. After a
+    // successful `next`, `start` points at the next grapheme and
+    // `prev_break` remains true, matching the old observable state.
     start: usize = 0,
     prev_break: bool = true,
 
@@ -26,42 +29,56 @@ pub const GraphemeIterator = struct {
     }
 
     pub fn next(self: *GraphemeIterator) ?Grapheme {
-        while (self.inner.nextCodePoint()) |res| {
-
-            // When leaving a break and entering a non-break, set the start of a cluster
-            if (self.prev_break and !res.is_break) {
-                const cp_len: usize = std.unicode.utf8CodepointSequenceLength(res.code_point) catch 1;
-                self.start = self.inner.i - cp_len;
-            }
-
-            // A break marks the end of the current grapheme
-            if (res.is_break) {
-                const end = self.inner.i;
-                const s = self.start;
-                self.start = end;
-                self.prev_break = true;
-                return .{ .start = s, .len = end - s };
-            }
-
-            self.prev_break = false;
-        }
-
-        // Flush the last grapheme if we ended mid-cluster
-        if (!self.prev_break and self.start < self.str.len) {
-            const s = self.start;
-            const len = self.str.len - s;
-            self.start = self.str.len;
-            self.prev_break = true;
-            return .{ .start = s, .len = len };
-        }
-
-        return null;
+        const grapheme = self.inner.nextGrapheme() orelse return null;
+        self.start = grapheme.end;
+        self.prev_break = true;
+        return .{
+            .start = grapheme.start,
+            .len = grapheme.end - grapheme.start,
+        };
     }
 };
 
 /// creates a grapheme iterator based on str
 pub fn graphemeIterator(str: []const u8) GraphemeIterator {
     return GraphemeIterator.init(str);
+}
+
+test "grapheme iterator preserves malformed utf8 byte spans" {
+    const malformed = "\xff\xcc\x81";
+    var iter = graphemeIterator(malformed);
+
+    const grapheme = iter.next().?;
+    try std.testing.expectEqual(@as(usize, 0), grapheme.start);
+    try std.testing.expectEqual(@as(usize, malformed.len), grapheme.len);
+    try std.testing.expectEqualStrings(malformed, grapheme.bytes(malformed));
+    try std.testing.expectEqual(null, iter.next());
+}
+
+test "grapheme iterator preserves public compatibility state" {
+    const text = "a\xcc\x81b";
+    var iter = graphemeIterator(text);
+    try std.testing.expectEqual(@as(usize, 0), iter.start);
+    try std.testing.expect(iter.prev_break);
+    try std.testing.expectEqual(@as(usize, 0), iter.inner.i);
+
+    const first = iter.next().?;
+    try std.testing.expectEqual(@as(usize, 0), first.start);
+    try std.testing.expectEqual(@as(usize, 3), first.len);
+    try std.testing.expectEqual(@as(usize, 3), iter.start);
+    try std.testing.expect(iter.prev_break);
+    try std.testing.expectEqual(iter.start, iter.inner.i);
+
+    const second = iter.next().?;
+    try std.testing.expectEqual(@as(usize, 3), second.start);
+    try std.testing.expectEqual(@as(usize, 1), second.len);
+    try std.testing.expectEqual(text.len, iter.start);
+    try std.testing.expect(iter.prev_break);
+    try std.testing.expectEqual(iter.start, iter.inner.i);
+
+    try std.testing.expectEqual(null, iter.next());
+    try std.testing.expectEqual(text.len, iter.start);
+    try std.testing.expect(iter.prev_break);
 }
 
 test {

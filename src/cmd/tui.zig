@@ -4,7 +4,6 @@ const vaxis = @import("vaxis");
 const builtin = @import("builtin");
 const runtime_alloc = @import("runtime_alloc");
 const runtime_io = @import("runtime_io");
-const oneserial = @import("oneserial");
 
 const app = scrapers.providers_app;
 const common = scrapers.common;
@@ -16,13 +15,64 @@ fn tuiPanic(msg: []const u8, ret_addr: ?usize) noreturn {
     std.debug.defaultPanic(msg, ret_addr);
 }
 
+const terminal_feature_reset =
+    // End synchronized output and close any open hyperlink.
+    "\x1b[?2026l\x1b]8;;\x1b\\" ++
+    // Capability probing can enable these without enough state for deinit to
+    // know that they need resetting. Secondary cursors are likewise harmless
+    // to reset when unused and otherwise must not escape the application.
+    "\x1b[?2027l\x1b[?2048l\x1b[>0;4 q";
+
+const panic_terminal_reset = terminal_feature_reset ++
+    // Pop enhanced keyboard input and disable every mouse/focus mode Vaxis uses.
+    "\x1b[<u\x1b[?1000;1002;1003;1004;1006;1016l" ++
+    // Disable bracketed paste and color-scheme notifications.
+    "\x1b[?2004l\x1b[?2031l" ++
+    // Reset styling/cursor shape, show the cursor, and leave the alt screen.
+    "\x1b[0m\x1b[0 q\x1b[?25h\x1b[?1049l";
+
 fn restoreTerminalOnPanic() void {
-    if (comptime builtin.os.tag == .windows) return vaxis.recover();
+    if (comptime builtin.os.tag == .windows) {
+        if (vaxis.tty.global_tty) |*tty| {
+            tty.writer().writeAll(panic_terminal_reset) catch {};
+            tty.writer().flush() catch {};
+            tty.deinit();
+            vaxis.tty.global_tty = null;
+        }
+        return;
+    }
     if (vaxis.tty.global_tty) |tty| {
         std.posix.tcsetattr(tty.fd.handle, .FLUSH, tty.termios) catch {};
-        const reset = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b[?1049l";
-        _ = std.c.write(tty.fd.handle, reset.ptr, reset.len);
+        // A panic can interrupt a render while synchronized output is active,
+        // or occur after capability detection enabled modes that recover()
+        // does not track. Reset every terminal mode this Vaxis version may
+        // enable so the caller is not left with altered input or resize state.
+        _ = std.c.write(tty.fd.handle, panic_terminal_reset.ptr, panic_terminal_reset.len);
     }
+}
+
+test "panic recovery resets every terminal mode used by the TUI" {
+    for ([_][]const u8{
+        "\x1b[?2026l",
+        "\x1b]8;;\x1b\\",
+        "\x1b[<u",
+        "\x1b[?1000;1002;1003;1004;1006;1016l",
+        "\x1b[?2004l",
+        "\x1b[?2027l",
+        "\x1b[?2031l",
+        "\x1b[?2048l",
+        "\x1b[>0;4 q",
+        "\x1b[?25h",
+        "\x1b[?1049l",
+    }) |sequence| try std.testing.expect(std.mem.indexOf(u8, panic_terminal_reset, sequence) != null);
+}
+
+fn deinitVaxisForTui(vx: *vaxis.Vaxis, allocator: ?std.mem.Allocator, writer: *std.Io.Writer) void {
+    vx.deinit(allocator, writer);
+    // Do not call Vaxis.deinit twice: reset only modes that its state model can
+    // miss, without another cursor move, main-screen erase, or allocation free.
+    writer.writeAll(terminal_feature_reset) catch {};
+    writer.flush() catch {};
 }
 
 const Event = union(enum) {
@@ -425,19 +475,12 @@ const Ui = struct {
     context_line: ?[]const u8 = null,
     context_owned: ?[]u8 = null,
     search_reapers: std.ArrayListUnmanaged(SearchReaperEntry) = .empty,
+    terminal_restored: bool = false,
+    vx_alive: ?*bool = null,
+    tty_alive: ?*bool = null,
 
     fn writer(self: *Ui) *std.Io.Writer {
         return self.tty.writer();
-    }
-
-    fn hardQuit(self: *Ui) noreturn {
-        // Ctrl+D is an explicit process quit, not a graceful "back" action.
-        // Restore all terminal modes first, then let the OS reclaim any
-        // outstanding provider work instead of waiting on slow cancellation.
-        stopInputLoop(self.loop);
-        self.vx.deinit(null, self.writer());
-        self.tty.deinit();
-        std.process.exit(0);
     }
 
     fn resize(self: *Ui, ws: vaxis.Winsize) !void {
@@ -457,9 +500,13 @@ const Ui = struct {
     fn reapSearchWork(self: *Ui, work: *IncrementalSearchWork) bool {
         if (comptime builtin.single_threaded) return false;
         self.collectSearchReapers();
+        // Reserve before starting the reaper. If growing the bookkeeping list
+        // failed after the task was spawned, the fallback would have to await
+        // cancellation synchronously while the terminal was still in raw mode.
+        self.search_reapers.ensureUnusedCapacity(self.allocator, 1) catch return false;
         const job = self.allocator.create(SearchReaperJob) catch return false;
         job.* = .{ .work = work, .loop = self.loop };
-        var future = std.Io.concurrent(
+        const future = std.Io.concurrent(
             runtime_io.get(),
             runSearchReaper,
             .{job},
@@ -467,11 +514,7 @@ const Ui = struct {
             self.allocator.destroy(job);
             return false;
         };
-        self.search_reapers.append(self.allocator, .{ .future = future, .job = job }) catch {
-            future.await(runtime_io.get());
-            self.allocator.destroy(job);
-            return true;
-        };
+        self.search_reapers.appendAssumeCapacity(.{ .future = future, .job = job });
         return true;
     }
 
@@ -570,12 +613,17 @@ pub fn main(init: std.process.Init) !void {
 
     var tty_buffer: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(runtime_io.get(), &tty_buffer);
-    defer tty.deinit();
+    var tty_alive = true;
+    defer if (tty_alive) {
+        tty.deinit();
+        vaxis.tty.global_tty = null;
+    };
 
     var vx = try vaxis.init(runtime_io.get(), allocator, init.environ_map, .{
         .kitty_keyboard_flags = .{ .report_events = true },
     });
-    defer vx.deinit(allocator, tty.writer());
+    var vx_alive = true;
+    defer if (vx_alive) deinitVaxisForTui(&vx, allocator, tty.writer());
 
     var loop: vaxis.Loop(Event) = .init(runtime_io.get(), &tty, &vx);
     try loop.start();
@@ -583,16 +631,23 @@ pub fn main(init: std.process.Init) !void {
 
     try vx.enterAltScreen(tty.writer());
     try vx.queryTerminal(tty.writer(), .fromSeconds(1));
+    try vx.setBracketedPaste(tty.writer(), true);
     try vx.setMouseMode(tty.writer(), true);
 
-    const preferences_path = try tuiCachePath(allocator, init.environ_map, "ui-preferences.oneserial");
+    const preferences_path = try tuiCachePath(allocator, init.environ_map, "ui-preferences.json");
     defer allocator.free(preferences_path);
+    const legacy_preferences_path = try tuiCachePath(allocator, init.environ_map, "ui-preferences.oneserial");
+    defer allocator.free(legacy_preferences_path);
     var preferences_load_error: ?anyerror = null;
-    const loaded_preferences: PersistentUiPreferences = (loadPersistentUiPreferences(allocator, preferences_path) catch |err| blk: {
+    const loaded_preferences_optional = loadPersistentUiPreferences(allocator, preferences_path) catch |err| blk: {
         if (err == error.OutOfMemory) return err;
         preferences_load_error = err;
         break :blk null;
-    }) orelse .{
+    };
+    if (loaded_preferences_optional == null and preferences_load_error == null and persistentPathExists(legacy_preferences_path)) {
+        preferences_load_error = error.LegacyPersistentData;
+    }
+    const loaded_preferences: PersistentUiPreferences = loaded_preferences_optional orelse .{
         .version = ui_preferences_version,
         .theme_index = 0,
         .skip_confirm = false,
@@ -603,7 +658,9 @@ pub fn main(init: std.process.Init) !void {
         .allocator = allocator,
         .environ_map = init.environ_map,
         .tty = &tty,
+        .tty_alive = &tty_alive,
         .vx = &vx,
+        .vx_alive = &vx_alive,
         .loop = &loop,
         .frame_arena = std.heap.ArenaAllocator.init(allocator),
         .theme_index = preferences.theme_index,
@@ -619,19 +676,26 @@ pub fn main(init: std.process.Init) !void {
             // Restore the user's terminal before waiting for any slow provider
             // cancellation reapers. Cleanup remains deterministic for normal
             // back/cancel flows.
-            defer vx.exitAltScreen(tty.writer()) catch {};
-            defer vx.setMouseMode(tty.writer(), false) catch {};
-            defer stopInputLoop(&loop);
+            defer restoreTerminalForQuit(&ui);
 
             // Terminals that do not advertise in-band resize rely on SIGWINCH.
             // vaxis does not install that handler as part of Loop.start(), so
             // without this the UI can remain stuck at stale dimensions after a
             // normal terminal resize.
-            const use_signal_resize = !vx.state.in_band_resize;
-            if (use_signal_resize) try loop.installResizeHandler();
+            const use_signal_resize = !vx.state.in_band_resize.load(.acquire);
+            if (use_signal_resize) {
+                try loop.installResizeHandler();
+                // The input task can discover in-band resize immediately before
+                // fallback registration. Close that interleaving after install.
+                if (vx.state.in_band_resize.load(.acquire))
+                    loop.uninstallResizeHandler();
+            }
             defer if (use_signal_resize) loop.uninstallResizeHandler();
 
-            try runTui(&ui);
+            runTui(&ui) catch |err| switch (err) {
+                error.TuiQuit => return,
+                else => return err,
+            };
         }
     }
 }
@@ -662,6 +726,9 @@ fn isRemoteSearchFailure(err: anyerror) bool {
         error.CloudflareChallenge,
         error.CloudflareSessionUnavailable,
         error.InvalidSessionPayload,
+        error.BrowserAutomationDisabled,
+        error.BrowserAutomationUnavailable,
+        error.InvalidBrowserExecutable,
         error.BrowserAutomationFailed,
         error.SessionExpired,
         error.ProviderAccessBlocked,
@@ -752,7 +819,8 @@ fn waitForFetch(ui: *Ui, done: *const std.atomic.Value(u8), title: []const u8, d
 
         try vaxisStatus(ui, title, message, detail);
 
-        while (try ui.loop.tryEvent()) |event| {
+        while (try ui.loop.tryEvent()) |queued_event| {
+            const event = try decodeInputEvent(ui, queued_event);
             switch (event) {
                 .winsize => |ws| try ui.resize(ws),
                 .key_press => |key| {
@@ -765,9 +833,7 @@ fn waitForFetch(ui: *Ui, done: *const std.atomic.Value(u8), title: []const u8, d
                         ui.toggleTheme();
                         continue;
                     }
-                    if (key.matches('d', .{ .ctrl = true })) {
-                        ui.hardQuit();
-                    }
+                    if (isQuitKey(key)) return .quit;
                     if (key.matches('c', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
                         return .canceled;
                     }
@@ -814,7 +880,8 @@ fn waitForDownloadTask(ui: *Ui, task: *const DownloadTask, title: []const u8, de
 
         try vaxisStatus(ui, title, message, detail);
 
-        while (try ui.loop.tryEvent()) |event| {
+        while (try ui.loop.tryEvent()) |queued_event| {
+            const event = try decodeInputEvent(ui, queued_event);
             switch (event) {
                 .winsize => |ws| try ui.resize(ws),
                 .key_press => |key| {
@@ -827,9 +894,7 @@ fn waitForDownloadTask(ui: *Ui, task: *const DownloadTask, title: []const u8, de
                         ui.toggleTheme();
                         continue;
                     }
-                    if (key.matches('d', .{ .ctrl = true })) {
-                        ui.hardQuit();
-                    }
+                    if (isQuitKey(key)) return .quit;
                     if (key.matches('c', .{ .ctrl = true }) or key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
                         return .canceled;
                     }
@@ -856,6 +921,55 @@ fn downloadPhaseLabel(phase: app.DownloadPhase) []const u8 {
         .writing_output => "Writing output",
         .extracting_archive => "Extracting archive",
     };
+}
+
+test "fetch and download status ignore pasted commands and preserve real controls" {
+    const allocator = std.testing.allocator;
+    var env = try std.testing.environ.createMap(allocator);
+    defer env.deinit();
+    var tty_buffer: [4096]u8 = undefined;
+    var tty = try vaxis.Tty.init(runtime_io.get(), &tty_buffer);
+    defer tty.deinit();
+    var vx = try vaxis.init(runtime_io.get(), allocator, &env, .{});
+    defer vx.deinit(allocator, tty.writer());
+    try vx.resize(allocator, tty.writer(), .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    var loop: vaxis.Loop(Event) = .init(runtime_io.get(), &tty, &vx);
+    var ui: Ui = .{
+        .allocator = allocator,
+        .environ_map = &env,
+        .tty = &tty,
+        .vx = &vx,
+        .loop = &loop,
+        .frame_arena = std.heap.ArenaAllocator.init(allocator),
+    };
+    defer ui.frame_arena.deinit();
+    var task: DownloadTask = .{ .subtitle = undefined, .out_dir = "" };
+    for ([_]bool{ false, true }) |download| {
+        for ([_]FetchControl{ .canceled, .quit }) |expected| {
+            try loop.postEvent(.paste_start);
+            for ([_]vaxis.Key{
+                .{ .codepoint = 'q', .text = "q" },
+                .{ .codepoint = vaxis.Key.escape },
+                .{ .codepoint = 'c', .mods = .{ .ctrl = true } },
+                .{ .codepoint = 'd', .mods = .{ .ctrl = true } },
+                .{ .codepoint = vaxis.Key.f2 },
+                .{ .codepoint = vaxis.Key.f3 },
+            }) |key| try loop.postEvent(.{ .key_press = key });
+            try loop.postEvent(.paste_end);
+            try loop.postEvent(.{ .key_press = .{
+                .codepoint = if (expected == .quit) 'd' else 'c',
+                .mods = .{ .ctrl = true },
+            } });
+            const actual = if (download)
+                try waitForDownloadTask(&ui, &task, "Download", "fixture")
+            else
+                try waitForFetch(&ui, &task.done, "Fetch", "fixture");
+            try std.testing.expectEqual(expected, actual);
+            try std.testing.expect((try loop.tryEvent()) == null);
+            try std.testing.expect(!ui.skip_confirm);
+            try std.testing.expectEqual(@as(usize, 0), ui.theme_index);
+        }
+    }
 }
 
 fn downloadPhaseFromRaw(raw: u8) app.DownloadPhase {
@@ -920,8 +1034,17 @@ fn finalizeWorkerGroupWithStatus(
     title: []const u8,
     detail: []const u8,
 ) !void {
-    if (control == .canceled) {
-        try vaxisStatus(ui, title, "Canceling…", detail);
+    switch (control) {
+        .completed => {},
+        .canceled => try vaxisStatus(ui, title, "Canceling…", detail),
+        .quit => {
+            // Cancellation may need to tear down a browser process and remove
+            // its profile. Give the user's terminal back before that bounded
+            // cleanup runs instead of leaving it in the alternate screen. The
+            // defer also covers a final status-rendering failure.
+            defer restoreTerminalForQuit(ui);
+            try vaxisStatus(ui, title, "Quitting…", detail);
+        },
     }
     finalizeWorkerGroup(group, control);
 }
@@ -947,10 +1070,7 @@ fn runTui(ui: *Ui) !void {
     defer {
         // Restore terminal ownership before waiting, while keeping cache paths
         // alive until every cancelled provider has released its borrowed state.
-        stopInputLoop(ui.loop);
-        ui.vx.exitAltScreen(ui.writer()) catch {};
-        ui.vx.setMouseMode(ui.writer(), false) catch {};
-        ui.writer().flush() catch {};
+        restoreTerminalForQuit(ui);
         ui.awaitSearchReapers();
         common.configureFetchCache(.{});
     }
@@ -1496,10 +1616,18 @@ fn deinitSubtitlesPageCache(allocator: std.mem.Allocator, pages: *std.ArrayListU
 const persistent_version = 10;
 const ui_preferences_version: u32 = 1;
 const default_cache_ttl_seconds: i64 = 12 * 60 * 60;
-const search_state_magic = "subdl-tui-search-state-v1\n";
-const settings_state_magic = "subdl-tui-settings-v1\n";
-const keyword_state_magic = "subdl-tui-keywords-v1\n";
-const ui_preferences_magic = "subdl-tui-preferences-v1\n";
+const search_state_magic = "subdl-tui-search-state-json-v1\n";
+const settings_state_magic = "subdl-tui-settings-json-v1\n";
+const keyword_state_magic = "subdl-tui-keywords-json-v1\n";
+const ui_preferences_magic = "subdl-tui-preferences-json-v1\n";
+// Persisted JSON is local but untrusted. In addition to byte limits, decoding
+// gets a cumulative allocation-request budget below so arrays cannot amplify a
+// compact file into unbounded process memory before runtime trimming runs.
+const search_state_file_limit: usize = 16 * 1024 * 1024;
+const keyword_state_file_limit: usize = 2 * 1024 * 1024;
+const settings_state_file_limit: usize = 64 * 1024;
+const ui_preferences_file_limit: usize = 4096;
+const persistent_parse_allocation_factor: usize = 4;
 
 fn defaultTuiSettings() TuiSettings {
     return .{
@@ -1518,11 +1646,11 @@ fn loadTuiRuntimeState(allocator: std.mem.Allocator, environ_map: *std.process.E
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer if (!transferred) arena.deinit();
 
-    const state_path = try tuiCachePath(allocator, environ_map, "state.oneserial");
+    const state_path = try tuiCachePath(allocator, environ_map, "state.json");
     errdefer if (!transferred) allocator.free(state_path);
-    const settings_path = try tuiCachePath(allocator, environ_map, "settings.oneserial");
+    const settings_path = try tuiCachePath(allocator, environ_map, "settings.json");
     errdefer if (!transferred) allocator.free(settings_path);
-    const keyword_path = try tuiCachePath(allocator, environ_map, "keywords.oneserial");
+    const keyword_path = try tuiCachePath(allocator, environ_map, "keywords.json");
     errdefer if (!transferred) allocator.free(keyword_path);
     const cache_root_path = try tuiCachePath(allocator, environ_map, "cache");
     errdefer if (!transferred) allocator.free(cache_root_path);
@@ -1538,36 +1666,51 @@ fn loadTuiRuntimeState(allocator: std.mem.Allocator, environ_map: *std.process.E
     transferred = true;
     errdefer out.deinit(allocator);
 
+    var search_state_missing = true;
     if (loadPersistentSearchState(out.arena.allocator(), state_path) catch |err| blk: {
         if (err == error.OutOfMemory) return err;
         notePersistenceLoadFailure(&out, .cache, err);
         break :blk null;
     }) |loaded| {
+        search_state_missing = false;
         if (loaded.version == persistent_version) {
             out.settings = sanitizeSettings(loaded.settings);
             try out.cache_entries.appendSlice(allocator, loaded.cache_entries);
         }
     }
 
+    var settings_state_missing = true;
     if (loadPersistentSettingsState(out.arena.allocator(), settings_path) catch |err| blk: {
         if (err == error.OutOfMemory) return err;
         notePersistenceLoadFailure(&out, .settings, err);
         break :blk null;
     }) |loaded| {
+        settings_state_missing = false;
         if (loaded.version == persistent_version) {
             out.settings = sanitizeSettings(loaded.settings);
         }
     }
 
+    var keyword_state_missing = true;
     if (loadPersistentKeywordState(out.arena.allocator(), keyword_path) catch |err| blk: {
         if (err == error.OutOfMemory) return err;
         notePersistenceLoadFailure(&out, .history, err);
         break :blk null;
     }) |loaded| {
+        keyword_state_missing = false;
         if (loaded.version == persistent_version) {
             try out.keywords.appendSlice(allocator, loaded.keywords);
         }
     }
+
+    try noteLegacyRuntimeStateIfPresent(
+        allocator,
+        environ_map,
+        &out,
+        search_state_missing,
+        settings_state_missing,
+        keyword_state_missing,
+    );
 
     trimRuntimeStateBounds(&out);
     // Repack deserialized state once so temporary decoding allocations and
@@ -1599,51 +1742,178 @@ fn applyRuntimeCacheSettings(state: *const TuiRuntimeState) void {
 }
 
 fn loadPersistentSearchState(allocator: std.mem.Allocator, path: []const u8) !?PersistentSearchState {
-    const data = std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), path, allocator, .limited(64 * 1024 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer allocator.free(data);
-    if (!std.mem.startsWith(u8, data, search_state_magic)) return error.InvalidPersistentData;
-    const body = data[search_state_magic.len..];
-    const untrusted = oneserial.Untrusted(PersistentSearchState, .{}).init(body);
-    return try untrusted.toOwned(allocator);
+    const value = try loadPersistentJson(PersistentSearchState, allocator, path, search_state_magic, search_state_file_limit) orelse return null;
+    if (value.version != persistent_version) return error.InvalidPersistentData;
+    try validatePersistentSearchState(value);
+    return value;
 }
 
 fn loadPersistentKeywordState(allocator: std.mem.Allocator, path: []const u8) !?PersistentKeywordState {
-    const data = std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), path, allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer allocator.free(data);
-    if (!std.mem.startsWith(u8, data, keyword_state_magic)) return error.InvalidPersistentData;
-    const body = data[keyword_state_magic.len..];
-    const untrusted = oneserial.Untrusted(PersistentKeywordState, .{}).init(body);
-    return try untrusted.toOwned(allocator);
+    const value = try loadPersistentJson(PersistentKeywordState, allocator, path, keyword_state_magic, keyword_state_file_limit) orelse return null;
+    if (value.version != persistent_version) return error.InvalidPersistentData;
+    try validatePersistentKeywordState(value);
+    return value;
 }
 
 fn loadPersistentSettingsState(allocator: std.mem.Allocator, path: []const u8) !?PersistentSettingsState {
-    const data = std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer allocator.free(data);
-    if (!std.mem.startsWith(u8, data, settings_state_magic)) return error.InvalidPersistentData;
-    const body = data[settings_state_magic.len..];
-    const untrusted = oneserial.Untrusted(PersistentSettingsState, .{}).init(body);
-    return try untrusted.toOwned(allocator);
+    const value = try loadPersistentJson(PersistentSettingsState, allocator, path, settings_state_magic, settings_state_file_limit) orelse return null;
+    if (value.version != persistent_version) return error.InvalidPersistentData;
+    return value;
 }
 
 fn loadPersistentUiPreferences(allocator: std.mem.Allocator, path: []const u8) !?PersistentUiPreferences {
-    const data = std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), path, allocator, .limited(4096)) catch |err| switch (err) {
+    const value = try loadPersistentJson(PersistentUiPreferences, allocator, path, ui_preferences_magic, ui_preferences_file_limit) orelse return null;
+    if (value.version != ui_preferences_version) return error.InvalidPersistentData;
+    return value;
+}
+
+fn openPersistentDataFileAt(io: std.Io, dir: std.Io.Dir, path: []const u8) !std.Io.File {
+    if (comptime builtin.os.tag != .windows) {
+        if (comptime @hasField(std.posix.O, "NONBLOCK") and
+            @hasField(std.posix.O, "NOFOLLOW") and
+            @hasField(std.posix.O, "ACCMODE") and
+            @hasDecl(std.posix, "openat"))
+        {
+            var flags: std.posix.O = .{
+                .ACCMODE = .RDONLY,
+                .NONBLOCK = true,
+                .NOFOLLOW = true,
+            };
+            if (comptime @hasField(std.posix.O, "CLOEXEC")) flags.CLOEXEC = true;
+            const handle = try std.posix.openat(dir.handle, path, flags, 0);
+            return .{
+                .handle = handle,
+                .flags = .{ .nonblocking = true },
+            };
+        }
+    }
+    return dir.openFile(io, path, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+}
+
+fn readPersistentDataFileAlloc(
+    allocator: std.mem.Allocator,
+    dir: std.Io.Dir,
+    path: []const u8,
+    file_limit: usize,
+) ![]u8 {
+    const io = runtime_io.get();
+    const file = openPersistentDataFileAt(io, dir, path) catch |err| switch (err) {
+        error.SymLinkLoop, error.IsDir => return error.InvalidPersistentData,
+        else => return err,
+    };
+    defer file.close(io);
+
+    const stat = try file.stat(io);
+    if (stat.kind != .file) return error.InvalidPersistentData;
+    const size = std.math.cast(usize, stat.size) orelse return error.PersistentDataTooLarge;
+    if (size > file_limit) return error.PersistentDataTooLarge;
+
+    var read_buffer: [4096]u8 = undefined;
+    var reader = file.reader(io, &read_buffer);
+    return reader.interface.allocRemaining(allocator, .limited(file_limit)) catch |err| switch (err) {
+        error.StreamTooLong => error.PersistentDataTooLarge,
+        else => err,
+    };
+}
+
+fn loadPersistentJson(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    magic: []const u8,
+    file_limit: usize,
+) !?T {
+    const data = readPersistentDataFileAlloc(allocator, .cwd(), path, file_limit) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
     defer allocator.free(data);
-    if (!std.mem.startsWith(u8, data, ui_preferences_magic)) return error.InvalidPersistentData;
-    const body = data[ui_preferences_magic.len..];
-    const untrusted = oneserial.Untrusted(PersistentUiPreferences, .{}).init(body);
-    return try untrusted.toOwned(allocator);
+    if (!std.mem.startsWith(u8, data, magic)) return error.InvalidPersistentData;
+    const allocation_limit = std.math.mul(usize, file_limit, persistent_parse_allocation_factor) catch return error.PersistentDataTooLarge;
+    const value = try parsePersistentJson(T, allocator, data[magic.len..], allocation_limit);
+    return value;
+}
+
+const PersistentBudgetAllocator = struct {
+    child: std.mem.Allocator,
+    remaining: usize,
+    limit_exceeded: bool = false,
+
+    fn allocator(self: *PersistentBudgetAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn reserve(self: *PersistentBudgetAllocator, amount: usize) bool {
+        if (amount > self.remaining) {
+            self.limit_exceeded = true;
+            return false;
+        }
+        self.remaining -= amount;
+        return true;
+    }
+
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        const self: *PersistentBudgetAllocator = @ptrCast(@alignCast(context));
+        if (!self.reserve(len)) return null;
+        return self.child.rawAlloc(len, alignment, return_address) orelse {
+            self.remaining += len;
+            return null;
+        };
+    }
+
+    fn resize(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) bool {
+        const self: *PersistentBudgetAllocator = @ptrCast(@alignCast(context));
+        const growth = new_len -| memory.len;
+        if (!self.reserve(growth)) return false;
+        if (self.child.rawResize(memory, alignment, new_len, return_address)) return true;
+        self.remaining += growth;
+        return false;
+    }
+
+    fn remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+        const self: *PersistentBudgetAllocator = @ptrCast(@alignCast(context));
+        const growth = new_len -| memory.len;
+        if (!self.reserve(growth)) return null;
+        return self.child.rawRemap(memory, alignment, new_len, return_address) orelse {
+            self.remaining += growth;
+            return null;
+        };
+    }
+
+    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        const self: *PersistentBudgetAllocator = @ptrCast(@alignCast(context));
+        // Deliberately do not replenish the budget. Runtime state is decoded
+        // into an arena, whose individual frees do not release backing memory;
+        // cumulative requests are therefore the safe portable quantity.
+        self.child.rawFree(memory, alignment, return_address);
+    }
+};
+
+fn parsePersistentJson(comptime T: type, allocator: std.mem.Allocator, body: []const u8, allocation_limit: usize) !T {
+    var budget: PersistentBudgetAllocator = .{
+        .child = allocator,
+        .remaining = allocation_limit,
+    };
+    return std.json.parseFromSliceLeaky(T, budget.allocator(), body, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+        .ignore_unknown_fields = false,
+        .max_value_len = body.len,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => if (budget.limit_exceeded) return error.PersistentDataTooLarge else return error.OutOfMemory,
+        else => return error.InvalidPersistentData,
+    };
 }
 
 fn sanitizeUiPreferences(preferences: PersistentUiPreferences) PersistentUiPreferences {
@@ -1665,7 +1935,8 @@ fn saveTuiRuntimeState(allocator: std.mem.Allocator, state: *const TuiRuntimeSta
         .settings = state.settings,
         .cache_entries = state.cache_entries.items,
     };
-    try saveOneSerial(PersistentSearchState, allocator, state.state_path, search_state_magic, &persist);
+    try validatePersistentSearchState(persist);
+    try savePersistentJson(PersistentSearchState, allocator, state.state_path, search_state_magic, search_state_file_limit, &persist);
 }
 
 fn saveKeywordRuntimeState(allocator: std.mem.Allocator, state: *const TuiRuntimeState) !void {
@@ -1673,7 +1944,8 @@ fn saveKeywordRuntimeState(allocator: std.mem.Allocator, state: *const TuiRuntim
         .version = persistent_version,
         .keywords = state.keywords.items,
     };
-    try saveOneSerial(PersistentKeywordState, allocator, state.keyword_path, keyword_state_magic, &persist);
+    try validatePersistentKeywordState(persist);
+    try savePersistentJson(PersistentKeywordState, allocator, state.keyword_path, keyword_state_magic, keyword_state_file_limit, &persist);
 }
 
 fn saveTuiSettingsState(allocator: std.mem.Allocator, state: *const TuiRuntimeState) !void {
@@ -1681,7 +1953,7 @@ fn saveTuiSettingsState(allocator: std.mem.Allocator, state: *const TuiRuntimeSt
         .version = persistent_version,
         .settings = state.settings,
     };
-    try saveOneSerial(PersistentSettingsState, allocator, state.settings_path, settings_state_magic, &persist);
+    try savePersistentJson(PersistentSettingsState, allocator, state.settings_path, settings_state_magic, settings_state_file_limit, &persist);
 }
 
 fn persistTuiRuntimeState(allocator: std.mem.Allocator, state: *TuiRuntimeState) !void {
@@ -1764,32 +2036,115 @@ fn saveUiPreferences(
         .theme_index = @intCast(theme_index),
         .skip_confirm = skip_confirm,
     };
-    try saveOneSerial(PersistentUiPreferences, allocator, path, ui_preferences_magic, &persist);
+    try savePersistentJson(PersistentUiPreferences, allocator, path, ui_preferences_magic, ui_preferences_file_limit, &persist);
 }
 
-fn saveOneSerial(comptime T: type, allocator: std.mem.Allocator, path: []const u8, magic: []const u8, value: *const T) !void {
+fn savePersistentJson(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    magic: []const u8,
+    file_limit: usize,
+    value: *const T,
+) !void {
     try common.ensureParentDir(path);
-    const encoded = try oneserial.serializeAlloc(T, .{}, value, allocator);
-    defer allocator.free(encoded);
-    var atomic = try std.Io.Dir.cwd().createFileAtomic(runtime_io.get(), path, .{ .replace = true });
+    _ = allocator;
+    var count_buffer: [1024]u8 = undefined;
+    var counter: std.Io.Writer.Discarding = .init(&count_buffer);
+    try std.json.Stringify.value(value.*, .{}, &counter.writer);
+    const encoded_len = std.math.cast(usize, counter.fullCount()) orelse return error.PersistentDataTooLarge;
+    if (!persistentEncodingFits(magic.len, encoded_len, file_limit)) return error.PersistentDataTooLarge;
+    var atomic = try std.Io.Dir.cwd().createFileAtomic(runtime_io.get(), path, .{
+        .replace = true,
+        .permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o600) else .default_file,
+    });
     defer atomic.deinit(runtime_io.get());
     var buffer: [16 * 1024]u8 = undefined;
     var writer = atomic.file.writer(runtime_io.get(), &buffer);
     try writer.interface.writeAll(magic);
-    try writer.interface.writeAll(encoded);
+    try std.json.Stringify.value(value.*, .{}, &writer.interface);
     try writer.interface.flush();
     try atomic.file.sync(runtime_io.get());
     try atomic.replace(runtime_io.get());
 }
 
+fn persistentEncodingFits(magic_len: usize, encoded_len: usize, file_limit: usize) bool {
+    return magic_len <= file_limit and encoded_len <= file_limit - magic_len;
+}
+
+fn persistentPathExists(path: []const u8) bool {
+    std.Io.Dir.cwd().access(runtime_io.get(), path, .{}) catch return false;
+    return true;
+}
+
+fn noteLegacyRuntimeStateIfPresent(
+    allocator: std.mem.Allocator,
+    environ_map: *std.process.Environ.Map,
+    state: *TuiRuntimeState,
+    search_state_missing: bool,
+    settings_state_missing: bool,
+    keyword_state_missing: bool,
+) !void {
+    if (state.persistence_error != null) return;
+    const candidates = [_]struct {
+        missing: bool,
+        area: PersistenceArea,
+        basename: []const u8,
+    }{
+        .{ .missing = settings_state_missing, .area = .settings, .basename = "settings.oneserial" },
+        .{ .missing = keyword_state_missing, .area = .history, .basename = "keywords.oneserial" },
+        .{ .missing = search_state_missing, .area = .cache, .basename = "state.oneserial" },
+    };
+    for (candidates) |candidate| {
+        if (!candidate.missing) continue;
+        const legacy_path = try tuiCachePath(allocator, environ_map, candidate.basename);
+        defer allocator.free(legacy_path);
+        if (persistentPathExists(legacy_path)) {
+            notePersistenceLoadFailure(state, candidate.area, error.LegacyPersistentData);
+            return;
+        }
+    }
+}
+
 fn tuiCachePath(allocator: std.mem.Allocator, environ_map: *std.process.Environ.Map, basename: []const u8) ![]u8 {
     if (environ_map.get("XDG_CACHE_HOME")) |xdg| {
-        if (xdg.len > 0) return std.fmt.allocPrint(allocator, "{s}/subdl/{s}", .{ xdg, basename });
+        // XDG base directories are required to be absolute. Ignoring malformed
+        // relative values prevents persistence from silently following the
+        // process working directory.
+        if (std.fs.path.isAbsolute(xdg)) return std.fmt.allocPrint(allocator, "{s}/subdl/{s}", .{ xdg, basename });
     }
     if (environ_map.get("HOME")) |home| {
-        if (home.len > 0) return std.fmt.allocPrint(allocator, "{s}/.cache/subdl/{s}", .{ home, basename });
+        if (std.fs.path.isAbsolute(home)) return std.fmt.allocPrint(allocator, "{s}/.cache/subdl/{s}", .{ home, basename });
     }
     return std.fmt.allocPrint(allocator, ".zig-cache/subdl/{s}", .{basename});
+}
+
+test "tui cache path accepts only absolute environment roots" {
+    const allocator = std.testing.allocator;
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    try env_map.put("XDG_CACHE_HOME", "relative-xdg-cache");
+    try env_map.put("HOME", "relative-home");
+    const fallback = try tuiCachePath(allocator, &env_map, "state.json");
+    defer allocator.free(fallback);
+    try std.testing.expectEqualStrings(".zig-cache/subdl/state.json", fallback);
+
+    const absolute_home = if (builtin.os.tag == .windows) "C:\\fixture-home" else "/fixture-home";
+    try env_map.put("HOME", absolute_home);
+    const from_home = try tuiCachePath(allocator, &env_map, "state.json");
+    defer allocator.free(from_home);
+    const expected_home = try std.fmt.allocPrint(allocator, "{s}/.cache/subdl/state.json", .{absolute_home});
+    defer allocator.free(expected_home);
+    try std.testing.expectEqualStrings(expected_home, from_home);
+
+    const absolute_xdg = if (builtin.os.tag == .windows) "D:\\fixture-xdg" else "/fixture-xdg";
+    try env_map.put("XDG_CACHE_HOME", absolute_xdg);
+    const from_xdg = try tuiCachePath(allocator, &env_map, "state.json");
+    defer allocator.free(from_xdg);
+    const expected_xdg = try std.fmt.allocPrint(allocator, "{s}/subdl/state.json", .{absolute_xdg});
+    defer allocator.free(expected_xdg);
+    try std.testing.expectEqualStrings(expected_xdg, from_xdg);
 }
 
 fn normalizeQueryView(query: []const u8) []const u8 {
@@ -1823,7 +2178,61 @@ fn searchCacheKey(allocator: std.mem.Allocator, query_norm: []const u8, language
 const max_query_cache_entries: usize = 512;
 const max_keyword_entries: usize = 128;
 const max_home_query_bytes: usize = 180;
+const max_cached_search_items_per_entry: usize = 4096;
+const max_cached_search_items_total: usize = 64 * 1024;
+const max_cached_ref_list_entries: usize = 512;
 const arena_compact_after_stale_mutations: usize = 32;
+
+fn validatePersistentSearchState(state: PersistentSearchState) !void {
+    // Reject oversized decoded collections before appendSlice duplicates their
+    // storage outside the JSON parser's allocation budget. Runtime writers
+    // never exceed these limits, so truncating here would only hide corrupt or
+    // incompatible state and make eviction order ambiguous.
+    if (state.cache_entries.len > max_query_cache_entries) return error.PersistentDataTooLarge;
+
+    var total_items: usize = 0;
+    for (state.cache_entries) |entry| {
+        const entry_items = try validatePersistentCacheEntry(entry);
+        total_items = std.math.add(usize, total_items, entry_items) catch return error.PersistentDataTooLarge;
+        if (total_items > max_cached_search_items_total) return error.PersistentDataTooLarge;
+    }
+}
+
+fn validatePersistentCacheEntry(entry: QueryCacheEntry) !usize {
+    if (app.providerIndex(entry.provider) == null or
+        entry.page == 0 or
+        entry.response.provider != entry.provider or
+        entry.response.page != entry.page)
+    {
+        return error.InvalidPersistentData;
+    }
+    if (entry.response.items.len > max_cached_search_items_per_entry) return error.PersistentDataTooLarge;
+    for (entry.response.items) |item| {
+        if (std.meta.activeTag(item.ref) != entry.provider) return error.InvalidPersistentData;
+        if (!persistentSearchRefWithinBounds(item.ref)) return error.PersistentDataTooLarge;
+    }
+    return entry.response.items.len;
+}
+
+fn persistentSearchRefWithinBounds(ref: app.SearchRef) bool {
+    return switch (ref) {
+        .subsource_net => |item| item.seasons.len <= max_cached_ref_list_entries,
+        .gestdown_info => |item| item.seasons.len <= max_cached_ref_list_entries,
+        else => true,
+    };
+}
+
+fn validatePersistentKeywordState(state: PersistentKeywordState) !void {
+    if (state.keywords.len > max_keyword_entries) return error.PersistentDataTooLarge;
+    for (state.keywords) |entry| {
+        if (entry.query.len == 0 or
+            entry.query.len > max_home_query_bytes or
+            !std.unicode.utf8ValidateSlice(entry.query))
+        {
+            return error.InvalidPersistentData;
+        }
+    }
+}
 
 fn trimRuntimeStateBounds(state: *TuiRuntimeState) void {
     while (state.cache_entries.items.len > max_query_cache_entries) {
@@ -1907,7 +2316,6 @@ fn oldestCacheEntryIndex(entries: []const QueryCacheEntry) ?usize {
 
 fn upsertCacheEntry(allocator: std.mem.Allocator, state: *TuiRuntimeState, provider: app.Provider, query_norm: []const u8, page: u32, fetched_at_unix: i64, response: app.SearchResponse) !bool {
     if (!state.settings.cache_enabled) return false;
-    const a = state.arena.allocator();
     var existing_idx: ?usize = null;
     for (state.cache_entries.items, 0..) |existing, idx| {
         if (existing.provider == provider and existing.page == page and std.mem.eql(u8, existing.query_norm, query_norm)) {
@@ -1915,6 +2323,28 @@ fn upsertCacheEntry(allocator: std.mem.Allocator, state: *TuiRuntimeState, provi
             break;
         }
     }
+    const response_page = std.math.cast(u32, response.page) orelse return false;
+    const prospective: QueryCacheEntry = .{
+        .provider = provider,
+        .query_norm = query_norm,
+        .page = page,
+        .fetched_at_unix = fetched_at_unix,
+        .response = .{
+            .provider = response.provider,
+            .items = response.items,
+            .page = response_page,
+            .has_prev_page = response.has_prev_page,
+            .has_next_page = response.has_next_page,
+        },
+    };
+    var prospective_total = validatePersistentCacheEntry(prospective) catch return false;
+    for (state.cache_entries.items, 0..) |existing, idx| {
+        if (existing_idx != null and idx == existing_idx.?) continue;
+        prospective_total = std.math.add(usize, prospective_total, existing.response.items.len) catch return false;
+        if (prospective_total > max_cached_search_items_total) return false;
+    }
+
+    const a = state.arena.allocator();
     const cached_response = try cachedResponseFromSearch(a, response);
     const query_copy = try a.dupe(u8, query_norm);
     const entry: QueryCacheEntry = .{
@@ -1987,6 +2417,7 @@ fn cloneSearchRef(allocator: std.mem.Allocator, ref: app.SearchRef) !app.SearchR
             .title = try allocator.dupe(u8, item.title),
             .media_type = item.media_type,
             .link = try allocator.dupe(u8, item.link),
+            .language_code = try allocator.dupe(u8, item.language_code),
         } },
         .opensubtitles_com => |item| .{ .opensubtitles_com = .{
             .title = try allocator.dupe(u8, item.title),
@@ -2186,8 +2617,6 @@ fn cloneSearchRef(allocator: std.mem.Allocator, ref: app.SearchRef) !app.SearchR
             .season = item.season,
             .episode = item.episode,
             .subtitle_id = try allocator.dupe(u8, item.subtitle_id),
-            .download_hash = try allocator.dupe(u8, item.download_hash),
-            .session_cookie = try allocator.dupe(u8, item.session_cookie),
             .search_query = try allocator.dupe(u8, item.search_query),
             .title_type = try allocator.dupe(u8, item.title_type),
             .page_url = try allocator.dupe(u8, item.page_url),
@@ -2315,6 +2744,20 @@ fn cloneSearchRef(allocator: std.mem.Allocator, ref: app.SearchRef) !app.SearchR
     };
 }
 
+test "cloned subdl search refs retain an owned selected language" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var source_language = [_]u8{ 'f', 'r' };
+    const cloned = try cloneSearchRef(arena.allocator(), .{ .subdl_com = .{
+        .title = "The Matrix",
+        .media_type = .movie,
+        .link = "https://subdl.com/subtitle/sd21581/the-matrix",
+        .language_code = &source_language,
+    } });
+    @memset(&source_language, 'x');
+    try std.testing.expectEqualStrings("fr", cloned.subdl_com.language_code);
+}
+
 fn dupOptionalLocal(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
     return if (value) |v| try allocator.dupe(u8, v) else null;
 }
@@ -2353,6 +2796,9 @@ fn executeQuerySearchIncremental(
         search_work.group.cancel(runtime_io.get());
         releaseIncrementalSearchWork(search_work);
     };
+    // Any propagated error exits the TUI. Restore the terminal before the
+    // search-work defer potentially blocks while canceling provider I/O.
+    errdefer restoreTerminalForQuit(ui);
     const tasks = search_work.tasks;
     const consumed = search_work.consumed;
     const search_group = search_work.group;
@@ -2363,8 +2809,9 @@ fn executeQuerySearchIncremental(
     defer ui.allocator.free(cache_key);
     const now = scrapers.common.compatUnixTimestamp();
     for (app.providers()) |provider| {
-        if (!state.settings.providers_enabled[app.providerIndex(provider)]) continue;
-        if (provider_mask) |mask| if (!mask[app.providerIndex(provider)]) continue;
+        const provider_index = app.providerIndex(provider) orelse continue;
+        if (!state.settings.providers_enabled[provider_index]) continue;
+        if (provider_mask) |mask| if (!mask[provider_index]) continue;
         if (findCacheEntry(state, provider, cache_key, requested_page, now)) |cache_idx| {
             const response_index = bundle.searches.items.len;
             var cached = try searchResponseFromCache(ui.allocator, state.cache_entries.items[cache_idx]);
@@ -2500,8 +2947,11 @@ fn executeQuerySearchIncremental(
                 },
                 .key_press => |key| {
                     if (key.isModifier()) continue;
-                    if (key.matches('d', .{ .ctrl = true })) {
-                        ui.hardQuit();
+                    if (isQuitKey(key)) {
+                        if (ui.reapSearchWork(search_work)) {
+                            search_work_owned = false;
+                        }
+                        return error.TuiQuit;
                     }
                     if (key.matches('c', .{ .ctrl = true })) {
                         bundle.searching = false;
@@ -2726,8 +3176,20 @@ fn releaseProviderSearchCredit(task: *ProviderSearchTask, in_flight: *usize) voi
         task.in_flight_credit = false;
     }
 }
+
+fn runOrScheduleGroup(
+    comptime run_inline: bool,
+    group: *std.Io.Group,
+    io: std.Io,
+    comptime function: anytype,
+    args: anytype,
+) !void {
+    if (run_inline) return @call(.auto, function, args);
+    return group.concurrent(io, function, args);
+}
+
 fn scheduleProvider(group: *std.Io.Group, task: *ProviderSearchTask) !void {
-    try group.concurrent(runtime_io.get(), providerSearchTaskMain, .{task});
+    try runOrScheduleGroup(builtin.single_threaded, group, runtime_io.get(), providerSearchTaskMain, .{task});
 }
 fn startQueuedProviderSearches(
     group: *std.Io.Group,
@@ -3030,15 +3492,15 @@ test "query display order cache preserves token ranking, filtering, and selectio
     const items = try a.alloc(app.SearchChoice, 3);
     items[0] = .{
         .label = "Matrix Revolutions (2003)",
-        .ref = .{ .subdl_com = .{ .title = "Matrix Revolutions", .media_type = .movie, .link = "https://example.test/0" } },
+        .ref = .{ .subdl_com = .{ .title = "Matrix Revolutions", .media_type = .movie, .link = "https://example.test/0", .language_code = "en" } },
     };
     items[1] = .{
         .label = "The Matrix (1999)",
-        .ref = .{ .subdl_com = .{ .title = "The Matrix", .media_type = .movie, .link = "https://example.test/1" } },
+        .ref = .{ .subdl_com = .{ .title = "The Matrix", .media_type = .movie, .link = "https://example.test/1", .language_code = "en" } },
     };
     items[2] = .{
         .label = "Matrix Reloaded (2003)",
-        .ref = .{ .subdl_com = .{ .title = "Matrix Reloaded", .media_type = .movie, .link = "https://example.test/2" } },
+        .ref = .{ .subdl_com = .{ .title = "Matrix Reloaded", .media_type = .movie, .link = "https://example.test/2", .language_code = "en" } },
     };
 
     var bundle: SearchBundle = .{ .query_norm = try allocator.dupe(u8, "matrix") };
@@ -3089,7 +3551,8 @@ fn queryHitScore(bundle: *const SearchBundle, hit_idx: usize, query_norm: []cons
     const hit = bundle.hits.items[hit_idx];
     const item = bundle.searches.items[hit.response_index].items[hit.item_index];
     const title = cleanSearchTitle(item.label);
-    const title_query = common.parseEpisodeQuery(query_norm).title;
+    const episode_query = common.parseEpisodeQuery(query_norm);
+    const title_query = episode_query.title;
     var score: u32 = 0;
     if (startsWithCaseInsensitive(title, title_query)) {
         score += 1000;
@@ -3103,7 +3566,15 @@ fn queryHitScore(bundle: *const SearchBundle, hit_idx: usize, query_norm: []cons
     var terms = std.mem.tokenizeAny(u8, title_query, " \t\r\n._-");
     while (terms.next()) |term| {
         if (term.len < 2) continue;
-        if (containsCaseInsensitive(title, term)) score += 50 else if (!provider_match) return 0;
+        if (containsCaseInsensitive(title, term)) {
+            score += 50;
+        } else if (episode_query.episode != null and !provider_match) {
+            // Episode suffixes are stripped because search-result labels usually
+            // contain only the series title. Keep that special case strict so a
+            // shared title token cannot admit an unrelated series; ordinary
+            // queries intentionally retain partial-token matches for ranking.
+            return 0;
+        }
     }
     return score;
 }
@@ -3790,9 +4261,9 @@ fn editSettingsPopup(
                         redraw_background = true;
                         continue;
                     }
-                    if (key.matches('d', .{ .ctrl = true })) {
+                    if (isQuitKey(key)) {
                         if (settings_dirty) try persistTuiSettingsState(ui.allocator, state);
-                        ui.hardQuit();
+                        return error.TuiQuit;
                     }
                     if (key.matches('c', .{ .ctrl = true })) {
                         if (settings_dirty) {
@@ -4895,7 +5366,8 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
             defer if (subtitles_task.result) |*r| r.deinit();
             var subtitles_group: std.Io.Group = .init;
             defer subtitles_group.cancel(runtime_io.get());
-            try subtitles_group.concurrent(runtime_io.get(), subtitlesTaskMain, .{&subtitles_task});
+            errdefer restoreTerminalForQuit(ui);
+            try runOrScheduleGroup(builtin.single_threaded, &subtitles_group, runtime_io.get(), subtitlesTaskMain, .{&subtitles_task});
             const subtitles_control = try waitForTask(ui, &subtitles_task.done, "Subtitles", detail);
             try finalizeWorkerGroupWithStatus(ui, &subtitles_group, subtitles_control, "Subtitles", detail);
             if (subtitles_control == .quit) {
@@ -4958,7 +5430,7 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
                 .quit => .quit,
             };
         }
-        const subtitle_idx = (if (allow_auto_subtitle_select) singleEnabledIndex(subtitle_enabled) else null) orelse blk: {
+        const subtitle_idx = (if (allow_auto_subtitle_select) autoSelectSubtitleIndex(subtitle_enabled, page_nav_opt) else null) orelse blk: {
             const subtitle_choice = try vaxisSelectSubtitle(
                 ui,
                 "Select Subtitle",
@@ -4985,8 +5457,8 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
         allow_auto_subtitle_select = false;
 
         const selected_subtitle = subtitles.items[subtitle_idx];
-        const download_url = selected_subtitle.download_url orelse "(no direct URL)";
-        const download_url_display = if (isSubtitlecatTranslateToken(selected_subtitle.download_url)) "subtitlecat translate request" else download_url;
+        const download_url_display = try app.downloadTargetForDisplay(ui.allocator, selected_subtitle.download_url);
+        defer ui.allocator.free(download_url_display);
         if (!ui.skip_confirm) {
             const lines = [_][]const u8{
                 try frameFmt(ui, "Provider: {s}", .{app.providerDisplayName(selected_provider)}),
@@ -5023,7 +5495,8 @@ fn openSearchResult(ui: *Ui, bundle: *SearchBundle, hit_idx: usize, state: *TuiR
         defer if (download_task.result) |*r| r.deinit(std.heap.page_allocator);
         var download_group: std.Io.Group = .init;
         defer download_group.cancel(runtime_io.get());
-        try download_group.concurrent(runtime_io.get(), downloadTaskMain, .{&download_task});
+        errdefer restoreTerminalForQuit(ui);
+        try runOrScheduleGroup(builtin.single_threaded, &download_group, runtime_io.get(), downloadTaskMain, .{&download_task});
         const download_control = try waitForDownloadTask(ui, &download_task, "Download", download_detail);
         try finalizeWorkerGroupWithStatus(ui, &download_group, download_control, "Download", download_detail);
         if (download_control == .quit) {
@@ -5165,6 +5638,36 @@ fn singleEnabledIndex(flags: []const bool) ?usize {
         found = idx;
     }
     return found;
+}
+
+fn autoSelectSubtitleIndex(flags: []const bool, page_nav: ?PageNav) ?usize {
+    if (page_nav) |nav| {
+        if (nav.has_prev or nav.has_next) return null;
+    }
+    return singleEnabledIndex(flags);
+}
+
+test "single subtitle auto-selection preserves pagination navigation" {
+    const one = [_]bool{true};
+    try std.testing.expectEqual(@as(?usize, 0), autoSelectSubtitleIndex(&one, null));
+    try std.testing.expectEqual(@as(?usize, 0), autoSelectSubtitleIndex(&one, .{
+        .enabled = true,
+        .page = 1,
+        .has_prev = false,
+        .has_next = false,
+    }));
+    try std.testing.expectEqual(@as(?usize, null), autoSelectSubtitleIndex(&one, .{
+        .enabled = true,
+        .page = 1,
+        .has_prev = false,
+        .has_next = true,
+    }));
+    try std.testing.expectEqual(@as(?usize, null), autoSelectSubtitleIndex(&one, .{
+        .enabled = true,
+        .page = 2,
+        .has_prev = true,
+        .has_next = false,
+    }));
 }
 
 fn exportCachedDownload(ui: *Ui, result: app.DownloadResult) !MessageResult {
@@ -5557,6 +6060,8 @@ fn friendlyErrorMessage(err: anyerror) []const u8 {
         error.AccessDenied => "Permission denied while accessing this file or directory.",
         error.NotDir => "Expected a directory, but found a file instead.",
         error.InvalidPersistentData => "Saved TUI data is invalid or incompatible and could not be loaded.",
+        error.LegacyPersistentData => "Legacy .oneserial TUI data was left untouched; defaults are active until new JSON state is saved.",
+        error.PersistentDataTooLarge => "Saved TUI data exceeds the supported size limit.",
         error.UnexpectedHttpStatus => "Provider returned an unexpected HTTP status.",
         error.HttpRequestFailed => "The HTTP request to the provider failed.",
         error.RateLimited => "Provider rate limit hit. Retry in a few moments.",
@@ -5568,21 +6073,34 @@ fn friendlyErrorMessage(err: anyerror) []const u8 {
         error.EndOfStream, error.ReadFailed => "Provider connection ended while reading the response.",
         error.ParseFailed, error.MissingField, error.InvalidField, error.InvalidFieldType => "Provider response format was not as expected.",
         error.InvalidDownloadUrl => "Provider returned an invalid download URL.",
+        error.DownloadConsentRequired => "Prijevodi: enable download-protection consent and set up that browser session; see DOCUMENTATION.md.",
+        error.InvalidDownloadSession => "Prijevodi: supply all three session values from one consenting browser; see DOCUMENTATION.md.",
         error.UnsafeHttpTarget => "Provider attempted an unsafe redirect or network target; the request was blocked.",
         error.ProviderAccessBlocked => "Provider blocked access from this connection or region.",
-        error.CloudflareChallenge, error.CloudflareSessionUnavailable, error.SessionExpired => "Cloudflare session is missing or expired for this provider.",
+        error.CloudflareChallenge => "Provider requires Cloudflare verification.",
+        error.CloudflareSessionUnavailable => "No usable Cloudflare session was acquired. Verify that supported Chromium is installed and, if authorized, complete the visible challenge manually.",
+        error.SessionExpired => "Cloudflare session expired; retry verification.",
         error.InvalidSessionPayload => "Provider session data was invalid or incomplete.",
-        error.BrowserAutomationFailed => "Browser automation failed while acquiring session cookies.",
+        error.BrowserAutomationDisabled => "Browser handoff is disabled in this build. Rebuild with -Denable-alldriver=true.",
+        error.BrowserAutomationUnavailable => "Secure browser handoff is unavailable on this platform or in this build.",
+        error.InvalidBrowserExecutable => "SUBDL_CHROMIUM_PATH must be an absolute path to a supported Chromium executable.",
+        error.BrowserAutomationFailed => "Browser handoff failed while acquiring session cookies. Verify the Chromium installation and retry.",
         error.ArchiveExtractionUnavailable => "Archive extraction is not available for this archive format in this build.",
-        error.ArchiveFormatNeedsExternalExtraction => "7z needs an external extractor. The original archive was saved.",
-        error.ArchiveEntryLimit, error.ArchiveEntryTooLarge, error.ArchiveTooLarge => "Archive exceeds safe extraction limits. The original archive was saved.",
-        error.InvalidArchivePath, error.ArchiveMetadataUnsupported, error.ArchiveEncrypted => "Archive metadata is unsafe or unsupported. The original archive was saved.",
-        error.ArchiveExtractionFailed => "Downloaded archive could not be extracted on this machine.",
+        error.ArchiveFormatNeedsExternalExtraction => "This archive needs an external extractor.",
+        error.ArchiveEntryLimit, error.ArchiveEntryTooLarge, error.ArchiveTooLarge => "Archive exceeded safe extraction limits; the download was not completed.",
+        error.InvalidArchivePath, error.ArchiveMetadataUnsupported, error.ArchiveEncrypted => "Archive metadata was unsafe or unsupported; the download was not completed.",
+        error.ArchiveExtractionFailed => "Downloaded archive could not be extracted; the download was not completed.",
         else => "An unexpected error occurred at this step.",
     };
 }
 
 test "friendly errors explain common provider network failures" {
+    try std.testing.expect(std.mem.indexOf(u8, friendlyErrorMessage(error.DownloadConsentRequired), "download-protection consent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, friendlyErrorMessage(error.InvalidDownloadSession), "all three session values") != null);
+    for ([_]anyerror{ error.DownloadConsentRequired, error.InvalidDownloadSession }) |err| {
+        try std.testing.expect(std.mem.indexOf(u8, friendlyErrorMessage(err), "browser") != null);
+        try std.testing.expect(std.mem.indexOf(u8, friendlyErrorMessage(err), "DOCUMENTATION.md") != null);
+    }
     try std.testing.expectEqualStrings(
         "Provider connection timed out.",
         friendlyErrorMessage(error.ConnectionTimedOut),
@@ -5602,6 +6120,37 @@ test "friendly errors explain common provider network failures" {
     try std.testing.expectEqualStrings(
         "Provider attempted an unsafe redirect or network target; the request was blocked.",
         friendlyErrorMessage(error.UnsafeHttpTarget),
+    );
+    try std.testing.expectEqualStrings(
+        "Browser handoff is disabled in this build. Rebuild with -Denable-alldriver=true.",
+        friendlyErrorMessage(error.BrowserAutomationDisabled),
+    );
+    const challenge_message = friendlyErrorMessage(error.CloudflareSessionUnavailable);
+    try std.testing.expect(std.mem.indexOf(u8, challenge_message, "if authorized") != null);
+    try std.testing.expect(std.mem.indexOf(u8, challenge_message, "manually") != null);
+    try std.testing.expect(std.mem.indexOf(u8, friendlyErrorMessage(error.InvalidBrowserExecutable), "SUBDL_CHROMIUM_PATH") != null);
+}
+
+test "archive failure messages do not claim rolled-back downloads were saved" {
+    for ([_]anyerror{
+        error.ArchiveEntryLimit,
+        error.ArchiveEntryTooLarge,
+        error.ArchiveTooLarge,
+        error.InvalidArchivePath,
+        error.ArchiveMetadataUnsupported,
+        error.ArchiveEncrypted,
+        error.ArchiveExtractionFailed,
+    }) |err| {
+        const message = friendlyErrorMessage(err);
+        try std.testing.expect(std.ascii.findIgnoreCase(message, "not completed") != null);
+        try std.testing.expect(std.ascii.findIgnoreCase(message, "saved") == null);
+    }
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            friendlyErrorMessage(error.ArchiveFormatNeedsExternalExtraction),
+            "external extractor",
+        ) != null,
     );
 }
 
@@ -6868,9 +7417,13 @@ const KeyAction = enum {
     quit,
 };
 
+fn isQuitKey(key: vaxis.Key) bool {
+    return !key.isModifier() and key.matches('d', .{ .ctrl = true });
+}
+
 fn handleGlobalKey(ui: *Ui, key: vaxis.Key) KeyAction {
     if (key.isModifier()) return .consumed;
-    if (key.matches('d', .{ .ctrl = true })) ui.hardQuit();
+    if (isQuitKey(key)) return .quit;
     if (key.matches('c', .{ .ctrl = true })) return .to_query;
     if (key.matches(vaxis.Key.f2, .{})) {
         ui.toggleConfirm();
@@ -6881,6 +7434,25 @@ fn handleGlobalKey(ui: *Ui, key: vaxis.Key) KeyAction {
         return .consumed;
     }
     return .none;
+}
+
+test "Ctrl+D requests graceful TUI quit" {
+    const ctrl_d: vaxis.Key = .{ .codepoint = 'd', .mods = .{ .ctrl = true } };
+    try std.testing.expect(isQuitKey(ctrl_d));
+    var unused_ui: Ui = undefined;
+    try std.testing.expectEqual(KeyAction.quit, handleGlobalKey(&unused_ui, ctrl_d));
+}
+
+test "TUI group work has an eager single-threaded fallback" {
+    const Fixture = struct {
+        fn run(calls: *usize) std.Io.Cancelable!void {
+            calls.* += 1;
+        }
+    };
+    var group: std.Io.Group = .init;
+    var calls: usize = 0;
+    try runOrScheduleGroup(true, &group, std.testing.io, Fixture.run, .{&calls});
+    try std.testing.expectEqual(@as(usize, 1), calls);
 }
 
 fn isTextKey(key: vaxis.Key) bool {
@@ -7783,20 +8355,42 @@ fn classifyDisplayText(text: []const u8) DisplayTextClass {
     var simple_ascii = true;
     var has_non_ascii = false;
     for (text) |byte| {
-        if (byte < 0x20) {
-            if (byte != '\n' and byte != '\r' and byte != '\t') return .needs_sanitize;
-            simple_ascii = false;
-            continue;
-        }
-        if (byte == 0x7f) return .needs_sanitize;
+        if (byte < 0x20 or byte == 0x7f) return .needs_sanitize;
         if (byte >= 0x80) {
             simple_ascii = false;
             has_non_ascii = true;
         }
     }
     if (simple_ascii) return .simple_ascii;
-    if (has_non_ascii and !std.unicode.utf8ValidateSlice(text)) return .needs_sanitize;
+    if (has_non_ascii) {
+        var view = std.unicode.Utf8View.init(text) catch return .needs_sanitize;
+        var iterator = view.iterator();
+        while (iterator.nextCodepoint()) |codepoint| {
+            if ((codepoint >= 0x80 and codepoint <= 0x9f) or isTerminalFormatControl(codepoint))
+                return .needs_sanitize;
+        }
+    }
     return .valid_utf8;
+}
+
+fn isTerminalFormatControl(codepoint: u21) bool {
+    return switch (codepoint) {
+        0x00ad,
+        0x061c,
+        0x180e,
+        0x200b,
+        0xfeff,
+        0xe0001,
+        0x17b4...0x17b5,
+        0x200e...0x200f,
+        0x2028...0x202e,
+        0x2060...0x2064,
+        0x2066...0x206f,
+        0xfff9...0xfffb,
+        0xe0020...0xe007f,
+        => true,
+        else => false,
+    };
 }
 
 fn sanitizeUtf8ForDisplay(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
@@ -7818,7 +8412,7 @@ fn sanitizeUtf8ForDisplay(allocator: std.mem.Allocator, input: []const u8) ![]u8
         }
 
         const segment = input[i .. i + seq_len];
-        _ = std.unicode.utf8Decode(segment) catch {
+        const codepoint = std.unicode.utf8Decode(segment) catch {
             try common.appendHexEscape(allocator, &out, first);
             i += 1;
             continue;
@@ -7832,6 +8426,13 @@ fn sanitizeUtf8ForDisplay(allocator: std.mem.Allocator, input: []const u8) ![]u8
                 else => try common.appendHexEscape(allocator, &out, first),
             }
             i += 1;
+            continue;
+        }
+        if ((codepoint >= 0x80 and codepoint <= 0x9f) or isTerminalFormatControl(codepoint)) {
+            var escaped_buf: [16]u8 = undefined;
+            const escaped = std.fmt.bufPrint(&escaped_buf, "\\u{{{x}}}", .{codepoint}) catch unreachable;
+            try out.appendSlice(allocator, escaped);
+            i += seq_len;
             continue;
         }
 
@@ -7988,11 +8589,29 @@ test "sanitizeUtf8ForDisplay escapes invalid bytes" {
     try std.testing.expect(std.unicode.utf8ValidateSlice(safe));
 }
 
+test "sanitizeUtf8ForDisplay escapes terminal controls and preserves ordinary Unicode" {
+    const allocator = std.testing.allocator;
+    const raw = "line\n字幕\u{009b}2J\u{202e}abc\u{feff}";
+    const safe = try sanitizeUtf8ForDisplay(allocator, raw);
+    defer allocator.free(safe);
+
+    try std.testing.expectEqualStrings("line\\n字幕\\u{9b}2J\\u{202e}abc\\u{feff}", safe);
+    try std.testing.expectEqual(DisplayTextClass.needs_sanitize, classifyDisplayText(raw));
+    try std.testing.expectEqual(DisplayTextClass.valid_utf8, classifyDisplayText(safe));
+    try std.testing.expectEqual(
+        DisplayTextClass.valid_utf8,
+        classifyDisplayText("字幕 \u{1f469}\u{200d}\u{1f4bb}"),
+    );
+}
+
 test "remote search failures do not count as application failures" {
     try std.testing.expect(isRemoteSearchFailure(error.UnexpectedHttpStatus));
     try std.testing.expect(isRemoteSearchFailure(error.InvalidFieldType));
     try std.testing.expect(isRemoteSearchFailure(error.CloudflareSessionUnavailable));
     try std.testing.expect(isRemoteSearchFailure(error.InvalidSessionPayload));
+    try std.testing.expect(isRemoteSearchFailure(error.BrowserAutomationDisabled));
+    try std.testing.expect(isRemoteSearchFailure(error.BrowserAutomationUnavailable));
+    try std.testing.expect(isRemoteSearchFailure(error.InvalidBrowserExecutable));
     try std.testing.expect(isRemoteSearchFailure(error.ProviderAccessBlocked));
     try std.testing.expect(isRemoteSearchFailure(error.UnsafeHttpTarget));
     try std.testing.expect(!isRemoteSearchFailure(error.OutOfMemory));
@@ -8209,9 +8828,9 @@ test "download cache refresh discovers new files and exports the selected entry"
     var state: TuiRuntimeState = .{
         .arena = std.heap.ArenaAllocator.init(allocator),
         .settings = defaultTuiSettings(),
-        .state_path = try std.fmt.allocPrint(allocator, "{s}/state.oneserial", .{cache_root}),
-        .settings_path = try std.fmt.allocPrint(allocator, "{s}/settings.oneserial", .{cache_root}),
-        .keyword_path = try std.fmt.allocPrint(allocator, "{s}/keywords.oneserial", .{cache_root}),
+        .state_path = try std.fmt.allocPrint(allocator, "{s}/state.json", .{cache_root}),
+        .settings_path = try std.fmt.allocPrint(allocator, "{s}/settings.json", .{cache_root}),
+        .keyword_path = try std.fmt.allocPrint(allocator, "{s}/keywords.json", .{cache_root}),
         .cache_root_path = try allocator.dupe(u8, cache_root),
     };
     defer state.deinit(allocator);
@@ -8275,8 +8894,14 @@ test "download cache scan propagates invalid downloads directory" {
     try std.testing.expectError(error.NotDir, cachedDownloadLabels(allocator, cache_root));
 }
 
-test "keyword state serializes through oneserial" {
+test "keyword state round trips through bounded json" {
     const allocator = std.testing.allocator;
+    const unique = scrapers.common.compatNanoTimestamp();
+    const test_root = try std.fmt.allocPrint(allocator, ".zig-cache/tui-keyword-json-test-{d}", .{unique});
+    defer allocator.free(test_root);
+    defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
+    const path = try std.fmt.allocPrint(allocator, "{s}/keywords.json", .{test_root});
+    defer allocator.free(path);
     const state: PersistentKeywordState = .{
         .version = persistent_version,
         .keywords = &.{
@@ -8284,19 +8909,278 @@ test "keyword state serializes through oneserial" {
             .{ .query = "alien", .used_at_unix = 20, .use_count = 1 },
         },
     };
-    const encoded = try oneserial.serializeAlloc(PersistentKeywordState, .{}, &state, allocator);
-    defer allocator.free(encoded);
+    try savePersistentJson(PersistentKeywordState, allocator, path, keyword_state_magic, keyword_state_file_limit, &state);
 
-    const decoded = try oneserial.Untrusted(PersistentKeywordState, .{}).init(encoded).toOwned(allocator);
-    defer {
-        for (decoded.keywords) |entry| allocator.free(entry.query);
-        allocator.free(decoded.keywords);
-    }
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    const decoded = (try loadPersistentKeywordState(decode_arena.allocator(), path)).?;
 
     try std.testing.expectEqual(@as(u32, persistent_version), decoded.version);
     try std.testing.expectEqual(@as(usize, 2), decoded.keywords.len);
     try std.testing.expectEqualStrings("matrix", decoded.keywords[0].query);
+    try std.testing.expectEqual(@as(i64, 10), decoded.keywords[0].used_at_unix);
     try std.testing.expectEqual(@as(u32, 2), decoded.keywords[0].use_count);
+    try std.testing.expectEqualStrings("alien", decoded.keywords[1].query);
+    try std.testing.expectEqual(@as(i64, 20), decoded.keywords[1].used_at_unix);
+    try std.testing.expectEqual(@as(u32, 1), decoded.keywords[1].use_count);
+}
+
+test "search cache state round trips a provider-tagged search reference" {
+    const allocator = std.testing.allocator;
+    const unique = scrapers.common.compatNanoTimestamp();
+    const test_root = try std.fmt.allocPrint(allocator, ".zig-cache/tui-search-json-test-{d}", .{unique});
+    defer allocator.free(test_root);
+    defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
+    const path = try std.fmt.allocPrint(allocator, "{s}/state.json", .{test_root});
+    defer allocator.free(path);
+
+    const choices = [_]app.SearchChoice{.{
+        .label = "The Matrix (1999)",
+        .ref = .{ .subdl_com = .{
+            .title = "The Matrix",
+            .media_type = .movie,
+            .link = "https://subdl.com/subtitle/sd21581/the-matrix",
+            .language_code = "en",
+        } },
+    }};
+    const entries = [_]QueryCacheEntry{.{
+        .provider = .subdl_com,
+        .query_norm = "matrix",
+        .page = 1,
+        .fetched_at_unix = 42,
+        .response = .{
+            .provider = .subdl_com,
+            .items = &choices,
+            .page = 1,
+            .has_prev_page = false,
+            .has_next_page = true,
+        },
+    }};
+    const state: PersistentSearchState = .{
+        .version = persistent_version,
+        .settings = defaultTuiSettings(),
+        .cache_entries = &entries,
+    };
+    try savePersistentJson(PersistentSearchState, allocator, path, search_state_magic, search_state_file_limit, &state);
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    const decoded = (try loadPersistentSearchState(decode_arena.allocator(), path)).?;
+    try std.testing.expectEqual(@as(usize, 1), decoded.cache_entries.len);
+    try std.testing.expectEqual(app.Provider.subdl_com, decoded.cache_entries[0].provider);
+    try std.testing.expectEqualStrings("matrix", decoded.cache_entries[0].query_norm);
+    try std.testing.expect(decoded.cache_entries[0].response.has_next_page);
+    try std.testing.expectEqualStrings("The Matrix (1999)", decoded.cache_entries[0].response.items[0].label);
+    switch (decoded.cache_entries[0].response.items[0].ref) {
+        .subdl_com => |item| {
+            try std.testing.expectEqualStrings("The Matrix", item.title);
+            try std.testing.expectEqualStrings("en", item.language_code);
+            try std.testing.expectEqualStrings("https://subdl.com/subtitle/sd21581/the-matrix", item.link);
+            try std.testing.expect(item.media_type == .movie);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "hand-authored json decodes an alternate search reference with optional fields" {
+    const fixture =
+        \\{"opensubtitles_com":{"title":"Alien","year":null,"item_type":"movie","path":"/en/movies/alien","subtitles_count":null,"subtitles_list_url":"https://www.opensubtitles.com/en/movies/alien"}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const decoded = try parsePersistentJson(app.SearchRef, arena.allocator(), fixture, 4096);
+    switch (decoded) {
+        .opensubtitles_com => |item| {
+            try std.testing.expectEqualStrings("Alien", item.title);
+            try std.testing.expect(item.year == null);
+            try std.testing.expectEqualStrings("movie", item.item_type.?);
+            try std.testing.expect(item.subtitles_count == null);
+            try std.testing.expectEqualStrings("/en/movies/alien", item.path);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "hand-authored framed search state remains reader compatible" {
+    const allocator = std.testing.allocator;
+    const unique = scrapers.common.compatNanoTimestamp();
+    const test_root = try std.fmt.allocPrint(allocator, ".zig-cache/tui-search-fixture-test-{d}", .{unique});
+    defer allocator.free(test_root);
+    defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
+    const path = try std.fmt.allocPrint(allocator, "{s}/state.json", .{test_root});
+    defer allocator.free(path);
+
+    // Deliberately do not use the production writer or magic constant here:
+    // this fixture freezes the complete v1 frame and representative wire shape.
+    const fixture =
+        \\subdl-tui-search-state-json-v1
+        \\{"version":10,"settings":{"providers_enabled":[
+        \\true,true,true,true,true,true,true,true,true,true,
+        \\true,true,true,true,true,true,true,true,true,true,
+        \\true,true,true,true,true,true,true,true,true,true,
+        \\true,true,true,true,true,true,true,true,true,true,
+        \\true,true,true,true,true,true
+        \\],"languages_enabled":[
+        \\true,true,true,true,true,true,true,true,true,true,
+        \\true,true,true,true,true,true,true,true,true,true,
+        \\true,true,true,true,true,true,true,true,true,true,
+        \\true,true,true,true,true,true,true,true,true,true,
+        \\true,true,true,true,true,true,true,true,true,true,
+        \\true,true,true,true,true,true
+        \\],"language_filter_enabled":true,"cache_enabled":true,"download_cache_enabled":true,"cache_ttl_seconds":43200,"keyword_cache_enabled":true},"cache_entries":[{"provider":"subdl_com","query_norm":"matrix\u001flang=en","page":1,"fetched_at_unix":42,"response":{"provider":"subdl_com","items":[{"label":"The Matrix","ref":{"subdl_com":{"title":"The Matrix","media_type":"movie","link":"https://subdl.com/subtitle/sd21581/the-matrix","language_code":"en"}}}],"page":1,"has_prev_page":false,"has_next_page":true}}]}
+    ;
+    try common.ensureParentDir(path);
+    {
+        var file = try std.Io.Dir.cwd().createFile(runtime_io.get(), path, .{});
+        defer file.close(runtime_io.get());
+        try file.writeStreamingAll(runtime_io.get(), fixture);
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const decoded = (try loadPersistentSearchState(arena.allocator(), path)).?;
+    try std.testing.expectEqual(@as(u32, persistent_version), decoded.version);
+    try std.testing.expectEqual(@as(usize, 1), decoded.cache_entries.len);
+    const entry = decoded.cache_entries[0];
+    try std.testing.expectEqual(app.Provider.subdl_com, entry.provider);
+    try std.testing.expectEqualStrings("matrix\x1flang=en", entry.query_norm);
+    try std.testing.expectEqual(@as(u32, 1), entry.page);
+    try std.testing.expect(entry.response.has_next_page);
+    try std.testing.expectEqualStrings("The Matrix", entry.response.items[0].label);
+    switch (entry.response.items[0].ref) {
+        .subdl_com => |item| {
+            try std.testing.expectEqualStrings("The Matrix", item.title);
+            try std.testing.expect(item.media_type == .movie);
+            try std.testing.expectEqualStrings("en", item.language_code);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "persistent state rejects oversized collections before runtime import" {
+    const valid_entry: QueryCacheEntry = .{
+        .provider = .subdl_com,
+        .query_norm = "matrix\x1flang=en",
+        .page = 1,
+        .fetched_at_unix = 42,
+        .response = .{
+            .provider = .subdl_com,
+            .items = &.{},
+            .page = 1,
+            .has_prev_page = false,
+            .has_next_page = false,
+        },
+    };
+    const too_many_cache_entries: [max_query_cache_entries + 1]QueryCacheEntry = @splat(valid_entry);
+    try std.testing.expectError(error.PersistentDataTooLarge, validatePersistentSearchState(.{
+        .version = persistent_version,
+        .settings = defaultTuiSettings(),
+        .cache_entries = &too_many_cache_entries,
+    }));
+
+    const valid_keyword: KeywordEntry = .{
+        .query = "matrix",
+        .used_at_unix = 42,
+        .use_count = 1,
+    };
+    const too_many_keywords: [max_keyword_entries + 1]KeywordEntry = @splat(valid_keyword);
+    try std.testing.expectError(error.PersistentDataTooLarge, validatePersistentKeywordState(.{
+        .version = persistent_version,
+        .keywords = &too_many_keywords,
+    }));
+}
+
+test "persistent search cache validates dispatch invariants" {
+    const valid_choices = [_]app.SearchChoice{.{
+        .label = "The Matrix",
+        .ref = .{ .subdl_com = .{
+            .title = "The Matrix",
+            .media_type = .movie,
+            .link = "https://subdl.com/subtitle/sd21581/the-matrix",
+            .language_code = "en",
+        } },
+    }};
+    const valid_entry: QueryCacheEntry = .{
+        .provider = .subdl_com,
+        .query_norm = "matrix\x1flang=en",
+        .page = 1,
+        .fetched_at_unix = 42,
+        .response = .{
+            .provider = .subdl_com,
+            .items = &valid_choices,
+            .page = 1,
+            .has_prev_page = false,
+            .has_next_page = false,
+        },
+    };
+    var entries = [_]QueryCacheEntry{valid_entry};
+    const state: PersistentSearchState = .{
+        .version = persistent_version,
+        .settings = defaultTuiSettings(),
+        .cache_entries = &entries,
+    };
+    try validatePersistentSearchState(state);
+
+    entries[0].response.provider = .opensubtitles_com;
+    try std.testing.expectError(error.InvalidPersistentData, validatePersistentSearchState(state));
+    entries[0] = valid_entry;
+    entries[0].page = 0;
+    try std.testing.expectError(error.InvalidPersistentData, validatePersistentSearchState(state));
+    entries[0] = valid_entry;
+    entries[0].response.page = 2;
+    try std.testing.expectError(error.InvalidPersistentData, validatePersistentSearchState(state));
+
+    const mismatched_choices = [_]app.SearchChoice{.{
+        .label = "Wrong provider",
+        .ref = .{ .moviesubtitles_org = .{
+            .title = "Wrong provider",
+            .link = "https://www.moviesubtitles.org/example.html",
+        } },
+    }};
+    entries[0] = valid_entry;
+    entries[0].response.items = &mismatched_choices;
+    try std.testing.expectError(error.InvalidPersistentData, validatePersistentSearchState(state));
+
+    const too_many_seasons: [max_cached_ref_list_entries + 1]scrapers.subsource_net.SeasonItem = @splat(.{
+        .season = 1,
+        .link = "/season-1",
+    });
+    const oversized_nested_choice = [_]app.SearchChoice{.{
+        .label = "Too many seasons",
+        .ref = .{ .subsource_net = .{
+            .title = "Too many seasons",
+            .link = "/series/example",
+            .media_type = "tv",
+            .seasons = &too_many_seasons,
+        } },
+    }};
+    entries[0] = .{
+        .provider = .subsource_net,
+        .query_norm = "example\x1flang=en",
+        .page = 1,
+        .fetched_at_unix = 42,
+        .response = .{
+            .provider = .subsource_net,
+            .items = &oversized_nested_choice,
+            .page = 1,
+            .has_prev_page = false,
+            .has_next_page = false,
+        },
+    };
+    try std.testing.expectError(error.PersistentDataTooLarge, validatePersistentSearchState(state));
+
+    var found_inactive = false;
+    for (std.meta.tags(app.Provider)) |provider| {
+        if (app.providerIndex(provider) != null) continue;
+        entries[0] = valid_entry;
+        entries[0].provider = provider;
+        entries[0].response.provider = provider;
+        entries[0].response.items = &.{};
+        try std.testing.expectError(error.InvalidPersistentData, validatePersistentSearchState(state));
+        found_inactive = true;
+        break;
+    }
+    try std.testing.expect(found_inactive);
 }
 
 test "search settings invalidation only tracks provider and language scope" {
@@ -8397,6 +9281,14 @@ test "search reaper completion wakes tui event loop" {
     try std.testing.expect(event == .search_reaper_done);
 }
 
+fn putAbsoluteTestCacheRoot(allocator: std.mem.Allocator, env_map: *std.process.Environ.Map, relative_root: []const u8) !void {
+    const cwd = try std.process.currentPathAlloc(runtime_io.get(), allocator);
+    defer allocator.free(cwd);
+    const absolute_root = try std.fs.path.join(allocator, &.{ cwd, relative_root });
+    defer allocator.free(absolute_root);
+    try env_map.put("XDG_CACHE_HOME", absolute_root);
+}
+
 test "settings persist independently from search cache state" {
     const allocator = std.testing.allocator;
     const unique = scrapers.common.compatNanoTimestamp();
@@ -8407,9 +9299,9 @@ test "settings persist independently from search cache state" {
     var state: TuiRuntimeState = .{
         .arena = std.heap.ArenaAllocator.init(allocator),
         .settings = defaultTuiSettings(),
-        .state_path = try std.fmt.allocPrint(allocator, "{s}/state.oneserial", .{test_root}),
-        .settings_path = try std.fmt.allocPrint(allocator, "{s}/settings.oneserial", .{test_root}),
-        .keyword_path = try std.fmt.allocPrint(allocator, "{s}/keywords.oneserial", .{test_root}),
+        .state_path = try std.fmt.allocPrint(allocator, "{s}/state.json", .{test_root}),
+        .settings_path = try std.fmt.allocPrint(allocator, "{s}/settings.json", .{test_root}),
+        .keyword_path = try std.fmt.allocPrint(allocator, "{s}/keywords.json", .{test_root}),
         .cache_root_path = try std.fmt.allocPrint(allocator, "{s}/cache", .{test_root}),
     };
     defer state.deinit(allocator);
@@ -8444,7 +9336,7 @@ test "corrupt settings fall back and surface a load warning" {
     defer allocator.free(test_root);
     defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
 
-    const settings_path = try std.fmt.allocPrint(allocator, "{s}/subdl/settings.oneserial", .{test_root});
+    const settings_path = try std.fmt.allocPrint(allocator, "{s}/subdl/settings.json", .{test_root});
     defer allocator.free(settings_path);
     try common.ensureParentDir(settings_path);
     {
@@ -8455,7 +9347,7 @@ test "corrupt settings fall back and surface a load warning" {
 
     var env_map = try std.testing.environ.createMap(allocator);
     defer env_map.deinit();
-    try env_map.put("XDG_CACHE_HOME", test_root);
+    try putAbsoluteTestCacheRoot(allocator, &env_map, test_root);
 
     var state = try loadTuiRuntimeState(allocator, &env_map);
     defer state.deinit(allocator);
@@ -8473,16 +9365,107 @@ test "corrupt settings fall back and surface a load warning" {
     try std.testing.expect(std.mem.indexOf(u8, warning, "InvalidPersistentData") == null);
 }
 
+test "legacy oneserial runtime state remains untouched and surfaces a migration notice" {
+    const allocator = std.testing.allocator;
+    const unique = scrapers.common.compatNanoTimestamp();
+    const test_root = try std.fmt.allocPrint(allocator, ".zig-cache/tui-legacy-state-test-{d}", .{unique});
+    defer allocator.free(test_root);
+    defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
+
+    const legacy_path = try std.fmt.allocPrint(allocator, "{s}/subdl/settings.oneserial", .{test_root});
+    defer allocator.free(legacy_path);
+    const json_path = try std.fmt.allocPrint(allocator, "{s}/subdl/settings.json", .{test_root});
+    defer allocator.free(json_path);
+    const sentinel = "legacy bytes must remain untouched";
+    try common.ensureParentDir(legacy_path);
+    {
+        var file = try std.Io.Dir.cwd().createFile(runtime_io.get(), legacy_path, .{});
+        defer file.close(runtime_io.get());
+        try file.writeStreamingAll(runtime_io.get(), sentinel);
+    }
+
+    var env_map = try std.testing.environ.createMap(allocator);
+    defer env_map.deinit();
+    try putAbsoluteTestCacheRoot(allocator, &env_map, test_root);
+
+    var state = try loadTuiRuntimeState(allocator, &env_map);
+    defer state.deinit(allocator);
+    try std.testing.expect(state.persistence_error != null);
+    try std.testing.expectEqual(PersistenceArea.settings, state.persistence_error.?.area);
+    try std.testing.expectEqual(PersistenceOperation.load, state.persistence_error.?.operation);
+    try std.testing.expectEqual(error.LegacyPersistentData, state.persistence_error.?.err);
+    try std.testing.expect(state.settings.cache_enabled);
+    try std.testing.expect(!persistentPathExists(json_path));
+
+    const after = try std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), legacy_path, allocator, .limited(1024));
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(sentinel, after);
+}
+
+test "current json state takes precedence without touching a legacy oneserial file" {
+    const allocator = std.testing.allocator;
+    const unique = scrapers.common.compatNanoTimestamp();
+    const test_root = try std.fmt.allocPrint(allocator, ".zig-cache/tui-json-precedence-test-{d}", .{unique});
+    defer allocator.free(test_root);
+    defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
+
+    const legacy_path = try std.fmt.allocPrint(allocator, "{s}/subdl/settings.oneserial", .{test_root});
+    defer allocator.free(legacy_path);
+    const json_path = try std.fmt.allocPrint(allocator, "{s}/subdl/settings.json", .{test_root});
+    defer allocator.free(json_path);
+    const sentinel = "leave this old state alone";
+    try common.ensureParentDir(legacy_path);
+    {
+        var file = try std.Io.Dir.cwd().createFile(runtime_io.get(), legacy_path, .{});
+        defer file.close(runtime_io.get());
+        try file.writeStreamingAll(runtime_io.get(), sentinel);
+    }
+    var settings = defaultTuiSettings();
+    settings.cache_enabled = false;
+    const current: PersistentSettingsState = .{
+        .version = persistent_version,
+        .settings = settings,
+    };
+    try savePersistentJson(PersistentSettingsState, allocator, json_path, settings_state_magic, settings_state_file_limit, &current);
+
+    var env_map = try std.testing.environ.createMap(allocator);
+    defer env_map.deinit();
+    try putAbsoluteTestCacheRoot(allocator, &env_map, test_root);
+
+    var state = try loadTuiRuntimeState(allocator, &env_map);
+    defer state.deinit(allocator);
+    try std.testing.expect(state.persistence_error == null);
+    try std.testing.expect(!state.settings.cache_enabled);
+    const after = try std.Io.Dir.cwd().readFileAlloc(runtime_io.get(), legacy_path, allocator, .limited(1024));
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(sentinel, after);
+}
+
 test "ui preferences persist independently and sanitize invalid themes" {
     const allocator = std.testing.allocator;
     const unique = scrapers.common.compatNanoTimestamp();
     const test_root = try std.fmt.allocPrint(allocator, ".zig-cache/tui-preferences-test-{d}", .{unique});
     defer allocator.free(test_root);
     defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
-    const path = try std.fmt.allocPrint(allocator, "{s}/ui-preferences.oneserial", .{test_root});
+    const path = try std.fmt.allocPrint(allocator, "{s}/ui-preferences.json", .{test_root});
     defer allocator.free(path);
 
+    // Replacing an older broadly-readable file must not preserve its mode.
+    try common.ensureParentDir(path);
+    {
+        var old = try std.Io.Dir.cwd().createFile(runtime_io.get(), path, .{});
+        defer old.close(runtime_io.get());
+        if (comptime builtin.os.tag != .windows and @hasDecl(std.Io.File.Permissions, "fromMode")) {
+            try old.setPermissions(runtime_io.get(), .fromMode(0o666));
+        }
+        try old.writeStreamingAll(runtime_io.get(), "old preferences");
+    }
     try saveUiPreferences(allocator, path, 1, true);
+    if (comptime builtin.os.tag != .windows and @hasDecl(std.Io.File.Permissions, "toMode")) {
+        const file = try std.Io.Dir.cwd().openFile(runtime_io.get(), path, .{});
+        defer file.close(runtime_io.get());
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), (try file.stat(runtime_io.get())).permissions.toMode() & 0o777);
+    }
     const loaded = (try loadPersistentUiPreferences(allocator, path)).?;
     const preferences = sanitizeUiPreferences(loaded);
     try std.testing.expectEqual(@as(u32, ui_preferences_version), preferences.version);
@@ -8497,13 +9480,39 @@ test "ui preferences persist independently and sanitize invalid themes" {
     try std.testing.expectEqual(@as(u8, 0), invalid_theme.theme_index);
     try std.testing.expect(invalid_theme.skip_confirm);
 
-    const stale_version = sanitizeUiPreferences(.{
+    const unsupported_version: PersistentUiPreferences = .{
         .version = ui_preferences_version + 1,
         .theme_index = 1,
         .skip_confirm = true,
-    });
+    };
+    const stale_version = sanitizeUiPreferences(unsupported_version);
     try std.testing.expectEqual(@as(u8, 0), stale_version.theme_index);
     try std.testing.expect(!stale_version.skip_confirm);
+
+    try savePersistentJson(PersistentUiPreferences, allocator, path, ui_preferences_magic, ui_preferences_file_limit, &unsupported_version);
+    try std.testing.expectError(error.InvalidPersistentData, loadPersistentUiPreferences(allocator, path));
+}
+
+test "hand-authored framed preferences v1 fixture remains readable" {
+    const allocator = std.testing.allocator;
+    const unique = scrapers.common.compatNanoTimestamp();
+    const test_root = try std.fmt.allocPrint(allocator, ".zig-cache/tui-preferences-v1-fixture-{d}", .{unique});
+    defer allocator.free(test_root);
+    defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
+    const path = try std.fmt.allocPrint(allocator, "{s}/ui-preferences.json", .{test_root});
+    defer allocator.free(path);
+    try common.ensureParentDir(path);
+    {
+        var file = try std.Io.Dir.cwd().createFile(runtime_io.get(), path, .{});
+        defer file.close(runtime_io.get());
+        try file.writeStreamingAll(
+            runtime_io.get(),
+            "subdl-tui-preferences-json-v1\n{\"version\":1,\"theme_index\":1,\"skip_confirm\":true}",
+        );
+    }
+    const loaded = (try loadPersistentUiPreferences(allocator, path)).?;
+    try std.testing.expectEqual(@as(u8, 1), loaded.theme_index);
+    try std.testing.expect(loaded.skip_confirm);
 }
 
 test "corrupt ui preferences report an error instead of silently resetting" {
@@ -8512,7 +9521,7 @@ test "corrupt ui preferences report an error instead of silently resetting" {
     const test_root = try std.fmt.allocPrint(allocator, ".zig-cache/tui-preferences-corrupt-test-{d}", .{unique});
     defer allocator.free(test_root);
     defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
-    const path = try std.fmt.allocPrint(allocator, "{s}/ui-preferences.oneserial", .{test_root});
+    const path = try std.fmt.allocPrint(allocator, "{s}/ui-preferences.json", .{test_root});
     defer allocator.free(path);
     try common.ensureParentDir(path);
     {
@@ -8541,9 +9550,9 @@ test "ui preference toggle records and clears persistence failures" {
         var blocker = try std.Io.Dir.cwd().createFile(runtime_io.get(), blocker_path, .{});
         defer blocker.close(runtime_io.get());
     }
-    const bad_path = try std.fmt.allocPrint(allocator, "{s}/ui-preferences.oneserial", .{blocker_path});
+    const bad_path = try std.fmt.allocPrint(allocator, "{s}/ui-preferences.json", .{blocker_path});
     defer allocator.free(bad_path);
-    const good_path = try std.fmt.allocPrint(allocator, "{s}/ui-preferences.oneserial", .{test_root});
+    const good_path = try std.fmt.allocPrint(allocator, "{s}/ui-preferences.json", .{test_root});
     defer allocator.free(good_path);
 
     var ui: Ui = .{
@@ -8568,40 +9577,40 @@ test "ui preference toggle records and clears persistence failures" {
     try std.testing.expect((try loadPersistentUiPreferences(allocator, good_path)) != null);
 }
 
-test "independent settings override legacy settings embedded in search state" {
+test "independent settings override settings embedded in search state" {
     const allocator = std.testing.allocator;
     const unique = scrapers.common.compatNanoTimestamp();
     const test_root = try std.fmt.allocPrint(allocator, ".zig-cache/tui-settings-precedence-test-{d}", .{unique});
     defer allocator.free(test_root);
     defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
 
-    const state_path = try std.fmt.allocPrint(allocator, "{s}/subdl/state.oneserial", .{test_root});
+    const state_path = try std.fmt.allocPrint(allocator, "{s}/subdl/state.json", .{test_root});
     defer allocator.free(state_path);
-    const settings_path = try std.fmt.allocPrint(allocator, "{s}/subdl/settings.oneserial", .{test_root});
+    const settings_path = try std.fmt.allocPrint(allocator, "{s}/subdl/settings.json", .{test_root});
     defer allocator.free(settings_path);
 
-    var legacy_settings = defaultTuiSettings();
-    legacy_settings.cache_enabled = true;
-    legacy_settings.providers_enabled[0] = true;
-    const legacy_state: PersistentSearchState = .{
+    var embedded_settings = defaultTuiSettings();
+    embedded_settings.cache_enabled = true;
+    embedded_settings.providers_enabled[0] = true;
+    const search_state: PersistentSearchState = .{
         .version = persistent_version,
-        .settings = legacy_settings,
+        .settings = embedded_settings,
         .cache_entries = &.{},
     };
-    try saveOneSerial(PersistentSearchState, allocator, state_path, search_state_magic, &legacy_state);
+    try savePersistentJson(PersistentSearchState, allocator, state_path, search_state_magic, search_state_file_limit, &search_state);
 
-    var current_settings = legacy_settings;
+    var current_settings = embedded_settings;
     current_settings.cache_enabled = false;
     current_settings.providers_enabled[0] = false;
     const current_state: PersistentSettingsState = .{
         .version = persistent_version,
         .settings = current_settings,
     };
-    try saveOneSerial(PersistentSettingsState, allocator, settings_path, settings_state_magic, &current_state);
+    try savePersistentJson(PersistentSettingsState, allocator, settings_path, settings_state_magic, settings_state_file_limit, &current_state);
 
     var env_map = try std.testing.environ.createMap(allocator);
     defer env_map.deinit();
-    try env_map.put("XDG_CACHE_HOME", test_root);
+    try putAbsoluteTestCacheRoot(allocator, &env_map, test_root);
 
     var loaded = try loadTuiRuntimeState(allocator, &env_map);
     defer loaded.deinit(allocator);
@@ -8706,7 +9715,7 @@ fn rebuildSubtitleMatches(
 
     for (order) |idx| {
         const subtitle = subtitles[idx];
-        if (filter.len == 0 or subtitleMatchesFilter(subtitle, filter)) {
+        if (filter.len == 0 or try subtitleMatchesFilter(allocator, subtitle, filter)) {
             try out.append(allocator, idx);
         }
     }
@@ -8736,7 +9745,7 @@ test "subtitle sorting can preserve the highlighted item" {
     try std.testing.expectEqual(@as(?usize, 2), findIndexInMatches(matches.items, selected_subtitle_idx));
 }
 
-fn subtitleMatchesFilter(subtitle: app.SubtitleChoice, filter: []const u8) bool {
+fn subtitleMatchesFilter(allocator: std.mem.Allocator, subtitle: app.SubtitleChoice, filter: []const u8) !bool {
     if (containsCaseInsensitive(subtitle.label, filter)) return true;
     if (subtitle.language) |lang| {
         if (containsCaseInsensitive(lang, filter)) return true;
@@ -8745,7 +9754,9 @@ fn subtitleMatchesFilter(subtitle: app.SubtitleChoice, filter: []const u8) bool 
         if (containsCaseInsensitive(name, filter)) return true;
     }
     if (subtitle.download_url) |url| {
-        if (containsCaseInsensitive(url, filter)) return true;
+        const display = try app.downloadTargetForDisplay(allocator, url);
+        defer allocator.free(display);
+        if (containsCaseInsensitive(display, filter)) return true;
     }
     return false;
 }
@@ -8773,6 +9784,7 @@ fn renderSubtitleDetails(
     var row: u16 = 3;
     const max_row: u16 = if (win.height > 4) win.height - 4 else win.height;
     const is_translate = isSubtitlecatTranslateToken(subtitle.download_url);
+    const is_opaque = if (subtitle.download_url) |url| app.downloadTargetIsOpaque(url) else false;
 
     try printFitted(ui, win, row, col, subtitleFilenameForDisplay(subtitle), ui.stylePaneTitle(), pane_width);
     row += 2;
@@ -8793,6 +9805,8 @@ fn renderSubtitleDetails(
             "unavailable"
         else if (is_translate)
             "translate"
+        else if (is_opaque)
+            "provider"
         else
             "direct",
     );
@@ -8807,18 +9821,13 @@ fn renderSubtitleDetails(
     row += 1;
 
     if (row >= max_row) return;
+    const download_url_display = try app.downloadTargetForDisplay(ui.frameAllocator(), subtitle.download_url);
     try printFitted(
         ui,
         win,
         row,
         col,
-        if (subtitle.download_url) |url|
-            if (is_translate)
-                "subtitlecat translate request"
-            else
-                url
-        else
-            "(not available)",
+        download_url_display,
         .{},
         pane_width,
     );
@@ -8863,6 +9872,14 @@ fn subtitleFilenameForDisplay(subtitle: app.SubtitleChoice) []const u8 {
 fn isSubtitlecatTranslateToken(download_url: ?[]const u8) bool {
     const url = download_url orelse return false;
     return std.mem.startsWith(u8, url, "subtitlecat-translate:");
+}
+
+test "subtitle details redact secret-bearing internal download targets" {
+    const secret = "animesubinfo-session:v1:1:74:hash24:ansi_sciagnij=sentinel1:x";
+    const display = try app.downloadTargetForDisplay(std.testing.allocator, secret);
+    defer std.testing.allocator.free(display);
+    try std.testing.expectEqualStrings("provider-mediated download", display);
+    try std.testing.expect(std.mem.indexOf(u8, display, "sentinel") == null);
 }
 
 fn printLabelValue(
@@ -8950,8 +9967,16 @@ test "runtime state construction transfers cleanup once under allocation failure
     defer std.testing.allocator.free(root);
     var env = try std.testing.environ.createMap(std.testing.allocator);
     defer env.deinit();
-    try env.put("XDG_CACHE_HOME", root);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkRuntimeLoadOwnership, .{&env});
+    try putAbsoluteTestCacheRoot(std.testing.allocator, &env, root);
+    // Zig 0.17's allocPrint may grow through remap. SafeAllocator can satisfy
+    // that growth only at some bucket positions, so its allocation count varies
+    // between sweep iterations. Force the allocation fallback to exercise every
+    // OOM boundary independently of environment size and allocator layout.
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    std.testing.checkAllAllocationFailures(no_resize.allocator(), checkRuntimeLoadOwnership, .{&env}) catch |err| {
+        std.debug.print("runtime state allocation sweep failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
 }
 test "active and idle bracketed paste decode controls as text and preserve next event" {
     var loop: vaxis.Loop(Event) = .init(std.testing.io, undefined, undefined);
@@ -8991,7 +10016,10 @@ fn clearSearchPages(allocator: std.mem.Allocator, pages: *std.ArrayList(SearchBu
 fn nextSearchProviders(bundle: *const SearchBundle) [app.providerCount()]bool {
     var mask: [app.providerCount()]bool = @splat(false);
     for (bundle.searches.items) |response| {
-        if (response.has_next_page) mask[app.providerIndex(response.provider)] = true;
+        if (response.has_next_page) {
+            const provider_index = app.providerIndex(response.provider) orelse continue;
+            mask[provider_index] = true;
+        }
     }
     return mask;
 }
@@ -9002,9 +10030,11 @@ test "next search page admits only responses advertising another page" {
     defer bundle.deinit(allocator);
     try bundle.searches.append(allocator, .{ .arena = std.heap.ArenaAllocator.init(allocator), .provider = .subdl_com, .items = &.{}, .has_next_page = false });
     try bundle.searches.append(allocator, .{ .arena = std.heap.ArenaAllocator.init(allocator), .provider = .subsource_net, .items = &.{}, .has_next_page = true });
+    try bundle.searches.append(allocator, .{ .arena = std.heap.ArenaAllocator.init(allocator), .provider = .opensubtitles_org, .items = &.{}, .has_next_page = true });
     const mask = nextSearchProviders(&bundle);
     try std.testing.expectEqual(@as(usize, 1), common.countTrue(&mask));
-    try std.testing.expect(mask[app.providerIndex(.subsource_net)]);
+    const subsource_index = app.providerIndex(.subsource_net) orelse return error.MissingActiveProviderIndex;
+    try std.testing.expect(mask[subsource_index]);
 }
 
 fn searchPaneAvailable(bundle: *const SearchBundle) bool {
@@ -9026,75 +10056,191 @@ test "empty search pages retain navigation when continuation exists" {
 }
 
 fn stopInputLoop(loop: *vaxis.Loop(Event)) void {
-    // vaxis.stop waits for a terminal status reply and cannot release a full
-    // event queue. Cancellation wakes both the tty read and queue condition.
-    if (loop.thread) |*future| {
-        future.cancel(loop.io);
-        loop.thread = null;
-        loop.should_quit = false;
+    // Loop.stop closes the queue before canceling the input task, so a producer
+    // blocked on a full queue is released as part of shutdown.
+    loop.stop();
+}
+
+fn restoreTerminalForQuit(ui: *Ui) void {
+    if (ui.terminal_restored) return;
+    ui.terminal_restored = true;
+    // The SIGWINCH callback dereferences Loop.vaxis, so detach it before the
+    // early full deinit below. The owning scope's later uninstall is idempotent.
+    ui.loop.uninstallResizeHandler();
+    stopInputLoop(ui.loop);
+    // Reset and free Vaxis exactly once. Calling deinit(null) here and the
+    // owning deinit later would run resetState twice; the second pass occurs
+    // on the main screen and can move the cursor or erase visible content.
+    if (ui.vx_alive) |alive| {
+        if (alive.*) {
+            deinitVaxisForTui(ui.vx, ui.allocator, ui.writer());
+            alive.* = false;
+        }
+    } else {
+        deinitVaxisForTui(ui.vx, null, ui.writer());
+    }
+    if (ui.tty_alive) |alive| {
+        if (alive.*) {
+            ui.tty.deinit();
+            // Tty.deinit restores and closes the terminal but leaves Vaxis's
+            // panic-recovery copy populated. Do not let cleanup-time panics
+            // write reset bytes through a stale, potentially reused handle.
+            vaxis.tty.global_tty = null;
+            alive.* = false;
+        }
     }
 }
 
 test "input shutdown cancels a producer blocked on the full event queue" {
+    if (builtin.single_threaded) return error.SkipZigTest;
     var tty: vaxis.Tty = undefined;
     var vx: vaxis.Vaxis = undefined;
     var loop = vaxis.Loop(Event).init(runtime_io.get(), &tty, &vx);
     for (0..512) |_| try loop.postEvent(.{ .key_press = .{ .codepoint = 'x' } });
+    try std.testing.expect(try loop.queue.isFull());
     const Producer = struct {
-        fn run(input: *vaxis.Loop(Event)) void {
-            input.postEvent(.{ .key_press = .{ .codepoint = 'y' } }) catch {};
+        ready: std.Io.Event = .unset,
+        result: anyerror!void = undefined,
+
+        fn run(self: *@This(), input: *vaxis.Loop(Event)) void {
+            self.ready.set(input.io);
+            self.result = input.postEvent(.{ .key_press = .{ .codepoint = 'y' } });
         }
     };
-    loop.thread = try runtime_io.get().concurrent(Producer.run, .{&loop});
+    var producer: Producer = .{};
+    loop.thread = try runtime_io.get().concurrent(Producer.run, .{ &producer, &loop });
+    defer stopInputLoop(&loop);
+    try producer.ready.wait(runtime_io.get());
+    try runtime_io.get().sleep(.fromMilliseconds(10), .awake);
     stopInputLoop(&loop);
     try std.testing.expect(loop.thread == null);
-    stopInputLoop(&loop);
+    if (producer.result) |_| {
+        return error.ExpectedBlockedProducerFailure;
+    } else |err| switch (err) {
+        error.Closed, error.Canceled => {},
+        else => return err,
+    }
 }
 
-test "serializer compatibility preserves pointer alignment and golden wire bytes" {
+test "persistent json rejects malformed duplicate unknown trailing and invalid enum data" {
     const allocator = std.testing.allocator;
-    const Tag = enum(u8) { first = 1, last = 7 };
-    const Wire = struct { number: u16, tag: Tag };
-    const value: Wire = .{ .number = 0x1234, .tag = .last };
-    const bytes = try oneserial.serializeAlloc(Wire, .{ .endian = .little }, &value, allocator);
-    defer allocator.free(bytes);
-    // The pinned wire format advances an aligned u16 by two padding bytes.
-    // Preserve it to keep existing persisted data readable.
-    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0x34, 0x12, 7 }, bytes);
-    try std.testing.expectError(error.InvalidEnumTag, oneserial.Untrusted(Tag, .{}).init(&.{255}).toOwned(allocator));
-    var natural: u32 = 42;
-    var aligned: [2]u32 align(64) = .{ 7, 9 };
-    const Pointers = struct { natural: *const u32, aligned: []align(64) const u32 };
-    const pointers: Pointers = .{ .natural = &natural, .aligned = &aligned };
-    const encoded = try oneserial.serializeAlloc(Pointers, .{}, &pointers, allocator);
-    defer allocator.free(encoded);
-    var arena = std.heap.ArenaAllocator.init(allocator);
+    const Kind = enum { one, two };
+    const Shape = struct { version: u32, kind: Kind };
+    const invalid = [_][]const u8{
+        "{",
+        "{\"version\":1,\"kind\":\"one\"} trailing",
+        "{\"version\":1,\"version\":1,\"kind\":\"one\"}",
+        "{\"version\":1,\"kind\":\"one\",\"unexpected\":true}",
+        "{\"version\":1,\"kind\":\"bogus\"}",
+    };
+    for (invalid) |body| {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        try std.testing.expectError(error.InvalidPersistentData, parsePersistentJson(Shape, arena.allocator(), body, 4096));
+    }
+}
+
+test "persistent json decode allocation amplification is capped" {
+    const Shape = struct { values: []const u64 };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const decoded = try oneserial.Untrusted(Pointers, .{}).init(encoded).toOwned(arena.allocator());
-    try std.testing.expectEqual(@as(u32, 42), decoded.natural.*);
-    try std.testing.expectEqualSlices(u32, &aligned, decoded.aligned);
-    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(decoded.aligned.ptr) % 64);
+    try std.testing.expectError(
+        error.PersistentDataTooLarge,
+        parsePersistentJson(Shape, arena.allocator(), "{\"values\":[1,2,3,4]}", 1),
+    );
+}
+
+test "persistent json bounds include the magic and reject oversized saves" {
+    try std.testing.expect(persistentEncodingFits(3, 6, 10));
+    try std.testing.expect(persistentEncodingFits(3, 7, 10));
+    try std.testing.expect(persistentEncodingFits(10, 0, 10));
+    try std.testing.expect(!persistentEncodingFits(3, 8, 10));
+
+    const allocator = std.testing.allocator;
+    const unique = scrapers.common.compatNanoTimestamp();
+    const test_root = try std.fmt.allocPrint(allocator, ".zig-cache/tui-json-save-cap-test-{d}", .{unique});
+    defer allocator.free(test_root);
+    defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
+    const path = try std.fmt.allocPrint(allocator, "{s}/preferences.json", .{test_root});
+    defer allocator.free(path);
+    const value: PersistentUiPreferences = .{
+        .version = ui_preferences_version,
+        .theme_index = 0,
+        .skip_confirm = false,
+    };
+    try std.testing.expectError(
+        error.PersistentDataTooLarge,
+        savePersistentJson(PersistentUiPreferences, allocator, path, ui_preferences_magic, ui_preferences_magic.len + 1, &value),
+    );
+    try std.testing.expect(!persistentPathExists(path));
+}
+
+test "persistent json maps oversized input to a bounded load error" {
+    const allocator = std.testing.allocator;
+    const unique = scrapers.common.compatNanoTimestamp();
+    const test_root = try std.fmt.allocPrint(allocator, ".zig-cache/tui-json-load-cap-test-{d}", .{unique});
+    defer allocator.free(test_root);
+    defer std.Io.Dir.cwd().deleteTree(runtime_io.get(), test_root) catch {};
+    const path = try std.fmt.allocPrint(allocator, "{s}/preferences.json", .{test_root});
+    defer allocator.free(path);
+    try common.ensureParentDir(path);
+
+    const oversized = try allocator.alloc(u8, ui_preferences_file_limit + 1);
+    defer allocator.free(oversized);
+    @memset(oversized, 'x');
+    @memcpy(oversized[0..ui_preferences_magic.len], ui_preferences_magic);
+    {
+        var file = try std.Io.Dir.cwd().createFile(runtime_io.get(), path, .{});
+        defer file.close(runtime_io.get());
+        try file.writeStreamingAll(runtime_io.get(), oversized);
+    }
+    try std.testing.expectError(error.PersistentDataTooLarge, loadPersistentUiPreferences(allocator, path));
+}
+
+test "persistent json load rejects symlinks" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = runtime_io.get();
+    try tmp.dir.writeFile(io, .{ .sub_path = "state.json", .data = ui_preferences_magic ++ "{}" });
+    try tmp.dir.symLink(io, "state.json", "state-link.json", .{});
+    try std.testing.expectError(
+        error.InvalidPersistentData,
+        readPersistentDataFileAlloc(std.testing.allocator, tmp.dir, "state-link.json", 1024),
+    );
+}
+
+test "persistent json load rejects a FIFO without blocking" {
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result = std.os.linux.mknodat(
+        tmp.dir.handle,
+        "state.fifo",
+        std.os.linux.S.IFIFO | std.os.linux.S.IRUSR | std.os.linux.S.IWUSR,
+        0,
+    );
+    try std.testing.expect(std.os.linux.errno(result) == .SUCCESS);
+    try std.testing.expectError(
+        error.InvalidPersistentData,
+        readPersistentDataFileAlloc(std.testing.allocator, tmp.dir, "state.fifo", 1024),
+    );
 }
 
 fn isCachedArchivePath(path: []const u8) bool {
     return std.ascii.endsWithIgnoreCase(path, ".zip") or std.ascii.endsWithIgnoreCase(path, ".rar") or std.ascii.endsWithIgnoreCase(path, ".7z");
 }
 fn escapeConfirmationText(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    const hex = "0123456789abcdef";
-    for (input) |byte| {
-        if (byte < 0x20 or byte == 0x7f) {
-            try out.appendSlice(allocator, &.{ '\\', 'x', hex[byte >> 4], hex[byte & 15] });
-        } else try out.append(allocator, byte);
-    }
-    return out.toOwnedSlice(allocator);
+    return sanitizeUtf8ForDisplay(allocator, input);
 }
 
-test "confirmation escapes control bytes into visible single-line text" {
-    const text = try escapeConfirmationText(std.testing.allocator, "safe\nhidden\t\x1b");
+test "confirmation escapes terminal controls into visible single-line text" {
+    const text = try escapeConfirmationText(
+        std.testing.allocator,
+        "safe\nhidden\t\x1b\u{009b}\u{202e}",
+    );
     defer std.testing.allocator.free(text);
-    try std.testing.expectEqualStrings("safe\\x0ahidden\\x09\\x1b", text);
+    try std.testing.expectEqualStrings("safe\\nhidden\\t\\x1B\\u{9b}\\u{202e}", text);
 }
 
 test "cached archive downloads remain visible beside subtitles" {

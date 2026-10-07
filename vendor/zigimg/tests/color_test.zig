@@ -3,6 +3,23 @@ const zigimg = @import("zigimg");
 const color = zigimg.color;
 const helpers = @import("helpers.zig");
 
+test "Four-component float color conversions preserve component order" {
+    const value: @Vector(4, f32) = .{ 0.125, -0.25, 0.75, 0.5 };
+
+    inline for (.{
+        color.CIEXYZAlpha,
+        color.CIELabAlpha,
+        color.CIELuvAlpha,
+        color.HSLuvAlpha,
+        color.OklabAlpha,
+    }) |ColorType| {
+        const round_trip = ColorType.fromFloat4(value).toFloat4();
+        inline for (0..4) |index| {
+            try std.testing.expectEqual(value[index], round_trip[index]);
+        }
+    }
+}
+
 test "Convert color to premultipled alpha" {
     const originalColor = color.Colorf32.from.rgba(100 / 255, 128 / 255, 210 / 255, 100 / 255);
     const premultipliedAlpha = originalColor.to.premultipliedAlpha();
@@ -129,6 +146,15 @@ test "Convert Grayscale8 to Colorf32" {
     try helpers.expectEq(result.g, 128);
     try helpers.expectEq(result.b, 128);
     try helpers.expectEq(result.a, 255);
+}
+
+test "Convert Grayscale8 to float4" {
+    const original = color.Grayscale8{ .value = 128 };
+    const result = original.to.float4();
+
+    try helpers.expectEq(result[0], result[1]);
+    try helpers.expectEq(result[1], result[2]);
+    try helpers.expectEq(result[3], 1.0);
 }
 
 test "Convert Grayscale8Alpha to Colorf32" {

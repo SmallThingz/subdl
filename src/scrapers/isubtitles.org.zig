@@ -8,6 +8,7 @@ const HtmlNode = HtmlParseOptions.GetNode();
 
 const Allocator = std.mem.Allocator;
 const site = "https://isubtitles.org";
+const max_pagination_page: usize = 128;
 
 pub const SearchOptions = common.PageOptions;
 
@@ -49,16 +50,30 @@ pub const Scraper = struct {
     }
 
     pub fn searchWithOptions(self: *Scraper, query: []const u8, options: SearchOptions) !SearchResponse {
+        return self.searchWithOptionsUsing(common.fetchBytes, query, options);
+    }
+
+    fn searchWithOptionsUsing(self: *Scraper, comptime fetch: anytype, query: []const u8, options: SearchOptions) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+
+        const page_start = if (options.page_start == 0) 1 else options.page_start;
+        const trimmed = std.mem.trim(u8, query, " \t\r\n");
+        if (trimmed.len == 0) return .{
+            .arena = arena,
+            .items = &.{},
+            .page = page_start,
+            .has_prev_page = page_start > 1,
+            .has_next_page = false,
+        };
+        if (page_start > max_pagination_page) return error.ResponseTooLarge;
 
         var out: std.ArrayListUnmanaged(SearchItem) = .empty;
         var seen = std.StringHashMapUnmanaged(void).empty;
 
         const max_pages = if (options.max_pages == 0) 1 else options.max_pages;
-        var page = if (options.page_start == 0) 1 else options.page_start;
-        const page_start = page;
+        var page = page_start;
         var next_url: ?[]const u8 = null;
         var traversed: usize = 0;
         var last_page = page_start;
@@ -67,15 +82,15 @@ pub const Scraper = struct {
         while (traversed < max_pages) : (traversed += 1) {
             last_page = page;
             const page_url = if (traversed == 0)
-                try buildSearchUrl(a, query, page)
+                try buildSearchUrl(a, trimmed, page)
             else if (next_url) |u|
                 u
             else
                 break;
-            const response = try self.fetchHtml(a, page_url);
+            const response = try fetchHtmlWith(fetch, self.client, a, page_url);
             if (response.body.len == 0) break;
 
-            maybeDebugDumpFirstPage(response.status, page_url, response.body, traversed);
+            maybeDebugLogFirstPage(a, response.status, page_url, response.body.len, traversed);
 
             var parsed = try common.parseHtmlStable(a, response.body);
 
@@ -97,8 +112,7 @@ pub const Scraper = struct {
 
             if (traversed + 1 >= max_pages) break;
             if (next_url == null) break;
-            page += 1;
-            if (page > 128) break;
+            page = (try checkedNextPage(page)) orelse break;
         }
 
         return common.finishResponse(SearchResponse, &arena, .{
@@ -119,11 +133,12 @@ pub const Scraper = struct {
     }
 
     fn fetchSubtitlesByMovieLinkWithOptionsUsing(self: *Scraper, comptime fetch: anytype, details_url: []const u8, options: SubtitlesOptions) !SubtitlesResponse {
-        try validateProviderUrl(details_url);
+        try validateProviderRoute(details_url, .details_root);
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
         const owned_details_url = try a.dupe(u8, details_url);
+        const details_title = detailsTitleSegment(owned_details_url) orelse return error.InvalidDownloadUrl;
 
         var out: std.ArrayListUnmanaged(SubtitleItem) = .empty;
         var seen = std.StringHashMapUnmanaged(void).empty;
@@ -133,6 +148,7 @@ pub const Scraper = struct {
         const max_pages = if (options.max_pages == 0) 1 else options.max_pages;
         var page = if (options.page_start == 0) 1 else options.page_start;
         const page_start = page;
+        if (page_start > max_pagination_page) return error.ResponseTooLarge;
         var next_url: ?[]const u8 = null;
         var last_page = page_start;
         var has_next_page = false;
@@ -161,12 +177,21 @@ pub const Scraper = struct {
 
             var rows = parsed.doc.queryAll("section table.table tr");
             while (rows.next()) |row| {
-                const download_anchor = row.queryOne("td[data-title='Download'] a[href]") orelse continue;
-                const href = common.getAttributeValueSafe(download_anchor, "href") orelse continue;
-                const download_page_url = try common.resolveUrl(a, site, href);
-                if (!isProviderUrl(download_page_url)) continue;
-                if (seen.contains(download_page_url)) continue;
-                try seen.put(a, download_page_url, {});
+                var download_page_url: ?[]const u8 = null;
+                var download_anchors = row.queryAll("td[data-title='Download'] a[href]");
+                while (download_anchors.next()) |download_anchor| {
+                    const href = common.getAttributeValueSafe(download_anchor, "href") orelse continue;
+                    const candidate = common.resolveUrl(a, site, href) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        continue;
+                    };
+                    if (!isDownloadForDetailsTitle(candidate, details_title)) continue;
+                    if (seen.contains(candidate)) continue;
+                    download_page_url = candidate;
+                    break;
+                }
+                const resolved_download_page_url = download_page_url orelse continue;
+                try seen.put(a, resolved_download_page_url, {});
 
                 const fields = try extractSubtitleRowText(row, a);
 
@@ -182,7 +207,7 @@ pub const Scraper = struct {
                     .comment = fields.comment,
                     .filename = filename,
                     .details_url = owned_details_url,
-                    .download_page_url = download_page_url,
+                    .download_page_url = resolved_download_page_url,
                 });
             }
 
@@ -190,8 +215,7 @@ pub const Scraper = struct {
             has_next_page = next_url != null;
             if (traversed + 1 >= max_pages) break;
             if (next_url == null) break;
-            page += 1;
-            if (page > 128) break;
+            page = (try checkedNextPage(page)) orelse break;
         }
 
         return common.finishResponse(SubtitlesResponse, &arena, .{
@@ -210,7 +234,7 @@ pub const Scraper = struct {
 };
 
 fn fetchHtmlWith(comptime fetch: anytype, client: *std.http.Client, allocator: Allocator, url: []const u8) !common.HttpResponse {
-    try validateProviderUrl(url);
+    try validateProviderPageUrl(url);
     const headers = [_]std.http.Header{
         .{ .name = "accept-encoding", .value = "identity" },
         .{ .name = "accept-language", .value = "en-US,en;q=0.8" },
@@ -238,14 +262,207 @@ fn acceptHtmlResponse(allocator: Allocator, response: common.HttpResponse) !comm
     return response;
 }
 
-fn validateProviderUrl(url: []const u8) !void {
+const ProviderRoute = enum {
+    search_page,
+    details_root,
+    details_page,
+    download_page,
+};
+
+fn validateProviderPageUrl(url: []const u8) !void {
+    if (isProviderRoute(url, .search_page) or isProviderRoute(url, .details_page)) return;
+    return error.InvalidDownloadUrl;
+}
+
+fn validateProviderRoute(url: []const u8, route: ProviderRoute) !void {
+    common.validatePublicHttpUrl(url) catch return error.InvalidDownloadUrl;
     const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
     if (uri.user != null or uri.password != null) return error.InvalidDownloadUrl;
     if (!(common.sameOrigin(site, url) catch false)) return error.InvalidDownloadUrl;
+    if (uri.fragment != null) return error.InvalidDownloadUrl;
+
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    const query = if (uri.query) |component| switch (component) {
+        .raw, .percent_encoded => |value| value,
+    } else null;
+
+    const valid = switch (route) {
+        .search_page => std.mem.eql(u8, path, "/search") and
+            query != null and isCanonicalSearchQuery(query.?),
+        .details_root => isCanonicalDetailsPath(path) and query == null,
+        .details_page => isCanonicalDetailsPath(path) and
+            (query == null or isCanonicalPageQuery(query.?)),
+        .download_page => isCanonicalDownloadPath(path) and query == null,
+    };
+    if (!valid) return error.InvalidDownloadUrl;
 }
 
-fn isProviderUrl(url: []const u8) bool {
-    validateProviderUrl(url) catch return false;
+fn isProviderRoute(url: []const u8, route: ProviderRoute) bool {
+    validateProviderRoute(url, route) catch return false;
+    return true;
+}
+
+fn isCanonicalSearchQuery(query: []const u8) bool {
+    const prefix = "kwd=";
+    if (!std.mem.startsWith(u8, query, prefix)) return false;
+    const rest = query[prefix.len..];
+    const page_marker = std.mem.indexOf(u8, rest, "&p=");
+    const keyword = if (page_marker) |index| rest[0..index] else rest;
+    if (!isCanonicalQueryValue(keyword)) return false;
+    if (page_marker) |index| return isCanonicalPageNumber(rest[index + "&p=".len ..]);
+    return true;
+}
+
+fn isCanonicalQueryValue(value: []const u8) bool {
+    if (value.len == 0) return false;
+    var index: usize = 0;
+    while (index < value.len) {
+        const c = value[index];
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~' or c == '+') {
+            index += 1;
+            continue;
+        }
+        if (c != '%' or value.len - index < 3 or
+            !std.ascii.isHex(value[index + 1]) or !std.ascii.isHex(value[index + 2])) return false;
+        index += 3;
+    }
+    return true;
+}
+
+fn isCanonicalDetailsPath(path: []const u8) bool {
+    const suffix = "-subtitles";
+    if (path.len <= 1 + suffix.len or path[0] != '/' or !std.mem.endsWith(u8, path, suffix)) return false;
+    return isCanonicalPathSegment(path[1 .. path.len - suffix.len]);
+}
+
+fn isCanonicalDownloadPath(path: []const u8) bool {
+    var segments = std.mem.splitScalar(u8, path, '/');
+    if (!std.mem.eql(u8, segments.next() orelse return false, "")) return false;
+    if (!std.mem.eql(u8, segments.next() orelse return false, "download")) return false;
+    const title = segments.next() orelse return false;
+    const language = segments.next() orelse return false;
+    const id = segments.next() orelse return false;
+    return segments.next() == null and
+        isCanonicalPathSegment(title) and
+        isCanonicalPathSegment(language) and
+        isCanonicalPositiveDecimal(id);
+}
+
+fn detailsTitleSegment(url: []const u8) ?[]const u8 {
+    const uri = std.Uri.parse(url) catch return null;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    const suffix = "-subtitles";
+    if (!isCanonicalDetailsPath(path)) return null;
+    return path[1 .. path.len - suffix.len];
+}
+
+fn downloadTitleSegment(url: []const u8) ?[]const u8 {
+    const uri = std.Uri.parse(url) catch return null;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    var segments = std.mem.splitScalar(u8, path, '/');
+    if (!std.mem.eql(u8, segments.next() orelse return null, "") or
+        !std.mem.eql(u8, segments.next() orelse return null, "download"))
+    {
+        return null;
+    }
+    return segments.next();
+}
+
+fn isDownloadForDetailsTitle(url: []const u8, details_title: []const u8) bool {
+    if (!isProviderRoute(url, .download_page)) return false;
+    const download_title = downloadTitleSegment(url) orelse return false;
+    return encodedPathSegmentsEqual(details_title, download_title);
+}
+
+fn encodedPathSegmentsEqual(lhs: []const u8, rhs: []const u8) bool {
+    var lhs_index: usize = 0;
+    var rhs_index: usize = 0;
+    while (lhs_index < lhs.len and rhs_index < rhs.len) {
+        const lhs_byte = nextEncodedPathByte(lhs, &lhs_index) orelse return false;
+        const rhs_byte = nextEncodedPathByte(rhs, &rhs_index) orelse return false;
+        if (lhs_byte != rhs_byte) return false;
+    }
+    return lhs_index == lhs.len and rhs_index == rhs.len;
+}
+
+fn nextEncodedPathByte(value: []const u8, index: *usize) ?u8 {
+    if (index.* >= value.len) return null;
+    const byte = value[index.*];
+    if (byte != '%') {
+        index.* += 1;
+        return byte;
+    }
+    if (value.len - index.* < 3) return null;
+    const high = std.fmt.charToDigit(value[index.* + 1], 16) catch return null;
+    const low = std.fmt.charToDigit(value[index.* + 2], 16) catch return null;
+    index.* += 3;
+    return @intCast(high * 16 + low);
+}
+
+fn isCanonicalPathSegment(value: []const u8) bool {
+    if (value.len == 0 or value.len > 512 or
+        std.mem.eql(u8, value, ".") or std.mem.eql(u8, value, "..")) return false;
+    var decoded: [512]u8 = undefined;
+    var decoded_len: usize = 0;
+    var index: usize = 0;
+    while (index < value.len) {
+        const c = value[index];
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
+            decoded[decoded_len] = c;
+            decoded_len += 1;
+            index += 1;
+            continue;
+        }
+        if (c != '%' or value.len - index < 3 or
+            !std.ascii.isHex(value[index + 1]) or !std.ascii.isHex(value[index + 2])) return false;
+        const byte = percentEncodedByte(value[index + 1], value[index + 2]) orelse return false;
+        // ASCII has a canonical unescaped spelling in provider path segments.
+        // Rejecting its escaped form also closes double-decoded separators,
+        // controls, query/fragment delimiters, and encoded percent signs.
+        if (byte < 0x80) return false;
+        decoded[decoded_len] = byte;
+        decoded_len += 1;
+        index += 3;
+    }
+    return std.unicode.utf8ValidateSlice(decoded[0..decoded_len]);
+}
+
+fn percentEncodedByte(high: u8, low: u8) ?u8 {
+    const high_value = hexNibble(high) orelse return null;
+    const low_value = hexNibble(low) orelse return null;
+    return (high_value << 4) | low_value;
+}
+
+fn hexNibble(byte: u8) ?u8 {
+    return switch (byte) {
+        '0'...'9' => byte - '0',
+        'a'...'f' => byte - 'a' + 10,
+        'A'...'F' => byte - 'A' + 10,
+        else => null,
+    };
+}
+
+fn isCanonicalPageQuery(query: []const u8) bool {
+    const prefix = "p=";
+    return std.mem.startsWith(u8, query, prefix) and
+        isCanonicalPageNumber(query[prefix.len..]);
+}
+
+fn isCanonicalPageNumber(value: []const u8) bool {
+    if (!isCanonicalPositiveDecimal(value)) return false;
+    _ = std.fmt.parseInt(usize, value, 10) catch return false;
+    return true;
+}
+
+fn isCanonicalPositiveDecimal(value: []const u8) bool {
+    if (value.len == 0 or value[0] == '0') return false;
+    for (value) |c| if (!std.ascii.isDigit(c)) return false;
     return true;
 }
 
@@ -259,14 +476,35 @@ fn collectSearchItemsFromSelector(
     var anchors = doc.queryAll(selector);
     while (anchors.next()) |anchor| {
         const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
-        const details_url = try common.resolveUrl(allocator, site, href);
-        if (!isProviderUrl(details_url)) continue;
-        if (seen.contains(details_url)) continue;
-        try seen.put(allocator, details_url, {});
-
         const raw_title = try common.innerTextTrimmedOwned(allocator, anchor);
+        errdefer allocator.free(raw_title);
         const split = splitTitleAndYear(raw_title);
-        try out.append(allocator, .{
+        if (split.title.len == 0) {
+            allocator.free(raw_title);
+            continue;
+        }
+
+        const details_url = common.resolveUrl(allocator, site, href) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            allocator.free(raw_title);
+            continue;
+        };
+        errdefer allocator.free(details_url);
+        if (!isProviderRoute(details_url, .details_root)) {
+            allocator.free(details_url);
+            allocator.free(raw_title);
+            continue;
+        }
+        if (seen.contains(details_url)) {
+            allocator.free(details_url);
+            allocator.free(raw_title);
+            continue;
+        }
+
+        try out.ensureUnusedCapacity(allocator, 1);
+        try seen.ensureUnusedCapacity(allocator, 1);
+        seen.putAssumeCapacityNoClobber(details_url, {});
+        out.appendAssumeCapacity(.{
             .title = split.title,
             .year = split.year,
             .details_url = details_url,
@@ -280,10 +518,18 @@ fn collectSearchItemsFromRawHtml(
     seen: *std.StringHashMapUnmanaged(void),
     out: *std.ArrayListUnmanaged(SearchItem),
 ) !void {
+    const href_prefix = "href=\"";
     var cursor: usize = 0;
-    while (std.mem.indexOfPos(u8, body, cursor, "href=\"")) |href_marker| {
-        const href_start = href_marker + "href=\"".len;
+    while (std.mem.indexOfPos(u8, body, cursor, href_prefix)) |href_marker| {
+        const href_start = href_marker + href_prefix.len;
+        const next_href_marker = std.mem.indexOfPos(u8, body, href_start, href_prefix);
         const href_end = std.mem.indexOfScalarPos(u8, body, href_start, '"') orelse break;
+        if (next_href_marker) |next_marker| {
+            if (next_marker < href_end) {
+                cursor = next_marker;
+                continue;
+            }
+        }
         cursor = href_end + 1;
 
         const href = body[href_start..href_end];
@@ -294,17 +540,46 @@ fn collectSearchItemsFromRawHtml(
         if (std.mem.indexOf(u8, href, "/search") != null) continue;
 
         const tag_end = std.mem.indexOfScalarPos(u8, body, href_end, '>') orelse continue;
+        if (next_href_marker) |next_marker| {
+            if (next_marker < tag_end) {
+                cursor = next_marker;
+                continue;
+            }
+        }
         const text_end = std.mem.indexOfPos(u8, body, tag_end + 1, "</a>") orelse continue;
+        if (next_href_marker) |next_marker| {
+            if (next_marker < text_end) {
+                cursor = next_marker;
+                continue;
+            }
+        }
         const raw_title = std.mem.trim(u8, body[tag_end + 1 .. text_end], " \t\r\n");
         if (raw_title.len == 0) continue;
 
-        const details_url = try common.resolveUrl(allocator, site, href);
-        if (!isProviderUrl(details_url)) continue;
-        if (seen.contains(details_url)) continue;
-        try seen.put(allocator, details_url, {});
+        const details_url = common.resolveUrl(allocator, site, href) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            continue;
+        };
+        errdefer allocator.free(details_url);
+        if (!isProviderRoute(details_url, .details_root)) {
+            allocator.free(details_url);
+            continue;
+        }
+        if (seen.contains(details_url)) {
+            allocator.free(details_url);
+            continue;
+        }
 
         const split = splitTitleAndYear(raw_title);
-        try out.append(allocator, .{
+        if (split.title.len == 0) {
+            allocator.free(details_url);
+            continue;
+        }
+
+        try out.ensureUnusedCapacity(allocator, 1);
+        try seen.ensureUnusedCapacity(allocator, 1);
+        seen.putAssumeCapacityNoClobber(details_url, {});
+        out.appendAssumeCapacity(.{
             .title = split.title,
             .year = split.year,
             .details_url = details_url,
@@ -346,6 +621,11 @@ fn buildSearchUrl(allocator: Allocator, query: []const u8, page: usize) ![]const
     defer allocator.free(form_query);
     if (page <= 1) return std.fmt.allocPrint(allocator, "{s}/search?kwd={s}", .{ site, form_query });
     return std.fmt.allocPrint(allocator, "{s}/search?kwd={s}&p={d}", .{ site, form_query, page });
+}
+
+fn checkedNextPage(page: usize) !?usize {
+    if (page >= max_pagination_page) return null;
+    return try std.math.add(usize, page, 1);
 }
 
 fn replaceEncodedSpaces(allocator: Allocator, encoded: []const u8) ![]u8 {
@@ -419,23 +699,17 @@ fn extractNextPageUrl(allocator: Allocator, doc: *const HtmlDocument, current_ur
 
     const current_page = pageFromUrl(current_url) orelse 1;
 
-    if (doc.queryOne("a[rel='next'][href]")) |a| {
-        if (common.getAttributeValueSafe(a, "href")) |href| {
-            const resolved = try common.resolveUrl(temp, site, href);
-            if (isProviderUrl(resolved) and !std.mem.eql(u8, resolved, current_url))
-                return try allocator.dupe(u8, resolved);
-        }
-    }
-
     var best_next_url: ?[]const u8 = null;
     var best_next_page: ?usize = null;
 
     var anchors = doc.queryAll("a[href]");
     while (anchors.next()) |anchor| {
         const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
-        const resolved = try common.resolveUrl(temp, site, href);
-        if (!isProviderUrl(resolved)) continue;
-        if (std.mem.eql(u8, resolved, current_url)) continue;
+        const resolved = common.resolveUrl(temp, site, href) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            continue;
+        };
+        if (!isCanonicalPaginationSuccessor(current_url, resolved)) continue;
 
         if (pageFromUrl(resolved)) |candidate_page| {
             if (candidate_page > current_page) {
@@ -443,13 +717,7 @@ fn extractNextPageUrl(allocator: Allocator, doc: *const HtmlDocument, current_ur
                     best_next_page = candidate_page;
                     best_next_url = resolved;
                 }
-                continue;
             }
-        }
-
-        const text = try common.innerTextTrimmedOwned(temp, anchor);
-        if (isLikelyNextText(text) and best_next_url == null) {
-            best_next_url = resolved;
         }
     }
 
@@ -457,12 +725,58 @@ fn extractNextPageUrl(allocator: Allocator, doc: *const HtmlDocument, current_ur
     return null;
 }
 
-fn maybeDebugDumpFirstPage(status: std.http.Status, page_url: []const u8, body: []const u8, traversed: usize) void {
+fn isCanonicalPaginationSuccessor(current_url: []const u8, candidate_url: []const u8) bool {
+    const current_route = providerPageRoute(current_url) orelse return false;
+    const candidate_route = providerPageRoute(candidate_url) orelse return false;
+    if (current_route != candidate_route) return false;
+
+    const current_uri = std.Uri.parse(current_url) catch return false;
+    const candidate_uri = std.Uri.parse(candidate_url) catch return false;
+    const current_path = switch (current_uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    const candidate_path = switch (candidate_uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    if (!std.mem.eql(u8, current_path, candidate_path)) return false;
+
+    if (current_route == .search_page) {
+        const current_keyword = searchKeywordFromUrl(current_url) orelse return false;
+        const candidate_keyword = searchKeywordFromUrl(candidate_url) orelse return false;
+        if (!std.mem.eql(u8, current_keyword, candidate_keyword)) return false;
+    }
+
+    const current_page = pageFromUrl(current_url) orelse 1;
+    const expected_page = (checkedNextPage(current_page) catch return false) orelse return false;
+    const candidate_page = pageFromUrl(candidate_url) orelse return false;
+    return candidate_page == expected_page;
+}
+
+fn providerPageRoute(url: []const u8) ?ProviderRoute {
+    if (isProviderRoute(url, .search_page)) return .search_page;
+    if (isProviderRoute(url, .details_page)) return .details_page;
+    return null;
+}
+
+fn searchKeywordFromUrl(url: []const u8) ?[]const u8 {
+    if (!isProviderRoute(url, .search_page)) return null;
+    const uri = std.Uri.parse(url) catch return null;
+    const component = uri.query orelse return null;
+    const query = switch (component) {
+        .raw, .percent_encoded => |value| value,
+    };
+    const prefix = "kwd=";
+    const rest = query[prefix.len..];
+    const end = std.mem.indexOf(u8, rest, "&p=") orelse rest.len;
+    return rest[0..end];
+}
+
+fn maybeDebugLogFirstPage(allocator: Allocator, status: std.http.Status, page_url: []const u8, body_len: usize, traversed: usize) void {
     if (traversed != 0) return;
     if (common.getenv("SCRAPERS_DEBUG_ISUB") == null) return;
 
-    std.debug.print("[isubtitles] status={d} body_len={d} url={s}\n", .{ @backingInt(status), body.len, page_url });
-    if (status != .ok) std.debug.print("[isubtitles] response={s}\n", .{body[0..@min(body.len, 1200)]});
+    const safe_url: []const u8 = common.redactUrlForLog(allocator, page_url) catch "<redacted-url>";
+    std.debug.print("[isubtitles] status={d} body_len={d} url={s}\n", .{ @backingInt(status), body_len, safe_url });
 }
 
 fn isLikelyNextText(text: []const u8) bool {
@@ -472,22 +786,22 @@ fn isLikelyNextText(text: []const u8) bool {
 }
 
 fn pageFromUrl(url: []const u8) ?usize {
-    const query_start = std.mem.indexOfScalar(u8, url, '?') orelse return null;
-    var query = url[query_start + 1 ..];
-    if (std.mem.indexOfScalar(u8, query, '#')) |hash_idx| {
-        query = query[0..hash_idx];
-    }
+    const uri = std.Uri.parse(url) catch return null;
+    const component = uri.query orelse return null;
+    const query = switch (component) {
+        .raw, .percent_encoded => |value| value,
+    };
 
     var fields = std.mem.splitScalar(u8, query, '&');
     while (fields.next()) |field| {
         if (field.len == 0) continue;
         const eq_idx = std.mem.indexOfScalar(u8, field, '=') orelse continue;
         const key = field[0..eq_idx];
-        if (!std.mem.eql(u8, key, "p") and !std.mem.eql(u8, key, "page")) continue;
+        if (!std.mem.eql(u8, key, "p")) continue;
 
         const value = field[eq_idx + 1 ..];
-        if (value.len == 0) continue;
-        return std.fmt.parseInt(usize, value, 10) catch continue;
+        if (!isCanonicalPositiveDecimal(value)) continue;
+        return std.fmt.parseInt(usize, value, 10) catch return null;
     }
 
     return null;
@@ -524,16 +838,89 @@ test "isubtitles split title/year" {
     try std.testing.expect(b.year == null);
 }
 
-test "isubtitles rejects non-provider navigation targets" {
-    try validateProviderUrl("https://isubtitles.org/the-matrix-subtitles");
-    for ([_][]const u8{
-        "http://127.0.0.1/the-matrix-subtitles",
-        "https://isubtitles.org.example/the-matrix-subtitles",
-        "https://user@isubtitles.org/the-matrix-subtitles",
-        "http://isubtitles.org/the-matrix-subtitles",
-    }) |url| {
-        try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl(url));
+test "isubtitles pagination counter is checked and capped" {
+    try std.testing.expectEqual(@as(?usize, 2), try checkedNextPage(1));
+    try std.testing.expectEqual(@as(?usize, max_pagination_page), try checkedNextPage(max_pagination_page - 1));
+    try std.testing.expect((try checkedNextPage(max_pagination_page)) == null);
+    try std.testing.expect((try checkedNextPage(std.math.maxInt(usize))) == null);
+}
+
+test "isubtitles rejects page starts beyond its request ceiling before I/O" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, _: Allocator, _: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+    try std.testing.expectError(error.ResponseTooLarge, scraper.searchWithOptionsUsing(Fixture.fetch, "Matrix", .{
+        .page_start = max_pagination_page + 1,
+    }));
+    try std.testing.expectError(error.ResponseTooLarge, scraper.fetchSubtitlesByMovieLinkWithOptionsUsing(
+        Fixture.fetch,
+        site ++ "/the-matrix-subtitles",
+        .{ .page_start = max_pagination_page + 1 },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+}
+
+test "isubtitles pagination accepts only the checked immediate successor" {
+    try std.testing.expect(isCanonicalPaginationSuccessor(
+        site ++ "/search?kwd=matrix&p=2",
+        site ++ "/search?kwd=matrix&p=3",
+    ));
+    try std.testing.expect(!isCanonicalPaginationSuccessor(
+        site ++ "/search?kwd=matrix&p=2",
+        site ++ "/search?kwd=matrix&p=5",
+    ));
+    try std.testing.expect(!isCanonicalPaginationSuccessor(
+        site ++ "/search?kwd=matrix&p=128",
+        site ++ "/search?kwd=matrix&p=129",
+    ));
+}
+
+test "isubtitles accepts only exact canonical provider routes" {
+    try validateProviderRoute(site ++ "/search?kwd=the+matrix&p=2", .search_page);
+    try validateProviderRoute(site ++ "/the-matrix-subtitles", .details_root);
+    try validateProviderRoute(site ++ "/the-matrix-subtitles?p=2", .details_page);
+    try validateProviderRoute(site ++ "/download/the-matrix/english/123", .download_page);
+
+    const invalid = [_]struct { url: []const u8, route: ProviderRoute }{
+        .{ .url = "http://127.0.0.1/the-matrix-subtitles", .route = .details_page },
+        .{ .url = "https://isubtitles.org.example/the-matrix-subtitles", .route = .details_page },
+        .{ .url = "https://user@isubtitles.org/the-matrix-subtitles", .route = .details_page },
+        .{ .url = "http://isubtitles.org/the-matrix-subtitles", .route = .details_page },
+        .{ .url = site ++ "/admin?p=2", .route = .details_page },
+        .{ .url = site ++ "/the-matrix-subtitles?p=2", .route = .details_root },
+        .{ .url = site ++ "/the-matrix-subtitles/extra", .route = .details_page },
+        .{ .url = site ++ "/the-matrix-subtitles?page=2", .route = .details_page },
+        .{ .url = site ++ "/the-matrix-subtitles?p=2&next=/admin", .route = .details_page },
+        .{ .url = site ++ "/the-matrix-subtitles#fragment", .route = .details_page },
+        .{ .url = site ++ "/search?kwd=matrix&next=/admin", .route = .search_page },
+        .{ .url = site ++ "/search?kwd=matrix&p=02", .route = .search_page },
+        .{ .url = site ++ "/download/123", .route = .download_page },
+        .{ .url = site ++ "/download/the-matrix/english/123?next=/admin", .route = .download_page },
+        .{ .url = site ++ "/download/the-matrix/english/123/extra", .route = .download_page },
+        .{ .url = site ++ "/download/the-matrix%2f..%2fadmin/english/123", .route = .download_page },
+        .{ .url = site ++ "/download/the-matrix%252f..%252fadmin/english/123", .route = .download_page },
+        .{ .url = site ++ "/download/the-matrix%00/english/123", .route = .download_page },
+        .{ .url = site ++ "/download/the-matrix%3fnext/english/123", .route = .download_page },
+        .{ .url = site ++ "/download/the-matrix%23fragment/english/123", .route = .download_page },
+        .{ .url = site ++ "/download/the-matrix%C0%AFadmin/english/123", .route = .download_page },
+    };
+    for (invalid) |case| {
+        try std.testing.expectError(error.InvalidDownloadUrl, validateProviderRoute(case.url, case.route));
     }
+
+    try validateProviderRoute(site ++ "/am%C3%A9lie-subtitles", .details_root);
+    try validateProviderRoute(site ++ "/download/am%C3%A9lie/french/123", .download_page);
 }
 
 test "isubtitles subtitle response owns the caller details URL" {
@@ -545,10 +932,14 @@ test "isubtitles subtitle response owns the caller details URL" {
                 .status = .ok,
                 .body = try allocator.dupe(
                     u8,
-                    "<section><table class='table'><tr>" ++
+                    "<section><table class='table'>" ++
+                        "<tr><td data-title='Download'><a href='/admin?download=123'>Bad</a></td></tr>" ++
+                        "<tr><td data-title='Download'><a href='/download/123'>Bad</a></td></tr>" ++
+                        "<tr><td data-title='Download'><a href='/download/the-matrix/english/123/extra'>Bad</a></td></tr>" ++
+                        "<tr>" ++
                         "<td data-title='Language'><a>English</a></td>" ++
                         "<td data-title='Release / Movie'><a>The.Matrix.1999</a></td>" ++
-                        "<td data-title='Download'><a href='/download/123'>Download</a></td>" ++
+                        "<td data-title='Download'><a href='/download/the-matrix/english/123'>Download</a></td>" ++
                         "</tr></table></section>",
                 ),
             };
@@ -563,8 +954,46 @@ test "isubtitles subtitle response owns the caller details URL" {
     defer response.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), response.subtitles.len);
+    try std.testing.expectEqualStrings(site ++ "/download/the-matrix/english/123", response.subtitles[0].download_page_url);
     @memset(&details_url, 'x');
     try std.testing.expectEqualStrings(site ++ "/the-matrix-subtitles", response.subtitles[0].details_url);
+}
+
+test "isubtitles binds download title and scans all row anchors" {
+    const Fixture = struct {
+        fn fetch(_: *std.http.Client, allocator: Allocator, _: []const u8, _: common.FetchOptions) !common.HttpResponse {
+            return .{
+                .status = .ok,
+                .body = try allocator.dupe(
+                    u8,
+                    "<section><table class='table'><tr>" ++
+                        "<td data-title='Language'><a>English</a></td>" ++
+                        "<td data-title='Release / Movie'><a>The.Matrix.1999</a></td>" ++
+                        "<td data-title='Download'>" ++
+                        "<a href='/download/another-title/english/123'>Wrong title</a>" ++
+                        "<a href='/download/123'>Malformed</a>" ++
+                        "<a href='/download/the-matrix/english/456'>Download</a>" ++
+                        "</td></tr></table></section>",
+                ),
+            };
+        }
+    };
+
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &client);
+    var response = try scraper.fetchSubtitlesByMovieLinkWithOptionsUsing(
+        Fixture.fetch,
+        site ++ "/the-matrix-subtitles",
+        .{},
+    );
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), response.subtitles.len);
+    try std.testing.expectEqualStrings(
+        site ++ "/download/the-matrix/english/456",
+        response.subtitles[0].download_page_url,
+    );
 }
 
 fn HtmlResponseFixture(comptime status: std.http.Status, comptime body: []const u8) type {
@@ -582,6 +1011,85 @@ fn HtmlErrorFixture(comptime fetch_error: anyerror) type {
             return fetch_error;
         }
     };
+}
+
+test "isubtitles trims queries and does not fetch empty searches" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, url: []const u8, _: common.FetchOptions) !common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            try std.testing.expectEqualStrings(site ++ "/search?kwd=Matrix", url);
+            return .{ .status = .ok, .body = try allocator.dupe(u8, "") };
+        }
+    };
+
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+
+    var empty = try scraper.searchWithOptionsUsing(Fixture.fetch, " \t\r\n ", .{ .page_start = 3 });
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.items.len);
+    try std.testing.expectEqual(@as(usize, 3), empty.page);
+    try std.testing.expect(empty.has_prev_page);
+    try std.testing.expect(!empty.has_next_page);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+
+    var trimmed = try scraper.searchWithOptionsUsing(Fixture.fetch, "  Matrix\t", .{});
+    defer trimmed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), trimmed.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+}
+
+test "isubtitles malformed duplicate does not suppress a valid search title" {
+    const Fixture = struct {
+        fn fetch(_: *std.http.Client, allocator: Allocator, _: []const u8, _: common.FetchOptions) !common.HttpResponse {
+            return .{
+                .status = .ok,
+                .body = try allocator.dupe(
+                    u8,
+                    "<div class=\"movie-list-info\"><h3>" ++
+                        "<a href=\"/admin/the-matrix-subtitles?next=/private\">Malicious sibling</a>" ++
+                        "<a href=\"/the-matrix-subtitles\"></a>" ++
+                        "<a href=\"/the-matrix-subtitles\">The Matrix - (1999)</a>" ++
+                        "</h3></div>",
+                ),
+            };
+        }
+    };
+
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &client);
+    var response = try scraper.searchWithOptionsUsing(Fixture.fetch, "The Matrix", .{});
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), response.items.len);
+    try std.testing.expectEqualStrings("The Matrix", response.items[0].title);
+    try std.testing.expectEqualStrings("1999", response.items[0].year.?);
+}
+
+test "isubtitles raw fallback recovers after a malformed first anchor" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    var out = std.ArrayListUnmanaged(SearchItem).empty;
+    try collectSearchItemsFromRawHtml(
+        a,
+        "<a href=\"/broken-subtitles<a href=\"/the-matrix-subtitles\">The Matrix - (1999)</a>",
+        &seen,
+        &out,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqualStrings("The Matrix", out.items[0].title);
+    try std.testing.expectEqualStrings("1999", out.items[0].year.?);
+    try std.testing.expectEqualStrings(site ++ "/the-matrix-subtitles", out.items[0].details_url);
 }
 
 test "isubtitles classifies failed and deceptive HTML responses" {
@@ -751,4 +1259,26 @@ test "isubtitles extractNextPageUrl prefers nearest greater numeric page" {
     try std.testing.expect(next != null);
     defer a.free(next.?);
     try std.testing.expectEqualStrings("https://isubtitles.org/search?kwd=matrix&p=3", next.?);
+}
+
+test "isubtitles pager ignores malicious and cross-query siblings" {
+    const a = std.testing.allocator;
+    const html_source =
+        \\<div class="paging">
+        \\  <a rel="next" href="/admin?p=2">Next</a>
+        \\  <a href="/search?kwd=other&p=2">2</a>
+        \\  <a href="/the-matrix-subtitles?p=2">2</a>
+        \\  <a href="/search?kwd=matrix&page=2">2</a>
+        \\  <a href="/search?kwd=matrix&p=3">3</a>
+        \\  <a href="/search?kwd=matrix&p=2">2</a>
+        \\</div>
+    ;
+
+    var parsed = try common.parseHtmlStable(a, html_source);
+    defer parsed.deinit();
+
+    const next = try extractNextPageUrl(a, &parsed.doc, site ++ "/search?kwd=matrix");
+    try std.testing.expect(next != null);
+    defer a.free(next.?);
+    try std.testing.expectEqualStrings(site ++ "/search?kwd=matrix&p=2", next.?);
 }

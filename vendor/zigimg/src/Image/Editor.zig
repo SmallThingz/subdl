@@ -1,5 +1,5 @@
 const std = @import("std");
-pub const Error = std.mem.Allocator.Error;
+pub const Error = std.mem.Allocator.Error || error{ InvalidData, Unsupported };
 
 const color = @import("../color.zig");
 const Image = @import("../Image.zig");
@@ -7,6 +7,9 @@ const Image = @import("../Image.zig");
 /// Flip the image vertically, along the X axis.
 pub fn flipVertically(pixels: *const color.PixelStorage, height: usize, allocator: std.mem.Allocator) Error!void {
     var image_data = pixels.asBytes();
+    if (height == 0 or image_data.len == 0 or image_data.len % height != 0) {
+        return error.InvalidData;
+    }
     const row_size = image_data.len / height;
 
     const temp = try allocator.alloc(u8, row_size);
@@ -22,15 +25,24 @@ pub fn flipVertically(pixels: *const color.PixelStorage, height: usize, allocato
 
 /// Create and allocate a cropped subsection of this image.
 pub fn crop(image: *const Image, allocator: std.mem.Allocator, crop_area: Box) Error!Image {
+    const pixel_format = image.pixelFormat();
+    if (pixel_format == .invalid) return error.Unsupported;
+
     const box = crop_area.clamp(image.width, image.height);
+    const crop_pixel_count = std.math.mul(usize, box.width, box.height) catch return error.InvalidData;
+    const source_pixel_count = std.math.mul(usize, image.width, image.height) catch return error.InvalidData;
+    const pixel_size: usize = pixel_format.pixelStride();
+    const expected_source_len = std.math.mul(usize, source_pixel_count, pixel_size) catch return error.InvalidData;
+    const original_data = image.pixels.asConstBytes();
+    if (original_data.len != expected_source_len) return error.InvalidData;
 
     var cropped_pixels = try color.PixelStorage.init(
         allocator,
-        image.pixelFormat(),
-        box.width * box.height,
+        pixel_format,
+        crop_pixel_count,
     );
 
-    if (image.pixelFormat().isIndexed()) {
+    if (pixel_format.isIndexed()) {
         const source_palette = image.pixels.getPalette().?;
         cropped_pixels.resizePalette(source_palette.len);
 
@@ -49,16 +61,16 @@ pub fn crop(image: *const Image, allocator: std.mem.Allocator, crop_area: Box) E
         };
     }
 
-    const original_data = image.pixels.asBytes();
     const cropped_data = cropped_pixels.asBytes();
-    const pixel_size = image.pixelFormat().pixelStride();
-    std.debug.assert(cropped_data.len == box.width * box.height * pixel_size);
+    const expected_crop_len = std.math.mul(usize, crop_pixel_count, pixel_size) catch unreachable;
+    std.debug.assert(cropped_data.len == expected_crop_len);
 
     var y: usize = 0;
-    const row_byte_width = box.width * pixel_size;
+    const row_byte_width = std.math.mul(usize, box.width, pixel_size) catch unreachable;
     while (y < box.height) : (y += 1) {
-        const start_pixel = (box.x * pixel_size) + ((y + box.y) * image.width * pixel_size);
-        const source = original_data[start_pixel .. start_pixel + row_byte_width];
+        const start_pixel = box.x + (y + box.y) * image.width;
+        const start_byte = start_pixel * pixel_size;
+        const source = original_data[start_byte .. start_byte + row_byte_width];
         const destination_pixel = y * row_byte_width;
         const destination = cropped_data[destination_pixel .. destination_pixel + row_byte_width];
         @memcpy(destination, source);
@@ -88,8 +100,10 @@ pub const Box = struct {
     /// adjust the crop region.
     pub fn clamp(area: Box, image_width: usize, image_height: usize) Box {
         var box = area;
-        if (box.x + box.width > image_width) box.width = image_width - box.x;
-        if (box.y + box.height > image_height) box.height = image_height - box.y;
+        box.x = @min(box.x, image_width);
+        box.y = @min(box.y, image_height);
+        box.width = @min(box.width, image_width - box.x);
+        box.height = @min(box.height, image_height - box.y);
         return box;
     }
 };

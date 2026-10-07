@@ -15,9 +15,7 @@ pub const SearchOptions = struct {
     /// enabled, tvseries rows include season links so callers can fetch one
     /// season-specific subtitle page instead of scraping the generic series URL.
     include_seasons: bool = true,
-    page_start: usize = 1,
-    max_pages: usize = 1,
-    limit_per_page: usize = 5000,
+    result_limit: usize = 5000,
     cf_clearance: ?[]const u8 = null,
     user_agent: ?[]const u8 = null,
     auto_cloudflare_session: bool = false,
@@ -108,15 +106,22 @@ pub const Scraper = struct {
         const a = arena.allocator();
 
         const query_trimmed = std.mem.trim(u8, query, " \t\r\n");
+        if (query_trimmed.len == 0) {
+            return common.finishResponse(SearchResponse, &arena, .{
+                .arena = arena,
+                .query_used = try a.dupe(u8, ""),
+                .items = &.{},
+                .page = 1,
+                .has_prev_page = false,
+                .has_next_page = false,
+            });
+        }
         var auth = try resolveAuth(a, options.cf_clearance, options.user_agent);
         defer auth.deinit(a);
 
         var out: std.ArrayListUnmanaged(SearchItem) = .empty;
         var seen = std.AutoHashMapUnmanaged(i64, void).empty;
-        var query_used: []const u8 = if (query_trimmed.len > 0)
-            try a.dupe(u8, query_trimmed)
-        else
-            try a.dupe(u8, query);
+        var query_used: []const u8 = try a.dupe(u8, query_trimmed);
 
         // Keep broad queries broad. The browser uses movie/search directly and
         // that endpoint returns both movie and tvseries results; the suggestion
@@ -168,6 +173,7 @@ pub const Scraper = struct {
         var seen_endpoint = std.StringHashMapUnmanaged(void).empty;
         var seen_subtitle = std.StringHashMapUnmanaged(void).empty;
         var out: std.ArrayListUnmanaged(SubtitleItem) = .empty;
+        var has_next_page = false;
 
         for (endpoints.items) |endpoint| {
             if (seen_endpoint.contains(endpoint)) continue;
@@ -177,11 +183,12 @@ pub const Scraper = struct {
             var page = if (options.page_start == 0) 1 else options.page_start;
             var traversed: usize = 0;
 
-            while (traversed < max_pages) : (traversed += 1) {
+            while (traversed < max_pages) {
                 const endpoint_url = if (page <= 1)
                     try std.fmt.allocPrint(a, "{s}{s}", .{ api_base, endpoint })
                 else
                     try std.fmt.allocPrint(a, "{s}{s}?page={d}", .{ api_base, endpoint, page });
+                try validateSubtitlesListingApiUrl(endpoint_url);
 
                 const response = try fetchApiJsonWith(fetchApiJsonRequest, acquireBrowserAuth, self.client, a, endpoint_url, null, &auth, options);
 
@@ -197,19 +204,20 @@ pub const Scraper = struct {
                     else => return error.InvalidFieldType,
                 };
 
-                var new_count: usize = 0;
                 for (subtitles_arr.items) |entry| {
                     const obj = switch (entry) {
                         .object => |o| o,
                         else => continue,
                     };
 
-                    const details_path = objString(obj, "link") orelse
+                    const raw_details_path = objString(obj, "link") orelse
                         objString(obj, "details_path") orelse
                         objString(obj, "path") orelse continue;
+                    const details_path = canonicalizeDetailsPath(a, raw_details_path) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        continue;
+                    };
                     if (seen_subtitle.contains(details_path)) continue;
-                    try seen_subtitle.put(a, details_path, {});
-                    new_count += 1;
 
                     const id = objInt(obj, "id") orelse 0;
                     const language_raw = objString(obj, "language") orelse objString(obj, "language_name");
@@ -225,6 +233,7 @@ pub const Scraper = struct {
                         download_url = details.download_url;
                     }
 
+                    try seen_subtitle.put(a, details_path, {});
                     try out.append(a, .{
                         .id = id,
                         .language_raw = language_raw,
@@ -237,8 +246,10 @@ pub const Scraper = struct {
                     });
                 }
 
-                if (new_count == 0) break;
-                page += 1;
+                traversed += 1;
+                if (subtitlePageMayHaveNext(subtitles_arr.items.len, traversed, max_pages)) has_next_page = true;
+                if (shouldStopSubtitlePagination(subtitles_arr.items.len, traversed, max_pages)) break;
+                page = try checkedNextPage(page);
             }
         }
 
@@ -250,7 +261,7 @@ pub const Scraper = struct {
             .subtitles = try out.toOwnedSlice(a),
             .page = current_page,
             .has_prev_page = current_page > 1,
-            .has_next_page = false,
+            .has_next_page = has_next_page,
         });
     }
 
@@ -295,8 +306,9 @@ fn fetchSubtitleDetailsWith(
     auth: *Auth,
     options: SubtitlesOptions,
 ) !Scraper.SubtitleDetails {
-    const trimmed = std.mem.trimStart(u8, details_path, "/");
-    const url = try std.fmt.allocPrint(allocator, "{s}/subtitle/{s}", .{ api_base, trimmed });
+    const canonical_path = try canonicalizeDetailsPath(allocator, details_path);
+    defer allocator.free(canonical_path);
+    const url = try std.fmt.allocPrint(allocator, "{s}/subtitle/{s}", .{ api_base, canonical_path });
     try validateSubsourceApiUrl(url);
 
     const response = try fetchApiJsonWith(fetch, acquire, client, allocator, url, null, auth, options);
@@ -320,10 +332,11 @@ fn fetchSubtitleDetailsWith(
 
     const token = objString(subtitle_obj, "download_token") orelse return .{ .download_token = null, .download_url = null };
     if (token.len == 0) return .{ .download_token = null, .download_url = null };
+    const encoded_token = try canonicalizeApiPathSegment(allocator, token, false);
 
     return .{
-        .download_token = token,
-        .download_url = try std.fmt.allocPrint(allocator, "{s}/subtitle/download/{s}", .{ api_base, token }),
+        .download_token = encoded_token,
+        .download_url = try std.fmt.allocPrint(allocator, "{s}/subtitle/download/{s}", .{ api_base, encoded_token }),
     };
 }
 
@@ -491,7 +504,7 @@ fn appendSearchResults(
     options: SearchOptions,
     auth: *Auth,
 ) !void {
-    const payload = try buildSearchPayload(allocator, query, options.include_seasons, options.limit_per_page);
+    const payload = try buildSearchPayload(allocator, query, options.include_seasons, options.result_limit);
 
     const response = try fetchApiJsonWith(fetchApiJsonRequest, acquireBrowserAuth, client, allocator, api_base ++ "/movie/search", payload, auth, options);
 
@@ -507,24 +520,37 @@ fn appendSearchResults(
         else => return error.InvalidFieldType,
     };
 
-    for (results.items) |entry| {
+    try appendSearchResultValues(allocator, out, seen, results.items);
+}
+
+fn appendSearchResultValues(
+    allocator: Allocator,
+    out: *std.ArrayListUnmanaged(SearchItem),
+    seen: *std.AutoHashMapUnmanaged(i64, void),
+    entries: []const std.json.Value,
+) !void {
+    for (entries) |entry| {
         const obj = switch (entry) {
             .object => |o| o,
             else => continue,
         };
 
         const id = objInt(obj, "id") orelse continue;
-        if (seen.contains(id)) continue;
-        try seen.put(allocator, id, {});
+        if (id <= 0 or seen.contains(id)) continue;
 
         const title = objString(obj, "title") orelse objString(obj, "name") orelse continue;
         const media_type = objString(obj, "type") orelse objString(obj, "media_type") orelse "unknown";
         const raw_link = objString(obj, "link") orelse objString(obj, "url") orelse continue;
-        const link = try toAbsoluteSiteLink(allocator, raw_link);
+        const link = toAbsoluteSiteLink(allocator, raw_link) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            continue;
+        };
         const release_year = objInt(obj, "releaseYear") orelse objInt(obj, "release_year");
         const subtitle_count = objInt(obj, "subtitleCount") orelse objInt(obj, "subtitle_count");
 
         var seasons_out: std.ArrayListUnmanaged(SeasonItem) = .empty;
+        var seen_seasons = std.AutoHashMapUnmanaged(i64, void).empty;
+        defer seen_seasons.deinit(allocator);
         if (obj.get("seasons")) |seasons_v| {
             if (seasons_v == .array) {
                 for (seasons_v.array.items) |season_v| {
@@ -533,13 +559,23 @@ fn appendSearchResults(
                         else => continue,
                     };
                     const season_num = objInt(season_obj, "season") orelse objInt(season_obj, "number") orelse continue;
+                    if (season_num <= 0 or seen_seasons.contains(season_num)) continue;
                     const season_link_raw = objString(season_obj, "link") orelse objString(season_obj, "url") orelse continue;
-                    const season_link = try toAbsoluteSiteLink(allocator, season_link_raw);
+                    const season_link = toAbsoluteSiteLink(allocator, season_link_raw) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        continue;
+                    };
+                    if (!(try siteLinkBindsSeason(allocator, season_link, link, season_num))) {
+                        allocator.free(season_link);
+                        continue;
+                    }
                     try seasons_out.append(allocator, .{ .season = season_num, .link = season_link });
+                    try seen_seasons.put(allocator, season_num, {});
                 }
             }
         }
 
+        try seen.put(allocator, id, {});
         try out.append(allocator, .{
             .id = id,
             .title = title,
@@ -590,6 +626,99 @@ fn validateDownloadBody(body: []const u8) !void {
 fn validateSubsourceApiUrl(url: []const u8) !void {
     try common.validatePublicHttpUrl(url);
     if (!(try common.sameOrigin(api_base, url))) return error.InvalidDownloadUrl;
+}
+
+fn validateSubtitlesListingApiUrl(url: []const u8) !void {
+    try validateSubsourceApiUrl(url);
+    const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
+    if (uri.user != null or uri.password != null or uri.fragment != null) return error.InvalidDownloadUrl;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    const prefix = "/v1/subtitles/";
+    if (!std.mem.startsWith(u8, path, prefix)) return error.InvalidDownloadUrl;
+
+    var segments = std.mem.splitScalar(u8, path[prefix.len..], '/');
+    const slug = segments.next() orelse return error.InvalidDownloadUrl;
+    if (!isCanonicalEncodedListingSlug(slug)) return error.InvalidDownloadUrl;
+    if (segments.next()) |season_segment| {
+        const season_prefix = "season-";
+        if (!std.mem.startsWith(u8, season_segment, season_prefix) or
+            !isCanonicalPositiveDecimal(season_segment[season_prefix.len..])) return error.InvalidDownloadUrl;
+    }
+    if (segments.next() != null) return error.InvalidDownloadUrl;
+
+    if (uri.query) |component| {
+        const query = switch (component) {
+            .raw, .percent_encoded => |value| value,
+        };
+        const page_prefix = "page=";
+        if (!std.mem.startsWith(u8, query, page_prefix) or
+            !isCanonicalPositiveDecimal(query[page_prefix.len..])) return error.InvalidDownloadUrl;
+    }
+}
+
+/// Normalize the provider's subtitle-detail route to exactly
+/// `<title>/<language>/<numeric id>`. The returned value never has a leading
+/// slash, so callers can append it only beneath `/v1/subtitle/`.
+pub fn canonicalizeDetailsPath(allocator: Allocator, details_path: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, details_path, " \t\r\n");
+    if (trimmed.len == 0 or std.mem.indexOfAny(u8, trimmed, "?#") != null) return error.InvalidDownloadUrl;
+
+    const path = if (trimmed[0] == '/') trimmed[1..] else trimmed;
+    if (path.len == 0 or path[0] == '/') return error.InvalidDownloadUrl;
+
+    var split = std.mem.splitScalar(u8, path, '/');
+    var encoded: [3][]u8 = undefined;
+    var initialized: usize = 0;
+    errdefer for (encoded[0..initialized]) |segment| allocator.free(segment);
+
+    while (initialized < encoded.len) : (initialized += 1) {
+        const raw_segment = split.next() orelse return error.InvalidDownloadUrl;
+        encoded[initialized] = try canonicalizeApiPathSegment(allocator, raw_segment, initialized == encoded.len - 1);
+    }
+    if (split.next() != null) return error.InvalidDownloadUrl;
+
+    defer for (encoded) |segment| allocator.free(segment);
+    return std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ encoded[0], encoded[1], encoded[2] });
+}
+
+fn canonicalizeApiPathSegment(allocator: Allocator, raw_segment: []const u8, require_digits: bool) ![]u8 {
+    if (raw_segment.len == 0) return error.InvalidDownloadUrl;
+    const decoded = try decodeApiPathSegment(allocator, raw_segment);
+    defer allocator.free(decoded);
+
+    if (decoded.len == 0 or std.mem.eql(u8, decoded, ".") or std.mem.eql(u8, decoded, ".."))
+        return error.InvalidDownloadUrl;
+    for (decoded) |byte| {
+        if (byte < 0x20 or byte == 0x7f or byte == '/' or byte == '\\' or byte == '?' or byte == '#')
+            return error.InvalidDownloadUrl;
+        if (require_digits and !std.ascii.isDigit(byte)) return error.InvalidDownloadUrl;
+    }
+    if (require_digits and decoded[0] == '0') return error.InvalidDownloadUrl;
+
+    return common.encodeUriComponent(allocator, decoded);
+}
+
+fn decodeApiPathSegment(allocator: Allocator, raw_segment: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < raw_segment.len) {
+        if (raw_segment[index] != '%') {
+            try out.append(allocator, raw_segment[index]);
+            index += 1;
+            continue;
+        }
+        if (raw_segment.len - index < 3) return error.InvalidDownloadUrl;
+        const high = std.fmt.charToDigit(raw_segment[index + 1], 16) catch return error.InvalidDownloadUrl;
+        const low = std.fmt.charToDigit(raw_segment[index + 2], 16) catch return error.InvalidDownloadUrl;
+        try out.append(allocator, @intCast(high * 16 + low));
+        index += 3;
+    }
+
+    return out.toOwnedSlice(allocator);
 }
 
 fn fetchApiJsonRequest(client: *std.http.Client, allocator: Allocator, url: []const u8, payload: ?[]const u8, auth: Auth) !common.HttpResponse {
@@ -738,6 +867,7 @@ fn getWithAuth(comptime fetch: anytype, client: *std.http.Client, allocator: All
         .cache = false,
         .require_public_origin = true,
         .require_https = true,
+        .require_same_origin = true,
     });
 }
 
@@ -775,6 +905,7 @@ fn postJson(client: *std.http.Client, allocator: Allocator, url: []const u8, pay
         .cache = false,
         .require_public_origin = true,
         .require_https = true,
+        .require_same_origin = true,
     });
 }
 
@@ -793,59 +924,122 @@ fn normalizeSubsourceLanguage(raw: ?[]const u8) ?[]const u8 {
 }
 
 fn pathToSubtitles(allocator: Allocator, link: []const u8) !?[]const u8 {
-    var normalized = std.mem.trim(u8, link, " \t\r\n");
-    if (normalized.len == 0) return null;
+    const trimmed = std.mem.trim(u8, link, " \t\r\n");
+    if (trimmed.len == 0) return null;
 
-    if (std.mem.startsWith(u8, normalized, "http://") or std.mem.startsWith(u8, normalized, "https://")) {
-        const start = std.mem.indexOf(u8, normalized, "/subtitles/") orelse
-            std.mem.indexOf(u8, normalized, "/series/") orelse return null;
-        normalized = normalized[start..];
+    var path = trimmed;
+    if (std.mem.indexOf(u8, trimmed, "://") != null) {
+        common.validatePublicHttpUrl(trimmed) catch return null;
+        if (!(common.sameOrigin(site, trimmed) catch false)) return null;
+        const uri = std.Uri.parse(trimmed) catch return null;
+        if (uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return null;
+        path = switch (uri.path) {
+            .raw, .percent_encoded => |value| value,
+        };
+    } else if (std.mem.indexOfAny(u8, trimmed, "?#\\") != null) {
+        return null;
     }
 
-    const marker = "/season=";
+    const tail = if (std.mem.startsWith(u8, path, "/subtitles/"))
+        path["/subtitles/".len..]
+    else if (std.mem.startsWith(u8, path, "/series/"))
+        path["/series/".len..]
+    else if (path.len > 0 and path[0] != '/')
+        path
+    else
+        return null;
 
-    if (std.mem.startsWith(u8, normalized, "/subtitles/")) {
-        if (std.mem.indexOf(u8, normalized, marker)) |idx| {
-            const season = normalized[idx + marker.len ..];
-            if (season.len > 0) {
-                return try std.fmt.allocPrint(allocator, "{s}/season-{s}", .{ normalized[0..idx], season });
-            }
-        }
-        return try allocator.dupe(u8, normalized);
-    }
-    if (std.mem.startsWith(u8, normalized, "/series/")) {
-        return try std.fmt.allocPrint(allocator, "/subtitles/{s}", .{normalized["/series/".len..]});
+    var parts = std.mem.splitScalar(u8, tail, '/');
+    const raw_slug = parts.next() orelse return null;
+    const raw_season = parts.next();
+    if (parts.next() != null) return null;
+
+    const slug = canonicalizeListingSlug(allocator, raw_slug) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return null;
+    };
+    defer allocator.free(slug);
+
+    if (raw_season) |season_segment| {
+        const season = if (std.mem.startsWith(u8, season_segment, "season="))
+            season_segment["season=".len..]
+        else if (std.mem.startsWith(u8, season_segment, "season-"))
+            season_segment["season-".len..]
+        else
+            return null;
+        if (!isCanonicalPositiveDecimal(season)) return null;
+        return try std.fmt.allocPrint(allocator, "/subtitles/{s}/season-{s}", .{ slug, season });
     }
 
-    if (!std.mem.startsWith(u8, normalized, "/")) {
-        if (std.mem.indexOf(u8, normalized, marker)) |idx| {
-            const season = normalized[idx + marker.len ..];
-            if (season.len > 0) {
-                return try std.fmt.allocPrint(allocator, "/subtitles/{s}/season-{s}", .{ normalized[0..idx], season });
-            }
-        }
-        return try std.fmt.allocPrint(allocator, "/subtitles/{s}", .{normalized});
-    }
-
-    if (std.mem.indexOf(u8, normalized, marker)) |idx| {
-        const season = normalized[idx + marker.len ..];
-        if (season.len > 0) {
-            return try std.fmt.allocPrint(allocator, "/subtitles{s}/season-{s}", .{ normalized[0..idx], season });
-        }
-    }
-    return try std.fmt.allocPrint(allocator, "/subtitles{s}", .{normalized});
+    return try std.fmt.allocPrint(allocator, "/subtitles/{s}", .{slug});
 }
 
 fn toAbsoluteSiteLink(allocator: Allocator, link: []const u8) ![]const u8 {
     const trimmed = std.mem.trim(u8, link, " \t\r\n");
-    if (trimmed.len == 0) return try allocator.dupe(u8, trimmed);
-    if (std.mem.startsWith(u8, trimmed, "http://") or std.mem.startsWith(u8, trimmed, "https://")) {
-        return try allocator.dupe(u8, trimmed);
+    if (trimmed.len == 0) return error.InvalidDownloadUrl;
+    const resolved = try common.resolveUrl(allocator, site, trimmed);
+    errdefer allocator.free(resolved);
+    const listing_path = (try pathToSubtitles(allocator, resolved)) orelse return error.InvalidDownloadUrl;
+    allocator.free(listing_path);
+    return resolved;
+}
+
+fn isCanonicalPositiveDecimal(value: []const u8) bool {
+    if (value.len == 0 or value[0] == '0') return false;
+    for (value) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+fn canonicalizeListingSlug(allocator: Allocator, raw_slug: []const u8) ![]u8 {
+    const decoded = try decodeApiPathSegment(allocator, raw_slug);
+    defer allocator.free(decoded);
+    if (decoded.len == 0 or std.mem.eql(u8, decoded, ".") or std.mem.eql(u8, decoded, ".."))
+        return error.InvalidDownloadUrl;
+    for (decoded) |byte| {
+        if (byte >= 0x80) continue;
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.' or byte == '~'))
+            return error.InvalidDownloadUrl;
     }
-    if (std.mem.startsWith(u8, trimmed, "/")) {
-        return try std.fmt.allocPrint(allocator, "{s}{s}", .{ site, trimmed });
+    return common.encodeUriComponent(allocator, decoded);
+}
+
+fn isCanonicalEncodedListingSlug(value: []const u8) bool {
+    if (value.len == 0 or std.mem.eql(u8, value, ".") or std.mem.eql(u8, value, "..")) return false;
+    var index: usize = 0;
+    while (index < value.len) {
+        const c = value[index];
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
+            index += 1;
+            continue;
+        }
+        if (c != '%' or value.len - index < 3 or
+            !std.ascii.isHex(value[index + 1]) or !std.ascii.isHex(value[index + 2])) return false;
+        const high = std.fmt.charToDigit(value[index + 1], 16) catch return false;
+        const low = std.fmt.charToDigit(value[index + 2], 16) catch return false;
+        const decoded: u8 = @intCast(high * 16 + low);
+        if (decoded < 0x80) return false;
+        index += 3;
     }
-    return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ site, trimmed });
+    return true;
+}
+
+fn siteLinkBindsSeason(
+    allocator: Allocator,
+    link: []const u8,
+    base_link: []const u8,
+    expected_season: i64,
+) !bool {
+    if (expected_season <= 0) return false;
+    const listing_path = (try pathToSubtitles(allocator, link)) orelse return false;
+    defer allocator.free(listing_path);
+    const base_path = (try pathToSubtitles(allocator, base_link)) orelse return false;
+    defer allocator.free(base_path);
+    const marker = "/season-";
+    const marker_index = std.mem.lastIndexOf(u8, listing_path, marker) orelse return false;
+    if (std.mem.indexOf(u8, base_path, marker) != null or marker_index != base_path.len or
+        !std.mem.eql(u8, listing_path[0..marker_index], base_path)) return false;
+    const season = std.fmt.parseInt(i64, listing_path[marker_index + marker.len ..], 10) catch return false;
+    return season == expected_season;
 }
 
 fn objString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -892,6 +1086,8 @@ fn objFirstArrayString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 }
 
 fn escapeJson(allocator: Allocator, input: []const u8) ![]const u8 {
+    if (!std.unicode.utf8ValidateSlice(input)) return error.InvalidUtf8Data;
+
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
@@ -899,14 +1095,34 @@ fn escapeJson(allocator: Allocator, input: []const u8) ![]const u8 {
         switch (c) {
             '\\' => try out.appendSlice(allocator, "\\\\"),
             '"' => try out.appendSlice(allocator, "\\\""),
+            0x08 => try out.appendSlice(allocator, "\\b"),
+            0x0c => try out.appendSlice(allocator, "\\f"),
             '\n' => try out.appendSlice(allocator, "\\n"),
             '\r' => try out.appendSlice(allocator, "\\r"),
             '\t' => try out.appendSlice(allocator, "\\t"),
-            else => try out.append(allocator, c),
+            else => if (c < 0x20) {
+                const hex = "0123456789abcdef";
+                const escaped = [_]u8{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 0x0f] };
+                try out.appendSlice(allocator, &escaped);
+            } else {
+                try out.append(allocator, c);
+            },
         }
     }
 
     return try out.toOwnedSlice(allocator);
+}
+
+fn checkedNextPage(page: usize) !usize {
+    return std.math.add(usize, page, 1) catch error.PageOverflow;
+}
+
+fn shouldStopSubtitlePagination(page_item_count: usize, traversed: usize, max_pages: usize) bool {
+    return page_item_count == 0 or traversed >= max_pages;
+}
+
+fn subtitlePageMayHaveNext(page_item_count: usize, traversed: usize, max_pages: usize) bool {
+    return page_item_count > 0 and traversed >= max_pages;
 }
 
 fn makeFixtureBrowserSession(allocator: Allocator, generation: u64) !cf_shared.Session {
@@ -969,7 +1185,28 @@ test "subsource path to subtitles" {
     defer allocator.free(d);
     try std.testing.expectEqualStrings("/subtitles/friends/season-10", d);
 
-    try std.testing.expect((try pathToSubtitles(allocator, "")) == null);
+    const e = (try pathToSubtitles(allocator, "the-matrix-1999")).?;
+    defer allocator.free(e);
+    try std.testing.expectEqualStrings("/subtitles/the-matrix-1999", e);
+
+    for ([_][]const u8{
+        "",
+        "https://evil.example/subtitles/the-matrix-1999",
+        "https://user@subsource.net/subtitles/the-matrix-1999",
+        "http://subsource.net/subtitles/the-matrix-1999",
+        "/admin/the-matrix-1999",
+        "/subtitles/../admin",
+        "/subtitles/the-matrix-1999?next=/admin",
+        "/subtitles/the-matrix-1999#fragment",
+        "/subtitles/the-matrix-1999/extra",
+        "/subtitles/friends/season=0",
+        "/subtitles/friends/season=01",
+        "/subtitles/friends/season=one",
+        "/subtitles/the%2fmatrix",
+        "javascript:alert(1)",
+    }) |invalid| {
+        try std.testing.expect((try pathToSubtitles(allocator, invalid)) == null);
+    }
 }
 
 test "subsource language normalization" {
@@ -1177,7 +1414,7 @@ test "subsource authenticated download keeps recovered auth for the archive" {
 
         fn fetchDetails(_: *std.http.Client, allocator: Allocator, url: []const u8, payload: ?[]const u8, auth: Auth) !common.HttpResponse {
             detail_calls += 1;
-            try std.testing.expectEqualStrings(api_base ++ "/subtitle/fixture-details", url);
+            try std.testing.expectEqualStrings(api_base ++ "/subtitle/fixture-title/english/42", url);
             try std.testing.expect(payload == null);
             if (detail_calls == 1) {
                 try std.testing.expect(auth.browser_session == null);
@@ -1204,7 +1441,7 @@ test "subsource authenticated download keeps recovered auth for the archive" {
 
         fn acquire(allocator: Allocator, request_url: []const u8, rejected_generation: ?u64, force_refresh: bool) !Auth {
             acquire_calls += 1;
-            try std.testing.expectEqualStrings(api_base ++ "/subtitle/fixture-details", request_url);
+            try std.testing.expectEqualStrings(api_base ++ "/subtitle/fixture-title/english/42", request_url);
             try std.testing.expect(rejected_generation == null);
             try std.testing.expect(!force_refresh);
             return makeFixtureBrowserAuth(allocator, 41);
@@ -1222,7 +1459,7 @@ test "subsource authenticated download keeps recovered auth for the archive" {
         Mock.acquire,
         &client,
         std.testing.allocator,
-        "fixture-details",
+        "fixture-title/english/42",
         .{
             .cf_clearance = "configured-clearance",
             .user_agent = "configured-agent",
@@ -1257,6 +1494,23 @@ test "subsource API URL validation rejects alternate and unsafe origins" {
     try validateSubsourceApiUrl(api_base ++ "/subtitle/download/fixture");
     try std.testing.expectError(error.InvalidDownloadUrl, validateSubsourceApiUrl("https://example.com/archive.zip"));
     try std.testing.expectError(error.UnsafeHttpTarget, validateSubsourceApiUrl("http://127.0.0.1/archive.zip"));
+}
+
+test "subsource listing credentials are confined to canonical API routes" {
+    try validateSubtitlesListingApiUrl(api_base ++ "/subtitles/the-matrix-1999");
+    try validateSubtitlesListingApiUrl(api_base ++ "/subtitles/friends/season-10?page=2");
+
+    for ([_][]const u8{
+        api_base ++ "/admin",
+        api_base ++ "/subtitles/the-matrix-1999/extra",
+        api_base ++ "/subtitles/friends/season-01",
+        api_base ++ "/subtitles/friends/season-1?next=/admin",
+        api_base ++ "/subtitles/friends/season-1?page=02",
+        api_base ++ "/subtitles/the%2fmatrix",
+        api_base ++ "/subtitles/the-matrix-1999#fragment",
+    }) |invalid| {
+        try std.testing.expectError(error.InvalidDownloadUrl, validateSubtitlesListingApiUrl(invalid));
+    }
 }
 
 test "subsource initial auth resolution does not acquire a browser session" {
@@ -1304,11 +1558,11 @@ test "subsource configured auth rejects header and cookie injection" {
     try std.testing.expectError(error.InvalidSessionPayload, resolveAuthWith(noEnvironment, "token", " \t"));
     try std.testing.expectError(
         error.InvalidSessionPayload,
-        resolveAuthWith(noEnvironment, "x" ** (max_configured_auth_bytes + 1), "agent"),
+        resolveAuthWith(noEnvironment, &@as([max_configured_auth_bytes + 1]u8, @splat('x')), "agent"),
     );
     try std.testing.expectError(
         error.InvalidSessionPayload,
-        resolveAuthWith(noEnvironment, "token", "x" ** (max_configured_auth_bytes + 1)),
+        resolveAuthWith(noEnvironment, "token", &@as([max_configured_auth_bytes + 1]u8, @splat('x'))),
     );
 }
 
@@ -1405,6 +1659,66 @@ test "subsource search payload is fixed schema" {
     );
 }
 
+test "subsource whitespace search is an owned empty response before auth or network" {
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &client);
+
+    // The deliberately invalid configured cookie proves the empty-query return
+    // happens before auth validation. Any network attempt would also make this
+    // deterministic unit test fail instead of returning immediately.
+    var response = try scraper.searchWithOptions(" \t\r\n", .{
+        .cf_clearance = "invalid;cookie",
+    });
+    defer response.deinit();
+    try std.testing.expectEqualStrings("", response.query_used);
+    try std.testing.expectEqual(@as(usize, 0), response.items.len);
+    try std.testing.expect(!response.has_prev_page);
+    try std.testing.expect(!response.has_next_page);
+}
+
+test "subsource detail and download route segments are canonical" {
+    const allocator = std.testing.allocator;
+    const canonical = try canonicalizeDetailsPath(
+        allocator,
+        "/malcolm%20in-the-middle-season-1/eng%6Cish/123",
+    );
+    defer allocator.free(canonical);
+    try std.testing.expectEqualStrings(
+        "malcolm%20in-the-middle-season-1/english/123",
+        canonical,
+    );
+
+    for ([_][]const u8{
+        "",
+        "title/language",
+        "title/language/123/extra",
+        "title//123",
+        "../language/123",
+        "%2e%2e/language/123",
+        "title/%2f/123",
+        "title/language/not-a-number",
+        "title/language/0",
+        "title/language/01",
+        "title/language/123?next=1",
+        "title/language/123#fragment",
+        "title/language/%",
+    }) |invalid| {
+        try std.testing.expectError(
+            error.InvalidDownloadUrl,
+            canonicalizeDetailsPath(allocator, invalid),
+        );
+    }
+
+    const token = try canonicalizeApiPathSegment(allocator, "token%20value", false);
+    defer allocator.free(token);
+    try std.testing.expectEqualStrings("token%20value", token);
+    try std.testing.expectError(
+        error.InvalidDownloadUrl,
+        canonicalizeApiPathSegment(allocator, "token%2fother", false),
+    );
+}
+
 test "subsource search payload defaults limit when zero" {
     const allocator = std.testing.allocator;
     const payload = try buildSearchPayload(allocator, "The Matrix", false, 0);
@@ -1413,6 +1727,103 @@ test "subsource search payload defaults limit when zero" {
         "{\"query\":\"The Matrix\",\"includeSeasons\":false,\"limit\":5000}",
         payload,
     );
+}
+
+test "subsource search payload escapes every JSON control byte" {
+    const allocator = std.testing.allocator;
+    const query = "quote:\" slash:\\ back:\x08 form:\x0c nul:\x00 unit:\x1f\n\r\t";
+    const payload = try buildSearchPayload(allocator, query, true, 25);
+    defer allocator.free(payload);
+    try std.testing.expect(std.mem.indexOfScalar(u8, payload, 0) == null);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.TestUnexpectedResult,
+    };
+    const parsed_query = switch (root.get("query") orelse return error.TestUnexpectedResult) {
+        .string => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings(query, parsed_query);
+
+    const invalid_utf8 = [_]u8{0xff};
+    try std.testing.expectError(error.InvalidUtf8Data, buildSearchPayload(allocator, &invalid_utf8, true, 25));
+}
+
+test "subsource valid duplicate result is not shadowed by a malformed one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        a,
+        "{\"results\":[" ++
+            "{\"id\":0,\"title\":\"Zero\",\"type\":\"movie\",\"link\":\"/subtitles/zero\"}," ++
+            "{\"id\":-1,\"title\":\"Negative\",\"type\":\"movie\",\"link\":\"/subtitles/negative\"}," ++
+            "{\"id\":7,\"title\":\"Evil sibling\",\"type\":\"movie\",\"link\":\"https://evil.example/subtitles/the-matrix\"}," ++
+            "{\"id\":7,\"title\":\"The Matrix\",\"type\":\"movie\",\"link\":\"/subtitles/the-matrix\"," ++
+            "\"seasons\":[{\"season\":1,\"link\":\"/subtitles/other-show/season=1\"}," ++
+            "{\"season\":1,\"link\":\"/subtitles/the-matrix/season=2\"}," ++
+            "{\"season\":1,\"link\":\"/subtitles/the-matrix/season=1\"}," ++
+            "{\"season\":1,\"link\":\"/subtitles/the-matrix/season=1\"}]}]}",
+        .{},
+    );
+    const object = switch (root) {
+        .object => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    const results = switch (object.get("results") orelse return error.TestUnexpectedResult) {
+        .array => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    var out: std.ArrayListUnmanaged(SearchItem) = .empty;
+    var seen = std.AutoHashMapUnmanaged(i64, void).empty;
+    try appendSearchResultValues(a, &out, &seen, results.items);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqualStrings("The Matrix", out.items[0].title);
+    try std.testing.expectEqualStrings(site ++ "/subtitles/the-matrix", out.items[0].link);
+    try std.testing.expectEqual(@as(usize, 1), out.items[0].seasons.len);
+    try std.testing.expectEqual(@as(i64, 1), out.items[0].seasons[0].season);
+}
+
+test "subsource authenticated requests pin redirects to the request origin" {
+    const Mock = struct {
+        fn fetch(_: *std.http.Client, allocator: Allocator, _: []const u8, options: common.FetchOptions) !common.HttpResponse {
+            try std.testing.expect(options.require_public_origin);
+            try std.testing.expect(options.require_https);
+            try std.testing.expect(options.require_same_origin);
+            return .{ .status = .ok, .body = try allocator.dupe(u8, "{}") };
+        }
+    };
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    const response = try getWithAuth(
+        Mock.fetch,
+        &client,
+        std.testing.allocator,
+        api_base ++ "/movie/search",
+        .{ .cf_clearance = "fixture", .user_agent = "fixture-agent" },
+        "application/json",
+        true,
+    );
+    defer std.testing.allocator.free(response.body);
+}
+
+test "subsource subtitle page increment is checked" {
+    try std.testing.expectEqual(@as(usize, 2), try checkedNextPage(1));
+    try std.testing.expectError(error.PageOverflow, checkedNextPage(std.math.maxInt(usize)));
+}
+
+test "subsource raw page emptiness and traversal bound drive pagination" {
+    try std.testing.expect(!shouldStopSubtitlePagination(3, 1, 2));
+    try std.testing.expect(shouldStopSubtitlePagination(0, 1, 2));
+    try std.testing.expect(shouldStopSubtitlePagination(3, 2, 2));
+    try std.testing.expect(!subtitlePageMayHaveNext(0, 1, 1));
+    try std.testing.expect(!subtitlePageMayHaveNext(3, 1, 2));
+    try std.testing.expect(subtitlePageMayHaveNext(3, 1, 1));
+    try std.testing.expect(subtitlePageMayHaveNext(3, 2, 2));
 }
 
 test "subsource ranks exact title ahead of containing titles" {

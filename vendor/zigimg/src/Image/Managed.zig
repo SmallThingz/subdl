@@ -69,24 +69,12 @@ pub fn fromMemory(allocator: std.mem.Allocator, buffer: []const u8) !Managed {
 /// Create an Image from a raw memory stream and create a copy of it.
 /// The resulting Image will own the pixel data.
 pub fn fromRawPixels(allocator: std.mem.Allocator, width: usize, height: usize, pixels: []const u8, pixel_format: PixelFormat) !Managed {
-    return .{
-        .allocator = allocator,
-        .width = width,
-        .height = height,
-        .pixels = try color.PixelStorage.initRawPixels(try allocator.dupe(u8, pixels), pixel_format),
-    };
+    return (try Image.fromRawPixels(allocator, width, height, pixels, pixel_format)).toManaged(allocator);
 }
 
 /// Create a pixel surface from scratch
 pub fn create(allocator: std.mem.Allocator, width: usize, height: usize, pixel_format: PixelFormat) !Managed {
-    const result = Managed{
-        .allocator = allocator,
-        .width = width,
-        .height = height,
-        .pixels = try color.PixelStorage.init(allocator, pixel_format, width * height),
-    };
-
-    return result;
+    return (try Image.create(allocator, width, height, pixel_format)).toManaged(allocator);
 }
 
 pub fn dupe(self: Managed) !Managed {
@@ -113,6 +101,7 @@ pub fn rawBytes(self: Managed) []const u8 {
 
 /// Return the byte size of a row in the image
 pub fn rowByteSize(self: Managed) usize {
+    if (self.height == 0) return 0;
     return self.imageByteSize() / self.height;
 }
 

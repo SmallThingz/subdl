@@ -2,6 +2,7 @@ const std = @import("std");
 const vaxis = @import("../main.zig");
 const ScrollView = vaxis.widgets.ScrollView;
 const LineNumbers = vaxis.widgets.LineNumbers;
+const TextView = vaxis.widgets.TextView;
 
 pub const DrawOptions = struct {
     highlighted_line: u16 = 0,
@@ -9,7 +10,7 @@ pub const DrawOptions = struct {
     indentation: u16 = 0,
 };
 
-pub const Buffer = vaxis.widgets.TextView.Buffer;
+pub const Buffer = TextView.Buffer;
 
 scroll_view: ScrollView = .{ .vertical_scrollbar = null },
 highlighted_style: vaxis.Style = .{ .bg = .{ .index = 0 } },
@@ -26,15 +27,16 @@ pub fn input(self: *@This(), key: vaxis.Key) void {
 }
 
 pub fn draw(self: *@This(), win: vaxis.Window, buffer: Buffer, opts: DrawOptions) void {
-    const pad_left: u16 = if (opts.draw_line_numbers) LineNumbers.numDigits(buffer.rows) +| 1 else 0;
+    const visible_rows = buffer.lineCount();
+    const pad_left: u16 = if (opts.draw_line_numbers) LineNumbers.numDigits(visible_rows) +| 1 else 0;
     self.scroll_view.draw(win, .{
         .cols = buffer.cols + pad_left,
-        .rows = buffer.rows,
+        .rows = visible_rows,
     });
     if (opts.draw_line_numbers) {
         var nl: LineNumbers = .{
             .highlighted_line = opts.highlighted_line,
-            .num_lines = buffer.rows +| 1,
+            .num_lines = visible_rows,
         };
         nl.draw(win.child(.{
             .x_off = 0,
@@ -60,7 +62,7 @@ fn drawCode(self: *@This(), win: vaxis.Window, buffer: Buffer, opts: DrawOptions
         const cluster = buffer.content.items[g_offset..][0..g_len];
         defer byte_index += cluster.len;
 
-        if (std.mem.eql(u8, cluster, "\n")) {
+        if (TextView.isNewlineCluster(cluster)) {
             if (index == buffer.grapheme.len - 1) {
                 break;
             }

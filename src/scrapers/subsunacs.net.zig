@@ -33,7 +33,9 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        const encoded = try common.encodeUriComponent(a, std.mem.trim(u8, query, " \t\r\n"));
+        const trimmed = std.mem.trim(u8, query, " \t\r\n");
+        if (trimmed.len == 0) return .{ .arena = arena, .items = &.{} };
+        const encoded = try common.encodeUriComponent(a, trimmed);
         const payload = try std.fmt.allocPrint(a, "m={s}&l=1&c=&y=&a=&d=&u=&g=&t=&imdbcheck=1", .{encoded});
         const headers = [_]std.http.Header{.{ .name = "referer", .value = site ++ "/index.php" }};
         const response = try common.fetchBytes(self.client, a, search_url, .{
@@ -45,6 +47,7 @@ pub const Scraper = struct {
             .max_attempts = 2,
             .cache = false,
             .require_public_origin = true,
+            .require_https = true,
         });
 
         return parseSearchHtml(common.takeArena(&arena), response.body);
@@ -54,8 +57,10 @@ pub const Scraper = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
-        try validateProviderEndpoint(item.page_url);
-        try validateProviderEndpoint(item.download_page_url);
+        const page_route = try validateProviderEndpoint(item.page_url, .page);
+        const listing_route = try validateProviderEndpoint(item.download_page_url, .listing);
+        if (!std.mem.eql(u8, page_route.slug, listing_route.slug) or
+            !std.mem.eql(u8, page_route.id, listing_route.id)) return error.UnsafeHttpTarget;
 
         const headers = [_]std.http.Header{.{ .name = "referer", .value = search_url }};
         const response = try common.fetchBytes(self.client, a, item.download_page_url, .{
@@ -64,6 +69,7 @@ pub const Scraper = struct {
             .max_attempts = 2,
             .cache = false,
             .require_public_origin = true,
+            .require_https = true,
         });
 
         var parsed = try common.parseHtmlStable(a, response.body);
@@ -73,10 +79,13 @@ pub const Scraper = struct {
             const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
             const filename = try common.innerTextTrimmedOwned(a, anchor);
             if (!isSubtitleFilename(filename)) continue;
-            try subtitles.append(a, .{
-                .filename = filename,
-                .download_url = try resolveProviderUrl(a, href),
-            });
+            const download_url = resolveProviderUrl(a, href, .entry) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
+            const entry_route = validateProviderEndpoint(download_url, .entry) catch unreachable;
+            if (!std.mem.eql(u8, page_route.id, entry_route.id)) continue;
+            try subtitles.append(a, .{ .filename = filename, .download_url = download_url });
         }
 
         return common.finishResponse(SubtitlesResponse, &arena, .{
@@ -102,7 +111,10 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8) !SearchResp
         const title = try common.innerTextTrimmedOwned(a, anchor);
         if (title.len == 0) continue;
 
-        const page_url = try resolveProviderUrl(a, href);
+        const page_url = resolveProviderUrl(a, href, .page) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
         if (seen.contains(page_url)) continue;
         try seen.put(a, page_url, {});
 
@@ -118,6 +130,7 @@ fn parseSearchHtml(arena: std.heap.ArenaAllocator, body: []const u8) !SearchResp
             try std.fmt.allocPrint(a, "{s}!", .{page_url})
         else
             try std.fmt.allocPrint(a, "{s}/!", .{page_url});
+        _ = validateProviderEndpoint(download_page_url, .listing) catch continue;
 
         try items.append(a, .{
             .title = title,
@@ -147,7 +160,11 @@ fn parseYear(value: []const u8) ?i64 {
 }
 
 fn isSubtitleFilename(filename: []const u8) bool {
-    if (filename.len == 0) return false;
+    if (filename.len == 0 or filename.len > 512 or
+        std.mem.eql(u8, filename, ".") or std.mem.eql(u8, filename, "..")) return false;
+    for (filename) |c| {
+        if (c < 0x20 or c == 0x7f or c == '/' or c == '\\') return false;
+    }
     if (std.ascii.endsWithIgnoreCase(filename, ".srt")) return true;
     if (std.ascii.endsWithIgnoreCase(filename, ".sub")) return true;
     if (std.ascii.endsWithIgnoreCase(filename, ".ass")) return true;
@@ -160,22 +177,110 @@ fn isSubtitleFilename(filename: []const u8) bool {
     return false;
 }
 
-fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+const ProviderRoute = enum { page, listing, entry };
+
+const ProviderRouteParts = struct {
+    slug: []const u8 = "",
+    id: []const u8,
+    entry_index: []const u8 = "",
+};
+
+fn resolveProviderUrl(allocator: Allocator, href: []const u8, route: ProviderRoute) ![]const u8 {
     const resolved = try common.resolveUrl(allocator, site, href);
     errdefer allocator.free(resolved);
-    try validateProviderEndpoint(resolved);
+    _ = try validateProviderEndpoint(resolved, route);
     return resolved;
 }
 
-fn validateProviderEndpoint(url: []const u8) !void {
+fn validateProviderEndpoint(url: []const u8, route: ProviderRoute) !ProviderRouteParts {
     try common.validatePublicHttpUrl(url);
     if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+
+    const uri = std.Uri.parse(url) catch return error.UnsafeHttpTarget;
+    if (uri.user != null or uri.password != null or uri.fragment != null) return error.UnsafeHttpTarget;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    const query = if (uri.query) |component| switch (component) {
+        .raw, .percent_encoded => |value| value,
+    } else null;
+
+    if (route == .entry) {
+        if (!std.mem.eql(u8, path, "/getentry.php") or query == null) return error.UnsafeHttpTarget;
+        var id: ?[]const u8 = null;
+        var entry_index: ?[]const u8 = null;
+        var fields = std.mem.splitScalar(u8, query.?, '&');
+        while (fields.next()) |field| {
+            const equals = std.mem.indexOfScalar(u8, field, '=') orelse return error.UnsafeHttpTarget;
+            const key = field[0..equals];
+            const value = field[equals + 1 ..];
+            if (std.mem.eql(u8, key, "id")) {
+                if (id != null or !isCanonicalPositiveId(value)) return error.UnsafeHttpTarget;
+                id = value;
+            } else if (std.mem.eql(u8, key, "ei")) {
+                if (entry_index != null or !isCanonicalNonNegativeInteger(value)) return error.UnsafeHttpTarget;
+                entry_index = value;
+            } else return error.UnsafeHttpTarget;
+        }
+        return .{ .id = id orelse return error.UnsafeHttpTarget, .entry_index = entry_index orelse return error.UnsafeHttpTarget };
+    }
+
+    if (query != null) return error.UnsafeHttpTarget;
+    const prefix = "/subtitles/";
+    if (!std.mem.startsWith(u8, path, prefix)) return error.UnsafeHttpTarget;
+    const route_suffix = switch (route) {
+        .page => "/",
+        .listing => "/!",
+        .entry => unreachable,
+    };
+    if (!std.mem.endsWith(u8, path, route_suffix)) return error.UnsafeHttpTarget;
+    const core = path[prefix.len .. path.len - route_suffix.len];
+    const separator = std.mem.lastIndexOfScalar(u8, core, '-') orelse return error.UnsafeHttpTarget;
+    const slug = core[0..separator];
+    const id = core[separator + 1 ..];
+    if (!isSafeEncodedSegment(slug) or !isCanonicalPositiveId(id)) return error.UnsafeHttpTarget;
+    return .{ .slug = slug, .id = id };
+}
+
+fn isCanonicalPositiveId(value: []const u8) bool {
+    return isCanonicalNonNegativeInteger(value) and value[0] != '0';
+}
+
+fn isCanonicalNonNegativeInteger(value: []const u8) bool {
+    if (value.len == 0 or value.len > 19 or (value.len > 1 and value[0] == '0')) return false;
+    for (value) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+fn isSafeEncodedSegment(segment: []const u8) bool {
+    if (segment.len == 0 or segment.len > 512 or
+        std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return false;
+    var index: usize = 0;
+    while (index < segment.len) {
+        const c = segment[index];
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
+            index += 1;
+            continue;
+        }
+        if (c != '%' or segment.len - index < 3 or
+            !std.ascii.isHex(segment[index + 1]) or !std.ascii.isHex(segment[index + 2])) return false;
+        const decoded = std.fmt.parseInt(u8, segment[index + 1 .. index + 3], 16) catch return false;
+        if (decoded < 0x20 or decoded == 0x7f or decoded == '/' or decoded == '\\' or
+            decoded == '?' or decoded == '#' or decoded == '%') return false;
+        index += 3;
+    }
+    return true;
 }
 
 test "subsunacs rejects unsafe provider links" {
-    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "http://127.0.0.1/private"));
-    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://user:pass@subsunacs.net/private"));
-    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://subsunacs.net.evil.com/private"));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "http://127.0.0.1/private", .page));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://user:pass@subsunacs.net/private", .page));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://subsunacs.net.evil.com/private", .page));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint(site ++ "/subtitles/The_Matrix-0/", .page));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint(site ++ "/subtitles/The_Matrix-103573/?next=/", .page));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint(site ++ "/subtitles/The%252fMatrix-103573/", .page));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint(site ++ "/getentry.php?id=103573&ei=0&next=/", .entry));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint(site ++ "/getentry.php?id=103574&ei=-1", .entry));
 }
 
 test "subsunacs parses movie search and direct entries" {
@@ -191,6 +296,15 @@ test "subsunacs parses movie search and direct entries" {
 
     try std.testing.expect(isSubtitleFilename("The.Matrix.1999.srt"));
     try std.testing.expect(!isSubtitleFilename("subsunacs.net_103573.txt"));
+}
+
+test "subsunacs empty search does not acquire the provider" {
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &client);
+    var response = try scraper.search(" \t\r\n");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(usize, 0), response.items.len);
 }
 
 test "live subsunacs movie search, listing and download" {
@@ -213,6 +327,7 @@ test "live subsunacs movie search, listing and download" {
         .accept = "text/plain,application/octet-stream,*/*",
         .cache = false,
         .require_public_origin = true,
+        .require_https = true,
     });
     defer std.testing.allocator.free(response.body);
     try std.testing.expect(response.body.len > 32);

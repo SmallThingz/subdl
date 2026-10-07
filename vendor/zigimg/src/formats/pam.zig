@@ -90,7 +90,9 @@ const Header = struct {
                 const line = line_buffer_stream.written(); // empty lines are meaningless
                 if (line.len == 0) continue;
                 if (line[0] == '#') { // comment
-                    try comments.append(allocator, try allocator.dupe(u8, line[1..]));
+                    const comment = try allocator.dupe(u8, line[1..]);
+                    errdefer allocator.free(comment);
+                    try comments.append(allocator, comment);
                     continue;
                 }
 

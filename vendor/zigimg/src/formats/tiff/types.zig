@@ -206,6 +206,7 @@ pub const Header = extern struct {
 pub const TagType = enum(u16) {
     short = 3,
     long = 4,
+    rational = 5,
 };
 
 // Tag as found inside the TIFF file
@@ -227,22 +228,30 @@ pub const TagField = extern struct {
     data_count: u32 align(1),
     data_offset: u32 align(1),
 
-    pub inline fn toLong(self: *const TagField) u32 {
+    pub inline fn toLong(self: *const TagField) !u32 {
+        if (self.data_type != @backingInt(TagType.long) or self.data_count != 1) return error.InvalidData;
         return self.data_offset;
     }
 
     // Some fields (eg. image_width) can be encoded as long or short:
     // this function either returns an u16 casted to u32, or an u32
     // based on the tag data_type
-    pub inline fn toLongOrShort(self: *const TagField, endianess: std.builtin.Endian) u32 {
-        return if (self.data_type == @intFromEnum(TagType.short)) self.toShort(endianess) else self.data_offset;
+    pub inline fn toLongOrShort(self: *const TagField, endianess: std.builtin.Endian) !u32 {
+        if (self.data_count != 1) return error.InvalidData;
+        return switch (self.data_type) {
+            @backingInt(TagType.short) => try self.toShort(endianess),
+            @backingInt(TagType.long) => self.data_offset,
+            else => return error.InvalidData,
+        };
     }
 
-    pub inline fn toShort(self: *const TagField, endianess: std.builtin.Endian) u16 {
+    pub inline fn toShort(self: *const TagField, endianess: std.builtin.Endian) !u16 {
+        if (self.data_type != @backingInt(TagType.short) or self.data_count != 1) return error.InvalidData;
         return if (endianess == .big) @truncate(self.data_offset >> 16) else @truncate(self.data_offset & 0xFFFF);
     }
 
     pub fn readRational(self: *const TagField, read_stream: *io.ReadStream, endianess: std.builtin.Endian) ![2]u32 {
+        if (self.data_type != @backingInt(TagType.rational) or self.data_count != 1) return error.InvalidData;
         try read_stream.seekTo(self.data_offset);
         const reader = read_stream.reader();
 
@@ -253,13 +262,29 @@ pub const TagField = extern struct {
     }
 
     pub fn readTagData(self: *const TagField, allocator: std.mem.Allocator, read_stream: *io.ReadStream, endianess: std.builtin.Endian) ![]u32 {
-        const byte_size = if (self.data_type == @intFromEnum(TagType.short)) self.data_count * 2 else self.data_count * 4;
-        const long_data: []u32 = try allocator.alloc(u32, self.data_count);
+        const data_count = std.math.cast(usize, self.data_count) orelse return error.InvalidData;
+        if (data_count == 0) return error.InvalidData;
 
-        // the offset is enough to hold the data so
-        // the offset already holds the data
-        if (self.data_count == 1) {
-            long_data[0] = self.data_offset;
+        const element_size: usize = switch (self.data_type) {
+            @backingInt(TagType.short) => @sizeOf(u16),
+            @backingInt(TagType.long) => @sizeOf(u32),
+            else => return error.InvalidData,
+        };
+        const byte_size = std.math.mul(usize, data_count, element_size) catch return error.InvalidData;
+        const long_data: []u32 = try allocator.alloc(u32, data_count);
+        errdefer allocator.free(long_data);
+
+        // TIFF stores values of up to four bytes directly in the offset field.
+        if (byte_size <= @sizeOf(u32)) {
+            if (self.data_type == @backingInt(TagType.long)) {
+                long_data[0] = self.data_offset;
+            } else if (endianess == .big) {
+                long_data[0] = (self.data_offset >> 16) & 0xFFFF;
+                if (data_count == 2) long_data[1] = self.data_offset & 0xFFFF;
+            } else {
+                long_data[0] = self.data_offset & 0xFFFF;
+                if (data_count == 2) long_data[1] = (self.data_offset >> 16) & 0xFFFF;
+            }
             return long_data;
         }
 
@@ -270,25 +295,25 @@ pub const TagField = extern struct {
 
         const reader = read_stream.reader();
 
-        _ = try reader.readSliceShort(data[0..]);
+        try reader.readSliceAll(data);
 
-        if (self.data_type == @intFromEnum(TagType.long)) {
+        if (self.data_type == @backingInt(TagType.long)) {
             if (endianess == native_endian) {
                 @memcpy(std.mem.sliceAsBytes(long_data)[0..], std.mem.sliceAsBytes(data)[0..]);
             } else {
                 const slice_to_swap = std.mem.bytesAsSlice(u32, data);
-                for (slice_to_swap, 0..self.data_count) |value, index| {
+                for (slice_to_swap, 0..data_count) |value, index| {
                     long_data[index] = @byteSwap(value);
                 }
             }
         } else {
             const slice_to_swap = std.mem.bytesAsSlice(u16, data);
             if (native_endian != endianess) {
-                for (slice_to_swap, 0..self.data_count) |value, index| {
+                for (slice_to_swap, 0..data_count) |value, index| {
                     long_data[index] = @byteSwap(value);
                 }
             } else {
-                for (slice_to_swap, 0..self.data_count) |value, index| {
+                for (slice_to_swap, 0..data_count) |value, index| {
                     long_data[index] = value;
                 }
             }

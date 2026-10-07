@@ -28,16 +28,22 @@ pub const Scraper = struct {
     }
 
     pub fn search(self: *Scraper, query: []const u8) !SearchResponse {
+        return self.searchUsing(common.fetchBytes, query);
+    }
+
+    fn searchUsing(self: *Scraper, comptime fetch: anytype, query: []const u8) !SearchResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
 
         const trimmed = std.mem.trim(u8, query, " \t\r\n");
         if (trimmed.len == 0) return .{ .arena = arena, .items = &.{} };
+        const wanted = try common.normalizeTitle(a, trimmed);
+        if (wanted.len == 0) return .{ .arena = arena, .items = &.{} };
 
         const encoded = try common.encodeUriComponent(a, trimmed);
         const url = try std.fmt.allocPrint(a, "{s}/api/search?q={s}", .{ search_site, encoded });
-        const response = try common.fetchBytes(self.client, a, url, .{
+        const response = try fetch(self.client, a, url, .{
             .accept = "application/json",
             .cache = false,
             .max_attempts = 2,
@@ -54,9 +60,9 @@ pub const Scraper = struct {
             else => return error.InvalidFieldType,
         };
 
-        const wanted = try common.normalizeTitle(a, trimmed);
         var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
         var other: std.ArrayListUnmanaged(SearchItem) = .empty;
+        var seen_ids = std.AutoHashMapUnmanaged(i64, void).empty;
 
         for (results.items) |entry| {
             const item_obj = switch (entry) {
@@ -66,10 +72,14 @@ pub const Scraper = struct {
             const title = common.jsonString(item_obj, "title") orelse continue;
             const movie_id = common.jsonIntField(item_obj, "id") orelse continue;
             if (movie_id <= 0) continue;
+            if (seen_ids.contains(movie_id)) continue;
             const release_date = common.jsonString(item_obj, "release_date");
             const year = release_dateToYear(release_date);
             const slugged = try movieSlug(a, title, year);
+            if (!isCanonicalSlug(slugged)) continue;
             const page_url = try std.fmt.allocPrint(a, "{s}/movie/{d}/{s}", .{ site, movie_id, slugged });
+            validateProviderUrl(page_url, movie_id, slugged) catch continue;
+            try seen_ids.put(a, movie_id, {});
             const normalized = try common.normalizeTitle(a, title);
 
             const item: SearchItem = .{
@@ -95,7 +105,8 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        try validateProviderUrl(item.page_url);
+        const expected_slug = try movieSlug(a, item.title, item.year);
+        try validateProviderUrl(item.page_url, item.movie_id, expected_slug);
 
         const response = try common.fetchBytes(self.client, a, item.page_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
@@ -114,10 +125,64 @@ pub const Scraper = struct {
     }
 };
 
-fn validateProviderUrl(url: []const u8) !void {
+fn validateProviderUrl(url: []const u8, expected_movie_id: i64, expected_slug: []const u8) !void {
+    if (expected_movie_id <= 0 or !isCanonicalSlug(expected_slug)) return error.InvalidDownloadUrl;
+    common.validatePublicHttpUrl(url) catch return error.InvalidDownloadUrl;
     const uri = std.Uri.parse(url) catch return error.InvalidDownloadUrl;
     if (uri.user != null or uri.password != null) return error.InvalidDownloadUrl;
     if (!(common.sameOrigin(site, url) catch false)) return error.InvalidDownloadUrl;
+    if (uri.query != null or uri.fragment != null) return error.InvalidDownloadUrl;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    if (std.mem.indexOfScalar(u8, path, '\\') != null or std.mem.indexOfScalar(u8, path, '%') != null) {
+        return error.InvalidDownloadUrl;
+    }
+
+    const prefix = "/movie/";
+    if (!std.mem.startsWith(u8, path, prefix)) return error.InvalidDownloadUrl;
+    const route = path[prefix.len..];
+    const separator = std.mem.indexOfScalar(u8, route, '/') orelse return error.InvalidDownloadUrl;
+    const id_text = route[0..separator];
+    const slug = route[separator + 1 ..];
+    if (id_text.len == 0 or slug.len == 0 or std.mem.indexOfScalar(u8, slug, '/') != null) {
+        return error.InvalidDownloadUrl;
+    }
+    if (id_text.len > 1 and id_text[0] == '0') return error.InvalidDownloadUrl;
+    for (id_text) |c| if (!std.ascii.isDigit(c)) return error.InvalidDownloadUrl;
+    const movie_id = std.fmt.parseInt(i64, id_text, 10) catch return error.InvalidDownloadUrl;
+    if (movie_id != expected_movie_id or !std.mem.eql(u8, slug, expected_slug)) return error.InvalidDownloadUrl;
+}
+
+fn isCanonicalSlug(value: []const u8) bool {
+    if (value.len == 0 or value.len > 256 or value[0] == '-' or value[value.len - 1] == '-') return false;
+    var previous_dash = false;
+    for (value) |c| {
+        if (c == '-') {
+            if (previous_dash) return false;
+            previous_dash = true;
+        } else {
+            if (!(std.ascii.isDigit(c) or (c >= 'a' and c <= 'z'))) return false;
+            previous_dash = false;
+        }
+    }
+    return true;
+}
+
+fn isCanonicalSubtitlePath(value: []const u8) bool {
+    const prefix = "/subtitle/";
+    if (!std.mem.startsWith(u8, value, prefix)) return false;
+    const filename = value[prefix.len..];
+    if (filename.len == 0 or filename.len > 512 or
+        std.mem.eql(u8, filename, ".") or std.mem.eql(u8, filename, "..") or
+        !std.ascii.endsWithIgnoreCase(filename, ".zip"))
+    {
+        return false;
+    }
+    for (filename) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~')) return false;
+    }
+    return true;
 }
 
 fn extractNextFlightText(allocator: Allocator, body: []const u8) ![]u8 {
@@ -128,7 +193,13 @@ fn extractNextFlightText(allocator: Allocator, body: []const u8) ![]u8 {
 
     while (std.mem.indexOfPos(u8, body, cursor, marker)) |start| {
         const payload_start = start + marker.len;
-        const close = std.mem.indexOfPos(u8, body, payload_start, ")</script>") orelse break;
+        const next_marker = std.mem.indexOfPos(u8, body, payload_start, marker);
+        const candidate_end = next_marker orelse body.len;
+        const close_rel = std.mem.indexOf(u8, body[payload_start..candidate_end], ")</script>") orelse {
+            cursor = candidate_end;
+            continue;
+        };
+        const close = payload_start + close_rel;
         cursor = close + ")</script>".len;
         const payload = body[payload_start..close];
 
@@ -180,7 +251,7 @@ fn parseInitialSubtitles(allocator: Allocator, flight: []const u8) ![]const Subt
             else => continue,
         };
         const relative_url = common.jsonString(obj, "url") orelse continue;
-        if (!std.mem.startsWith(u8, relative_url, "/subtitle/")) continue;
+        if (!isCanonicalSubtitlePath(relative_url)) continue;
         if (seen.contains(relative_url)) continue;
         try seen.put(allocator, relative_url, {});
 
@@ -268,20 +339,83 @@ fn lowerAscii(allocator: Allocator, value: []const u8) ![]u8 {
 }
 
 test "justsubtitles rejects non-provider movie targets" {
-    try validateProviderUrl("https://www.justsubtitles.com/movie/1/title");
+    try validateProviderUrl("https://www.justsubtitles.com/movie/1/title", 1, "title");
     for ([_][]const u8{
         "http://127.0.0.1/movie/1/title",
         "https://www.justsubtitles.com.example/movie/1/title",
         "https://user@www.justsubtitles.com/movie/1/title",
+        "https://www.justsubtitles.com/movie/2/title",
+        "https://www.justsubtitles.com/movie/1/other",
+        "https://www.justsubtitles.com/movie/1/title/extra",
+        "https://www.justsubtitles.com/movie/1/title?next=/admin",
+        "https://www.justsubtitles.com/movie/1/%2e%2e",
     }) |url| {
-        try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl(url));
+        try std.testing.expectError(error.InvalidDownloadUrl, validateProviderUrl(url, 1, "title"));
     }
+}
+
+test "justsubtitles rejects normalized-empty searches before I/O" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, _: Allocator, _: []const u8, _: common.FetchOptions) anyerror!common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+    var response = try scraper.searchUsing(Fixture.fetch, "---");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 0), response.items.len);
+}
+
+test "justsubtitles search deduplicates IDs and rejects fractional IDs" {
+    const Fixture = struct {
+        client: std.http.Client,
+        calls: usize = 0,
+
+        fn fetch(client: *std.http.Client, allocator: Allocator, url: []const u8, options: common.FetchOptions) !common.HttpResponse {
+            const self: *@This() = @fieldParentPtr("client", client);
+            self.calls += 1;
+            try std.testing.expectEqualStrings(search_site ++ "/api/search?q=The%20Matrix", url);
+            try std.testing.expectEqualStrings("application/json", options.accept orelse return error.TestUnexpectedResult);
+            const body =
+                \\{"results":[
+                \\{"title":"The Matrix","id":1,"release_date":"1999-03-31"},
+                \\{"title":"Duplicate Matrix","id":1,"release_date":"2000-01-01"},
+                \\{"title":"Fractional","id":2.5,"release_date":"2001-01-01"},
+                \\{"title":"The Matrix Reloaded","id":2,"release_date":"2003-05-15"}
+                \\]}
+            ;
+            return .{ .status = .ok, .body = try allocator.dupe(u8, body) };
+        }
+    };
+
+    var fixture: Fixture = .{ .client = .{ .allocator = std.testing.allocator, .io = std.testing.io } };
+    defer fixture.client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &fixture.client);
+    var response = try scraper.searchUsing(Fixture.fetch, "The Matrix");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 2), response.items.len);
+    try std.testing.expectEqual(@as(i64, 1), response.items[0].movie_id);
+    try std.testing.expectEqual(@as(i64, 2), response.items[1].movie_id);
 }
 
 test "justsubtitles parses next flight subtitle rows" {
     const allocator = std.testing.allocator;
     const flight =
-        "x\"initialSubtitles\":[{\"release_name\":\"The.Matrix.1999\",\"name\":\"The.Matrix.1999.zip\",\"url\":\"/subtitle/1-2.zip\",\"language\":\"EN\"}]y";
+        "x\"initialSubtitles\":[" ++
+        "{\"release_name\":\"Traversal\",\"url\":\"/subtitle/../../admin.zip\"}," ++
+        "{\"release_name\":\"Query\",\"url\":\"/subtitle/file.zip?next=/admin\"}," ++
+        "{\"release_name\":\"Encoded\",\"url\":\"/subtitle/%2e%2e.zip\"}," ++
+        "{\"release_name\":\"The.Matrix.1999\",\"name\":\"The.Matrix.1999.zip\",\"url\":\"/subtitle/1-2.zip\",\"language\":\"EN\"}]y";
     const subtitles = try parseInitialSubtitles(allocator, flight);
     defer {
         for (subtitles) |item| {
@@ -307,6 +441,7 @@ test "justsubtitles extracts next flight strings" {
 
 test "justsubtitles flight JSON skips malformed input and preserves allocation errors" {
     const body =
+        "<script>self.__next_f.push([1,\"unterminated\"]</script>" ++
         "<script>self.__next_f.push(not-json)</script>" ++
         "<script>self.__next_f.push([1,\"valid\"])</script>";
     const text = try extractNextFlightText(std.testing.allocator, body);

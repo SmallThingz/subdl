@@ -50,73 +50,20 @@ pub const Scraper = struct {
 
         const parsed_query = parseQuery(query);
         if (parsed_query.title.len < 2) return .{ .arena = arena, .items = &.{} };
+        const wanted = try common.normalizeTitle(a, parsed_query.title);
+        if (wanted.len == 0) return .{ .arena = arena, .items = &.{} };
 
         const response = try common.fetchBytes(self.client, a, catalog_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = true,
             .max_attempts = 2,
             .require_public_origin = true,
+            .require_https = true,
+            .require_same_origin = true,
         });
         const entries = try parseCatalog(a, response.body);
-        const wanted = try common.normalizeTitle(a, parsed_query.title);
-
-        var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
-        var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
-
-        for (entries) |entry| {
-            if (exact.items.len + partial.items.len >= max_search_items * 4) break;
-            const normalized = try common.normalizeTitle(a, entry.title);
-            const is_exact = std.mem.eql(u8, normalized, wanted);
-            const is_partial = std.mem.indexOf(u8, normalized, wanted) != null or std.mem.indexOf(u8, wanted, normalized) != null;
-            if (!is_exact and !is_partial) continue;
-
-            const media_kind: MediaKind = if (parsed_query.episode != null or entry.release_season != null) .tv else .movie;
-            if (parsed_query.episode != null and !releaseMatchesSeason(entry, parsed_query.season orelse 1)) continue;
-
-            const item: SearchItem = .{
-                .title = try a.dupe(u8, entry.title),
-                .release_label = try a.dupe(u8, entry.release_label),
-                .media_kind = media_kind,
-                .season = if (media_kind == .tv) parsed_query.season orelse entry.release_season else null,
-                .episode = if (media_kind == .tv) parsed_query.episode else null,
-                .page_url = try a.dupe(u8, entry.page_url),
-            };
-            if (is_exact)
-                try exact.append(a, item)
-            else
-                try partial.append(a, item);
-        }
-
-        // If a requested season had no explicit N.série label, NyaSub's own
-        // addon falls back to release position. Preserve that behavior only for
-        // exact title matches and only when it yields one deterministic entry.
-        if (parsed_query.episode != null and exact.items.len == 0) {
-            const requested_season = parsed_query.season orelse 1;
-            for (entries) |entry| {
-                const normalized = try common.normalizeTitle(a, entry.title);
-                if (!std.mem.eql(u8, normalized, wanted)) continue;
-                if (entry.release_index + 1 != requested_season) continue;
-                try exact.append(a, .{
-                    .title = try a.dupe(u8, entry.title),
-                    .release_label = try a.dupe(u8, entry.release_label),
-                    .media_kind = .tv,
-                    .season = requested_season,
-                    .episode = parsed_query.episode,
-                    .page_url = try a.dupe(u8, entry.page_url),
-                });
-                break;
-            }
-        }
-
-        var items: std.ArrayListUnmanaged(SearchItem) = .empty;
-        const exact_count = @min(exact.items.len, max_search_items);
-        try items.appendSlice(a, exact.items[0..exact_count]);
-        if (items.items.len < max_search_items) {
-            const remaining = max_search_items - items.items.len;
-            try items.appendSlice(a, partial.items[0..@min(remaining, partial.items.len)]);
-        }
-
-        return common.finishResponse(SearchResponse, &arena, .{ .arena = arena, .items = try items.toOwnedSlice(a) });
+        const items = try buildSearchItems(a, entries, parsed_query, wanted);
+        return common.finishResponse(SearchResponse, &arena, .{ .arena = arena, .items = items });
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
@@ -124,12 +71,14 @@ pub const Scraper = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        try validateProviderEndpoint(item.page_url);
+        try validateProviderEndpoint(item.page_url, .details);
         const response = try common.fetchBytes(self.client, a, item.page_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
             .require_public_origin = true,
+            .require_https = true,
+            .require_same_origin = true,
         });
         const links = try parseDownloadLinks(a, response.body);
 
@@ -153,6 +102,72 @@ pub const Scraper = struct {
         });
     }
 };
+
+fn buildSearchItems(
+    allocator: Allocator,
+    entries: []const CatalogEntry,
+    parsed_query: ParsedQuery,
+    wanted: []const u8,
+) ![]const SearchItem {
+    var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
+    var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
+
+    for (entries) |entry| {
+        if (exact.items.len >= max_search_items and partial.items.len >= max_search_items) break;
+        const normalized = try common.normalizeTitle(allocator, entry.title);
+        const is_exact = std.mem.eql(u8, normalized, wanted);
+        const is_partial = common.normalizedTitlesRelated(normalized, wanted);
+        if (!is_exact and !is_partial) continue;
+        if ((is_exact and exact.items.len >= max_search_items) or
+            (!is_exact and partial.items.len >= max_search_items)) continue;
+
+        const media_kind: MediaKind = if (parsed_query.episode != null or entry.release_season != null) .tv else .movie;
+        if (parsed_query.episode != null and !releaseMatchesSeason(entry, parsed_query.season orelse 1)) continue;
+
+        const item: SearchItem = .{
+            .title = try allocator.dupe(u8, entry.title),
+            .release_label = try allocator.dupe(u8, entry.release_label),
+            .media_kind = media_kind,
+            .season = if (media_kind == .tv) parsed_query.season orelse entry.release_season else null,
+            .episode = if (media_kind == .tv) parsed_query.episode else null,
+            .page_url = try allocator.dupe(u8, entry.page_url),
+        };
+        if (is_exact)
+            try exact.append(allocator, item)
+        else
+            try partial.append(allocator, item);
+    }
+
+    // If a requested season had no explicit N.série label, NyaSub's own addon
+    // falls back to release position. Preserve that behavior only for exact
+    // title matches and only when it yields one deterministic entry.
+    if (parsed_query.episode != null and exact.items.len == 0) {
+        const requested_season = parsed_query.season orelse 1;
+        for (entries) |entry| {
+            const normalized = try common.normalizeTitle(allocator, entry.title);
+            if (!std.mem.eql(u8, normalized, wanted)) continue;
+            if (entry.release_index + 1 != requested_season) continue;
+            try exact.append(allocator, .{
+                .title = try allocator.dupe(u8, entry.title),
+                .release_label = try allocator.dupe(u8, entry.release_label),
+                .media_kind = .tv,
+                .season = requested_season,
+                .episode = parsed_query.episode,
+                .page_url = try allocator.dupe(u8, entry.page_url),
+            });
+            break;
+        }
+    }
+
+    var items: std.ArrayListUnmanaged(SearchItem) = .empty;
+    const exact_count = @min(exact.items.len, max_search_items);
+    try items.appendSlice(allocator, exact.items[0..exact_count]);
+    if (items.items.len < max_search_items) {
+        const remaining = max_search_items - items.items.len;
+        try items.appendSlice(allocator, partial.items[0..@min(remaining, partial.items.len)]);
+    }
+    return items.toOwnedSlice(allocator);
+}
 
 fn appendSubtitle(
     allocator: Allocator,
@@ -208,7 +223,13 @@ fn parseCatalog(allocator: Allocator, body: []const u8) ![]const CatalogEntry {
             const text_end = tag_end + 1 + close_rel;
             const label = try htmlFragmentText(allocator, body[tag_end + 1 .. text_end]);
             if (title.len > 0 and label.len > 0) {
-                const page_url = try resolveProviderUrl(allocator, href_raw);
+                const page_url = resolveProviderUrl(allocator, href_raw, .details) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {
+                        pos = text_end + "</a>".len;
+                        continue;
+                    },
+                };
                 try out.append(allocator, .{
                     .title = try allocator.dupe(u8, title),
                     .release_label = label,
@@ -248,31 +269,133 @@ fn parseDownloadLinks(allocator: Allocator, body: []const u8) ![]const []const u
         }
         const close_rel = findIgnoreCase(body[tag_end + 1 ..], "</a>") orelse break;
         const text_end = tag_end + 1 + close_rel;
+        cursor = text_end + "</a>".len;
         const label = try htmlFragmentText(allocator, body[tag_end + 1 .. text_end]);
         if (indexOfIgnoreCase(label, "Titulky") != null) {
             const decoded_href = try decodeBasicEntities(allocator, href_raw);
-            const url = try resolveProviderUrl(allocator, decoded_href);
+            defer allocator.free(decoded_href);
+            const url = resolveProviderUrl(allocator, decoded_href, .download) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
             if (!seen.contains(url)) {
                 try seen.put(allocator, url, {});
                 try out.append(allocator, url);
             }
         }
-        cursor = text_end + "</a>".len;
     }
 
     return out.toOwnedSlice(allocator);
 }
 
-fn resolveProviderUrl(allocator: Allocator, href: []const u8) ![]const u8 {
+const ProviderRoute = enum { details, download };
+
+fn resolveProviderUrl(allocator: Allocator, href: []const u8, route: ProviderRoute) ![]const u8 {
     const resolved = try common.resolveUrl(allocator, site, href);
     errdefer allocator.free(resolved);
-    try validateProviderEndpoint(resolved);
+    try validateProviderEndpoint(resolved, route);
     return resolved;
 }
 
-fn validateProviderEndpoint(url: []const u8) !void {
+fn validateProviderEndpoint(url: []const u8, route: ProviderRoute) !void {
     try common.validatePublicHttpUrl(url);
     if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+
+    const uri = std.Uri.parse(url) catch return error.UnsafeHttpTarget;
+    if (uri.user != null or uri.password != null or uri.fragment != null) return error.UnsafeHttpTarget;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    const query = if (uri.query) |component| switch (component) {
+        .raw, .percent_encoded => |value| value,
+    } else null;
+
+    switch (route) {
+        .details => {
+            if (query != null or !isSingleSlugRoute(path, "/hotove-preklady/", "/")) {
+                return error.UnsafeHttpTarget;
+            }
+        },
+        .download => {
+            if (!isSingleSlugRoute(path, "/download/", "/") or
+                query == null or !isDownloadQuery(query.?)) return error.UnsafeHttpTarget;
+        },
+    }
+}
+
+fn isSingleSlugRoute(path: []const u8, prefix: []const u8, suffix: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix) or
+        path.len <= prefix.len + suffix.len) return false;
+    return isSafeEncodedSegment(path[prefix.len .. path.len - suffix.len]);
+}
+
+fn isDownloadQuery(query: []const u8) bool {
+    var download_id: ?[]const u8 = null;
+    var master_key: ?[]const u8 = null;
+    var fields = std.mem.splitScalar(u8, query, '&');
+    while (fields.next()) |field| {
+        const equals = std.mem.indexOfScalar(u8, field, '=') orelse return false;
+        const key = field[0..equals];
+        const value = field[equals + 1 ..];
+        if (std.mem.eql(u8, key, "wpdmdl")) {
+            if (download_id != null or !isCanonicalPositiveId(value)) return false;
+            download_id = value;
+        } else if (std.mem.eql(u8, key, "masterkey")) {
+            if (master_key != null or !isSafeQueryValue(value)) return false;
+            master_key = value;
+        } else return false;
+    }
+    return download_id != null;
+}
+
+fn isCanonicalPositiveId(value: []const u8) bool {
+    if (value.len == 0 or value.len > 19 or value[0] == '0') return false;
+    for (value) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+fn isSafeQueryValue(value: []const u8) bool {
+    if (value.len == 0 or value.len > 256) return false;
+    var index: usize = 0;
+    while (index < value.len) {
+        const c = value[index];
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~' or c == '+') {
+            index += 1;
+            continue;
+        }
+        if (c != '%' or value.len - index < 3 or
+            !std.ascii.isHex(value[index + 1]) or !std.ascii.isHex(value[index + 2])) return false;
+        const decoded = std.fmt.parseInt(u8, value[index + 1 .. index + 3], 16) catch return false;
+        if (decoded == '&' or decoded == '=' or decoded == '%' or decoded < 0x20 or decoded == 0x7f) return false;
+        index += 3;
+    }
+    return true;
+}
+
+fn isSafeEncodedSegment(segment: []const u8) bool {
+    if (segment.len == 0 or segment.len > 512 or
+        std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return false;
+    var decoded_len: usize = 0;
+    var decoded_all_dots = true;
+    var index: usize = 0;
+    while (index < segment.len) {
+        const c = segment[index];
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
+            decoded_len += 1;
+            if (c != '.') decoded_all_dots = false;
+            index += 1;
+            continue;
+        }
+        if (c != '%' or segment.len - index < 3 or
+            !std.ascii.isHex(segment[index + 1]) or !std.ascii.isHex(segment[index + 2])) return false;
+        const decoded = std.fmt.parseInt(u8, segment[index + 1 .. index + 3], 16) catch return false;
+        if (decoded < 0x20 or decoded == 0x7f or decoded == '/' or decoded == '\\' or
+            decoded == '?' or decoded == '#' or decoded == '%') return false;
+        decoded_len += 1;
+        if (decoded != '.') decoded_all_dots = false;
+        index += 3;
+    }
+    return !(decoded_all_dots and decoded_len <= 2);
 }
 
 fn releaseMatchesSeason(entry: CatalogEntry, season: u16) bool {
@@ -455,6 +578,33 @@ test "nyasub parses catalog titles and release links" {
     try std.testing.expectEqual(MediaKind.tv, if (entries[0].release_season != null) MediaKind.tv else MediaKind.movie);
 }
 
+test "nyasub partial cap does not hide a later exact catalog match" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const entries = try a.alloc(CatalogEntry, max_search_items * 4 + 1);
+    for (entries[0 .. entries.len - 1], 0..) |*entry, index| {
+        entry.* = .{
+            .title = "Target extended",
+            .release_label = "release",
+            .page_url = site ++ "/hotove-preklady/target-extended/",
+            .release_season = null,
+            .release_index = index,
+        };
+    }
+    entries[entries.len - 1] = .{
+        .title = "Target",
+        .release_label = "exact",
+        .page_url = site ++ "/hotove-preklady/target/",
+        .release_season = null,
+        .release_index = entries.len - 1,
+    };
+
+    const items = try buildSearchItems(a, entries, parseQuery("Target"), "target");
+    try std.testing.expectEqual(@as(usize, max_search_items), items.len);
+    try std.testing.expectEqualStrings("Target", items[0].title);
+}
+
 test "nyasub parses episode links in page order" {
     const fixture =
         \\<a href="https://nyasub.cz/download/a/?wpdmdl=1&amp;masterkey=abc"><span>Titulky</span></a>
@@ -465,6 +615,18 @@ test "nyasub parses episode links in page order" {
     const links = try parseDownloadLinks(arena.allocator(), fixture);
     try std.testing.expectEqual(@as(usize, 2), links.len);
     try std.testing.expect(std.mem.indexOf(u8, links[0], "wpdmdl=1&masterkey=abc") != null);
+}
+
+test "nyasub skips unsafe download candidates and keeps later valid links" {
+    const fixture =
+        \\<a href="http://127.0.0.1/?wpdmdl=1"><span>Titulky</span></a>
+        \\<a href="https://nyasub.cz/download/a/?wpdmdl=2&amp;masterkey=ok"><span>Titulky</span></a>
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const links = try parseDownloadLinks(arena.allocator(), fixture);
+    try std.testing.expectEqual(@as(usize, 1), links.len);
+    try std.testing.expectEqualStrings("https://nyasub.cz/download/a/?wpdmdl=2&masterkey=ok", links[0]);
 }
 
 test "nyasub decodes numeric url entities" {
@@ -480,10 +642,26 @@ test "nyasub parses SxxExx queries" {
     try std.testing.expectEqual(@as(?u16, 1), parsed.episode);
 }
 
+test "nyasub does not fetch its catalog for punctuation-only queries" {
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &client);
+    var response = try scraper.search("---...");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(usize, 0), response.items.len);
+}
+
 test "nyasub rejects unsafe provider links before fetch" {
-    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "http://127.0.0.1/?wpdmdl=1"));
-    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://user:pass@nyasub.cz/?wpdmdl=1"));
-    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://www.google.com/?wpdmdl=1"));
+    try validateProviderEndpoint(site ++ "/hotove-preklady/caf%C3%A9/", .details);
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "http://127.0.0.1/?wpdmdl=1", .download));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://user:pass@nyasub.cz/?wpdmdl=1", .download));
+    try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, "https://www.google.com/?wpdmdl=1", .download));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint(site ++ "/hotove-preklady/show/?next=/", .details));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint(site ++ "/hotove-preklady/a%252fb/", .details));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint(site ++ "/download/show/?wpdmdl=0", .download));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint(site ++ "/download/show/?wpdmdl=2&next=/", .download));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint(site ++ "/wp-admin/export/?wpdmdl=2", .download));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderEndpoint(site ++ "/hotove-preklady/%2e%2E/", .details));
 }
 
 test "live nyasub tv search and subtitle listing" {

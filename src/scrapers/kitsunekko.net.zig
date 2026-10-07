@@ -41,6 +41,7 @@ pub const Scraper = struct {
         const parsed_query = parseQuery(query);
         if (parsed_query.title.len == 0) return .{ .arena = arena, .items = &.{} };
         const wanted = try common.normalizeTitle(a, parsed_query.title);
+        if (wanted.len == 0) return .{ .arena = arena, .items = &.{} };
 
         var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
         var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
@@ -75,51 +76,25 @@ pub const Scraper = struct {
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = true,
             .max_attempts = 2,
+            .require_public_origin = true,
+            .require_https = true,
         });
 
-        var parsed = try common.parseHtmlStable(allocator, response.body);
-        var anchors = parsed.doc.queryAll("a[href*='dirlist.php?dir=']");
-        while (anchors.next()) |anchor| {
-            if (exact.items.len + partial.items.len >= max_search_items * 4) break;
-            const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
-            if (std.mem.indexOf(u8, href, "&sort=") != null or std.mem.indexOf(u8, href, "&amp;sort=") != null) continue;
-
-            const raw_title = try common.innerTextTrimmedOwned(allocator, anchor);
-            if (raw_title.len == 0) continue;
-            const normalized = try common.normalizeTitle(allocator, raw_title);
-            if (normalized.len == 0) continue;
-
-            const is_exact = std.mem.eql(u8, normalized, wanted);
-            const is_partial = std.mem.indexOf(u8, normalized, wanted) != null or std.mem.indexOf(u8, wanted, normalized) != null;
-            if (!is_exact and !is_partial) continue;
-
-            const page_url = try common.resolveUrl(allocator, site, href);
-            if (seen.contains(page_url)) continue;
-            try seen.put(allocator, page_url, {});
-
-            const item: SearchItem = .{
-                .title = try allocator.dupe(u8, raw_title),
-                .language_code = language_code,
-                .season = parsed_query.season,
-                .episode = parsed_query.episode,
-                .page_url = page_url,
-            };
-            if (is_exact)
-                try exact.append(allocator, item)
-            else
-                try partial.append(allocator, item);
-        }
+        try appendCatalogMatchesFromBody(allocator, response.body, language_code, parsed_query, wanted, exact, partial, seen);
     }
 
     pub fn fetchSubtitlesBySearchItem(self: *Scraper, item: SearchItem) !SubtitlesResponse {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+        try validateProviderUrl(item.page_url, .listing);
 
         const response = try common.fetchBytes(self.client, a, item.page_url, .{
             .accept = "text/html,application/xhtml+xml,*/*",
             .cache = false,
             .max_attempts = 2,
+            .require_public_origin = true,
+            .require_https = true,
         });
 
         const subtitles = try parseSubtitleFiles(a, response.body, item);
@@ -131,6 +106,55 @@ pub const Scraper = struct {
         });
     }
 };
+
+fn appendCatalogMatchesFromBody(
+    allocator: Allocator,
+    body: []const u8,
+    language_code: []const u8,
+    parsed_query: ParsedQuery,
+    wanted: []const u8,
+    exact: *std.ArrayListUnmanaged(SearchItem),
+    partial: *std.ArrayListUnmanaged(SearchItem),
+    seen: *std.StringHashMapUnmanaged(void),
+) !void {
+    var parsed = try common.parseHtmlStable(allocator, body);
+    var anchors = parsed.doc.queryAll("a[href*='dirlist.php?dir=']");
+    while (anchors.next()) |anchor| {
+        if (exact.items.len >= max_search_items and partial.items.len >= max_search_items) break;
+        const href = common.getAttributeValueSafe(anchor, "href") orelse continue;
+        if (std.mem.indexOf(u8, href, "&sort=") != null or std.mem.indexOf(u8, href, "&amp;sort=") != null) continue;
+
+        const raw_title = try common.innerTextTrimmedOwned(allocator, anchor);
+        if (raw_title.len == 0) continue;
+        const normalized = try common.normalizeTitle(allocator, raw_title);
+        if (normalized.len == 0) continue;
+
+        const is_exact = std.mem.eql(u8, normalized, wanted);
+        const is_partial = std.mem.indexOf(u8, normalized, wanted) != null or std.mem.indexOf(u8, wanted, normalized) != null;
+        if (!is_exact and !is_partial) continue;
+        if ((is_exact and exact.items.len >= max_search_items) or
+            (!is_exact and partial.items.len >= max_search_items)) continue;
+
+        const page_url = resolveProviderUrl(allocator, href, .listing) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => continue,
+        };
+        if (seen.contains(page_url)) continue;
+        try seen.put(allocator, page_url, {});
+
+        const item: SearchItem = .{
+            .title = try allocator.dupe(u8, raw_title),
+            .language_code = language_code,
+            .season = parsed_query.season,
+            .episode = parsed_query.episode,
+            .page_url = page_url,
+        };
+        if (is_exact)
+            try exact.append(allocator, item)
+        else
+            try partial.append(allocator, item);
+    }
+}
 
 fn parseSubtitleFiles(allocator: Allocator, body: []const u8, item: SearchItem) ![]const SubtitleItem {
     var parsed = try common.parseHtmlStable(allocator, body);
@@ -145,7 +169,10 @@ fn parseSubtitleFiles(allocator: Allocator, body: []const u8, item: SearchItem) 
         if (item.episode) |episode| {
             if (!filenameMatchesEpisode(filename, item.season orelse 1, episode)) continue;
         }
-        const download_url = try common.resolveUrl(allocator, site, href);
+        const download_url = resolveDownloadHref(allocator, href) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => continue,
+        };
         if (seen.contains(download_url)) continue;
         try seen.put(allocator, download_url, {});
         try subtitles.append(allocator, .{
@@ -158,6 +185,11 @@ fn parseSubtitleFiles(allocator: Allocator, body: []const u8, item: SearchItem) 
 }
 
 fn isSupportedFilename(filename: []const u8) bool {
+    if (filename.len == 0 or filename.len > 512 or
+        std.mem.eql(u8, filename, ".") or std.mem.eql(u8, filename, "..")) return false;
+    for (filename) |c| {
+        if (c < 0x20 or c == 0x7f or c == '/' or c == '\\') return false;
+    }
     // Keep the user path on plain subtitle files or ZIP. Kitsunekko also hosts
     // RAR and 7z packs, but those are intentionally not advertised because
     // extraction support is less reliable and equivalent direct/ZIP files exist.
@@ -166,6 +198,174 @@ fn isSupportedFilename(filename: []const u8) bool {
         std.ascii.endsWithIgnoreCase(filename, ".ssa") or
         std.ascii.endsWithIgnoreCase(filename, ".vtt") or
         std.ascii.endsWithIgnoreCase(filename, ".zip");
+}
+
+const ProviderRoute = enum { listing, download };
+
+fn resolveProviderUrl(allocator: Allocator, href: []const u8, route: ProviderRoute) ![]const u8 {
+    const resolved = try common.resolveUrl(allocator, site, href);
+    errdefer allocator.free(resolved);
+    try validateProviderUrl(resolved, route);
+    return resolved;
+}
+
+fn resolveDownloadHref(allocator: Allocator, href: []const u8) ![]const u8 {
+    const encoded_href = try encodeDownloadHref(allocator, href);
+    defer allocator.free(encoded_href);
+    return resolveProviderUrl(allocator, encoded_href, .download);
+}
+
+fn encodeDownloadHref(allocator: Allocator, href: []const u8) ![]u8 {
+    if (href.len == 0 or href.len > 4096 or std.mem.indexOfAny(u8, href, "?#") != null or
+        std.mem.startsWith(u8, href, "//")) return error.UnsafeHttpTarget;
+    const relative = if (href[0] == '/') href[1..] else href;
+    if (!std.mem.startsWith(u8, relative, "subtitles/")) return error.UnsafeHttpTarget;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    if (href[0] == '/') try out.append(allocator, '/');
+    var index: usize = 0;
+    while (index < relative.len) {
+        const byte = relative[index];
+        if (byte < 0x20 or byte == 0x7f or byte == '\\') return error.UnsafeHttpTarget;
+        if (byte == '/' or std.ascii.isAlphanumeric(byte) or
+            byte == '-' or byte == '_' or byte == '.' or byte == '~')
+        {
+            try out.append(allocator, byte);
+            index += 1;
+            continue;
+        }
+        if (byte == '%') {
+            if (relative.len - index < 3 or
+                !std.ascii.isHex(relative[index + 1]) or !std.ascii.isHex(relative[index + 2]))
+            {
+                return error.UnsafeHttpTarget;
+            }
+            const decoded = std.fmt.parseInt(u8, relative[index + 1 .. index + 3], 16) catch return error.UnsafeHttpTarget;
+            if (decoded < 0x20 or decoded == 0x7f or decoded == '/' or decoded == '\\' or
+                decoded == '?' or decoded == '#' or decoded == '%') return error.UnsafeHttpTarget;
+            try out.appendSlice(allocator, &.{
+                '%',
+                "0123456789ABCDEF"[decoded >> 4],
+                "0123456789ABCDEF"[decoded & 0xf],
+            });
+            index += 3;
+            continue;
+        }
+        try out.appendSlice(allocator, &.{
+            '%',
+            "0123456789ABCDEF"[byte >> 4],
+            "0123456789ABCDEF"[byte & 0xf],
+        });
+        index += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn validateProviderUrl(url: []const u8, route: ProviderRoute) !void {
+    try common.validatePublicHttpUrl(url);
+    if (!(try common.sameOrigin(site, url))) return error.UnsafeHttpTarget;
+
+    const uri = std.Uri.parse(url) catch return error.UnsafeHttpTarget;
+    if (uri.user != null or uri.password != null or uri.fragment != null) return error.UnsafeHttpTarget;
+    const path = switch (uri.path) {
+        .raw, .percent_encoded => |value| value,
+    };
+    const query = if (uri.query) |component| switch (component) {
+        .raw, .percent_encoded => |value| value,
+    } else null;
+
+    switch (route) {
+        .listing => {
+            if (!std.mem.eql(u8, path, "/dirlist.php") or query == null or
+                !isSafeDirectoryQuery(query.?)) return error.UnsafeHttpTarget;
+        },
+        .download => {
+            if (query != null or !isSafeDownloadPath(path)) return error.UnsafeHttpTarget;
+        },
+    }
+}
+
+fn isSafeDirectoryQuery(query: []const u8) bool {
+    const prefix = "dir=";
+    if (!std.mem.startsWith(u8, query, prefix)) return false;
+    const value = query[prefix.len..];
+    if (value.len == 0 or value.len > 2048 or std.mem.indexOfAny(u8, value, "&#=") != null) return false;
+
+    var segment_count: usize = 0;
+    var segment_len: usize = 0;
+    var segment_all_dots = true;
+    var first_segment_matches = true;
+    var index: usize = 0;
+    while (index < value.len) {
+        const decoded = if (value[index] == '%') blk: {
+            if (value.len - index < 3 or
+                !std.ascii.isHex(value[index + 1]) or !std.ascii.isHex(value[index + 2])) return false;
+            const byte = std.fmt.parseInt(u8, value[index + 1 .. index + 3], 16) catch return false;
+            index += 3;
+            break :blk byte;
+        } else blk: {
+            const byte = value[index];
+            index += 1;
+            break :blk byte;
+        };
+        if (decoded == '/') {
+            if (segment_len == 0 or (segment_all_dots and segment_len <= 2)) return false;
+            if (segment_count == 0 and
+                (!first_segment_matches or segment_len != "subtitles".len)) return false;
+            segment_count += 1;
+            segment_len = 0;
+            segment_all_dots = true;
+            continue;
+        }
+        if (decoded < 0x20 or decoded == 0x7f or decoded == '\\' or decoded == '%') return false;
+        if (segment_count == 0) {
+            const expected = "subtitles";
+            if (segment_len >= expected.len or decoded != expected[segment_len]) first_segment_matches = false;
+        }
+        segment_len += 1;
+        if (decoded != '.') segment_all_dots = false;
+    }
+    return segment_len == 0 and segment_count >= 1 and first_segment_matches;
+}
+
+fn isSafeDownloadPath(path: []const u8) bool {
+    const prefix = "/subtitles/";
+    if (path.len <= prefix.len or path.len > 4096 or !std.mem.startsWith(u8, path, prefix) or
+        path[path.len - 1] == '/') return false;
+    var segments = std.mem.splitScalar(u8, path[prefix.len..], '/');
+    var last: []const u8 = "";
+    while (segments.next()) |segment| {
+        if (!isSafeEncodedPathSegment(segment)) return false;
+        last = segment;
+    }
+    return isSupportedFilename(last);
+}
+
+fn isSafeEncodedPathSegment(segment: []const u8) bool {
+    if (segment.len == 0 or segment.len > 512 or
+        std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return false;
+    var decoded_len: usize = 0;
+    var decoded_all_dots = true;
+    var index: usize = 0;
+    while (index < segment.len) {
+        const c = segment[index];
+        if (std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "-._~!$'()*+,;=:@", c) != null) {
+            decoded_len += 1;
+            if (c != '.') decoded_all_dots = false;
+            index += 1;
+            continue;
+        }
+        if (c != '%' or segment.len - index < 3 or
+            !std.ascii.isHex(segment[index + 1]) or !std.ascii.isHex(segment[index + 2])) return false;
+        const decoded = std.fmt.parseInt(u8, segment[index + 1 .. index + 3], 16) catch return false;
+        if (decoded < 0x20 or decoded == 0x7f or decoded == '/' or decoded == '\\' or
+            decoded == '?' or decoded == '#' or decoded == '%') return false;
+        decoded_len += 1;
+        if (decoded != '.') decoded_all_dots = false;
+        index += 3;
+    }
+    return !(decoded_all_dots and decoded_len <= 2);
 }
 
 fn filenameMatchesEpisode(filename: []const u8, season: u16, episode: u16) bool {
@@ -280,16 +480,29 @@ fn episodeOnlySeasonMatches(value: []const u8, season: u16) bool {
 }
 
 fn releaseEpisodeMarkerMatches(value: []const u8, episode: u16) ?bool {
+    var bracket_depth: usize = 0;
+    var found = false;
     for (value, 0..) |c, i| {
-        if (c != '-') continue;
+        if (c == '[') {
+            bracket_depth += 1;
+            continue;
+        }
+        if (c == ']') {
+            if (bracket_depth > 0) bracket_depth -= 1;
+            continue;
+        }
+        // Release-group tags commonly contain numeric suffixes such as
+        // `[Group-2]`. They are metadata, not episode markers.
+        if (c != '-' or bracket_depth != 0) continue;
         var start = i + 1;
         while (start < value.len and std.ascii.isWhitespace(value[start])) : (start += 1) {}
         const parsed = parseEpisodeNumber(value, start) orelse continue;
         if (parsed.end - start > 3 or isDecimalNumber(value, start, parsed.end)) continue;
         _ = episodeTokenEnd(value, parsed.end) orelse continue;
-        return parsed.value == episode;
+        found = true;
+        if (parsed.value == episode) return true;
     }
-    return null;
+    return if (found) false else null;
 }
 
 fn isDecimalNumber(value: []const u8, start: usize, end: usize) bool {
@@ -323,19 +536,6 @@ fn bareEpisodeNumberMatches(value: []const u8, episode: u16) bool {
     return false;
 }
 
-fn filenameMatchesEpisode(filename: []const u8, season: u16, episode: u16) bool {
-    var sxe_buf: [16]u8 = undefined;
-    const sxe = std.fmt.bufPrint(&sxe_buf, "S{d:0>2}E{d:0>2}", .{ season, episode }) catch return false;
-    if (containsNumericToken(filename, sxe)) return true;
-
-    var x_buf: [16]u8 = undefined;
-    const x = std.fmt.bufPrint(&x_buf, "{d:0>2}x{d:0>2}", .{ season, episode }) catch return false;
-    if (containsNumericToken(filename, x)) return true;
-
-    var episode_buf: [24]u8 = undefined;
-    const episode_text = std.fmt.bufPrint(&episode_buf, "episode {d}", .{episode}) catch return false;
-    return containsNumericToken(filename, episode_text);
-}
 fn findResult(items: []const SearchItem, title: []const u8, language_code: []const u8) ?usize {
     for (items, 0..) |item, idx| {
         if (std.ascii.eqlIgnoreCase(item.title, title) and std.mem.eql(u8, item.language_code, language_code))
@@ -365,6 +565,102 @@ test "kitsunekko parses episode query and filters unsafe archive formats" {
     try std.testing.expect(isSupportedFilename("series.zip"));
     try std.testing.expect(!isSupportedFilename("series.rar"));
     try std.testing.expect(!isSupportedFilename("series.7z"));
+}
+
+test "kitsunekko does not fetch catalogs for punctuation-only queries" {
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    var scraper = Scraper.init(std.testing.allocator, &client);
+    var response = try scraper.search("---...");
+    defer response.deinit();
+    try std.testing.expectEqual(@as(usize, 0), response.items.len);
+}
+
+test "kitsunekko rejects off-origin listing and download links" {
+    try validateProviderUrl("https://kitsunekko.net/dirlist.php?dir=subtitles%2F", .listing);
+    try validateProviderUrl(site ++ "/subtitles/caf%C3%A9/file.srt", .download);
+    for ([_][]const u8{
+        "http://127.0.0.1/private.srt",
+        "https://user@kitsunekko.net/private.srt",
+        "https://kitsunekko.net.evil.example/private.srt",
+        "https://example.com/private.srt",
+    }) |url| try std.testing.expectError(error.UnsafeHttpTarget, resolveProviderUrl(std.testing.allocator, url, .download));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderUrl(site ++ "/dirlist.php?dir=..%2F", .listing));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderUrl(site ++ "/dirlist.php?dir=subtitles%252Fsecret%2F", .listing));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderUrl(site ++ "/dirlist.php?dir=subtitles%2FShow%2F&sort=name", .listing));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderUrl(site ++ "/admin/export.srt", .listing));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderUrl(site ++ "/subtitles/Show/a%252fb.srt", .download));
+    try std.testing.expectError(error.UnsafeHttpTarget, validateProviderUrl(site ++ "/subtitles/%2e%2E/file.srt", .download));
+    try std.testing.expect(!isSupportedFilename("../episode.srt"));
+}
+
+test "kitsunekko skips invalid catalog rows before a valid row" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body =
+        "<a href='https://example.com/dirlist.php?dir=subtitles%2FTarget%2F'>Target</a>" ++
+        "<a href='file:///dirlist.php?dir=subtitles%2FTarget%2F'>Target</a>" ++
+        "<a href='/dirlist.php?dir=subtitles%2FTarget%2F'>Target</a>";
+    var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
+    var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    try appendCatalogMatchesFromBody(a, body, "en", parseQuery("Target"), "target", &exact, &partial, &seen);
+    try std.testing.expectEqual(@as(usize, 1), exact.items.len);
+    try std.testing.expectEqual(@as(usize, 0), partial.items.len);
+    try std.testing.expectEqualStrings("https://kitsunekko.net/dirlist.php?dir=subtitles%2FTarget%2F", exact.items[0].page_url);
+}
+
+test "kitsunekko partial cap does not hide a later exact catalog match" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var body: std.Io.Writer.Allocating = .init(a);
+    defer body.deinit();
+    for (0..max_search_items * 4) |index| {
+        try body.writer.print(
+            "<a href='/dirlist.php?dir=subtitles%2FTarget-{d}%2F'>Target extended {d}</a>",
+            .{ index, index },
+        );
+    }
+    try body.writer.writeAll("<a href='/dirlist.php?dir=subtitles%2FTarget%2F'>Target</a>");
+
+    var exact: std.ArrayListUnmanaged(SearchItem) = .empty;
+    var partial: std.ArrayListUnmanaged(SearchItem) = .empty;
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    try appendCatalogMatchesFromBody(a, body.written(), "en", parseQuery("Target"), "target", &exact, &partial, &seen);
+
+    try std.testing.expectEqual(@as(usize, 1), exact.items.len);
+    try std.testing.expectEqual(@as(usize, max_search_items), partial.items.len);
+    try std.testing.expectEqualStrings("Target", exact.items[0].title);
+}
+
+test "kitsunekko skips invalid file rows before a valid row" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body =
+        "<a href='https://example.com/bad.srt'>Show.S01E02.bad.srt</a>" ++
+        "<a href='file:///bad.srt'>Show.S01E02.bad-too.srt</a>" ++
+        "<a href='subtitles/Show/good.srt'>Show.S01E02.good.srt</a>";
+    const subtitles = try parseSubtitleFiles(arena.allocator(), body, .{
+        .title = "Show",
+        .language_code = "en",
+        .season = 1,
+        .episode = 2,
+        .page_url = site ++ "/dirlist.php?dir=subtitles%2FShow%2F",
+    });
+    try std.testing.expectEqual(@as(usize, 1), subtitles.len);
+    try std.testing.expectEqualStrings("Show.S01E02.good.srt", subtitles[0].filename);
+    try std.testing.expectEqualStrings("https://kitsunekko.net/subtitles/Show/good.srt", subtitles[0].download_url);
+}
+
+test "kitsunekko encodes raw file href characters from directory listings" {
+    const url = try resolveDownloadHref(std.testing.allocator, "subtitles/Death Note/[Group] Episode 01.ass");
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings(
+        site ++ "/subtitles/Death%20Note/%5BGroup%5D%20Episode%2001.ass",
+        url,
+    );
 }
 
 test "live kitsunekko english and japanese movie plus tv downloads" {
@@ -425,7 +721,7 @@ test "explicit kitsunekko episode queries do not return unrelated fallback files
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const body = "<a href='/2.srt'>Show.S01E02.srt</a><a href='/pack.zip'>Show.zip</a>";
+    const body = "<a href='/subtitles/Show/2.srt'>Show.S01E02.srt</a><a href='/subtitles/Show/pack.zip'>Show.zip</a>";
     var item: SearchItem = .{
         .title = "Show",
         .language_code = "en",
@@ -459,16 +755,18 @@ test "episode tokens do not match longer episode numbers" {
         "Show [FLAC 2.0].ass",
     }) |name| try std.testing.expect(!filenameMatchesEpisode(name, 1, 2));
     for ([_][]const u8{ "Show S1E2.ass", "Show 1x2.ass", "Show Episode 02.ass", "Show - 02 [FLAC 2.0].ass" }) |name| try std.testing.expect(filenameMatchesEpisode(name, 1, 2));
+    try std.testing.expect(filenameMatchesEpisode("[Group-1] Show - 02.ass", 1, 2));
+    try std.testing.expect(!filenameMatchesEpisode("[Group-2] Show - 01.ass", 1, 2));
 }
 
 test "kitsunekko later-season selection requires a season-qualified episode" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const body =
-        "<a href='/ambiguous.srt'>Show Episode 02.srt</a>" ++
-        "<a href='/short.srt'>Show E02.srt</a>" ++
-        "<a href='/first.srt'>Show S01E02.srt</a>" ++
-        "<a href='/second.srt'>Show S02E02.srt</a>";
+        "<a href='/subtitles/Show/ambiguous.srt'>Show Episode 02.srt</a>" ++
+        "<a href='/subtitles/Show/short.srt'>Show E02.srt</a>" ++
+        "<a href='/subtitles/Show/first.srt'>Show S01E02.srt</a>" ++
+        "<a href='/subtitles/Show/second.srt'>Show S02E02.srt</a>";
     const subtitles = try parseSubtitleFiles(arena.allocator(), body, .{
         .title = "Show",
         .language_code = "en",

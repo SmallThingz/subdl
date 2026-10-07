@@ -12,6 +12,7 @@ const max_cookie_count: usize = 4096;
 const max_browser_path_bytes: usize = 4096;
 const max_zero_length_reads: usize = 8;
 const profile_cleanup_attempts: usize = 5;
+const profile_cleanup_grace_ms: i64 = 5_000;
 const minimum_secure_chromium_major: u16 = 154;
 const browser_path_env = "SUBDL_CHROMIUM_PATH";
 const pipe_shell = "/bin/sh";
@@ -160,7 +161,8 @@ pub const NavigationPolicy = struct {
         }
 
         var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-        const host_name = uri.getHost(&host_buffer) catch return error.InvalidBrowserNavigation;
+        const host_name = std.Io.net.HostName.fromUri(uri, &host_buffer) catch
+            return error.InvalidBrowserNavigation;
         const host = host_name.bytes;
         if (!validResolverHost(host)) return error.InvalidBrowserNavigation;
         const origin_host = try allocator.dupe(u8, host);
@@ -217,7 +219,7 @@ pub const NavigationPolicy = struct {
             uri.user == null and uri.password == null)
         {
             var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-            const host_name = uri.getHost(&host_buffer) catch return false;
+            const host_name = std.Io.net.HostName.fromUri(uri, &host_buffer) catch return false;
             const host = host_name.bytes;
             if (std.ascii.eqlIgnoreCase(host, self.origin_host) or
                 std.ascii.eqlIgnoreCase(host, cloudflare_challenge_host)) return true;
@@ -251,6 +253,48 @@ fn makeProxyBypassArg(allocator: Allocator, origin_host: []const u8) ![]u8 {
         "{s}https://{s}:443;https://{s}:443",
         .{ proxy_bypass_prefix, origin_host, cloudflare_challenge_host },
     );
+}
+
+fn profileCleanupDeadline(now_ms: i64) i64 {
+    return now_ms +| profile_cleanup_grace_ms;
+}
+
+fn deleteSecureProfileTree(io: std.Io, path: []const u8) !void {
+    try std.Io.Dir.cwd().deleteTree(io, path);
+}
+
+fn secureProfileCleanupTimestamp(_: std.Io) i64 {
+    return common.compatMilliTimestamp();
+}
+
+fn sleepForSecureProfileCleanup(_: std.Io, delay_ms: u64) !void {
+    try common.sleepMillisecondsCancelable(delay_ms);
+}
+
+fn cleanupSecureProfilePathWith(
+    context: anytype,
+    path: []const u8,
+    cleanup_deadline_ms: i64,
+    comptime delete_tree: anytype,
+    comptime timestamp: anytype,
+    comptime sleep: anytype,
+) ?anyerror {
+    var last_error: ?anyerror = null;
+    var attempt: usize = 0;
+    while (attempt < profile_cleanup_attempts) : (attempt += 1) {
+        if (attempt > 0 and timestamp(context) >= cleanup_deadline_ms) break;
+        delete_tree(context, path) catch |err| {
+            last_error = err;
+            const now = timestamp(context);
+            if (attempt + 1 >= profile_cleanup_attempts or now >= cleanup_deadline_ms) break;
+            const pause_ms: u64 = @intCast(@min(@as(i64, 100), cleanup_deadline_ms - now));
+            sleep(context, pause_ms) catch break;
+            if (timestamp(context) >= cleanup_deadline_ms) break;
+            continue;
+        };
+        return null;
+    }
+    return last_error;
 }
 
 const SecureProfile = struct {
@@ -288,7 +332,15 @@ const SecureProfile = struct {
             errdefer {
                 const protection = io.swapCancelProtection(.blocked);
                 defer _ = io.swapCancelProtection(protection);
-                std.Io.Dir.cwd().deleteTree(io, path) catch {};
+                const cleanup_deadline_ms = profileCleanupDeadline(common.compatMilliTimestamp());
+                _ = cleanupSecureProfilePathWith(
+                    io,
+                    path,
+                    cleanup_deadline_ms,
+                    deleteSecureProfileTree,
+                    secureProfileCleanupTimestamp,
+                    sleepForSecureProfileCleanup,
+                );
             }
 
             const stat = try std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
@@ -328,27 +380,22 @@ const SecureProfile = struct {
         return error.BrowserAutomationFailed;
     }
 
-    fn deinit(self: *SecureProfile, allocator: Allocator, deadline_ms: i64) void {
+    fn deinit(self: *SecureProfile, allocator: Allocator) void {
         const io = runtime_io.get();
         const protection = io.swapCancelProtection(.blocked);
         defer _ = io.swapCancelProtection(protection);
-        var last_error: ?anyerror = null;
-        var attempt: usize = 0;
-        while (attempt < profile_cleanup_attempts) : (attempt += 1) {
-            if (attempt > 0 and common.compatMilliTimestamp() >= deadline_ms) break;
-            std.Io.Dir.cwd().deleteTree(io, self.path) catch |err| {
-                last_error = err;
-                const now = common.compatMilliTimestamp();
-                if (attempt + 1 >= profile_cleanup_attempts or now >= deadline_ms) break;
-                const pause_ms: u64 = @intCast(@min(@as(i64, 100), deadline_ms - now));
-                common.sleepMillisecondsCancelable(pause_ms) catch break;
-                if (common.compatMilliTimestamp() >= deadline_ms) break;
-                continue;
-            };
-            last_error = null;
-            break;
-        }
-        if (last_error) |err| {
+        const cleanup_deadline_ms = profileCleanupDeadline(common.compatMilliTimestamp());
+        if (cleanupSecureProfilePathWith(
+            io,
+            self.path,
+            cleanup_deadline_ms,
+            deleteSecureProfileTree,
+            secureProfileCleanupTimestamp,
+            sleepForSecureProfileCleanup,
+        )) |err| {
+            // Do not print the randomized path: the profile can contain
+            // challenge cookies. The error name still makes a leftover
+            // credential-bearing profile observable to the user.
             std.log.warn("failed to remove temporary browser profile ({s})", .{@errorName(err)});
         }
         allocator.free(self.path);
@@ -391,7 +438,6 @@ pub const Browser = struct {
     primary_target_id: ?[]u8 = null,
     session_id: ?[]u8 = null,
     downloads_denied: bool = false,
-    deadline_ms: i64,
 
     pub fn launch(
         allocator: Allocator,
@@ -403,7 +449,7 @@ pub const Browser = struct {
         if (comptime !supportedOn(builtin.os.tag)) return error.BrowserAutomationUnavailable;
         try deadlineCheckpoint(deadline_ms);
         if (!validExecutablePath(executable)) return error.InvalidBrowserExecutable;
-        var browser = try spawnBrowser(allocator, executable, navigation_policy, headless, deadline_ms);
+        var browser = try spawnBrowser(allocator, executable, navigation_policy, headless);
         errdefer browser.deinit();
         try browser.initialize(deadline_ms);
         try deadlineCheckpoint(deadline_ms);
@@ -412,7 +458,7 @@ pub const Browser = struct {
 
     pub fn deinit(self: *Browser) void {
         killProcessTree(&self.child);
-        self.profile.deinit(self.allocator, self.deadline_ms);
+        self.profile.deinit(self.allocator);
         if (self.primary_target_id) |target_id| self.allocator.free(target_id);
         if (self.session_id) |session_id| self.allocator.free(session_id);
         self.allocator.free(self.read_buffer);
@@ -793,10 +839,9 @@ fn spawnBrowser(
     executable: []const u8,
     navigation_policy: *const NavigationPolicy,
     headless: bool,
-    deadline_ms: i64,
 ) !Browser {
     var profile = try SecureProfile.create(allocator);
-    errdefer profile.deinit(allocator, deadline_ms);
+    errdefer profile.deinit(allocator);
     const profile_arg = try std.fmt.allocPrint(allocator, "--user-data-dir={s}", .{profile.path});
     defer allocator.free(profile_arg);
     const resolver_arg = try std.fmt.allocPrint(allocator, "--host-resolver-rules={s}", .{navigation_policy.resolver_rules});
@@ -871,12 +916,11 @@ fn spawnBrowser(
         .profile = profile,
         .navigation_policy = navigation_policy,
         .read_buffer = read_buffer,
-        .deadline_ms = deadline_ms,
     };
 }
 
 fn setPipeNonblocking(file: *std.Io.File) !void {
-    const FlagInt = std.meta.Int(.unsigned, @bitSizeOf(std.posix.O));
+    const FlagInt = std.meta.BackingInt(std.posix.O);
     const current: FlagInt = while (true) {
         const result = std.posix.system.fcntl(file.handle, std.posix.F.GETFL, @as(c_int, 0));
         switch (std.posix.errno(result)) {
@@ -1262,6 +1306,44 @@ test "secure browser pipe support fails closed by platform" {
     try std.testing.expect(!supportedOn(.wasi));
 }
 
+test "secure profile cleanup retries independently of the browser deadline" {
+    const Mock = struct {
+        attempts: usize = 0,
+        now_ms: i64 = 1_000,
+
+        fn deleteTree(self: *@This(), _: []const u8) !void {
+            self.attempts += 1;
+            if (self.attempts == 1) return error.TransientDeleteFailure;
+        }
+
+        fn timestamp(self: *@This()) i64 {
+            return self.now_ms;
+        }
+
+        fn sleep(self: *@This(), delay_ms: u64) !void {
+            self.now_ms = self.now_ms +| @as(i64, @intCast(delay_ms));
+        }
+    };
+
+    var mock: Mock = .{};
+    const expired_browser_deadline_ms = mock.now_ms - 1;
+    const cleanup_deadline_ms = profileCleanupDeadline(mock.now_ms);
+    try std.testing.expect(cleanup_deadline_ms > expired_browser_deadline_ms);
+    try std.testing.expect(cleanupSecureProfilePathWith(
+        &mock,
+        "profile",
+        cleanup_deadline_ms,
+        Mock.deleteTree,
+        Mock.timestamp,
+        Mock.sleep,
+    ) == null);
+    try std.testing.expectEqual(@as(usize, 2), mock.attempts);
+    try std.testing.expectEqual(
+        std.math.maxInt(i64),
+        profileCleanupDeadline(std.math.maxInt(i64) - 1),
+    );
+}
+
 test "CDP response ids are exact nonnegative integers" {
     try std.testing.expectEqual(@as(?u64, 7), responseId(.{ .integer = 7 }));
     try std.testing.expectEqual(@as(?u64, 7), responseId(.{ .float = 7.0 }));
@@ -1439,7 +1521,7 @@ test "browser environment blocks desktop protocol launchers and preserves displa
 
 test "secure browser profile shadows external protocol helpers" {
     var profile = try SecureProfile.create(std.testing.allocator);
-    defer profile.deinit(std.testing.allocator, common.compatMilliTimestamp() + 5_000);
+    defer profile.deinit(std.testing.allocator);
     const io = runtime_io.get();
     inline for (.{ "xdg-email", "xdg-open" }) |helper| {
         const helper_path = try std.fs.path.join(
@@ -1564,7 +1646,7 @@ test "configured browser paths are absolute bounded and control free" {
     try std.testing.expect(validExecutablePath("/usr/bin/chromium"));
     try std.testing.expect(!validExecutablePath("chromium"));
     try std.testing.expect(!validExecutablePath("/usr/bin/chromium\n--flag"));
-    try std.testing.expect(!validExecutablePath("/" ++ ("x" ** max_browser_path_bytes)));
+    try std.testing.expect(!validExecutablePath("/" ++ @as([max_browser_path_bytes]u8, @splat('x'))));
 }
 
 test "CDP payload extractors reject malformed envelopes" {
@@ -1609,10 +1691,7 @@ test "opt-in local Chromium hardening smoke test" {
     defer std.testing.allocator.free(named_frame_compatibility);
     try std.testing.expect(try extractRuntimeBoolean(std.testing.allocator, named_frame_compatibility));
 
-    const targets_response = browser.sendCommand("Target.getTargets", EmptyCdpParams{}, deadline) catch |err| {
-        try std.testing.expectEqual(error.UnexpectedBrowserTarget, err);
-        return;
-    };
+    const targets_response = try browser.sendCommand("Target.getTargets", EmptyCdpParams{}, deadline);
     defer std.testing.allocator.free(targets_response);
     const target_summary = try pageTargetSummary(std.testing.allocator, targets_response);
     try std.testing.expectEqual(@as(usize, 1), target_summary.count);

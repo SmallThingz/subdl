@@ -73,7 +73,9 @@ pub fn recover() void {
 
         gty.writer().writeAll(reset) catch {};
         gty.writer().flush() catch {};
-        gty.deinit();
+        // global_tty is a non-owning panic-recovery snapshot. Normal owners
+        // remain responsible for restoring modes and closing handles.
+        tty.global_tty = null;
     }
 }
 
@@ -91,4 +93,8 @@ pub const logo =
 
 test "refAllDecls" {
     std.testing.refAllDecls(@This());
+}
+
+test "terminal widget" {
+    _ = @import("widgets/terminal/Terminal.zig");
 }

@@ -8,7 +8,7 @@ This is a work in progress library to create, process, read and write different 
 
 ## Install & Build
 
-This library currently uses zig [0.16.0](https://ziglang.org/download/)
+This library currently uses Zig [0.17.0](https://ziglang.org/download/)
 
 ### Use zigimg in your project
 
@@ -17,11 +17,14 @@ How to add to your project:
 #### As a submodule
 
 1. Clone this repository or add as a submodule
-1. Add to your `build.zig`
-```
-pub fn build(b: *std.Build) void {
-    exe.root_module.addAnonymousModule("zigimg", .{ .root_source_file = b.path("zigimg.zig") });
-}
+1. After creating `target`, `optimize`, and your executable `exe`, add this to your `build.zig` function:
+```zig
+const zigimg_module = b.createModule(.{
+    .root_source_file = b.path("zigimg.zig"),
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("zigimg", zigimg_module);
 ```
 
 #### Through the package manager
@@ -50,7 +53,7 @@ After you are done setting up, you can look at the user guide below.
 To run the test suite, checkout the [test suite](https://github.com/zigimg/test-suite) and run
 
 1. Checkout zigimg
-1. Go back one folder and checkout the [test suite](https://github.com/zigimg/test-suite) 
+1. Go back one folder and checkout the [test suite](https://github.com/zigimg/test-suite)
 1. Run the tests with `zig build`
 ```
 zig build test
@@ -233,18 +236,18 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-or a `std.fs.File` directly
+or a `std.Io.File` directly
 
 ```zig
 const std = @import("std");
 const zigimg = @import("zigimg");
 
 pub fn main(init: std.process.Init) !void {
-    var file = try std.Io.Dir.cwd().openFile(init.io, file_path, .{});
+    const file = try std.Io.Dir.cwd().openFile(init.io, "my_image.png", .{});
     defer file.close(init.io);
 
     var read_buffer: [zigimg.io.DEFAULT_BUFFER_SIZE]u8 = undefined;
-    var image = try zigimg.Image.fromFile(init.gpa, init.io, &file, read_buffer[0..]);
+    var image = try zigimg.Image.fromFile(init.gpa, init.io, file, read_buffer[0..]);
     defer image.deinit(init.gpa);
 
     // Do something with your image
@@ -260,7 +263,7 @@ const zigimg = @import("zigimg");
 const image_data = @embedFile("test.bmp");
 
 pub fn main(init: std.process.Init) !void {
-    const image = try zigimg.Image.fromMemory(init.gpa, init.io, image_data[0..]);
+    var image = try zigimg.Image.fromMemory(init.gpa, image_data[0..]);
     defer image.deinit(init.gpa);
 
     // Do something with your image
@@ -294,7 +297,7 @@ pub fn example() void {
 
     const first_pixel = image.pixels.grayscale8Alpha[0];
     const grayscale = first_pixel.value;
-    const alpha = grayscale.alpha;
+    const alpha = first_pixel.alpha;
 }
 ```
 
@@ -321,7 +324,7 @@ pub fn example() void {
     // [...]
     // Assuming you already have an image loaded
 
-    const color_it = image.iterator();
+    var color_it = image.iterator();
 
     while (color_it.next()) |color| {
         // Do something with color
@@ -342,7 +345,7 @@ pub fn example() void {
 
     const loop_count = image.animation.loop_count;
 
-    for (image.animation.frames) |frame| {
+    for (image.animation.frames.items) |frame| {
         const rgb24_data = frame.pixels.rgb24;
         const frame_duration = frame.duration;
     }
@@ -385,14 +388,14 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-or a `std.fs.File` directly
+or a `std.Io.File` directly
 
 ```zig
 const std = @import("std");
 const zigimg = @import("zigimg");
 
 pub fn main(init: std.process.Init) !void {
-    var file = try std.Io.Dir.cwd().openFile(init.io, "my_image.gif", .{});
+    const file = try std.Io.Dir.cwd().openFile(init.io, "my_image.gif", .{});
     defer file.close(init.io);
 
     var read_buffer: [zigimg.io.DEFAULT_BUFFER_SIZE]u8 = undefined;
@@ -438,7 +441,7 @@ pub fn example(allocator: std.mem.Allocator, io: std.Io) !void {
 }
 ```
 
-### Write to `std.fs.File`
+### Write to `std.Io.File`
 
 ```zig
 pub fn example(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -461,7 +464,7 @@ pub fn example(allocator: std.mem.Allocator) !void {
 
     // `allocator` is used for incidental allocations in the writing process.
     // `buffer` is where the image will be written to. It must be large enough to fit the output.
-    try image.writeToMemory(allocator, buffer[0..], .{ .tga = .{} });
+    _ = try image.writeToMemory(allocator, buffer[0..], .{ .tga = .{} });
 }
 ```
 
@@ -483,15 +486,15 @@ pub fn main(init: std.process.Init) !void {
 
 ## Interpret raw pixels
 
-If you are not dealing with a image format, you can import your pixel data using `Image.fromRawPixels()`. It will create a copy of the pixels data. If you want the image to take ownership or just pass the data along to write it to a image format, use `Image.fromRawPixelsOwned()`.
+If you are not dealing with an image format, you can import pixel data using `Image.fromRawPixels()`. It creates an owned, correctly aligned copy. To transfer an existing mutable allocation instead, use `Image.fromRawPixelsOwned()`. Ownership transfers only when that call succeeds; the byte slice must span the complete allocation, use the selected pixel type, and later be released by calling `deinit()` with the allocator that created it.
 
-Using `fromRawPixel()`:
+Using `fromRawPixels()`:
 ```zig
 const std = @import("std");
 const zigimg = @import("zigimg");
 
 pub fn main(init: std.process.Init) !void {
-    const my_raw_pixels = @embedData("raw_bgra32.bin");
+    const my_raw_pixels = @embedFile("raw_bgra32.bin");
 
     var image = try zigimg.Image.fromRawPixels(init.gpa, 1920, 1080, my_raw_pixels[0..], .bgra32);
     defer image.deinit(init.gpa);
@@ -505,10 +508,15 @@ Using `fromRawPixelsOwned()`:
 const std = @import("std");
 const zigimg = @import("zigimg");
 
-pub fn main() !void {
-    const my_raw_pixels = @embedData("raw_bgra32.bin");
+pub fn main(init: std.process.Init) !void {
+    const owned_pixels = try init.gpa.alloc(zigimg.color.Bgra32, 1920 * 1080);
+    // Fill owned_pixels before transferring it to the image.
 
-    var image = try zigimg.Image.fromRawPixelsOwned(1920, 1080, my_raw_pixels[0..], .bgra32);
+    var image = zigimg.Image.fromRawPixelsOwned(1920, 1080, std.mem.sliceAsBytes(owned_pixels), .bgra32) catch |err| {
+        init.gpa.free(owned_pixels);
+        return err;
+    };
+    defer image.deinit(init.gpa);
 
     // Do something with your image
 }
@@ -529,7 +537,7 @@ pub fn main(init: std.process.Init) !void {
 
     var bmp = zigimg.formats.bmp.BMP{};
 
-    const pixels = try bmp.read(init.gpa, read_stream.reader());
+    const pixels = try bmp.read(init.gpa, &read_stream);
     defer pixels.deinit(init.gpa);
 
     std.log.info("BMP info header: {}", .{bmp.info_header});
@@ -651,12 +659,12 @@ All color space transformation are done assuming a linear version of the color. 
 You can use either the accurate version or the fast version. For example the sRGB transfer function is linear below a threshold and an exponent curve above the threshold but the fast version will use the approximate exponent curve for the whole range.
 
 ```zig
-pub fn example(linear_color: zigimg.color.Colorf32) {
+pub fn example(linear_color: zigimg.color.Colorf32) void {
     const gamma_srgb = zigimg.color.sRGB.toGamma(linear_color);
     const gamma_bt709 = zigimg.color.BT709.toGammaFast(linear_color);
 
     const linear_srgb = zigimg.color.sRGB.toLinearFast(gamma_srgb);
-    const linear_bt709 = zigimg.color.BT709.toLinear(gamma_bt609);
+    const linear_bt709 = zigimg.color.BT709.toLinear(gamma_bt709);
 }
 ```
 
@@ -680,7 +688,7 @@ pub fn example(linear_color: zigimg.color.Colorf32) void {
 
 When converting from a color space to a RGB color space, you need to specify if you want the color to be clamped inside the RGB colorspace or not because the resulting color could be outside of the RGB color space.
 ```zig
-pub fn example(oklab: zigimg.color.Oklab) {
+pub fn example(oklab: zigimg.color.Oklab) void {
     const linear_srgb_clamped = zigimg.color.sRGB.fromOklab(oklab, .clamp);
     const linear_srgb = zigimg.color.sRGB.fromOklab(oklab, .none);
 }
@@ -707,15 +715,13 @@ pub fn exampleInPlace(linear_srgb_image: []zigimg.color.Colorf32) void {
 }
 
 pub fn exampleCopy(allocator: std.mem.Allocator, linear_srgb_image: []const zigimg.color.Colorf32) ![]zigimg.color.Colorf32 {
-    const slice_oklab_alpha = try zigimg.color.sRGB.sliceToOklabCopy(allocator, linear_srgb_image);
+    const slice_oklab_alpha = try zigimg.color.sRGB.sliceToOklabAlphaCopy(allocator, linear_srgb_image);
+    defer allocator.free(slice_oklab_alpha);
 
     // Do your image manipulatioon in Oklab
 
     // Convert back to linear sRGB
-    return try zigimg.color.sRGB.sliceFromOklabCopy(allocator, slice_oklab_alpha, .clamp);
-
-    // Or without clamping
-    return try zigimg.color.sRGB.sliceFromOklabCopy(allocator, slice_oklab_alpha, .none);
+    return zigimg.color.sRGB.sliceFromOkLabAlphaCopy(allocator, slice_oklab_alpha, .clamp);
 }
 ```
 
@@ -751,7 +757,7 @@ pub fn example(linear_color: zigimg.color.Colorf32) void {
 If you want to convert a whole slice of pixels, use `convertColors()`, it will apply the conversion in-place:
 ```zig
 pub fn example(linear_image: []zigimg.color.Colorf32) void {
-    const adobe_image = zigimg.color.sRGB.convertColors(zigimg.color.AdobeRGB, linear_image);
+    zigimg.color.sRGB.convertColors(zigimg.color.AdobeRGB, linear_image);
 }
 ```
 
@@ -793,7 +799,7 @@ fn myColorSpaceToLinear(value: f32) f32 {
 }
 
 pub fn example() void {
-    pub const my_color_space = zigimg.color.RgbColorspace.init(.{
+    const my_color_space = zigimg.color.RgbColorspace.init(.{
         .red = .{ .x = 0.6400, .y = 0.3300 },
         .green = .{ .x = 0.3000, .y = 0.6000 },
         .blue = .{ .x = 0.1500, .y = 0.0600 },
