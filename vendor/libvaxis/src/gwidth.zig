@@ -9,6 +9,14 @@ pub const Method = enum {
     no_zwj,
 };
 
+/// Convert a measured display width to the bounded representation stored in a
+/// `Cell.Character`. Callers may still use the full measurement for layout;
+/// this conversion only prevents an oversized grapheme from trapping while
+/// populating the cell.
+pub fn cellWidth(width: usize) u8 {
+    return @intCast(@min(width, std.math.maxInt(u8)));
+}
+
 /// Calculate width from east asian width property and Unicode properties
 fn eawToWidth(cp: u21, eaw: uucode.types.EastAsianWidth) i16 {
     // Based on wcwidth implementation
@@ -61,23 +69,27 @@ pub fn gwidth(str: []const u8, method: Method) u16 {
                 var has_text_vs: bool = false;
                 var has_emoji_base: bool = false;
                 var has_emoji_presentation: bool = false;
+                var previous_is_emoji_base: bool = false;
                 var ri_count: u8 = 0;
 
                 while (g_iter.next()) |cp| {
                     // Check for emoji variation selector (U+FE0F)
                     if (cp == 0xfe0f) {
-                        has_emoji_vs = true;
+                        has_emoji_vs = has_emoji_vs or previous_is_emoji_base;
+                        previous_is_emoji_base = false;
                         continue;
                     }
 
                     // Check for text variation selector (U+FE0E)
                     if (cp == 0xfe0e) {
-                        has_text_vs = true;
+                        has_text_vs = has_text_vs or previous_is_emoji_base;
+                        previous_is_emoji_base = false;
                         continue;
                     }
 
                     // Presentation selectors only affect emoji-capable bases.
-                    if (uucode.get(.is_emoji, cp)) {
+                    const is_emoji_base = uucode.get(.is_emoji_vs_base, cp);
+                    if (is_emoji_base) {
                         has_emoji_base = true;
                     }
 
@@ -95,6 +107,7 @@ pub fn gwidth(str: []const u8, method: Method) u16 {
                     const w = eawToWidth(cp, eaw);
                     // Take max of non-zero widths
                     if (w > 0 and w > width) width = w;
+                    previous_is_emoji_base = is_emoji_base;
                 }
 
                 // Handle variation selectors and emoji presentation
@@ -198,6 +211,16 @@ test "gwidth: variation selectors require an emoji base" {
     try testing.expectEqual(1, gwidth("A\u{FE0F}", .unicode));
 }
 
+test "gwidth: variation selectors apply only to the adjacent emoji base" {
+    // The combining mark breaks adjacency, so VS16 must not promote the
+    // preceding text-default heart to emoji presentation.
+    try testing.expectEqual(1, gwidth("\u{2764}\u{0301}\u{FE0F}", .unicode));
+
+    // The adjacent VS16 promotes the heart. A later VS15 following a
+    // combining mark must not demote that earlier, valid presentation choice.
+    try testing.expectEqual(2, gwidth("\u{2764}\u{FE0F}\u{0301}\u{FE0E}", .unicode));
+}
+
 test "gwidth: keycap sequence" {
     // Digit 1 + U+FE0F + U+20E3 (combining enclosing keycap)
     // Should be width 2
@@ -232,6 +255,30 @@ test "gwidth: no_zwj saturates across individually bounded segments" {
 
     try testing.expectEqual(@as(u16, 32768), gwidth(&segment, .unicode));
     try testing.expectEqual(std.math.maxInt(u16), gwidth(joined, .no_zwj));
+}
+
+test "cell width clamps a long valid grapheme" {
+    const long_grapheme = blk: {
+        var bytes: [1 + 3 * 300]u8 = undefined;
+        bytes[0] = 'a';
+        for (0..300) |index| {
+            const offset = 1 + 3 * index;
+            bytes[offset] = 0xE0;
+            bytes[offset + 1] = 0xA4;
+            bytes[offset + 2] = 0xBE;
+        }
+        break :blk bytes;
+    };
+    var grapheme_iter = uucode.grapheme.Iterator(uucode.utf8.Iterator).init(.init(&long_grapheme));
+    const grapheme = grapheme_iter.nextGrapheme().?;
+    try testing.expectEqual(@as(usize, 0), grapheme.start);
+    try testing.expectEqual(long_grapheme.len, grapheme.end);
+    try testing.expectEqual(null, grapheme_iter.nextGrapheme());
+
+    const measured = gwidth(&long_grapheme, .wcwidth);
+    try testing.expect(measured > std.math.maxInt(u8));
+    try testing.expectEqual(std.math.maxInt(u8), cellWidth(measured));
+    try testing.expectEqual(@as(u8, 0), cellWidth(0));
 }
 
 test {

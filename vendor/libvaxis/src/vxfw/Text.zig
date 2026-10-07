@@ -75,7 +75,7 @@ pub fn draw(self: *const Text, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surfa
                     col += 8;
                     continue;
                 }
-                const grapheme_width: u8 = @intCast(ctx.stringWidth(grapheme));
+                const grapheme_width = vaxis.gwidth.cellWidth(ctx.stringWidth(grapheme));
                 surface.writeCell(col, row, .{
                     .char = .{ .grapheme = grapheme, .width = grapheme_width },
                     .style = self.style,
@@ -100,7 +100,7 @@ pub fn draw(self: *const Text, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surfa
             while (char_iter.next()) |char| {
                 if (col >= container_size.width) break;
                 const grapheme = char.bytes(line);
-                const grapheme_width: u8 = @intCast(ctx.stringWidth(grapheme));
+                const grapheme_width = vaxis.gwidth.cellWidth(ctx.stringWidth(grapheme));
 
                 if (col + grapheme_width >= container_size.width and
                     line_width > container_size.width and
@@ -112,6 +112,7 @@ pub fn draw(self: *const Text, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surfa
                     });
                     col = container_size.width;
                 } else {
+                    if (grapheme_width > container_size.width - col) break;
                     surface.writeCell(col, row, .{
                         .char = .{ .grapheme = grapheme, .width = grapheme_width },
                         .style = self.style,
@@ -249,6 +250,9 @@ pub const SoftwrapIterator = struct {
                             const w = self.ctx.stringWidth(grapheme);
                             if (cur_width + w > max) {
                                 const end = self.index;
+                                // A grapheme wider than an empty viewport is clipped,
+                                // but must still advance the iterator.
+                                if (end == start) self.index += grapheme.len;
                                 return .{ .width = cur_width, .bytes = self.line[start..end] };
                             }
                             cur_width += @intCast(w);
@@ -505,4 +509,54 @@ test Text {
 
 test "refAllDecls" {
     std.testing.refAllDecls(@This());
+}
+
+test "widget qualification narrow Unicode wrapping makes progress" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    vxfw.DrawContext.init(.unicode);
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 1, .height = null },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    var iter = SoftwrapIterator.init("界x", ctx);
+    const first = iter.next().?;
+    try std.testing.expectEqual(@as(u16, 0), first.width);
+    try std.testing.expectEqual(@as(usize, 0), first.bytes.len);
+    const second = iter.next().?;
+    try std.testing.expectEqual(@as(u16, 1), second.width);
+    try std.testing.expectEqualStrings("x", second.bytes);
+    try std.testing.expect(iter.next() == null);
+}
+
+test "widget qualification Text draws CRLF and clips Unicode cells" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    vxfw.DrawContext.init(.unicode);
+    var ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 3, .height = 8 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    var text: Text = .{ .text = "界x\r\né", .softwrap = false, .overflow = .clip };
+    const full = try text.draw(ctx);
+    try std.testing.expectEqualStrings("界", full.readCell(0, 0).char.grapheme);
+    try std.testing.expectEqualStrings("x", full.readCell(2, 0).char.grapheme);
+    try std.testing.expectEqualStrings("é", full.readCell(0, 1).char.grapheme);
+    for ([_]bool{ false, true }) |softwrap| {
+        text.softwrap = softwrap;
+        for ([_]u16{ 0, 1, 2, 3 }) |width| {
+            ctx.max.width = width;
+            const surface = try text.draw(ctx);
+            try std.testing.expect(surface.size.width <= width);
+            for (0..surface.size.height) |row| {
+                for (0..surface.size.width) |col| {
+                    try std.testing.expect(surface.readCell(col, row).char.width <= surface.size.width - col);
+                }
+            }
+        }
+    }
 }

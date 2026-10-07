@@ -1,22 +1,22 @@
 # Validation
 
-2026-10-07 · Zig 0.17.0 · package 0.2.0.
+2026-10-08 (Australia/Brisbane) · Zig 0.17.0 · package 0.2.0.
 
-The **gate7 isolated candidate on `finalize/20261007` passed** native safe tests,
+The **final reconciled source for `main` and `finalize/20261007` passed** native safe tests,
 HTTP/browser checks, five-target compilation, real terminal/CLI checks and fresh
-package consumers. The recorded source maps stayed unchanged during the gates;
-all 247 consumer code-map inputs still matched before this document-only update.
-Newer original-checkout edits are outside this qualification.
+package consumers in the isolated checkout. The recorded source maps stayed
+unchanged during the gates. Qualification identifies the frozen source maps,
+not the earlier `ef7c736` HEAD alone. Publication uses that verified source.
 
 ## Completed qualification
 
 | Check | Result |
 | --- | --- |
-| Native safe tests with headless browser enabled | 30/30 steps; **904/970 tests passed, 66 skipped**; exit 0; no source drift |
+| Native safe tests with headless browser enabled | 30/30 steps; **906/972 tests passed, 66 skipped**; exit 0; no source drift |
 | HTTP loopback integration | **53 checks, 51 requests, zero cross-origin credentials** |
 | Offline live-runner contract | **13 normal scenarios passed**; signal execution skipped, cleanup assertions static-only |
 | Cross-target build, browser support enabled | **71/71 steps**, five executables; exit 0; no source drift |
-| Real terminal and CLI | Normal/burst PTY passed; **18/18 CLI checks**; all **267** sealed files stable |
+| Real terminal and CLI | Normal/burst PTY passed; **18/18 CLI checks**; all **257** sealed files stable |
 | Fresh public-module consumers | Default **11/11**, minimal **5/5** build steps; both loopbacks passed; zero code/package drift |
 | Package archive audit | **255 files, 255 matching hashes**, no cache artifacts; public facade/runtime and retained notices present |
 
@@ -25,22 +25,29 @@ Foreign targets received compile/link coverage only. PTY/CLI exercised the newly
 built Linux x86_64 artifact, including navigation, resize, bracketed paste,
 2,000 cache fixtures, normal/burst shutdown and terminal-mode restoration.
 
-Local evidence is under `.tmp/finalize-20261007/` in the qualified isolated
-checkout: `safe-http-browser-gate7.log`, its result/start/end JSON files,
-`gate7/report.json`, its start/end maps, and `final-package-consumer-gate7/RESULT.md` with per-stage
-logs, exits and seals. Safe integration ran 11:47:05–11:51:12 UTC with zero source changes.
+Local evidence is under `.tmp/finalize-20261008/` in the qualified isolated
+checkout: `safe-http-browser-final.log`, its result/start/end JSON files,
+`gate-successor/report.json`, `gate-successor/VERIFIED.json`, its start/end maps,
+and `final-package-consumer-gate8/RESULT.md` with per-stage logs, exits and seals.
+Safe integration ran 04:08:45–04:17:23 on 8 October in Australia/Brisbane
+(18:08:45–18:17:23 UTC on 7 October), with zero source changes.
 Cross/PTY/CLI file-map SHA-256 (sorted compact JSON):
-`d1602b108fa13c2558c333ae0eab1cd9331dd913c40814af7b65906c2438dc24`.
-Consumer code-map SHA-256:
-`3bc870c90549f5a454170afad5e3d2ca031a91d0acab17bd33a5646363a631f1`.
+`534cfc4d3882a885abdc267bb785cc7fdfd74cea7ac802cc91f0096b7ec245fa`.
+Consumer pre-documentation code-map SHA-256:
+`3e1e502f156d6854bca10cce80cb3e763dce4ef1ad4073c9c86730ed80fe062b`.
 
 The runtime-tested package passed all seven audit/build/loopback stages. Its
 247-file code seal includes source, vendor, tools and build inputs, excluding
 only top-level Markdown, LICENCE and COPYING. Archive identity and exact file
-maps are retained in the consumer evidence, not embedded here. A
-post-documentation static repack audits archive inclusion against the unchanged
-tested inputs. Runtime qualification applies to those inputs; it does not
-claim the consumers ran against subsequently edited documentation.
+maps are retained in the consumer evidence, not embedded here. The subsequent
+documentation update changes this file and `vendor/README.md`; the latter is
+inside the conservative code seal despite being prose. A narrow static package
+audit must account for exactly these documentation changes and verify every
+other packaged input against the tested snapshot. Runtime qualification applies
+to the unchanged runtime inputs; it does not claim the consumers ran against
+subsequently edited documentation. The final static audit records its evidence
+under `final-package-consumer-gate8/final-docs-package/`, separately from runtime
+results.
 Local evidence and harnesses are not shipped package files.
 
 ## Configurations and reproduction
@@ -79,7 +86,7 @@ ownership, client/search cleanup and allocator leak checks. Reproduce from the
 isolated checkout containing that local fixture:
 
 ```sh
-cd .tmp/finalize-20261007/final-package-consumer-gate7
+cd .tmp/finalize-20261008/final-package-consumer-gate8
 ZIG_GLOBAL_CACHE_DIR=cache/global zig build -j1 --cache-dir cache/default --prefix output/default --summary all
 python3 -B loopback.py output/default/bin/package-consumer
 ZIG_GLOBAL_CACHE_DIR=cache/global zig build -j1 --cache-dir cache/minimal --prefix output/minimal --summary all -Dminimal=true
@@ -92,12 +99,24 @@ fetch caches beneath the directory being fetched.
 
 ## Focused coverage and live limits
 
-Gate7 focused checks already completed: IndexSubtitle **22 passed, 1 live
+Final focused vendor qualification passed **36/36 core tests** and **76/76
+widget tests** in safe mode. The widget snapshot matched all **53 libvaxis Zig
+source files**, including the merged dependencies; its earlier substitute-
+dependency run is superseded. Format and scoped diff checks passed. Evidence:
+`vendor-core/STATUS.md`, `vendor-core/frozen.json`, `widgets/FROZEN.json`,
+`widgets/final-source-seal.json` and their completion logs/exits.
+
+Titrari passed **14 tests, 1 disabled-live skip** and Subs.sab passed **9 tests,
+1 disabled-live skip** in debug mode, with unchanged HEAD and source hashes.
+Evidence: `titrari-subs/results.json` and its logs. Focused suites overlap and
+are separate from the integrated totals; they are not live availability proof.
+
+Historical gate7 focused checks completed: IndexSubtitle **22 passed, 1 live
 skip** after replacing inline iteration that rejected runtime continue;
 Greeksubs **18 passed, 1 live skip**; Grupahatak **15 passed, 1 live skip**;
-Unicode helper **2 passed**. Focused vendor qualification passed **41/41 tests**, with all **150 vendor
-files stable**.
-These focused results are separate from the integrated totals.
+Unicode helper **2 passed**. Its earlier vendor qualification passed **41/41
+tests**, with **150 vendor files stable** at that time. The earlier integrated
+**904 passed / 66 skipped** result belongs to gate7, not this final source.
 
 The runner's focused qualification passed **13 normal fixture scenarios** and
 **2/2 build steps**. Ten missing-tool cases (five tools removed individually
@@ -105,9 +124,10 @@ from each of production preflight and the contract harness) returned the
 expected exit 2 before creating temporary directories. A complete-PATH positive
 control reached its deliberate exit-99 sentinel. No timeout signals were sent;
 signal scenarios remain skipped/static-only. Evidence:
-`runner-delta7-qualification/STATUS.md` and `preflight-results.json`.
-Index repair evidence: `review2/index-inline-loop-fix/STATUS.md`. Focused vendor
-evidence: `vendor-delta7-qualification/test.log` and `test.exit`.
+`.tmp/finalize-20261007/runner-delta7-qualification/STATUS.md` and its
+`preflight-results.json`. Index repair evidence:
+`.tmp/finalize-20261007/review2/index-inline-loop-fix/STATUS.md`. Historical vendor
+evidence: `.tmp/finalize-20261007/vendor-delta7-qualification/test.log` and `test.exit`.
 
 Earlier TIFF/TGA qualification passed **17** with **26 absent-fixture skips**,
 scoped to the unchanged tested decoder implementations. No vendor full-suite

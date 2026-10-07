@@ -33,6 +33,7 @@ pub fn build(b: *std.Build) !void {
                 "general_category",
                 "is_emoji",
                 "is_emoji_presentation",
+                "is_emoji_vs_base",
             }),
         }) catch |err| switch (err) {
             error.LazyDependencyNeeded => break :blk null,

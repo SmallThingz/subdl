@@ -51,6 +51,15 @@ pub fn draw(self: @This(), win: vaxis.Window, y_scroll: usize) void {
     for (0..range.count) |row| {
         const line = range.start + row;
         const highlighted = line == self.highlighted_line;
+        if (highlighted) {
+            // Paint the gutter first so its padding receives the highlight
+            // without blank cells overwriting the right-aligned digits.
+            for (0..width) |col| {
+                win.writeCell(@intCast(col), @intCast(row), .{
+                    .style = self.highlighted_style,
+                });
+            }
+        }
         const num_digits = numDigits(line);
         const drawn_digits = @min(@as(usize, num_digits), width -| 1);
         for (0..drawn_digits) |i| {
@@ -62,14 +71,6 @@ pub fn draw(self: @This(), win: vaxis.Window, y_scroll: usize) void {
                 },
                 .style = if (highlighted) self.highlighted_style else self.style,
             });
-        }
-        if (highlighted) {
-            const fill_start = @min(drawn_digits + 1, width);
-            for (fill_start..width) |i| {
-                win.writeCell(@intCast(i), @intCast(row), .{
-                    .style = if (highlighted) self.highlighted_style else self.style,
-                });
-            }
         }
     }
 }
@@ -115,4 +116,51 @@ test "visibleLineRange is overflow safe" {
         VisibleLineRange{ .start = max, .count = 0 },
         visibleLineRange(max, max, 2),
     );
+}
+
+test "highlighting preserves shorter right-aligned numbers and styles padding" {
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 1,
+        .cols = 4,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 4,
+        .height = 1,
+        .screen = &screen,
+    };
+    const line_numbers: @This() = .{
+        .num_lines = 100,
+        .highlighted_line = 1,
+        .highlighted_style = .{ .bg = .{ .index = 3 } },
+    };
+
+    line_numbers.draw(win, 0);
+
+    for (0..win.width) |col| {
+        const cell = win.readCell(@intCast(col), 0).?;
+        try std.testing.expect(vaxis.Style.eql(cell.style, line_numbers.highlighted_style));
+    }
+    try std.testing.expectEqualStrings("1", win.readCell(2, 0).?.char.grapheme);
+}
+
+test "widget qualification line numbers tolerate zero and one column" {
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{ .rows = 2, .cols = 1, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(std.testing.allocator);
+    var win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 1, .height = 2, .screen = &screen };
+    const numbers: @This() = .{ .num_lines = 2, .highlighted_line = 1, .highlighted_style = .{ .bg = .{ .index = 3 } } };
+    win.width = 0;
+    numbers.draw(win, 0);
+    win.width = 1;
+    numbers.draw(win, 0);
+    try std.testing.expect(vaxis.Style.eql(win.readCell(0, 0).?.style, numbers.highlighted_style));
+    try std.testing.expectEqualStrings(" ", win.readCell(0, 0).?.char.grapheme);
+    numbers.draw(win, std.math.maxInt(usize));
 }

@@ -54,6 +54,19 @@ fn drawCode(self: *@This(), win: vaxis.Window, buffer: Buffer, opts: DrawOptions
     var byte_index: usize = 0;
     var is_indentation = true;
     const bounds = self.scroll_view.bounds(win);
+    if (opts.highlighted_line != 0) {
+        const highlighted_row = @as(usize, opts.highlighted_line) - 1;
+        if (highlighted_row < buffer.lineCount() and bounds.rowInside(highlighted_row)) {
+            // Paint the clipped row independently of its graphemes. Empty
+            // lines and lines wholly left of the horizontal viewport still
+            // need the same highlight as visible text.
+            for (bounds.x1..bounds.x2) |x| {
+                self.scroll_view.writeCell(win, x, highlighted_row, .{
+                    .style = self.highlighted_style,
+                });
+            }
+        }
+    }
     for (buffer.grapheme.items(.len), buffer.grapheme.items(.offset), 0..) |g_len, g_offset, index| {
         if (bounds.above(pos.y)) {
             break;
@@ -84,14 +97,19 @@ fn drawCode(self: *@This(), win: vaxis.Window, buffer: Buffer, opts: DrawOptions
         }
 
         const width = win.gwidth(cluster);
+        const cell_width = vaxis.gwidth.cellWidth(width);
         defer pos.x +|= width;
+
+        if (opts.indentation > 0 and !std.mem.eql(u8, cluster, " ")) {
+            is_indentation = false;
+        }
 
         if (!bounds.colInside(pos.x)) {
             continue;
         }
-
-        if (opts.indentation > 0 and !std.mem.eql(u8, cluster, " ")) {
-            is_indentation = false;
+        const remaining_cols = bounds.x2 - pos.x;
+        if (@as(usize, cell_width) > remaining_cols) {
+            continue;
         }
 
         if (is_indentation and opts.indentation > 0 and pos.x % opts.indentation == 0) {
@@ -100,15 +118,129 @@ fn drawCode(self: *@This(), win: vaxis.Window, buffer: Buffer, opts: DrawOptions
             self.scroll_view.writeCell(win, pos.x, pos.y, cell);
         } else {
             self.scroll_view.writeCell(win, pos.x, pos.y, .{
-                .char = .{ .grapheme = cluster, .width = @intCast(width) },
+                .char = .{ .grapheme = cluster, .width = cell_width },
                 .style = style,
             });
         }
+    }
+}
 
-        if (highlighted_line) {
-            for (pos.x +| width..bounds.x2) |x| {
-                self.scroll_view.writeCell(win, x, pos.y, .{ .style = style });
-            }
+test "highlight fills empty and horizontally clipped code rows" {
+    const highlighted_style: vaxis.Style = .{ .bg = .{ .index = 3 } };
+
+    {
+        var buffer: Buffer = .{};
+        defer buffer.deinit(std.testing.allocator);
+        try buffer.append(std.testing.allocator, .{ .bytes = "x\n" });
+
+        var screen = try vaxis.Screen.init(std.testing.allocator, .{
+            .rows = 2,
+            .cols = 4,
+            .x_pixel = 0,
+            .y_pixel = 0,
+        });
+        defer screen.deinit(std.testing.allocator);
+        const win: vaxis.Window = .{
+            .x_off = 0,
+            .y_off = 0,
+            .parent_x_off = 0,
+            .parent_y_off = 0,
+            .width = 4,
+            .height = 2,
+            .screen = &screen,
+        };
+        var code_view: @This() = .{ .highlighted_style = highlighted_style };
+
+        code_view.draw(win, buffer, .{
+            .highlighted_line = 2,
+            .draw_line_numbers = false,
+        });
+
+        for (0..win.width) |col| {
+            const cell = win.readCell(@intCast(col), 1).?;
+            try std.testing.expect(vaxis.Style.eql(cell.style, highlighted_style));
         }
     }
+
+    {
+        var buffer: Buffer = .{};
+        defer buffer.deinit(std.testing.allocator);
+        try buffer.append(std.testing.allocator, .{ .bytes = "x\nabcdef" });
+
+        var screen = try vaxis.Screen.init(std.testing.allocator, .{
+            .rows = 2,
+            .cols = 3,
+            .x_pixel = 0,
+            .y_pixel = 0,
+        });
+        defer screen.deinit(std.testing.allocator);
+        const win: vaxis.Window = .{
+            .x_off = 0,
+            .y_off = 0,
+            .parent_x_off = 0,
+            .parent_y_off = 0,
+            .width = 3,
+            .height = 2,
+            .screen = &screen,
+        };
+        var code_view: @This() = .{ .highlighted_style = highlighted_style };
+        code_view.scroll_view.scroll.x = 3;
+
+        code_view.draw(win, buffer, .{
+            .highlighted_line = 1,
+            .draw_line_numbers = false,
+        });
+
+        for (0..win.width) |col| {
+            const cell = win.readCell(@intCast(col), 0).?;
+            try std.testing.expect(vaxis.Style.eql(cell.style, highlighted_style));
+        }
+    }
+}
+
+test "draw requires the full code-cell span and retains zero-width graphemes" {
+    var buffer: Buffer = .{};
+    defer buffer.deinit(std.testing.allocator);
+    try buffer.append(std.testing.allocator, .{ .bytes = "界" });
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 1,
+        .cols = 1,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 1,
+        .height = 1,
+        .screen = &screen,
+    };
+    var code_view: @This() = .{};
+
+    code_view.draw(win, buffer, .{ .draw_line_numbers = false });
+    try std.testing.expectEqualStrings(" ", win.readCell(0, 0).?.char.grapheme);
+
+    screen.clear();
+    try buffer.update(std.testing.allocator, .{ .bytes = "\u{200B}" });
+    code_view.draw(win, buffer, .{ .draw_line_numbers = false });
+    const zero_width_cell = win.readCell(0, 0).?;
+    try std.testing.expectEqualStrings("\u{200B}", zero_width_cell.char.grapheme);
+    try std.testing.expectEqual(@as(u8, 0), zero_width_cell.char.width);
+}
+
+test "widget qualification horizontal clipping preserves indentation state" {
+    var buffer: Buffer = .{};
+    defer buffer.deinit(std.testing.allocator);
+    try buffer.append(std.testing.allocator, .{ .bytes = "x    y" });
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{ .rows = 1, .cols = 3, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(std.testing.allocator);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 3, .height = 1, .screen = &screen };
+    var code_view: @This() = .{};
+    code_view.scroll_view.scroll.x = 2;
+    code_view.draw(win, buffer, .{ .draw_line_numbers = false, .indentation = 2 });
+    try std.testing.expectEqualStrings(" ", win.readCell(0, 0).?.char.grapheme);
 }

@@ -240,7 +240,7 @@ pub fn draw(self: *TextField, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surfac
             continue;
         }
         const g = grapheme.bytes(first_half);
-        const w: u8 = @intCast(ctx.stringWidth(g));
+        const w = vaxis.gwidth.cellWidth(ctx.stringWidth(g));
         if (col + w >= max_width) {
             surface.writeCell(max_width - 1, 0, .{
                 .char = ellipsis,
@@ -267,7 +267,7 @@ pub fn draw(self: *TextField, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surfac
             continue;
         }
         const g = grapheme.bytes(second_half);
-        const w: u8 = @intCast(ctx.stringWidth(g));
+        const w = vaxis.gwidth.cellWidth(ctx.stringWidth(g));
         if (col + w > max_width) {
             surface.writeCell(max_width - 1, 0, .{
                 .char = ellipsis,
@@ -877,4 +877,32 @@ test "word motion with spaces" {
 
 test "refAllDecls" {
     std.testing.refAllDecls(@This());
+}
+
+test "widget qualification TextField Unicode cursor in narrow surfaces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    vxfw.DrawContext.init(.unicode);
+    var field = TextField.init(std.testing.allocator);
+    defer field.deinit();
+    try field.insertSliceAtCursor("e\u{301}界👩‍💻");
+    var ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 8, .height = 1 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    for ([_]u16{ 8, 2, 1, 0, 8 }) |width| {
+        ctx.max.width = width;
+        const surface = try field.draw(ctx);
+        try std.testing.expectEqual(width, surface.size.width);
+        if (width > 0) try std.testing.expect(field.prev_cursor_col < width);
+    }
+    field.buf.moveGapLeft(field.buf.firstHalf().len);
+    field.reset();
+    const surface = try field.draw(ctx);
+    try std.testing.expectEqualStrings("e\u{301}", surface.readCell(0, 0).char.grapheme);
+    try std.testing.expectEqualStrings("界", surface.readCell(1, 0).char.grapheme);
+    try std.testing.expectEqual(@as(u8, 2), surface.readCell(1, 0).char.width);
+    try std.testing.expectEqualStrings("👩‍💻", surface.readCell(3, 0).char.grapheme);
 }

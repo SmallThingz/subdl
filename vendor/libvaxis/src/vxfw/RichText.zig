@@ -81,6 +81,7 @@ pub fn draw(self: *const RichText, ctx: vxfw.DrawContext) Allocator.Error!vxfw.S
                 .right => container_size.width -| line_width,
             };
             for (line) |cell| {
+                if (col >= container_size.width) break;
                 if (col + cell.char.width >= container_size.width and
                     line_width > container_size.width and
                     self.overflow == .ellipsis)
@@ -92,6 +93,7 @@ pub fn draw(self: *const RichText, ctx: vxfw.DrawContext) Allocator.Error!vxfw.S
                     col = container_size.width;
                     continue;
                 } else {
+                    if (cell.char.width > container_size.width - col) break;
                     surface.writeCell(col, row, cell);
                     col += @intCast(cell.char.width);
                 }
@@ -181,7 +183,7 @@ pub const SoftwrapIterator = struct {
                 }
                 const width = ctx.stringWidth(char);
                 const cell: vaxis.Cell = .{
-                    .char = .{ .grapheme = char, .width = @intCast(width) },
+                    .char = .{ .grapheme = char, .width = vaxis.gwidth.cellWidth(width) },
                     .style = span.style,
                     .link = span.link,
                 };
@@ -209,25 +211,22 @@ pub const SoftwrapIterator = struct {
     fn nextHardBreak(self: *SoftwrapIterator) ?[]const vaxis.Cell {
         if (self.hard_index >= self.text.len) return null;
         const start = self.hard_index;
-        var saw_cr: bool = false;
         while (self.hard_index < self.text.len) : (self.hard_index += 1) {
-            const cell = self.text[self.hard_index];
-            if (std.mem.eql(u8, cell.char.grapheme, "\r")) {
-                saw_cr = true;
-            }
-            if (std.mem.eql(u8, cell.char.grapheme, "\n")) {
+            const grapheme = self.text[self.hard_index].char.grapheme;
+            if (std.mem.eql(u8, grapheme, "\r") or
+                std.mem.eql(u8, grapheme, "\n") or
+                std.mem.eql(u8, grapheme, "\r\n"))
+            {
+                const end = self.hard_index;
                 self.hard_index += 1;
-                if (saw_cr) {
-                    return self.text[start .. self.hard_index - 2];
-                }
-                return self.text[start .. self.hard_index - 1];
+                // A span boundary may split CRLF into two graphemes.
+                if (std.mem.eql(u8, grapheme, "\r") and self.hard_index < self.text.len and
+                    std.mem.eql(u8, self.text[self.hard_index].char.grapheme, "\n"))
+                    self.hard_index += 1;
+                return self.text[start..end];
             }
-            if (saw_cr) {
-                // back up one
-                self.hard_index -= 1;
-                return self.text[start .. self.hard_index - 1];
-            }
-        } else return self.text[start..];
+        }
+        return self.text[start..];
     }
 
     fn trimWSPRight(text: []const vaxis.Cell) []const vaxis.Cell {
@@ -305,6 +304,9 @@ pub const SoftwrapIterator = struct {
                     for (word) |cell| {
                         if (cur_width + cell.char.width > max_width) {
                             const end = self.index;
+                            // Consume an unrenderable grapheme on an empty line so
+                            // a narrow viewport cannot stall layout forever.
+                            if (end == start) self.index += 1;
                             return .{ .width = cur_width, .cells = self.line[start..end] };
                         }
                         cur_width += @intCast(cell.char.width);
@@ -422,4 +424,80 @@ test "long word wrapping" {
 
 test "refAllDecls" {
     std.testing.refAllDecls(@This());
+}
+
+test "widget qualification narrow Unicode wrapping makes progress" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    vxfw.DrawContext.init(.unicode);
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 1, .height = null },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    var iter = try SoftwrapIterator.init(&.{.{ .text = "界x" }}, ctx);
+    defer iter.deinit();
+    const first = iter.next().?;
+    try std.testing.expectEqual(@as(u16, 0), first.width);
+    try std.testing.expectEqual(@as(usize, 0), first.cells.len);
+    const second = iter.next().?;
+    try std.testing.expectEqual(@as(u16, 1), second.width);
+    try std.testing.expectEqualStrings("x", second.cells[0].char.grapheme);
+    try std.testing.expect(iter.next() == null);
+}
+
+test "widget qualification rich text handles CR LF and split CRLF" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    vxfw.DrawContext.init(.unicode);
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 8, .height = null },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    for ([_][]const u8{ "a\rb", "a\nb", "a\r\nb" }) |text| {
+        var iter = try SoftwrapIterator.init(&.{.{ .text = text }}, ctx);
+        defer iter.deinit();
+        try std.testing.expectEqualStrings("a", iter.nextHardBreak().?[0].char.grapheme);
+        try std.testing.expectEqualStrings("b", iter.nextHardBreak().?[0].char.grapheme);
+        try std.testing.expect(iter.nextHardBreak() == null);
+    }
+    var iter = try SoftwrapIterator.init(&.{ .{ .text = "a\r" }, .{ .text = "\nb\r\r" } }, ctx);
+    defer iter.deinit();
+    try std.testing.expectEqual(@as(usize, 1), iter.nextHardBreak().?.len);
+    try std.testing.expectEqualStrings("b", iter.nextHardBreak().?[0].char.grapheme);
+    try std.testing.expectEqual(@as(usize, 0), iter.nextHardBreak().?.len);
+    try std.testing.expect(iter.nextHardBreak() == null);
+}
+
+test "widget qualification RichText draws CRLF and clips Unicode cells" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    vxfw.DrawContext.init(.unicode);
+    var ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 3, .height = 8 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    var text: RichText = .{ .text = &.{.{ .text = "界x\r\né" }}, .softwrap = false, .overflow = .clip };
+    const full = try text.draw(ctx);
+    try std.testing.expectEqualStrings("界", full.readCell(0, 0).char.grapheme);
+    try std.testing.expectEqualStrings("x", full.readCell(2, 0).char.grapheme);
+    try std.testing.expectEqualStrings("é", full.readCell(0, 1).char.grapheme);
+    for ([_]bool{ false, true }) |softwrap| {
+        text.softwrap = softwrap;
+        for ([_]u16{ 0, 1, 2, 3 }) |width| {
+            ctx.max.width = width;
+            const surface = try text.draw(ctx);
+            try std.testing.expect(surface.size.width <= width);
+            for (0..surface.size.height) |row| {
+                for (0..surface.size.width) |col| {
+                    try std.testing.expect(surface.readCell(col, row).char.width <= surface.size.width - col);
+                }
+            }
+        }
+    }
 }

@@ -301,7 +301,7 @@ pub fn print(self: Window, segments: []const Segment, opts: PrintOptions) PrintR
                     }
                     if (row >= self.height) break :blk true;
                     const s = grapheme.bytes(segment.text);
-                    if (std.mem.eql(u8, s, "\n")) {
+                    if (std.mem.eql(u8, s, "\n") or std.mem.eql(u8, s, "\r") or std.mem.eql(u8, s, "\r\n")) {
                         row +|= 1;
                         col = 0;
                         continue;
@@ -311,7 +311,7 @@ pub fn print(self: Window, segments: []const Segment, opts: PrintOptions) PrintR
                     if (opts.commit) self.writeCell(col, row, .{
                         .char = .{
                             .grapheme = s,
-                            .width = @intCast(w),
+                            .width = gw.cellWidth(w),
                         },
                         .style = segment.style,
                         .link = segment.link,
@@ -388,7 +388,7 @@ pub fn print(self: Window, segments: []const Segment, opts: PrintOptions) PrintR
                                     if (opts.commit) self.writeCell(col, row, .{
                                         .char = .{
                                             .grapheme = s,
-                                            .width = @intCast(w),
+                                            .width = gw.cellWidth(w),
                                         },
                                         .style = segment.style,
                                         .link = segment.link,
@@ -419,13 +419,13 @@ pub fn print(self: Window, segments: []const Segment, opts: PrintOptions) PrintR
                 while (iter.next()) |grapheme| {
                     if (col >= self.width) break :blk true;
                     const s = grapheme.bytes(segment.text);
-                    if (std.mem.eql(u8, s, "\n")) break :blk true;
+                    if (std.mem.eql(u8, s, "\n") or std.mem.eql(u8, s, "\r") or std.mem.eql(u8, s, "\r\n")) break :blk true;
                     const w = self.gwidth(s);
                     if (w == 0) continue;
                     if (opts.commit) self.writeCell(col, row, .{
                         .char = .{
                             .grapheme = s,
-                            .width = @intCast(w),
+                            .width = gw.cellWidth(w),
                         },
                         .style = segment.style,
                         .link = segment.link,
@@ -440,7 +440,6 @@ pub fn print(self: Window, segments: []const Segment, opts: PrintOptions) PrintR
             };
         },
     }
-    return false;
 }
 
 /// print a single segment. This is just a shortcut for print(&.{segment}, opts)
@@ -886,4 +885,17 @@ const WhitespaceTokenizer = struct {
 
 test "refAllDecls" {
     std.testing.refAllDecls(@This());
+}
+
+test "widget qualification Window prints CRLF as one break" {
+    var screen = try Screen.init(std.testing.allocator, .{ .rows = 2, .cols = 4, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(std.testing.allocator);
+    const win: Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 4, .height = 2, .screen = &screen };
+    const result = win.print(&.{.{ .text = "a\r\nb" }}, .{});
+    try std.testing.expectEqual(@as(u16, 1), result.row);
+    try std.testing.expectEqualStrings("a", win.readCell(0, 0).?.char.grapheme);
+    try std.testing.expectEqualStrings("b", win.readCell(0, 1).?.char.grapheme);
+    const clipped = win.print(&.{.{ .text = "a\r\nb" }}, .{ .wrap = .none, .commit = false });
+    try std.testing.expect(clipped.overflow);
+    try std.testing.expectEqual(@as(u16, 1), clipped.col);
 }

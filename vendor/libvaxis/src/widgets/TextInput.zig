@@ -5,6 +5,7 @@ const Key = @import("../Key.zig");
 const Cell = @import("../Cell.zig");
 const Window = @import("../Window.zig");
 const unicode = @import("../unicode.zig");
+const gwidth = @import("../gwidth.zig");
 
 const TextInput = @This();
 
@@ -183,7 +184,7 @@ pub fn drawWithStyle(self: *TextInput, win: Window, style: Cell.Style) void {
         win.writeCell(col, 0, .{
             .char = .{
                 .grapheme = g,
-                .width = @intCast(w),
+                .width = gwidth.cellWidth(w),
             },
             .style = style,
         });
@@ -210,7 +211,7 @@ pub fn drawWithStyle(self: *TextInput, win: Window, style: Cell.Style) void {
         win.writeCell(col, 0, .{
             .char = .{
                 .grapheme = g,
-                .width = @intCast(w),
+                .width = gwidth.cellWidth(w),
             },
             .style = style,
         });
@@ -765,4 +766,28 @@ test "TextInput.zig: Buffer" {
     try std.testing.expectEqualStrings("ab", gap_buf.firstHalf());
     try std.testing.expectEqualStrings("", gap_buf.secondHalf());
     try std.testing.expectEqual(2, gap_buf.cursor);
+}
+
+test "widget qualification TextInput Unicode cursor in narrow windows" {
+    const vaxis = @import("../main.zig");
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{ .rows = 1, .cols = 8, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(std.testing.allocator);
+    var win: Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 8, .height = 1, .screen = &screen };
+    var input = TextInput.init(std.testing.allocator);
+    defer input.deinit();
+    try input.insertSliceAtCursor("e\u{301}界👩‍💻");
+    for ([_]u16{ 8, 2, 1, 0, 8 }) |width| {
+        win.width = width;
+        input.draw(win);
+        if (width > 0) try std.testing.expect(input.prev_cursor_col < width);
+    }
+    input.buf.moveGapLeft(input.buf.firstHalf().len);
+    input.reset();
+    win.width = 8;
+    screen.clear();
+    input.draw(win);
+    try std.testing.expectEqualStrings("e\u{301}", win.readCell(0, 0).?.char.grapheme);
+    try std.testing.expectEqualStrings("界", win.readCell(1, 0).?.char.grapheme);
+    try std.testing.expectEqual(@as(u8, 2), win.readCell(1, 0).?.char.width);
+    try std.testing.expectEqualStrings("👩‍💻", win.readCell(3, 0).?.char.grapheme);
 }

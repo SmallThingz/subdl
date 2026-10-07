@@ -83,15 +83,37 @@ input-state handling, bounded lifetime-safe storage for queued key text,
 transactional resize/render/mouse state, C API copying and bounds checks, vxfw
 initialization and event state, and terminal child process cancellation and
 cleanup. The affected runtime files are `src/GraphemeCache.zig`,
-`src/Loop.zig`, `src/Parser.zig`, `src/Vaxis.zig`, `src/c_api.zig`,
+`src/Loop.zig`, `src/Parser.zig`, `src/Vaxis.zig`, `src/Window.zig`, `src/c_api.zig`,
 `src/gwidth.zig`, `src/main.zig`, `src/tty.zig`, `src/unicode.zig`,
-`src/vxfw/App.zig`, `src/vxfw/vxfw.zig`, `src/widgets/terminal/Command.zig`,
+`src/vxfw/App.zig`, `src/vxfw/Border.zig`, `src/vxfw/RichText.zig`,
+`src/vxfw/Text.zig`, `src/vxfw/TextField.zig`, `src/vxfw/vxfw.zig`,
+`src/widgets/CodeView.zig`, `src/widgets/LineNumbers.zig`,
+`src/widgets/TextInput.zig`, `src/widgets/terminal/Command.zig`,
 `src/widgets/terminal/Screen.zig`, `src/widgets/TextView.zig`,
 `src/widgets/terminal/Terminal.zig`, and `src/widgets/terminal/ansi.zig`.
 The changes in `src/widgets/terminal/ansi.zig` make ANSI numeric-parameter
 parsing reject arithmetic overflow; cursor-style handling ignores invalid or
 overflowing CSI parameters instead of converting them into invalid enum values.
 Focused in-source regressions cover both paths.
+
+The Unicode tables retain both `is_emoji` and `is_emoji_vs_base`.
+`src/gwidth.zig` applies VS15/VS16 presentation selectors only to an immediately
+adjacent eligible emoji base; intervening combining marks break that adjacency.
+Width sums saturate at the measurement type's limit, including `no_zwj` segments.
+`cellWidth` clamps stored cell widths to 255 while callers retain full measured
+widths for layout, avoiding narrowing traps on oversized graphemes.
+
+Rendering fixes in `src/Window.zig`, `src/vxfw/RichText.zig` and
+`src/widgets/TextView.zig` handle line endings, clipping and zero-width content.
+Window and RichText recognize CR/LF/CRLF; RichText also handles CRLF split across
+spans. Text and RichText advance past oversized graphemes during wrapping and
+clip whole cell spans when drawing without wrapping. Border clips labels within
+the inner right edge and handles zero/narrow bounds without alignment underflow.
+CodeView preserves indentation during horizontal clipping and, with LineNumbers,
+corrects highlight/padding behavior. TextField and TextInput use bounded cell
+widths with Unicode cursor/drawing regressions across narrow viewports. Focused
+regressions cover combining marks, CJK, ZWJ emoji, selectors, line endings,
+scrolling, long labels and zero/narrow drawing bounds.
 
 `TextView.Buffer.writer` uses Zig 0.17's `std.Io.Writer` internally while
 retaining its value-style `write`, `writeAll`, and `print` conveniences and

@@ -57,7 +57,10 @@ pub fn draw(self: *const Border, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Sur
         .surface = child,
     };
 
-    const size: vxfw.Size = .{ .width = child.size.width + 2, .height = child.size.height + 2 };
+    const size: vxfw.Size = .{
+        .width = @min(child.size.width +| 2, ctx.max.width orelse std.math.maxInt(u16)),
+        .height = @min(child.size.height +| 2, ctx.max.height orelse std.math.maxInt(u16)),
+    };
 
     var surf = try vxfw.Surface.initWithChildren(ctx.arena, self.widget(), size, children);
 
@@ -93,16 +96,17 @@ pub fn draw(self: *const Border, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Sur
 
         var text_col: u16 = switch (label.alignment) {
             .top_left, .bottom_left => 1,
-            .top_center, .bottom_center => @max((size.width - text_len) / 2, 1),
-            .top_right, .bottom_right => @max(size.width - 1 - text_len, 1),
+            .top_center, .bottom_center => @max((size.width -| text_len) / 2, 1),
+            .top_right, .bottom_right => @max(size.width -| 1 -| text_len, 1),
         };
 
         var iter = ctx.graphemeIterator(label.text);
         while (iter.next()) |grapheme| {
             const text = grapheme.bytes(label.text);
             const width: u16 = @intCast(ctx.stringWidth(text));
+            if (text_col >= right_edge or width > right_edge - text_col) break;
             surf.writeCell(text_col, text_row, .{
-                .char = .{ .grapheme = text, .width = @intCast(width) },
+                .char = .{ .grapheme = text, .width = vaxis.gwidth.cellWidth(width) },
                 .style = self.style,
             });
             text_col += width;
@@ -145,4 +149,42 @@ test Border {
 
 test "refAllDecls" {
     std.testing.refAllDecls(@This());
+}
+
+test "widget qualification border clips long Unicode labels" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    vxfw.DrawContext.init(.unicode);
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 5, .height = 3 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const child: @import("Text.zig") = .{ .text = "abc" };
+    for ([_]BorderLabel{ .{ .text = "界界界", .alignment = .top_center }, .{ .text = "界界界", .alignment = .top_right } }) |label| {
+        const border: Border = .{ .child = child.widget(), .labels = &.{label} };
+        const surface = try border.draw(ctx);
+        try std.testing.expectEqualStrings("╭", surface.readCell(0, 0).char.grapheme);
+        try std.testing.expectEqualStrings("界", surface.readCell(1, 0).char.grapheme);
+        try std.testing.expectEqualStrings("╮", surface.readCell(4, 0).char.grapheme);
+    }
+}
+
+test "widget qualification border respects zero and one column constraints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    vxfw.DrawContext.init(.unicode);
+    const text: @import("Text.zig") = .{ .text = "界" };
+    const border: Border = .{ .child = text.widget() };
+    for ([_]u16{ 0, 1 }) |width| {
+        const surface = try border.draw(.{
+            .arena = arena.allocator(),
+            .min = .{},
+            .max = .{ .width = width, .height = 1 },
+            .cell_size = .{ .width = 10, .height = 20 },
+        });
+        try std.testing.expect(surface.size.width <= width);
+        try std.testing.expect(surface.size.height <= 1);
+    }
 }

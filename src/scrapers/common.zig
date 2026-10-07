@@ -3008,6 +3008,24 @@ pub fn encodeUriComponent(allocator: Allocator, value: []const u8) ![]u8 {
 
 pub fn resolveUrl(allocator: Allocator, base: []const u8, href: []const u8) ![]const u8 {
     const base_uri = try std.Uri.parse(base);
+    // `Uri.resolveInPlace` intentionally retries a failed absolute-URI parse as
+    // a relative reference. That permissive fallback can turn a malformed
+    // authority (for example, a non-numeric port) into an apparently safe path
+    // on `base`. Absolute and network-path references are untrusted provider
+    // input, so validate those forms strictly before resolving them.
+    if (std.mem.startsWith(u8, href, "//")) {
+        _ = try std.Uri.parseAfterScheme("", href);
+    } else {
+        var prefix_end: usize = 0;
+        while (prefix_end < href.len and
+            href[prefix_end] != '/' and
+            href[prefix_end] != '?' and
+            href[prefix_end] != '#') : (prefix_end += 1)
+        {}
+        if (std.mem.indexOfScalar(u8, href[0..prefix_end], ':') != null) {
+            _ = try std.Uri.parse(href);
+        }
+    }
     // resolveInPlace retains the input reference before allocating merged paths.
     const size = try std.math.add(usize, try std.math.add(usize, base.len, try std.math.mul(usize, href.len, 2)), 32);
     const storage = try allocator.alloc(u8, size);
@@ -3058,6 +3076,17 @@ test "URL resolution follows document relative and origin semantics" {
     try std.testing.expect(!try sameOrigin("https://example.test/a", "http://example.test/b"));
     try std.testing.expect(!try sameOrigin("http://localhost:8080/a", "http://localhost:8081/b"));
     try std.testing.expect(!try sameOrigin("https://example.test/a", "https://example.test/path\r\nx-injected: yes"));
+}
+
+test "URL resolution rejects malformed absolute authorities" {
+    try std.testing.expectError(
+        error.InvalidPort,
+        resolveUrl(std.testing.allocator, "https://example.test/base/", "https://cdn.test:bad/file.zip"),
+    );
+    try std.testing.expectError(
+        error.InvalidPort,
+        resolveUrl(std.testing.allocator, "https://example.test/base/", "//cdn.test:bad/file.zip"),
+    );
 }
 
 test "HTTP redirect targets normalize raw request-line whitespace" {

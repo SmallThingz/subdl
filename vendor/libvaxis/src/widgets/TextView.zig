@@ -389,9 +389,14 @@ pub fn draw(self: *@This(), win: vaxis.Window, buffer: Buffer) void {
         }
 
         const width = win.gwidth(cluster);
+        const cell_width = vaxis.gwidth.cellWidth(width);
         defer pos.x +|= width;
 
         if (!bounds.colInside(pos.x)) {
+            continue;
+        }
+        const remaining_cols = bounds.x2 - pos.x;
+        if (@as(usize, cell_width) > remaining_cols) {
             continue;
         }
 
@@ -403,7 +408,7 @@ pub fn draw(self: *@This(), win: vaxis.Window, buffer: Buffer) void {
         };
 
         self.scroll_view.writeCell(win, pos.x, pos.y, .{
-            .char = .{ .grapheme = cluster, .width = @intCast(width) },
+            .char = .{ .grapheme = cluster, .width = cell_width },
             .style = style,
         });
     }
@@ -714,4 +719,39 @@ test "Buffer.writer maps standard writer allocation failures" {
     try std.testing.expectError(error.WriteFailed, failing_writer.stdWriter().writeAll("x"));
     try std.testing.expectEqual(@as(?BufferWriter.Error, error.OutOfMemory), failing_writer.lastError());
     try expectEmptyBuffer(&failing_buffer);
+}
+
+test "draw requires the full cell span and retains zero-width graphemes" {
+    var buffer: Buffer = .{};
+    defer buffer.deinit(std.testing.allocator);
+    try buffer.append(std.testing.allocator, .{ .bytes = "界" });
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 1,
+        .cols = 1,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 1,
+        .height = 1,
+        .screen = &screen,
+    };
+    var text_view: @This() = .{};
+    text_view.scroll_view.vertical_scrollbar = null;
+
+    text_view.draw(win, buffer);
+    try std.testing.expectEqualStrings(" ", win.readCell(0, 0).?.char.grapheme);
+
+    screen.clear();
+    try buffer.update(std.testing.allocator, .{ .bytes = "\u{200B}" });
+    text_view.draw(win, buffer);
+    const zero_width_cell = win.readCell(0, 0).?;
+    try std.testing.expectEqualStrings("\u{200B}", zero_width_cell.char.grapheme);
+    try std.testing.expectEqual(@as(u8, 0), zero_width_cell.char.width);
 }
