@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+jobs:
+  docs-and-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Zig fmt check
+        shell: bash
+        run: |
+          files=$(find . -type f -name '*.zig' \
+            -not -path './.zig-cache/*' \
+            -not -path './zig-out/*' \
+            -not -path './zig-pkg/*')
+          zig fmt --check $files
+
+      - name: Debug tests
+        run: zig build test
+
+      - name: ReleaseSafe tests
+        run: zig build test -Doptimize=safe
+
+      - name: Build check
+        run: zig build check
+
+      - name: Shared build check
+        run: zig build -Dshared=true

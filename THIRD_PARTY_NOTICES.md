@@ -43,9 +43,8 @@ package's `LICENSE` is retained verbatim as
 
 ### unarr wrapper and native unarr
 
-The Zig wrapper is pinned from <https://github.com/SmallThingz/unarr.zig> at
-commit `077de0c78813cf851556a8907911e531d63ac67d`, with Zig content hash
-`unarr-0.0.0-9UpXA4QpAQB1NoRMmbz4ZFcJddLRcR0Fj5dvqCPoUaLd`. That wrapper pins
+The Zig wrapper is vendored at `vendor/unarr` from <https://github.com/SmallThingz/unarr.zig> at
+commit `077de0c78813cf851556a8907911e531d63ac67d`. That wrapper pins
 native <https://github.com/selmf/unarr> commit
 `00799b5d6a7456eff37276ad376d1715ee222e02`, with Zig content hash
 `N-V-__8AABWMCgDgDrwfEHLcf0rwMuWfSTEMZsTxuSs3oRJs`.
